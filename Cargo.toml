@@ -1,0 +1,49 @@
+[workspace]
+members = [
+  "vendor/ps5upload-pkg",
+  "vendor/ps5upload-fpkg",
+  "crates/ps5-dump-forge-exfat",
+  "crates/ps5-dump-forge-ufs2",
+  "crates/ps5-dump-forge-pfs",
+  "crates/ps5-dump-forge-core",
+  "crates/ps5-dump-forge-cli",
+  "crates/ps5-dump-forge-fpkg",
+  "app/src-tauri",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+version = "0.0.1-pre"
+rust-version = "1.99"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+unicode-normalization = "0.1"
+ps5upload-fpkg = { path = "vendor/ps5upload-fpkg" }
+ps5upload-pkg = { path = "vendor/ps5upload-pkg" }
+ps5-dump-forge-exfat = { path = "crates/ps5-dump-forge-exfat" }
+ps5-dump-forge-ufs2 = { path = "crates/ps5-dump-forge-ufs2" }
+ps5-dump-forge-pfs = { path = "crates/ps5-dump-forge-pfs" }
+ps5-dump-forge-core = { path = "crates/ps5-dump-forge-core" }
+ps5-dump-forge-fpkg = { path = "crates/ps5-dump-forge-fpkg" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# `tauri dev` and `cargo run` use the dev profile. Unoptimized, a conversion is ~20x slower
+# (BLAKE3 hashing and the writers' block loops are CPU-bound), so dev builds are optimized too.
+# ponytail: opt-level 1 for our crates keeps incremental rebuilds quick; debug info stays on.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

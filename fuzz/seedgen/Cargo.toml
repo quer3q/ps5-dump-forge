@@ -1,0 +1,12 @@
+[package]
+name = "ps5-dump-forge-fuzz-seedgen"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+ps5upload-fpkg = { path = "../../vendor/ps5upload-fpkg" }
+ps5-dump-forge-exfat = { path = "../../crates/ps5-dump-forge-exfat" }
+ps5-dump-forge-ufs2 = { path = "../../crates/ps5-dump-forge-ufs2" }
+ps5-dump-forge-pfs = { path = "../../crates/ps5-dump-forge-pfs" }

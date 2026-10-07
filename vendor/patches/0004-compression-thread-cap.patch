@@ -1,0 +1,137 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index b50e266..8f67755 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -66,6 +66,10 @@ pub struct BuildRequest {
+     /// Narrows the package's PlayGo languages to this one (`fr-FR`, …; see
+     /// [`cnt_write::playgo_scenario_json`]). Absent, it declares all of them with `en-US` first.
+     pub language: Option<String>,
++    /// How many threads compress the image: `None` (or `Some(0)`) uses every core, and a cap
++    /// above the core count is the core count. A cap leaves the rest of the machine usable while
++    /// a build runs; the package is the same either way.
++    pub threads: Option<usize>,
+     /// Whether the build itself consults the diagnostic variables `PS5UPLOAD_FPKG_PARAM_FILE`,
+     /// `PS5UPLOAD_FPKG_SPOOL_DIR`, `PS5UPLOAD_FPKG_DRM_TYPE` and `PS5UPLOAD_FPKG_KRAKEN_STORE`.
+     /// [`BuildRequest::new`] sets it, as the build always did; [`BuildRequest::production`]
+@@ -96,6 +100,7 @@ impl BuildRequest {
+                 .and_then(|v| v.parse().ok())
+                 .unwrap_or_default(),
+             language: None,
++            threads: None,
+             env_overrides: true,
+         }
+     }
+@@ -125,6 +130,7 @@ impl BuildRequest {
+             kraken: true,
+             level: crate::kraken::Level::Balanced,
+             language: None,
++            threads: None,
+             env_overrides: false,
+         }
+     }
+@@ -1066,6 +1072,7 @@ fn write_mode(
+                 kraken_store: request.env_overrides && crate::kraken_image::store_only(),
+                 drm_type: drm_type(request),
+                 level: request.level,
++                threads: request.threads,
+                 metadata_codec: request.metadata_codec,
+             };
+             let written =
+diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
+index 44a8b90..e9331ac 100644
+--- a/ps5upload-fpkg/src/stream.rs
++++ b/ps5upload-fpkg/src/stream.rs
+@@ -49,6 +49,9 @@ pub struct StreamRequest<'a> {
+     pub kraken_spool: Option<KrakenSpool>,
+     /// How hard the Kraken encoder works on a compressed image.
+     pub level: crate::kraken::Level,
++    /// Threads compressing the image; `None` or `Some(0)` is every core, and no cap goes past
++    /// the core count.
++    pub threads: Option<usize>,
+     /// Store a compressed image's blocks raw instead (see [`crate::kraken_image::store_only`]).
+     pub kraken_store: bool,
+     /// The container's DRM type (see [`crate::cnt_write::LICENSED_DRM_TYPE`]).
+@@ -164,6 +167,16 @@ fn spool_base(spool: &KrakenSpool) -> u64 {
+     }
+ }
+ 
++/// The compression pool's size: every core, or fewer when the request caps it. A cap above the
++/// core count buys nothing, and the pool sizes its queues from this number.
++pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
++    let all = std::thread::available_parallelism().map_or(4, |n| n.get());
++    match cap {
++        Some(n) if n > 0 => n.min(all),
++        _ => all,
++    }
++}
++
+ fn cancelled() -> crate::Error {
+     crate::Error::Format("the build was cancelled".to_string())
+ }
+@@ -194,7 +207,7 @@ pub fn write_package(
+     let kraken = match &request.kraken_spool {
+         Some(where_to) => {
+             (progress.phase)("compressing the image");
+-            let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
++            let threads = compression_threads(request.threads);
+             let keystone = crate::inner::keystone(request.passcode);
+             let metadata = source.metadata_region();
+             let image = crate::kraken_image::compress(
+@@ -528,6 +541,16 @@ mod tests {
+     use crate::plan;
+     use crate::source::SourceFile;
+ 
++    #[test]
++    fn the_compression_pool_follows_the_cap() {
++        let all = std::thread::available_parallelism().map_or(4, |n| n.get());
++        assert_eq!(compression_threads(Some(1)), 1);
++        assert_eq!(compression_threads(Some(3)), 3.min(all));
++        assert_eq!(compression_threads(Some(0)), all);
++        assert_eq!(compression_threads(None), all);
++        assert_eq!(compression_threads(Some(usize::MAX)), all);
++    }
++
+     /// The metric blob's digests must be the image's: one per stored block and one per file
+     /// in afid order, whether they come from the stream or from a built image.
+     #[test]
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index 25c1170..173d0bc 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -432,3 +432,24 @@ fn the_manifest_serializes() {
+     assert!(json.contains(r#""path":"eboot.bin""#), "{json}");
+     let _ = tree.describe();
+ }
++
++/// A thread cap changes how long compression takes, never what it produces.
++#[test]
++fn a_thread_cap_builds_the_same_package() {
++    let src = TempDir::new("threads-src");
++    write_tree(src.path());
++    let built = |threads: Option<usize>, name: &str| {
++        let out = TempDir::new(name);
++        let report = build::build(
++            &BuildRequest {
++                output_dir: out.path().to_path_buf(),
++                threads,
++                ..request(src.path())
++            },
++            &mut |_| {},
++        )
++        .unwrap();
++        std::fs::read(report.path).unwrap()
++    };
++    assert!(built(Some(1), "threads-one") == built(None, "threads-all"));
++}
+diff --git a/ps5upload-fpkg/tests/production.rs b/ps5upload-fpkg/tests/production.rs
+index 6826cb9..38ebe38 100644
+--- a/ps5upload-fpkg/tests/production.rs
++++ b/ps5upload-fpkg/tests/production.rs
+@@ -65,6 +65,7 @@ fn a_production_request_ignores_every_environment_override() {
+         ps5upload_fpkg::playgo::DEFAULT_CHUNKS
+     );
+     assert_eq!(request.firmware, None);
++    assert_eq!(request.threads, None);
+     assert!(!request.env_overrides);
+ 
+     // The build reads none of them either: the param file and spool folder do not exist, so

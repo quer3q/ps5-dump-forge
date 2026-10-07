@@ -1,0 +1,336 @@
+diff --git a/ps5upload-fpkg/src/exfat.rs b/ps5upload-fpkg/src/exfat.rs
+index 4860680..cde2fec 100644
+--- a/ps5upload-fpkg/src/exfat.rs
++++ b/ps5upload-fpkg/src/exfat.rs
+@@ -12,7 +12,7 @@
+ 
+ use std::path::Path;
+ 
+-use crate::source::{is_junk, SourceFile, SourceTree};
++use crate::source::{dir_label, is_junk, SourceFile, SourceTree};
+ use crate::{format_err, PkgFile, Result};
+ 
+ const OEM: &[u8; 8] = b"EXFAT   ";
+@@ -162,7 +162,7 @@ impl ExFat {
+         if depth > MAX_DEPTH {
+             return format_err(format!("{prefix} nests deeper than {MAX_DEPTH} levels"));
+         }
+-        let entries = parse_dir(bytes)?;
++        let entries = parse_dir(bytes, prefix)?;
+         w.listed += entries.len();
+         if w.listed > MAX_ENTRIES {
+             return format_err("the volume holds more than a million files and directories");
+@@ -469,8 +469,9 @@ struct Parsed {
+     is_dir: bool,
+ }
+ 
+-/// The 32-byte records of a directory stream, primary/stream/name groups assembled.
+-fn parse_dir(bytes: &[u8]) -> Result<Vec<Parsed>> {
++/// The 32-byte records of a directory stream, primary/stream/name groups assembled; `dir`
++/// is the directory's walk prefix, for errors.
++fn parse_dir(bytes: &[u8], dir: &str) -> Result<Vec<Parsed>> {
+     let mut out = Vec::new();
+     let mut pending: Option<Pending> = None;
+     for chunk in bytes.as_chunks::<32>().0 {
+@@ -517,7 +518,28 @@ fn parse_dir(bytes: &[u8]) -> Result<Vec<Parsed>> {
+                 }
+                 if p.name.len() >= p.name_len {
+                     let p = pending.take().unwrap();
+-                    let name = String::from_utf16_lossy(&p.name);
++                    // Names are taken as they are: a lossy decode would rename the file, and
++                    // a '/' would turn it into a path.
++                    let why = if p.name.contains(&0) {
++                        Some("contains a NUL")
++                    } else if p.name.contains(&u16::from(b'/')) {
++                        Some("contains a '/'")
++                    } else {
++                        None
++                    };
++                    let name = match (why, String::from_utf16(&p.name)) {
++                        (None, Ok(name)) => name,
++                        (why, _) => {
++                            let units: Vec<String> =
++                                p.name.iter().map(|u| format!("{u:04x}")).collect();
++                            return format_err(format!(
++                                "{} holds a name that {} (UTF-16 units {})",
++                                dir_label(dir),
++                                why.unwrap_or("is not UTF-16 (an unpaired surrogate)"),
++                                units.join(" ")
++                            ));
++                        }
++                    };
+                     if !name.is_empty() && name != "." && name != ".." && !is_junk(&name) {
+                         out.push(Parsed {
+                             name,
+@@ -646,7 +668,7 @@ mod tests {
+         records.extend(file_bytes("sce_sys", 9, 65536));
+         // The directory's attribute word marks it as one.
+         records[3][4..6].copy_from_slice(&0x10u16.to_le_bytes());
+-        let entries = parse_dir(&flat(records)).unwrap();
++        let entries = parse_dir(&flat(records), "").unwrap();
+         assert_eq!(entries.len(), 2);
+         assert_eq!(entries[0].name, "eboot.bin");
+         assert_eq!(entries[0].size, 1000);
+@@ -680,7 +702,7 @@ mod tests {
+         bytes.extend_from_slice(&flat(file_bytes("keep", 6, 20)));
+         bytes.extend_from_slice(&flat(file_bytes(".DS_Store", 7, 30)));
+ 
+-        let entries = parse_dir(&bytes).unwrap();
++        let entries = parse_dir(&bytes, "").unwrap();
+         assert_eq!(entries.len(), 1);
+         assert_eq!(entries[0].name, "keep");
+     }
+@@ -691,7 +713,7 @@ mod tests {
+         let mut bytes = file_bytes(&name[..15], 5, 1);
+         bytes.push(name_entry(&name[15..]));
+         bytes[1] = stream_entry(name.len(), 0x03, 5, 1);
+-        let entries = parse_dir(&flat(bytes)).unwrap();
++        let entries = parse_dir(&flat(bytes), "").unwrap();
+         assert_eq!(entries[0].name, name);
+     }
+ 
+@@ -700,14 +722,74 @@ mod tests {
+         let mut bytes = file_bytes("short", 5, 1);
+         bytes[1] = stream_entry(200, 0x03, 5, 1);
+         // Without a complete name the entry is dropped, not half-named.
+-        assert!(parse_dir(&flat(bytes)).unwrap().is_empty());
++        assert!(parse_dir(&flat(bytes), "").unwrap().is_empty());
+     }
+ 
+     #[test]
+     fn the_valid_data_length_wins_when_it_is_shorter() {
+         let mut bytes = file_bytes("a", 5, 65536);
+         bytes[1][8..16].copy_from_slice(&100u64.to_le_bytes());
+-        assert_eq!(parse_dir(&flat(bytes)).unwrap()[0].size, 100);
++        assert_eq!(parse_dir(&flat(bytes), "").unwrap()[0].size, 100);
++    }
++
++    /// A name is taken as it is on disk: an unpaired surrogate, a NUL or a '/' in it is an
++    /// error naming the directory and the raw units, never a renamed entry or a subfolder.
++    #[test]
++    fn a_bad_name_is_refused_with_its_units() {
++        for (units, why) in [
++            ([0x61, 0xD800, 0x62], "unpaired surrogate"),
++            ([0x61, 0xDC00, 0x62], "unpaired surrogate"),
++            ([0x61, 0x0000, 0x62], "a NUL"),
++            ([0x61, 0x002F, 0x62], "a '/'"),
++        ] {
++            let mut records = file_bytes("abc", 5, 1);
++            for (i, unit) in units.iter().enumerate() {
++                records[2][2 + 2 * i..4 + 2 * i].copy_from_slice(&u16::to_le_bytes(*unit));
++            }
++            let Err(e) = parse_dir(&flat(records), "sce_sys/") else {
++                panic!("{why}: the name must be refused");
++            };
++            let hex = units.map(|u| format!("{u:04x}")).join(" ");
++            let e = e.to_string();
++            assert!(e.contains("directory sce_sys holds"), "{e}");
++            assert!(e.contains(why) && e.contains(&hex), "{e}");
++        }
++        // `.` and `..` are still skipped, not refused.
++        let mut records = file_bytes(".", 5, 1);
++        records.extend(file_bytes("..", 6, 1));
++        assert!(parse_dir(&flat(records), "").unwrap().is_empty());
++    }
++
++    /// The same through a whole volume: a lone surrogate in `nest/deeper`, and a '/' in
++    /// `big.bin` at the root.
++    #[test]
++    fn a_volume_with_a_bad_name_is_refused() {
++        for (cluster, at, unit, want) in [
++            (
++                9u32,
++                2 + 2,
++                0xDC00u16,
++                "directory nest holds a name that is not UTF-16",
++            ),
++            (
++                4,
++                2 + 2 * 3,
++                0x002F,
++                "the root directory holds a name that contains a '/'",
++            ),
++        ] {
++            let mut img = image_with_dirs();
++            let at = 2 * 512 + (cluster as usize - 2) * 4096 + 64 + at;
++            img[at..at + 2].copy_from_slice(&unit.to_le_bytes());
++            let path = std::env::temp_dir().join(format!(
++                "fpkg-exfat-{}-bad-name-{cluster}",
++                std::process::id()
++            ));
++            std::fs::write(&path, img).unwrap();
++            let err = ExFatSource::open(&path).err().unwrap();
++            std::fs::remove_file(&path).ok();
++            assert!(err.to_string().contains(want), "{err}");
++        }
+     }
+ 
+     /// A 25 KiB image: 512-byte sectors, 4 KiB clusters, a root directory in cluster 4,
+diff --git a/ps5upload-fpkg/src/source.rs b/ps5upload-fpkg/src/source.rs
+index b530c43..246f03a 100644
+--- a/ps5upload-fpkg/src/source.rs
++++ b/ps5upload-fpkg/src/source.rs
+@@ -173,6 +173,15 @@ pub(crate) fn is_junk(name: &str) -> bool {
+         || name.starts_with("._")
+ }
+ 
++/// How errors name the directory a walk is in, from its `prefix` (its path and a `/`, or
++/// nothing at the root).
++pub(crate) fn dir_label(prefix: &str) -> String {
++    match prefix.strip_suffix('/') {
++        Some(dir) => format!("directory {dir}"),
++        None => "the root directory".into(),
++    }
++}
++
+ /// Walk `root` (a game folder) into its file list, sizes from the filesystem only.
+ pub fn scan(root: &Path) -> Result<Vec<SourceFile>> {
+     Ok(scan_tree(root)?.0)
+diff --git a/ps5upload-fpkg/src/ufs2_source.rs b/ps5upload-fpkg/src/ufs2_source.rs
+index fbdeb12..48556fb 100644
+--- a/ps5upload-fpkg/src/ufs2_source.rs
++++ b/ps5upload-fpkg/src/ufs2_source.rs
+@@ -4,7 +4,7 @@ use std::path::Path;
+ 
+ use ps5upload_pkg::ufs2::{Inode, Ufs2Error, Ufs2Image, ROOT_INODE};
+ 
+-use crate::source::{is_junk, SourceFile, SourceTree};
++use crate::source::{dir_label, is_junk, SourceFile, SourceTree};
+ use crate::{format_err, ReadSeek, Result};
+ 
+ /// A directory tree deeper than this is refused, as the reader's own walker does.
+@@ -158,7 +158,8 @@ fn walk(
+         return format_err(format!("{prefix} nests deeper than {MAX_DEPTH} levels"));
+     }
+     let entries: Vec<_> = image
+-        .list_dir(dir)?
++        .list_dir(dir)
++        .map_err(|e| crate::Error::Format(format!("{}: {e}", dir_label(prefix))))?
+         .into_iter()
+         .filter(|e| !e.name.is_empty() && !is_junk(&e.name))
+         .collect();
+@@ -418,6 +419,31 @@ mod tests {
+         assert!(e.to_string().contains("a second time"), "{e}");
+     }
+ 
++    /// A '/' or a NUL in a name is refused with the directory it is in, not walked as a
++    /// subfolder or cut short.
++    #[test]
++    fn a_bad_name_is_refused_with_its_directory() {
++        for (name, want) in [
++            (
++                "a/b",
++                "directory data: directory inode 4 holds a name that contains a '/' (bytes 612f62)",
++            ),
++            (
++                "a\0b",
++                "directory data: directory inode 4 holds a name that contains a NUL (bytes 610062)",
++            ),
++        ] {
++            let mut img = Image::new(64, 64);
++            img.dir(ROOT_INODE, ROOT_INODE, &[("eboot.bin", 3), ("data", 4)]);
++            img.file(3, b"eboot");
++            img.dir(4, ROOT_INODE, &[(name, 3)]);
++            let Err(e) = img.open() else {
++                panic!("{name:?} must not walk");
++            };
++            assert!(e.to_string().contains(want), "{e}");
++        }
++    }
++
+     /// Children far apart in a group with many inodes are read in more than one run, and none
+     /// is dropped.
+     #[test]
+diff --git a/ps5upload-pkg/src/ufs2.rs b/ps5upload-pkg/src/ufs2.rs
+index 3c0fc8d..7e29468 100644
+--- a/ps5upload-pkg/src/ufs2.rs
++++ b/ps5upload-pkg/src/ufs2.rs
+@@ -114,6 +114,12 @@ pub enum Ufs2Error {
+     InodeRunTooLong { count: u64, max: u64 },
+     #[error("directory inode {inode} has more than {max} entries")]
+     TooManyEntries { inode: u64, max: usize },
++    #[error("directory inode {inode} holds a name that {why} (bytes {hex})")]
++    BadName {
++        inode: u64,
++        why: &'static str,
++        hex: String,
++    },
+ }
+ 
+ /// Subset of the superblock we actually use for reading. The full
+@@ -477,14 +483,33 @@ impl<R: Read + Seek> Ufs2Image<R> {
+                     rec_len,
+                 });
+             }
+-            if inode != 0
+-                && name_len > 0
+-                && name_len + 8 <= rec_len as usize
+-                && off + 8 + name_len <= bytes.len()
+-            {
+-                let name = String::from_utf8_lossy(&bytes[off + 8..off + 8 + name_len])
+-                    .trim_end_matches('\0')
+-                    .to_string();
++            if inode != 0 && name_len + 8 > rec_len as usize {
++                return Err(Ufs2Error::BadDirEntry {
++                    offset: off as u64,
++                    rec_len,
++                });
++            }
++            if inode != 0 && name_len > 0 {
++                // Names are taken as they are: a lossy decode or a trimmed byte would rename
++                // the file, and a '/' would turn it into a path.
++                let raw = &bytes[off + 8..off + 8 + name_len];
++                let why = if raw.contains(&0) {
++                    Some("contains a NUL")
++                } else if raw.contains(&b'/') {
++                    Some("contains a '/'")
++                } else {
++                    None
++                };
++                let name = match (why, std::str::from_utf8(raw)) {
++                    (None, Ok(name)) => name.to_string(),
++                    (why, _) => {
++                        return Err(Ufs2Error::BadName {
++                            inode: dir.number,
++                            why: why.unwrap_or("is not UTF-8"),
++                            hex: raw.iter().map(|b| format!("{b:02x}")).collect(),
++                        })
++                    }
++                };
+                 let kind = dirent_kind(kind_byte);
+                 if name != "." && name != ".." {
+                     if out.len() == MAX_DIR_ENTRIES {
+@@ -1125,6 +1150,33 @@ mod tests {
+         assert!(entries.iter().all(|e| e.inode == 3));
+     }
+ 
++    /// A name is taken as it is on disk: bytes that are not UTF-8, a NUL or a '/' in it are
++    /// an error naming the directory and the raw bytes, never a renamed entry or a subfolder.
++    #[test]
++    fn a_bad_name_is_refused_with_its_bytes() {
++        for (name, why) in [
++            (b"ab\xffcdefg", "is not UTF-8"),
++            (b"abcdefg\0", "contains a NUL"),
++            (b"ab/cdefg", "contains a '/'"),
++        ] {
++            let (mut img, dir) = big_dir(3, 8);
++            // The first record's name, in the directory's first block.
++            img.reader.get_mut()[4096 + 8..4096 + 16].copy_from_slice(name);
++            let err = img.list_dir(&dir).unwrap_err();
++            let hex: String = name.iter().map(|b| format!("{b:02x}")).collect();
++            assert!(matches!(err, Ufs2Error::BadName { inode: 2, .. }), "{err}");
++            assert!(err.to_string().contains(why), "{err}");
++            assert!(err.to_string().contains(&hex), "{err}");
++        }
++        // A live entry whose name runs past its record is corrupt, not skipped.
++        let (mut img, dir) = big_dir(3, 8);
++        img.reader.get_mut()[4096 + 7] = 13;
++        assert!(matches!(
++            img.list_dir(&dir),
++            Err(Ufs2Error::BadDirEntry { offset: 0, .. })
++        ));
++    }
++
+     /// Short names fit five million records in the byte budget; the entry count stops first.
+     #[test]
+     fn a_directory_over_the_entry_count_is_refused() {

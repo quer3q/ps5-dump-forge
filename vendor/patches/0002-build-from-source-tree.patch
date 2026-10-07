@@ -1,0 +1,1258 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index 2a12304..34c051e 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -4,6 +4,10 @@
+ //! offset before the first read, and each file is read once while its image is filled. The
+ //! output lands as `<name>.pkg.partial`, is verified by this crate's own reader, and is
+ //! only then renamed.
++//!
++//! [`build`] is [`prepare`] then [`write_package`] around that output transaction. A caller
++//! that has its own (an already-open [`source::SourceTree`], its own temporary name, fsync and
++//! publish) calls the two directly.
+ 
+ use std::path::{Path, PathBuf};
+ 
+@@ -247,18 +251,227 @@ enum Mode {
+     InMemory,
+ }
+ 
+-fn build_mode(
++/// How a file the package carries relates to the source file at the same path.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Origin {
++    /// The source's bytes, unchanged.
++    Source,
++    /// The source's file, edited: `sce_sys/param.json` (DRM, launch, content id, firmware and
++    /// size class, or the `PS5UPLOAD_FPKG_PARAM_FILE` replacement).
++    Rewritten,
++    /// A malformed executable served repaired (see [`self_repair`]); its size may differ.
++    Repaired,
++    /// Made by the build; the source has no file at this path (`ampr_emu.index` for a
++    /// libSceAmpr title, `sce_sys/keystone` when the source has none).
++    Generated,
++}
++
++/// One file of a package, as the package will carry it.
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
++pub struct ManifestEntry {
++    /// `/`-separated, relative to the image root (`uroot`), exactly as the source spells it.
++    pub path: String,
++    /// The packaged size, which is what a reader of the package sees.
++    pub size: u64,
++    pub origin: Origin,
++}
++
++/// A build worked out before a byte is written: the plan, the effective `param.json`, the
++/// content id, the readiness warnings and the effective manifest.
++///
++/// [`prepare`] makes one from a [`source::SourceTree`] and [`write_package`] writes it into a
++/// file the caller owns. The split exists for a caller that validates the tree itself and runs
++/// its own output transaction (unique `.part` name, fsync, no-replace rename): nothing here
++/// opens, names or renames the output. The tree passed to [`write_package`] must be the one
++/// prepared, unchanged; every read is checked against the sizes fixed here.
++pub struct Prepared {
++    request: BuildRequest,
++    plan: Plan,
++    /// Packaged size by path, for every file of the plan.
++    sizes: std::collections::HashMap<String, u64>,
++    param_json: Vec<u8>,
++    /// Executables served repaired, with their size in the source.
++    repairs: std::collections::HashMap<String, (self_repair::SelfRepair, u64)>,
++    /// Files the build made, by path, with their bytes.
++    generated: std::collections::HashMap<String, Vec<u8>>,
++    icon_png: Vec<u8>,
++    icon_dds: Vec<u8>,
++    extras: Vec<cnt_write::ExtraEntry>,
++    content_id: String,
++    content_version: u32,
++    time: (i64, u32),
++    seed: [u8; 16],
++    warnings: Vec<String>,
++    log: Vec<String>,
++    manifest: Vec<ManifestEntry>,
++    container_only: Vec<ManifestEntry>,
++    empty_dirs: Vec<String>,
++    estimated_size: u64,
++}
++
++impl Prepared {
++    /// Every file of the package's inner filesystem, sorted by path, with its final size and
++    /// how it relates to the source: the rewritten `param.json`, repaired executables and
++    /// generated files included; sources' stale build leftovers (see [`sdk_rules::excluded`])
++    /// and the artwork the container carries instead (see [`Prepared::container_only`]) left
++    /// out. This is the list a reader of the finished image walks back.
++    pub fn manifest(&self) -> &[ManifestEntry] {
++        &self.manifest
++    }
++
++    /// Source files the package carries only as container (CNT) entries, not in its image:
++    /// the [`cnt_write::CONTAINER_ONLY`] artwork (`sce_sys/icon0.png`, `pic0.png`, `snd0.at9`,
++    /// …) when the source has it. Each entry's bytes are the source file's, unchanged
++    /// ([`Origin::Source`]), under the source path. A reader that merges the container's entries
++    /// with the image sees `manifest() ∪ container_only()`; the two never share a path.
++    ///
++    /// The container's other entries are not listed: copies of files the image also carries
++    /// (trophy and UDS data, the NP binding files, `param.json`) and metadata the build
++    /// generates with no source path (license, PlayGo tables and scenario, digests).
++    pub fn container_only(&self) -> &[ManifestEntry] {
++        &self.container_only
++    }
++
++    /// Directories of the image with nothing in them (source-relative paths, sorted), which a
++    /// file manifest cannot express.
++    pub fn empty_dirs(&self) -> &[String] {
++        &self.empty_dirs
++    }
++
++    /// The content id the package is built under.
++    pub fn content_id(&self) -> &str {
++        &self.content_id
++    }
++
++    /// Readiness findings that do not stop the build.
++    pub fn warnings(&self) -> &[String] {
++        &self.warnings
++    }
++
++    /// The phase lines the preparation produced: what was left out, repaired, rewritten or
++    /// generated, in order.
++    pub fn log(&self) -> &[String] {
++        &self.log
++    }
++
++    /// The package's size before it is written: [`estimate_size`]'s image and allowance, plus
++    /// the container's payloads and the tables that grow with the package. An over-estimate,
++    /// which is the safe direction for a free-space check.
++    pub fn estimated_size(&self) -> u64 {
++        self.estimated_size
++    }
++
++    /// The layout the package will have.
++    pub fn plan(&self) -> &Plan {
++        &self.plan
++    }
++
++    /// The bytes of a packaged file the preparation already holds: `sce_sys/param.json` as
++    /// packaged (whether or not it was rewritten), and every [`Origin::Generated`] file. `None`
++    /// for anything else, whose bytes [`Prepared::read_range`] serves from the tree.
++    pub fn generated_bytes(&self, path: &str) -> Option<&[u8]> {
++        if !self.sizes.contains_key(path) {
++            return None;
++        }
++        if path == PARAM_JSON {
++            return Some(&self.param_json);
++        }
++        self.generated.get(path).map(Vec::as_slice)
++    }
++
++    /// Up to `len` bytes at `offset` of `path` exactly as the package carries it, whatever its
++    /// [`Origin`]: what the writer itself reads, so a caller can hash the expected manifest.
++    /// `tree` is the tree this was prepared from. A path outside [`Prepared::manifest`] is an
++    /// error.
++    pub fn read_range(
++        &self,
++        tree: &mut dyn source::SourceTree,
++        path: &str,
++        offset: u64,
++        len: usize,
++    ) -> Result<Vec<u8>> {
++        if !self.sizes.contains_key(path) {
++            return format_err(format!(
++                "the plan asked for {path}, which is not in the source"
++            ));
++        }
++        if len == 0 {
++            return Ok(Vec::new());
++        }
++        if let Some(bytes) = self.generated_bytes(path) {
++            let at = usize::try_from(offset)
++                .unwrap_or(usize::MAX)
++                .min(bytes.len());
++            return Ok(bytes[at..at.saturating_add(len).min(bytes.len())].to_vec());
++        }
++        if let Some((repair, original)) = self.repairs.get(path) {
++            let mut read = |o: u64, l: usize| tree.read_range(path, o, l);
++            return repair.read(*original, offset, len, &mut read);
++        }
++        tree.read_range(path, offset, len)
++    }
++}
++
++/// The packaged `param.json`'s path.
++const PARAM_JSON: &str = "sce_sys/param.json";
++
++/// The most bytes [`prepare`] reads whole: `param.json` and the container's payloads together
++/// (see [`read_whole`]). Real ones are a few megabytes, trophies included.
++// ponytail: 256 MiB held in memory (twice while the container is written), stream the payloads into the container if a title ever needs more
++const MAX_WHOLE_READS: u64 = 256 << 20;
++
++/// The files [`prepare`] reads into memory: `param.json`, the icons and the other
++/// presentation and protected entries the container carries.
++fn read_whole(path: &str) -> bool {
++    path == PARAM_JSON
++        || path == "sce_sys/icon0.png"
++        || path == "sce_sys/icon0.dds"
++        || cnt_write::PRESENTATION.iter().any(|(_, p, _)| *p == path)
++        || cnt_write::PROTECTED.iter().any(|(_, p, _, _)| *p == path)
++}
++
++/// Work out a build from `tree` without writing anything: readiness, the effective
++/// `param.json` and content id, SELF repairs, generated files, the plan and its size.
++/// `request`'s `source`, `output_dir` and `file_name` are not used; everything else is.
++pub fn prepare(
++    tree: &mut dyn source::SourceTree,
++    request: &BuildRequest,
++    control: &mut BuildControl,
++) -> Result<Prepared> {
++    prepare_with(tree, request, &mut |_| {}, control)
++}
++
++/// [`prepare`], with its phase lines passed on to `progress` as they happen.
++fn prepare_with(
++    tree: &mut dyn source::SourceTree,
+     request: &BuildRequest,
+     progress: &mut dyn FnMut(&str),
+     control: &mut BuildControl,
+-    mode: Mode,
+-) -> Result<BuildReport> {
++) -> Result<Prepared> {
++    let mut log: Vec<String> = Vec::new();
++    let mut progress = |line: &str| {
++        log.push(line.to_string());
++        progress(line);
++    };
+     enter(control, Stage::Check);
+-    let mut tree = source::open(&request.source)?;
+     let mut files: Vec<SourceFile> = tree.files().to_vec();
+     if files.is_empty() {
+         return format_err(format!("{} has no files", tree.describe()));
+     }
++    // Everything read whole below is held in memory, so its sizes are checked first: an
++    // image's sizes are whatever its metadata says.
++    let whole: u64 = files
++        .iter()
++        .filter(|f| read_whole(&f.path))
++        .fold(0u64, |sum, f| sum.saturating_add(f.size));
++    if whole > MAX_WHOLE_READS {
++        return format_err(format!(
++            "{}: param.json and the files the container carries come to {whole} bytes, over \
++             the {MAX_WHOLE_READS} this builder holds in memory",
++            tree.describe()
++        ));
++    }
+     // Leftovers of an earlier build stay out of this one (see `sdk_rules`).
+     let before = files.len();
+     files.retain(|f| match sdk_rules::excluded(&f.path) {
+@@ -274,17 +487,17 @@ fn build_mode(
+             before - files.len()
+         ));
+     }
+-    let readiness = source::readiness(tree.as_mut());
++    let readiness = source::readiness(tree);
+     let warnings: Vec<String> = readiness
+         .warnings()
+         .map(|c| format!("{}: {}", c.name, c.detail))
+         .collect();
+-    let param_json = tree.read("sce_sys/param.json").unwrap_or_default();
++    let source_param = tree.read(PARAM_JSON).unwrap_or_default();
+     // A "free" or "upgradable" DRM value makes the console show a lock and refuse to start
+     // the title, so the package carries "standard". The user's file is untouched: the
+     // rewritten bytes are served in its place, and the file list's size for it is adjusted
+     // so the plan lays out what the package will actually carry.
+-    let param_json = source::drm_rewrite(&param_json).unwrap_or(param_json);
++    let param_json = source::drm_rewrite(&source_param).unwrap_or_else(|| source_param.clone());
+     let param_json = source::launch_rewrite(&param_json).unwrap_or(param_json);
+     let content_id = match &request.content_id {
+         Some(id) => id.clone(),
+@@ -341,7 +554,7 @@ fn build_mode(
+     // The declared size class, from everything but `param.json` itself.
+     let unpacked: u64 = files
+         .iter()
+-        .filter(|f| f.path != "sce_sys/param.json")
++        .filter(|f| f.path != PARAM_JSON)
+         .map(|f| f.size)
+         .sum();
+     let param_json = match sdk_rules::size_class_rewrite(&param_json, unpacked, files.len() as u64)
+@@ -373,7 +586,7 @@ fn build_mode(
+         }
+         _ => param_json,
+     };
+-    if let Some(entry) = files.iter_mut().find(|f| f.path == "sce_sys/param.json") {
++    if let Some(entry) = files.iter_mut().find(|f| f.path == PARAM_JSON) {
+         entry.size = param_json.len() as u64;
+     }
+     if !files.iter().any(|f| f.path == "eboot.bin") {
+@@ -411,9 +624,19 @@ fn build_mode(
+     if !icon_dds.is_empty() {
+         carried.insert("sce_sys/icon0.dds");
+     }
+-    files.retain(|f| {
+-        !(cnt_write::CONTAINER_ONLY.contains(&f.path.as_str()) && carried.contains(f.path.as_str()))
+-    });
++    let container_only_file = |f: &SourceFile| {
++        cnt_write::CONTAINER_ONLY.contains(&f.path.as_str()) && carried.contains(f.path.as_str())
++    };
++    let container_only: Vec<ManifestEntry> = files
++        .iter()
++        .filter(|f| container_only_file(f))
++        .map(|f| ManifestEntry {
++            path: f.path.clone(),
++            size: f.size,
++            origin: Origin::Source,
++        })
++        .collect();
++    files.retain(|f| !container_only_file(f));
+     let time = request.time.unwrap_or_else(now);
+     // A libSceAmpr title looks its files up through `ampr_emu.index` at the image root (see
+     // `ampr_index`); a dump without one gets one generated from exactly the files packaged.
+@@ -422,7 +645,7 @@ fn build_mode(
+     if !files
+         .iter()
+         .any(|f| f.path.eq_ignore_ascii_case(AMPR_INDEX))
+-        && source::imports_ampr(tree.as_mut(), "eboot.bin")
++        && source::imports_ampr(tree, "eboot.bin")
+     {
+         let listed: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
+         match crate::ampr_index::build(&listed, time.0) {
+@@ -467,17 +690,163 @@ fn build_mode(
+             (outer_write::max_inner_blocks() * BLOCK) as f64 / (1u64 << 30) as f64,
+         ));
+     }
+-    let sizes: std::collections::HashMap<&str, u64> =
+-        files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+-    let cancelled = || {
+-        control
+-            .cancel
+-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+-    };
++    // The keystone the plan adds when the source has none is generated too; its bytes are the
++    // ones the inner writer derives from the passcode.
++    if plan
++        .files
++        .iter()
++        .any(|f| f.generated && f.path == plan::KEYSTONE)
++    {
++        generated.insert(
++            plan::KEYSTONE.to_string(),
++            crate::inner::keystone(&request.passcode).to_vec(),
++        );
++    }
++    // `estimate_size` allows 2 MiB for the container and the install metadata. They also carry
++    // the payloads read above, and tables that grow with the package: a digest per outer
++    // block in each (`imagedigs`, `naps_meta_18`), a CRC per block, and a record per file and
++    // per directory (`pfsimage.xml` names each, escaped: six bytes for a byte at worst). The
++    // same manifest repeats three `param.json` fields, escaped too.
++    let image_size = estimate_size(&plan)?;
++    let payloads = [&param_json, &icon_png, &icon_dds]
++        .into_iter()
++        .chain(extras.iter().map(|e| &e.data))
++        .map(|d| d.len() as u64)
++        .sum::<u64>();
++    let per_file: u64 = plan
++        .files
++        .iter()
++        .map(|f| f.path.len())
++        .chain(plan.dirs.iter().map(|d| d.path.len()))
++        .map(|len| 512 + 6 * len as u64)
++        .sum();
++    let estimated_size = image_size
++        .saturating_add(payloads)
++        .saturating_add((image_size / BLOCK).saturating_mul(128))
++        .saturating_add(per_file)
++        .saturating_add(3 * 6 * param_json.len() as u64);
++    let sizes: std::collections::HashMap<String, u64> = plan
++        .files
++        .iter()
++        .map(|f| (f.path.clone(), f.size))
++        .collect();
++    let mut manifest: Vec<ManifestEntry> = plan
++        .files
++        .iter()
++        .map(|f| ManifestEntry {
++            path: f.path.clone(),
++            size: f.size,
++            origin: if generated.contains_key(&f.path) {
++                Origin::Generated
++            } else if repairs.contains_key(&f.path) {
++                Origin::Repaired
++            } else if f.path == PARAM_JSON && param_json != source_param {
++                Origin::Rewritten
++            } else {
++                Origin::Source
++            },
++        })
++        .collect();
++    manifest.sort_by(|a, b| a.path.cmp(&b.path));
++    let mut empty_dirs: Vec<String> = plan
++        .dirs
++        .iter()
++        .filter(|d| {
++            !d.path.is_empty()
++                && d.dirents
++                    .iter()
++                    .all(|(_, _, kind)| *kind == plan::DIRENT_DOT || *kind == plan::DIRENT_DOTDOT)
++        })
++        .map(|d| d.path.clone())
++        .collect();
++    empty_dirs.sort();
++    Ok(Prepared {
++        request: request.clone(),
++        plan,
++        sizes,
++        param_json,
++        repairs,
++        generated,
++        icon_png,
++        icon_dds,
++        extras,
++        content_id,
++        content_version,
++        time,
++        seed,
++        warnings,
++        log,
++        manifest,
++        container_only,
++        empty_dirs,
++        estimated_size,
++    })
++}
++
++/// Write the package `prepared` describes into `out`, then verify it.
++///
++/// `out` is the caller's: created empty, opened for reading **and** writing (a compressed
++/// image is written in place and read back for its digests), and at `out_path`, which the
++/// verifier reopens. Nothing here names, renames or removes the output: on an error `out` holds
++/// a partial package the caller deletes, and on success it holds the whole package, synced,
++/// which the caller publishes. `tree` is the tree `prepared` came from.
++///
++/// The package is read back with [`verify::verify_streaming`] and the report is returned in
++/// [`BuildReport::verify`]; a package that fails a check is an error (whose message carries
++/// the report), so an `Ok` report always has `verify.ok()`.
++pub fn write_package(
++    prepared: &Prepared,
++    tree: &mut dyn source::SourceTree,
++    out: &mut std::fs::File,
++    out_path: &Path,
++    progress: &mut dyn FnMut(&str),
++    control: &mut BuildControl,
++) -> Result<BuildReport> {
++    if out.metadata()?.len() != 0 {
++        return format_err(format!(
++            "{} is not empty; the package is written into a new file",
++            out_path.display()
++        ));
++    }
++    let written = write_mode(
++        prepared,
++        tree,
++        out,
++        out_path,
++        progress,
++        control,
++        Mode::Streaming,
++    )?;
++    let report = verify_written(prepared, out_path, progress, control)?;
++    let size = out.metadata()?.len();
++    if size != written {
++        return format_err(format!(
++            "{} is {size} bytes where the writer wrote {written}",
++            out_path.display()
++        ));
++    }
++    progress("done");
++    Ok(BuildReport {
++        path: out_path.to_path_buf(),
++        size,
++        content_id: prepared.content_id.clone(),
++        verify: report,
++        warnings: prepared.warnings.clone(),
++    })
++}
++
++fn build_mode(
++    request: &BuildRequest,
++    progress: &mut dyn FnMut(&str),
++    control: &mut BuildControl,
++    mode: Mode,
++) -> Result<BuildReport> {
++    let mut tree = source::open(&request.source)?;
++    let prepared = prepare_with(tree.as_mut(), request, progress, control)?;
+ 
+     // Refuse before the first write rather than fill the disk and fail halfway: a game
+     // package is as large as the game.
+-    let planned = estimate_size(&plan)?;
++    let planned = prepared.estimated_size;
+     if let Some(free) = free_bytes(&request.output_dir) {
+         if let Some(message) = shortfall(free, planned + planned / 100) {
+             return format_err(format!("{}: {message}", request.output_dir.display()));
+@@ -486,7 +855,7 @@ fn build_mode(
+     let stem = request
+         .file_name
+         .clone()
+-        .unwrap_or_else(|| content_id.clone());
++        .unwrap_or_else(|| prepared.content_id.clone());
+     std::fs::create_dir_all(&request.output_dir)?;
+     let final_path = request.output_dir.join(format!("{stem}.pkg"));
+     let partial = request.output_dir.join(format!("{stem}.pkg.partial"));
+@@ -502,36 +871,96 @@ fn build_mode(
+         e
+     };
+ 
++    // Read too: a compressed image is written in place and read back for its digests.
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&partial)?;
++    let written = match write_mode(
++        &prepared,
++        tree.as_mut(),
++        &mut file,
++        &partial,
++        progress,
++        control,
++        mode,
++    ) {
++        Ok(written) => written,
++        Err(e) => return Err(cleanup(e)),
++    };
++    drop(file);
++    let report = match verify_written(&prepared, &partial, progress, control) {
++        Ok(report) => report,
++        Err(e) => return Err(cleanup(e)),
++    };
++    if final_path.exists() {
++        return Err(cleanup(crate::Error::Format(format!(
++            "output appeared during conversion: {}",
++            final_path.display()
++        ))));
++    }
++    std::fs::rename(&partial, &final_path)?;
++    let size = std::fs::metadata(&final_path)?.len();
++    debug_assert_eq!(size, written);
++    progress("done");
++    Ok(BuildReport {
++        path: final_path,
++        size,
++        content_id: prepared.content_id,
++        verify: report,
++        warnings: prepared.warnings,
++    })
++}
++
++/// Read the package at `path` back and require every check to pass.
++fn verify_written(
++    prepared: &Prepared,
++    path: &Path,
++    progress: &mut dyn FnMut(&str),
++    control: &mut BuildControl,
++) -> Result<crate::verify::Report> {
++    enter(control, Stage::Verify);
++    progress("verifying");
++    // The streaming verifier reads the package block by block, so the self-check of a
++    // 155 GB package does not need 155 GB of memory.
++    let mut verify_bytes = |done: u64, total: u64| {
++        if let Some(f) = control.bytes.as_deref_mut() {
++            f(done, total);
++        }
++    };
++    match verify::verify_streaming(path, &prepared.request.passcode, &mut verify_bytes)? {
++        report if report.ok() => Ok(report),
++        report => format_err(format!("the built package failed verification:\n{report}")),
++    }
++}
++
++/// Write the package into `out` (empty, readable and writable) and return its length.
++fn write_mode(
++    prepared: &Prepared,
++    tree: &mut dyn source::SourceTree,
++    out: &mut std::fs::File,
++    out_path: &Path,
++    progress: &mut dyn FnMut(&str),
++    control: &mut BuildControl,
++    mode: Mode,
++) -> Result<u64> {
++    let request = &prepared.request;
++    let plan = &prepared.plan;
++    let content_id = prepared.content_id.as_str();
++    let param_json = &prepared.param_json;
++    let content_version = prepared.content_version;
++    let (time, seed) = (prepared.time, prepared.seed);
++    let cancelled = || {
++        control
++            .cancel
++            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
++    };
++
+     let written = match mode {
+         Mode::Streaming => {
+-            // Read too: a compressed image is written in place and read back for its digests.
+-            let mut file = std::fs::OpenOptions::new()
+-                .read(true)
+-                .write(true)
+-                .create_new(true)
+-                .open(&partial)?;
+             let mut read_range = |path: &str, offset: u64, len: usize| -> Result<Vec<u8>> {
+-                if !sizes.contains_key(path) {
+-                    return format_err(format!(
+-                        "the plan asked for {path}, which is not in the source"
+-                    ));
+-                }
+-                if len == 0 {
+-                    return Ok(Vec::new());
+-                }
+-                if path == "sce_sys/param.json" {
+-                    let at = (offset as usize).min(param_json.len());
+-                    return Ok(param_json[at..(at + len).min(param_json.len())].to_vec());
+-                }
+-                if let Some(bytes) = generated.get(path) {
+-                    let at = (offset as usize).min(bytes.len());
+-                    return Ok(bytes[at..(at + len).min(bytes.len())].to_vec());
+-                }
+-                if let Some((repair, original)) = repairs.get(path) {
+-                    let mut read = |o: u64, l: usize| tree.read_range(path, o, l);
+-                    return repair.read(*original, offset, len, &mut read);
+-                }
+-                tree.read_range(path, offset, len)
++                prepared.read_range(&mut *tree, path, offset, len)
+             };
+             let mut bytes = |done: u64, total: u64| {
+                 if let Some(f) = control.bytes.as_deref_mut() {
+@@ -551,45 +980,41 @@ fn build_mode(
+             let idle = std::sync::atomic::AtomicBool::new(false);
+             let cancel = control.cancel.unwrap_or(&idle);
+             let stream_request = stream::StreamRequest {
+-                plan: &plan,
++                plan,
+                 passcode: &request.passcode,
+                 seed,
+                 image_mode: request.image_mode,
+                 time,
+-                content_id: &content_id,
++                content_id,
+                 content_version,
+                 // The range reader keeps a borrow of it for the file's bytes.
+                 param_json: param_json.clone(),
+-                icon_png,
+-                icon_dds,
+-                extras,
++                icon_png: prepared.icon_png.clone(),
++                icon_dds: prepared.icon_dds.clone(),
++                extras: prepared.extras.clone(),
+                 playgo_chunks: request.playgo_chunks,
+-                kraken_spool: request.kraken.then(|| spool_for(&partial)),
++                kraken_spool: request.kraken.then(|| spool_for(out_path)),
+                 level: request.level,
+                 metadata_codec: request.metadata_codec,
+             };
+             let written =
+-                stream::write_package(&mut file, &stream_request, &mut read_range, &mut p, cancel);
++                stream::write_package(out, &stream_request, &mut read_range, &mut p, cancel);
+             if let Some(stream::KrakenSpool::File(spool)) = &stream_request.kraken_spool {
+                 std::fs::remove_file(spool).ok();
+             }
+-            match written {
+-                Ok(package) => package.size,
+-                Err(e) => return Err(cleanup(e)),
+-            }
++            written?.size
+         }
+         Mode::InMemory => {
+             if cancelled() {
+-                return Err(cleanup(crate::Error::Format(
+-                    "the build was cancelled".to_string(),
+-                )));
++                return format_err("the build was cancelled");
+             }
+             let mut read = |path: &str| -> Result<Vec<u8>> {
+-                match sizes.get(path) {
++                match prepared.sizes.get(path) {
+                     Some(0) => Ok(Vec::new()),
+-                    Some(_) if path == "sce_sys/param.json" => Ok(param_json.clone()),
+-                    Some(_) if generated.contains_key(path) => Ok(generated[path].clone()),
+-                    Some(&size) => match repairs.get(path) {
++                    Some(&size) if prepared.generated_bytes(path).is_some() => {
++                        prepared.read_range(&mut *tree, path, 0, size as usize)
++                    }
++                    Some(&size) => match prepared.repairs.get(path) {
+                         Some((repair, original)) => {
+                             let mut read = |o: u64, l: usize| tree.read_range(path, o, l);
+                             repair.read(*original, 0, size as usize, &mut read)
+@@ -605,7 +1030,7 @@ fn build_mode(
+             enter(control, Stage::Write);
+             progress("writing the inner image");
+             let inner = inner::write_with(
+-                &plan,
++                plan,
+                 &request.passcode,
+                 &mut read,
+                 crate::stream::image_time(request.image_mode, time),
+@@ -628,7 +1053,7 @@ fn build_mode(
+                 &naps,
+                 seed,
+                 request.image_mode,
+-                &content_id,
++                content_id,
+                 &request.passcode,
+                 crate::stream::image_time(request.image_mode, time),
+             )?;
+@@ -655,17 +1080,17 @@ fn build_mode(
+             progress("writing the container");
+             let outer_size = outer.image.len() as u64;
+             let playgo = crate::playgo::build(
+-                &content_id,
++                content_id,
+                 &plan.mount_files(),
+                 cnt_offset,
+                 request.playgo_chunks,
+             )?;
+             let cnt = cnt_write::write(&CntParams {
+-                content_id: &content_id,
+-                param_json: &param_json,
+-                icon_png: &icon_png,
+-                icon_dds: &icon_dds,
+-                extras: &extras,
++                content_id,
++                param_json,
++                icon_png: &prepared.icon_png,
++                icon_dds: &prepared.icon_dds,
++                extras: &prepared.extras,
+                 playgo_chunk: &playgo.chunk_dat,
+                 playgo_hash_table: &playgo.hash_table,
+                 playgo_ficm: &playgo.ficm,
+@@ -676,10 +1101,10 @@ fn build_mode(
+                 cnt_offset,
+                 seed,
+                 passcode: &request.passcode,
+-                content_type: cnt_write::content_class(&param_json).0,
++                content_type: cnt_write::content_class(param_json).0,
+                 drm_type: crate::cnt_write::drm_type_override()
+                     .unwrap_or(crate::cnt_write::LICENSED_DRM_TYPE),
+-                content_flags: cnt_write::content_class(&param_json).1,
++                content_flags: cnt_write::content_class(param_json).1,
+                 inner_size,
+             })?;
+ 
+@@ -707,9 +1132,9 @@ fn build_mode(
+             let sb_at = outer.superblock_block as usize * BLOCK as usize;
+             let manifest = pfsimage::build(&pfsimage::ManifestParams {
+                 facts: &cnt.facts,
+-                content_id: &content_id,
+-                content_type: cnt_write::content_class(&param_json).0,
+-                param_json: &param_json,
++                content_id,
++                content_type: cnt_write::content_class(param_json).0,
++                param_json,
+                 content_version,
+                 cnt_offset,
+                 si_offset: cnt_offset + cnt.facts.container_size,
+@@ -721,7 +1146,7 @@ fn build_mode(
+                 playgo: &playgo,
+                 outer: &outer_layout,
+                 naps_len: naps.len() as u64,
+-                plan: &plan,
++                plan,
+             });
+             let members = vec![
+                 ("common/etc/naps_meta_18.dat".to_string(), meta_18),
+@@ -740,11 +1165,8 @@ fn build_mode(
+ 
+             progress("writing the package");
+             {
+-                use std::io::Write;
+-                let mut out = std::fs::OpenOptions::new()
+-                    .write(true)
+-                    .create_new(true)
+-                    .open(&partial)?;
++                use std::io::{Seek, Write};
++                out.seek(std::io::SeekFrom::Start(0))?;
+                 out.write_all(&fih)?;
+                 out.write_all(&outer.image)?;
+                 out.write_all(&cnt.bytes)?;
+@@ -754,42 +1176,7 @@ fn build_mode(
+             cnt_offset + cnt.bytes.len() as u64 + si.len() as u64
+         }
+     };
+-
+-    enter(control, Stage::Verify);
+-    progress("verifying");
+-    // The streaming verifier reads the package block by block, so the self-check of a
+-    // 155 GB package does not need 155 GB of memory.
+-    let mut verify_bytes = |done: u64, total: u64| {
+-        if let Some(f) = control.bytes.as_deref_mut() {
+-            f(done, total);
+-        }
+-    };
+-    let report = match verify::verify_streaming(&partial, &request.passcode, &mut verify_bytes) {
+-        Ok(report) if report.ok() => report,
+-        Ok(report) => {
+-            return Err(cleanup(crate::Error::Format(format!(
+-                "the built package failed verification:\n{report}"
+-            ))))
+-        }
+-        Err(e) => return Err(cleanup(e)),
+-    };
+-    if final_path.exists() {
+-        return Err(cleanup(crate::Error::Format(format!(
+-            "output appeared during conversion: {}",
+-            final_path.display()
+-        ))));
+-    }
+-    std::fs::rename(&partial, &final_path)?;
+-    let size = std::fs::metadata(&final_path)?.len();
+-    debug_assert_eq!(size, written);
+-    progress("done");
+-    Ok(BuildReport {
+-        path: final_path,
+-        size,
+-        content_id,
+-        verify: report,
+-        warnings,
+-    })
++    Ok(written)
+ }
+ 
+ /// The package's size before it is written: the header block, the outer image the layout
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+new file mode 100644
+index 0000000..25c1170
+--- /dev/null
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -0,0 +1,434 @@
++//! `prepare` and `write_package`: a build from an open source tree into a file the caller owns,
++//! and the effective manifest that says what the package carries.
++
++use std::path::{Path, PathBuf};
++
++use ps5upload_fpkg::build::{self, BuildControl, BuildRequest, Origin};
++use ps5upload_fpkg::crypto::DEFAULT_PASSCODE;
++use ps5upload_fpkg::source::{FolderSource, SourceTree};
++use ps5upload_fpkg::{cnt, fih, inner, kraken_image, outer, PkgFile};
++
++const CONTENT_ID: &str = "UP0000-PPSA01234_00-TESTGAME00000000";
++
++struct TempDir(PathBuf);
++
++impl TempDir {
++    fn new(name: &str) -> Self {
++        let dir = std::env::temp_dir().join(format!("fpkg-prepared-{}-{name}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        Self(dir)
++    }
++
++    fn path(&self) -> &Path {
++        &self.0
++    }
++}
++
++impl Drop for TempDir {
++    fn drop(&mut self) {
++        std::fs::remove_dir_all(&self.0).ok();
++    }
++}
++
++/// A small libSceAmpr app: a module that names the library, artwork the container carries, a
++/// stale packaging leftover, one empty directory.
++fn write_tree(root: &Path) {
++    let put = |path: &str, data: Vec<u8>| {
++        let full = root.join(path);
++        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
++        std::fs::write(&full, &data).unwrap();
++    };
++    let mut eboot: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
++    eboot[1000..1014].copy_from_slice(b"libSceAmpr.prx");
++    put("eboot.bin", eboot);
++    put(
++        "data/small.bin",
++        (0..100u32).map(|i| (i % 13) as u8).collect(),
++    );
++    put("data/large.bin", vec![0xAB; 600 * 1024]);
++    put(
++        "sce_sys/param.json",
++        format!(
++            "{{\"contentId\":\"{CONTENT_ID}\",\"contentVersion\":\"01.001.000\",\"titleId\":\"PPSA01234\",\"applicationDrmType\":\"free\"}}"
++        )
++        .into_bytes(),
++    );
++    put("sce_sys/icon0.png", vec![0x89; 2048]);
++    put("sce_sys/pic0.png", vec![0x50; 1024]);
++    put("sce_sys/playgo-chunk.dat", vec![1; 64]);
++    std::fs::create_dir_all(root.join("data/empty")).unwrap();
++}
++
++fn request(source: &Path) -> BuildRequest {
++    BuildRequest {
++        time: Some((1_700_000_000, 0)),
++        ..BuildRequest::new(source, source)
++    }
++}
++
++/// One file of the built package's outer image.
++fn outer_file(pkg: &Path, name: &str) -> Vec<u8> {
++    let mut file = PkgFile::open(pkg).unwrap();
++    let head = file.read_at(0, fih::HEADER_LEN).unwrap();
++    let parsed = fih::parse(&head).unwrap();
++    let container = cnt::read(&mut file, parsed.cnt_offset).unwrap();
++    let image = outer::open(&mut file, &parsed, &container, DEFAULT_PASSCODE).unwrap();
++    let nodes = image.dinodes();
++    let uroot = nodes.get(2).unwrap();
++    let ino = image
++        .dirents(uroot)
++        .into_iter()
++        .find(|d| d.name == name)
++        .unwrap()
++        .ino as usize;
++    image.file_data(&nodes[ino])
++}
++
++/// The inner mount of a Kraken package, decoded through its descriptor.
++fn mount_of(pkg: &Path) -> Vec<u8> {
++    let naps = outer_file(pkg, "naps_pkg_layout.dat");
++    let image = outer_file(pkg, "pfs_image.dat");
++    let blocks = kraken_image::describe(&naps).unwrap();
++    let size = blocks.last().map(|b| b.logical + b.len).unwrap();
++    let mut mount = vec![0u8; size as usize];
++    for b in &blocks {
++        let bytes = kraken_image::decode_described(&image, b).unwrap();
++        mount[b.logical as usize..(b.logical + b.len) as usize].copy_from_slice(&bytes);
++    }
++    mount
++}
++
++#[test]
++fn a_prepared_build_writes_into_the_callers_file_and_its_manifest_is_the_image() {
++    let src = TempDir::new("src");
++    let out = TempDir::new("out");
++    write_tree(src.path());
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let request = request(src.path());
++    let prepared = build::prepare(&mut tree, &request, &mut BuildControl::default()).unwrap();
++    assert_eq!(prepared.content_id(), CONTENT_ID);
++    assert!(prepared.estimated_size() > 600 * 1024);
++
++    let origin = |path: &str| {
++        prepared
++            .manifest()
++            .iter()
++            .find(|e| e.path == path)
++            .map(|e| e.origin)
++    };
++    assert_eq!(origin("eboot.bin"), Some(Origin::Source));
++    assert_eq!(origin("data/large.bin"), Some(Origin::Source));
++    // The DRM type "free" is rewritten to "standard".
++    assert_eq!(origin("sce_sys/param.json"), Some(Origin::Rewritten));
++    let param = prepared.generated_bytes("sce_sys/param.json").unwrap();
++    assert!(std::str::from_utf8(param).unwrap().contains("standard"));
++    assert_eq!(origin("ampr_emu.index"), Some(Origin::Generated));
++    assert_eq!(origin("sce_sys/keystone"), Some(Origin::Generated));
++    assert_eq!(
++        prepared.generated_bytes("sce_sys/keystone").unwrap().len(),
++        96
++    );
++    assert!(prepared.generated_bytes("eboot.bin").is_none());
++    // The stale leftover is left out, and so is the artwork the container carries instead.
++    assert_eq!(origin("sce_sys/playgo-chunk.dat"), None);
++    assert_eq!(origin("sce_sys/icon0.png"), None);
++    assert_eq!(origin("sce_sys/pic0.png"), None);
++    let container_only: Vec<(&str, u64)> = prepared
++        .container_only()
++        .iter()
++        .map(|e| (e.path.as_str(), e.size))
++        .collect();
++    assert_eq!(
++        container_only,
++        vec![("sce_sys/icon0.png", 2048), ("sce_sys/pic0.png", 1024)]
++    );
++    assert!(prepared
++        .container_only()
++        .iter()
++        .all(|e| e.origin == Origin::Source));
++    assert_eq!(prepared.empty_dirs(), ["data/empty".to_string()]);
++    assert!(prepared.log().iter().any(|l| l.contains("leaving out")));
++    let paths: Vec<&str> = prepared
++        .manifest()
++        .iter()
++        .map(|e| e.path.as_str())
++        .collect();
++    let mut sorted = paths.clone();
++    sorted.sort();
++    assert_eq!(paths, sorted, "the manifest is sorted by path");
++
++    // The caller names, creates and keeps the file; nothing else appears beside it.
++    let path = out.path().join("game.42.part");
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .unwrap();
++    let report = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    drop(file);
++    assert!(report.verify.ok(), "{}", report.verify);
++    assert_eq!(report.path, path);
++    assert_eq!(report.size, std::fs::metadata(&path).unwrap().len());
++    let names: Vec<_> = std::fs::read_dir(out.path())
++        .unwrap()
++        .map(|e| e.unwrap().file_name())
++        .collect();
++    assert_eq!(names, vec![std::ffi::OsString::from("game.42.part")]);
++
++    // The image holds exactly the manifest, each file as `read_range` serves it.
++    let mount = mount_of(&path);
++    let walked = inner::read(&mount, prepared.plan().meta_base).unwrap();
++    let mut in_image: Vec<&str> = walked.files.iter().map(|f| f.path.as_str()).collect();
++    in_image.sort();
++    assert_eq!(in_image, paths);
++    for entry in prepared.manifest() {
++        let f = walked.files.iter().find(|f| f.path == entry.path).unwrap();
++        assert_eq!(f.size, entry.size, "{}", entry.path);
++        let expected = prepared
++            .read_range(&mut tree, &entry.path, 0, entry.size as usize)
++            .unwrap();
++        assert_eq!(
++            &mount[f.offset as usize..(f.offset + f.size) as usize],
++            &expected[..],
++            "{}",
++            entry.path
++        );
++    }
++    assert!(prepared
++        .read_range(&mut tree, "sce_sys/icon0.png", 0, 16)
++        .is_err());
++}
++
++/// `build` is `prepare` + `write_package`: the same request gives the same bytes.
++#[test]
++fn build_and_a_prepared_write_give_the_same_package() {
++    let src = TempDir::new("same-src");
++    let out = TempDir::new("same-out");
++    write_tree(src.path());
++    let built = build::build(
++        &BuildRequest {
++            output_dir: out.path().to_path_buf(),
++            ..request(src.path())
++        },
++        &mut |_| {},
++    )
++    .unwrap();
++
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let path = out.path().join("mine.part");
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .unwrap();
++    build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    assert!(std::fs::read(&built.path).unwrap() == std::fs::read(&path).unwrap());
++}
++
++#[test]
++fn write_package_refuses_a_file_that_is_not_empty() {
++    let src = TempDir::new("full-src");
++    write_tree(src.path());
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let path = src.path().join("taken.part");
++    std::fs::write(&path, b"someone else's").unwrap();
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(&path)
++        .unwrap();
++    let error = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .err()
++    .unwrap();
++    assert!(error.to_string().contains("not empty"), "{error}");
++    assert_eq!(std::fs::read(&path).unwrap(), b"someone else's");
++}
++
++/// A tree whose metadata claims a terabyte-sized artwork file, as a corrupt image can.
++struct Lying(FolderSource, Vec<ps5upload_fpkg::source::SourceFile>);
++
++impl SourceTree for Lying {
++    fn files(&self) -> &[ps5upload_fpkg::source::SourceFile] {
++        &self.1
++    }
++    fn read(&mut self, path: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
++        assert_ne!(
++            path, "sce_sys/pic0.png",
++            "read whole before its size was checked"
++        );
++        self.0.read(path)
++    }
++    fn describe(&self) -> String {
++        self.0.describe()
++    }
++}
++
++/// What is read whole into memory is bounded by its declared size before any of it is read.
++#[test]
++fn a_huge_container_payload_is_refused_before_it_is_read() {
++    let src = TempDir::new("huge-src");
++    write_tree(src.path());
++    let folder = FolderSource::open(src.path()).unwrap();
++    let mut files = folder.files().to_vec();
++    files
++        .iter_mut()
++        .find(|f| f.path == "sce_sys/pic0.png")
++        .unwrap()
++        .size = 1 << 40;
++    let mut tree = Lying(folder, files);
++    let error = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .err()
++    .unwrap();
++    assert!(error.to_string().contains("holds in memory"), "{error}");
++}
++
++/// The estimate covers what the container carries: here 8 MiB of artwork that does not
++/// compress, beside a game of a few kilobytes.
++#[test]
++fn the_estimate_covers_container_payloads() {
++    let src = TempDir::new("estimate-src");
++    let out = TempDir::new("estimate-out");
++    write_tree(src.path());
++    let mut x = 0x2545_F491_4F6C_DD1Du64;
++    let noise: Vec<u8> = (0..8 << 20)
++        .map(|_| {
++            x ^= x << 13;
++            x ^= x >> 7;
++            x ^= x << 17;
++            x as u8
++        })
++        .collect();
++    std::fs::write(src.path().join("sce_sys/pic0.png"), &noise).unwrap();
++    std::fs::write(src.path().join("data/large.bin"), b"small").unwrap();
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let path = out.path().join("estimate.part");
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .unwrap();
++    let report = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    assert!(
++        prepared.estimated_size() >= report.size,
++        "estimated {} for a package of {}",
++        prepared.estimated_size(),
++        report.size
++    );
++    assert!(report.size > 8 << 20);
++}
++
++/// ... and what grows with the tree: a thousand empty directories with long names, in a
++/// package whose image is stored flat (each directory takes an image block, and a record in
++/// the install metadata).
++#[test]
++fn the_estimate_covers_a_directory_heavy_tree() {
++    let src = TempDir::new("dirs-src");
++    let out = TempDir::new("dirs-out");
++    write_tree(src.path());
++    for i in 0..1000 {
++        std::fs::create_dir_all(src.path().join(format!("d/{i:0>200}"))).unwrap();
++    }
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let request = BuildRequest {
++        kraken: false,
++        ..request(src.path())
++    };
++    let prepared = build::prepare(&mut tree, &request, &mut BuildControl::default()).unwrap();
++    let path = out.path().join("dirs.part");
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .unwrap();
++    let report = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    assert!(
++        prepared.estimated_size() >= report.size,
++        "estimated {} for a package of {}",
++        prepared.estimated_size(),
++        report.size
++    );
++}
++
++/// The manifest serializes for a report.
++#[test]
++fn the_manifest_serializes() {
++    let src = TempDir::new("serde-src");
++    write_tree(src.path());
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let json = serde_json::to_string(prepared.manifest()).unwrap();
++    assert!(json.contains(r#""origin":"generated""#), "{json}");
++    assert!(json.contains(r#""path":"eboot.bin""#), "{json}");
++    let _ = tree.describe();
++}

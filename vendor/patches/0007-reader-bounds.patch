@@ -1,0 +1,570 @@
+diff --git a/ps5upload-fpkg/src/exfat.rs b/ps5upload-fpkg/src/exfat.rs
+index 2fbf7ff..4860680 100644
+--- a/ps5upload-fpkg/src/exfat.rs
++++ b/ps5upload-fpkg/src/exfat.rs
+@@ -22,6 +22,9 @@ const FAT_EOC: u32 = 0xFFFF_FFF7;
+ const MAX_DIR_BYTES: u64 = 64 * 1024 * 1024;
+ const MAX_ENTRIES: usize = 1_000_000;
+ const MAX_DEPTH: u32 = 32;
++/// The most path bytes a walk keeps (every file's, every empty directory's). A real game's are
++/// a few tens of megabytes; deep trees of long names in a corrupt image would be gigabytes.
++const MAX_PATH_BYTES: usize = 256 << 20;
+ 
+ /// The Microsoft basic-data GUID a GPT partition table gives an exFAT volume.
+ const BASIC_DATA_GUID: [u8; 16] = [
+@@ -73,9 +76,12 @@ impl ExFat {
+         if !(9..=12).contains(&sector_shift) {
+             return format_err(format!("exFAT sector shift {sector_shift} is out of range"));
+         }
+-        if cluster_shift > 25 {
++        // The specification caps a cluster at 32 MiB (the two shifts together at 25). A cluster
++        // is read whole, so a bigger one would size a buffer of up to 128 GiB from two bytes.
++        if cluster_shift > 25 || sector_shift + cluster_shift > 25 {
+             return format_err(format!(
+-                "exFAT cluster shift {cluster_shift} is out of range"
++                "exFAT cluster shift {cluster_shift} is out of range for {}-byte sectors",
++                1u64 << sector_shift
+             ));
+         }
+         let sector_size = 1u64 << sector_shift;
+@@ -126,11 +132,17 @@ impl ExFat {
+     /// [`ExFat::walk`], plus the directories left with nothing in them once junk is skipped
+     /// (sorted), as [`crate::source::scan_tree`] reports them for a folder.
+     pub fn walk_tree(&mut self) -> Result<(Vec<ExFatFile>, Vec<String>)> {
+-        let mut files = Vec::new();
+-        let mut empty = Vec::new();
+         let root = self.root_cluster;
+         let bytes = self.chain_stream(root)?;
+-        self.walk_dir(&bytes, "", 0, &mut files, &mut empty)?;
++        let mut w = Walked {
++            files: Vec::new(),
++            empty: Vec::new(),
++            dirs: std::collections::HashSet::from([root]),
++            path_bytes: 0,
++            listed: 0,
++        };
++        self.walk_dir(&bytes, "", 0, &mut w)?;
++        let (mut files, mut empty) = (w.files, w.empty);
+         files.sort_by(|a, b| a.path.cmp(&b.path));
+         empty.sort();
+         Ok((files, empty))
+@@ -146,31 +158,43 @@ impl ExFat {
+     }
+ 
+     /// Walks one directory; returns whether anything under it was kept.
+-    fn walk_dir(
+-        &mut self,
+-        bytes: &[u8],
+-        prefix: &str,
+-        depth: u32,
+-        out: &mut Vec<ExFatFile>,
+-        empty: &mut Vec<String>,
+-    ) -> Result<bool> {
++    fn walk_dir(&mut self, bytes: &[u8], prefix: &str, depth: u32, w: &mut Walked) -> Result<bool> {
+         if depth > MAX_DEPTH {
+             return format_err(format!("{prefix} nests deeper than {MAX_DEPTH} levels"));
+         }
++        let entries = parse_dir(bytes)?;
++        w.listed += entries.len();
++        if w.listed > MAX_ENTRIES {
++            return format_err("the volume holds more than a million files and directories");
++        }
+         let mut kept = false;
+-        for e in parse_dir(bytes)? {
++        for e in entries {
+             kept = true;
+             let path = format!("{prefix}{}", e.name);
+             if e.is_dir {
+-                if out.len() > MAX_ENTRIES {
+-                    return format_err("the volume holds more than a million files");
++                if !w.dirs.insert(e.first_cluster) {
++                    return format_err(format!(
++                        "directory {path} starts at cluster {}, as another one does",
++                        e.first_cluster
++                    ));
+                 }
+                 let bytes = self.read_dir_stream(&e, &path)?;
+-                if !self.walk_dir(&bytes, &format!("{path}/"), depth + 1, out, empty)? {
+-                    empty.push(path);
++                if !self.walk_dir(&bytes, &format!("{path}/"), depth + 1, w)? {
++                    w.keep(&path)?;
++                    w.empty.push(path);
+                 }
+             } else {
+-                out.push(ExFatFile {
++                // A file cannot hold more than the volume does. Bounding it here keeps a
++                // corrupt length from sizing a read buffer before the first cluster is checked.
++                let heap = u64::from(self.geom.cluster_count) * self.geom.cluster_size;
++                if e.size > heap {
++                    return format_err(format!(
++                        "{path} claims {} bytes, more than the volume's {heap}",
++                        e.size
++                    ));
++                }
++                w.keep(&path)?;
++                w.files.push(ExFatFile {
+                     path,
+                     size: e.size,
+                     first_cluster: e.first_cluster,
+@@ -313,6 +337,32 @@ impl ExFat {
+     }
+ }
+ 
++/// What a walk collects, and what it has spent of its budgets.
++struct Walked {
++    files: Vec<ExFatFile>,
++    empty: Vec<String>,
++    /// The first cluster of every directory walked: two directories never share one, so a
++    /// repeat is a cycle (or a fan-out the depth limit alone would let grow exponentially).
++    dirs: std::collections::HashSet<u32>,
++    /// Bytes of the paths kept so far, against [`MAX_PATH_BYTES`].
++    path_bytes: usize,
++    /// Entries parsed so far, every directory's (each is walked once), against
++    /// [`MAX_ENTRIES`]: counted as they are parsed, so the entries of directories still being
++    /// walked further up count too.
++    listed: usize,
++}
++
++impl Walked {
++    /// Count one more kept path against the walk's budgets.
++    fn keep(&mut self, path: &str) -> Result<()> {
++        self.path_bytes += path.len();
++        if self.path_bytes > MAX_PATH_BYTES {
++            return format_err("the volume's paths are over 256 MiB");
++        }
++        Ok(())
++    }
++}
++
+ /// What one FAT slot says.
+ enum FatLink {
+     Next(u32),
+@@ -795,6 +845,36 @@ mod tests {
+         assert_eq!(source.empty_dirs(), ["empty", "junk", "nest/deeper"]);
+     }
+ 
++    /// A directory entry pointing back at the root would be walked again and again (to the
++    /// depth limit, doubling with every extra link): refused.
++    #[test]
++    fn a_directory_cycle_is_refused() {
++        let mut img = image_with_dirs();
++        // `nest/deeper` now starts where the root does.
++        let at = 2 * 512 + (9 - 2) * 4096 + 32 + 20;
++        img[at..at + 4].copy_from_slice(&4u32.to_le_bytes());
++        let path = std::env::temp_dir().join(format!("fpkg-exfat-{}-cycle", std::process::id()));
++        std::fs::write(&path, img).unwrap();
++        let err = ExFatSource::open(&path).err().unwrap();
++        std::fs::remove_file(&path).ok();
++        assert!(err.to_string().contains("as another one does"), "{err}");
++    }
++
++    /// A file claiming more bytes than the volume holds is refused at the walk, before any
++    /// read sizes a buffer from it.
++    #[test]
++    fn a_file_larger_than_the_volume_is_refused() {
++        let mut img = synthetic_image();
++        // `big.bin`'s stream record: the second record of the root, in cluster 4.
++        let at = 2 * 512 + (4 - 2) * 4096 + 32 + 24;
++        img[at..at + 8].copy_from_slice(&(1u64 << 60).to_le_bytes());
++        let path = std::env::temp_dir().join(format!("fpkg-exfat-{}-huge", std::process::id()));
++        std::fs::write(&path, img).unwrap();
++        let err = ExFatSource::open(&path).err().unwrap();
++        std::fs::remove_file(&path).ok();
++        assert!(err.to_string().contains("more than the volume"), "{err}");
++    }
++
+     #[test]
+     fn a_stream_that_runs_off_the_volume_is_an_error() {
+         let (path, mut volume) = synthetic_at("short");
+@@ -854,6 +934,28 @@ mod tests {
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ 
++    /// Two shifts each in range can still make a 128 GiB cluster; the specification's 32 MiB
++    /// cap holds.
++    #[test]
++    fn a_cluster_over_32_mib_is_refused() {
++        let dir = std::env::temp_dir().join(format!("fpkg-exfat-big-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let img = dir.join("big.exfat");
++        let mut boot = vec![0u8; 8192];
++        boot[3..11].copy_from_slice(OEM);
++        boot[108] = 12;
++        boot[109] = 25;
++        boot[92..96].copy_from_slice(&16u32.to_le_bytes());
++        boot[96..100].copy_from_slice(&4u32.to_le_bytes());
++        std::fs::write(&img, &boot).unwrap();
++        let Err(err) = ExFat::open(&img) else {
++            panic!("{} must not open", img.display());
++        };
++        let err = err.to_string();
++        assert!(err.contains("cluster shift"), "{err}");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
+     #[test]
+     fn a_heap_past_the_image_is_refused() {
+         let dir = std::env::temp_dir().join(format!("fpkg-exfat-heap-{}", std::process::id()));
+diff --git a/ps5upload-fpkg/src/ufs2_source.rs b/ps5upload-fpkg/src/ufs2_source.rs
+index 22453e9..fbdeb12 100644
+--- a/ps5upload-fpkg/src/ufs2_source.rs
++++ b/ps5upload-fpkg/src/ufs2_source.rs
+@@ -9,6 +9,13 @@ use crate::{format_err, ReadSeek, Result};
+ 
+ /// A directory tree deeper than this is refused, as the reader's own walker does.
+ const MAX_DEPTH: u32 = 32;
++/// An image listing more files and directories than this is refused, as an exFAT one is: a
++/// game package holds at most half a million files (see
++/// [`crate::sdk_rules::LARGE_PACKAGE_LV2_FILE_LIMIT`]).
++const MAX_ENTRIES: usize = 1_000_000;
++/// The most path bytes a walk keeps (every file's, every empty directory's). A real game's are
++/// a few tens of megabytes; deep trees of long names in a corrupt image would be gigabytes.
++const MAX_PATH_BYTES: usize = 256 << 20;
+ 
+ impl From<Ufs2Error> for crate::Error {
+     fn from(e: Ufs2Error) -> Self {
+@@ -43,6 +50,9 @@ impl Ufs2Source {
+             files: &mut files,
+             inodes: &mut inodes,
+             empty: &mut empty_dirs,
++            dirs: std::collections::HashSet::from([ROOT_INODE]),
++            path_bytes: 0,
++            listed: 0,
+         };
+         walk(&mut image, &root, "", 0, &mut tree)?;
+         empty_dirs.sort();
+@@ -113,6 +123,27 @@ struct Walk<'a> {
+     files: &'a mut Vec<SourceFile>,
+     inodes: &'a mut Vec<Inode>,
+     empty: &'a mut Vec<String>,
++    /// Directory inodes already walked. UFS links a directory from one parent only, so a
++    /// second link is a cycle (or a fan-out the depth limit alone would let grow
++    /// exponentially) in a corrupt image.
++    dirs: std::collections::HashSet<u64>,
++    /// Bytes of the paths kept so far, against [`MAX_PATH_BYTES`].
++    path_bytes: usize,
++    /// Entries listed so far, every directory's (each is listed once), against
++    /// [`MAX_ENTRIES`]: counted as they are listed, so the entries of directories still being
++    /// walked further up count too.
++    listed: usize,
++}
++
++impl Walk<'_> {
++    /// Count one more kept path against the walk's budgets.
++    fn keep(&mut self, path: &str) -> Result<()> {
++        self.path_bytes += path.len();
++        if self.path_bytes > MAX_PATH_BYTES {
++            return format_err("the image's paths are over 256 MiB");
++        }
++        Ok(())
++    }
+ }
+ 
+ /// Walks one directory; returns whether anything under it was kept.
+@@ -131,6 +162,10 @@ fn walk(
+         .into_iter()
+         .filter(|e| !e.name.is_empty() && !is_junk(&e.name))
+         .collect();
++    tree.listed += entries.len();
++    if tree.listed > MAX_ENTRIES {
++        return format_err("the image holds more than a million files and directories");
++    }
+     // The children's inodes, in runs the image can hand over in one read each. A game
+     // mount holds a quarter of a million files, and one syscall apiece took minutes.
+     let mut inodes_by_entry: Vec<Option<Inode>> = vec![None; entries.len()];
+@@ -138,9 +173,12 @@ fn walk(
+     order.sort_by_key(|&i| entries[i].inode);
+     let mut run: Vec<usize> = Vec::new();
+     for &i in order.iter() {
++        // One cylinder group, and no more than the reader takes in one call: entries far apart
++        // in a group with a huge inode count would otherwise ask for one enormous read.
+         let fits = run.first().is_none_or(|&first| {
+             let per_cg = u64::from(image.superblock.inodes_per_cg);
+             entries[first].inode / per_cg == entries[i].inode / per_cg
++                && entries[i].inode - entries[first].inode < ps5upload_pkg::ufs2::MAX_INODE_RUN
+         });
+         if !fits {
+             read_run(image, &entries, &run, &mut inodes_by_entry);
+@@ -159,11 +197,19 @@ fn walk(
+         };
+         let path = format!("{prefix}{}", entry.name);
+         if inode.is_dir() {
++            if !tree.dirs.insert(inode.number) {
++                return format_err(format!(
++                    "{path} links a directory a second time (inode {})",
++                    inode.number
++                ));
++            }
+             if !walk(image, &inode, &format!("{path}/"), depth + 1, tree)? {
++                tree.keep(&path)?;
+                 tree.empty.push(path);
+             }
+             kept = true;
+         } else if inode.is_file() {
++            tree.keep(&path)?;
+             tree.files.push(SourceFile {
+                 path,
+                 size: inode.size,
+@@ -344,4 +390,47 @@ mod tests {
+         assert_eq!(source.empty_dirs(), ["empty", "junk", "nest/deeper"]);
+         assert_eq!(source.read("eboot.bin").unwrap(), b"eboot");
+     }
++
++    /// Thousands of long names in one directory: more than 1 MiB of entries, all read.
++    #[test]
++    fn a_directory_with_thousands_of_long_names_walks() {
++        let names: Vec<String> = (0..5000).map(|i| format!("{i:0200}")).collect();
++        let entries: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 3)).collect();
++        let mut img = Image::new(64, 400);
++        img.dir(ROOT_INODE, ROOT_INODE, &[("data", 4)]);
++        img.dir(4, ROOT_INODE, &entries);
++        img.file(3, b"same bytes");
++        let source = img.open().unwrap();
++        assert_eq!(source.files().len(), 5000);
++        assert_eq!(source.files()[0].path, format!("data/{}", names[0]));
++    }
++
++    /// A directory linked from two places — here back to the root — is a corrupt image.
++    #[test]
++    fn a_directory_cycle_is_refused() {
++        let mut img = Image::new(64, 64);
++        img.dir(ROOT_INODE, ROOT_INODE, &[("eboot.bin", 3), ("loop", 4)]);
++        img.file(3, b"eboot");
++        img.dir(4, ROOT_INODE, &[("again", ROOT_INODE)]);
++        let Err(e) = img.open() else {
++            panic!("a cycle must not walk");
++        };
++        assert!(e.to_string().contains("a second time"), "{e}");
++    }
++
++    /// Children far apart in a group with many inodes are read in more than one run, and none
++    /// is dropped.
++    #[test]
++    fn children_far_apart_are_all_read() {
++        let far = ps5upload_pkg::ufs2::MAX_INODE_RUN + 100;
++        // 16,384 inodes: a 4 MiB table, with data after it.
++        let mut img = Image::new(16_384, 1100);
++        img.dir(ROOT_INODE, ROOT_INODE, &[("a.bin", 3), ("b.bin", far)]);
++        img.file(3, b"near");
++        img.file(far, b"far away");
++        let mut source = img.open().unwrap();
++        let files: Vec<&str> = source.files().iter().map(|f| f.path.as_str()).collect();
++        assert_eq!(files, ["a.bin", "b.bin"]);
++        assert_eq!(source.read("b.bin").unwrap(), b"far away");
++    }
+ }
+diff --git a/ps5upload-pkg/src/ufs2.rs b/ps5upload-pkg/src/ufs2.rs
+index 46fb408..3c0fc8d 100644
+--- a/ps5upload-pkg/src/ufs2.rs
++++ b/ps5upload-pkg/src/ufs2.rs
+@@ -51,6 +51,23 @@ const INODE_SIZE: u64 = 256;
+ /// bad-block list (historic).
+ pub const ROOT_INODE: u64 = 2;
+ 
++/// The most bytes [`Ufs2Image::list_dir`] reads for one directory. A game folder can hold
++/// thousands of long names in one directory (a 255-byte name takes a 264-byte record, so
++/// 1 MiB is only ~4,000 of them), so the budget is far above any real directory while still
++/// bounding what a corrupt inode's size can make the reader hold.
++// ponytail: 64 MiB per directory read whole (~250,000 maximal names), stream the entries block by block if a real image ever needs more
++pub const MAX_DIR_BYTES: u64 = 64 * 1024 * 1024;
++
++/// The most entries [`Ufs2Image::list_dir`] returns for one directory. The byte budget alone
++/// would allow five million twelve-byte records, each a [`DirEntry`] on the heap.
++pub const MAX_DIR_ENTRIES: usize = 1_000_000;
++
++/// The most inodes [`Ufs2Image::read_inodes`] reads in one call: 2 MiB of inode table. The
++/// count comes from directory entries on a possibly-hostile image, and a cylinder group may
++/// declare billions of inodes; real images have 512 or 2048 per group, so a caller splits a
++/// longer run.
++pub const MAX_INODE_RUN: u64 = 8192;
++
+ /// Inode mode bit field constants. Mirrors POSIX `mode_t` layout —
+ /// not platform-specific, defined by UFS spec.
+ const IFMT: u16 = 0xF000;
+@@ -93,6 +110,10 @@ pub enum Ufs2Error {
+     FileTooLarge { size: u64, cap: u64 },
+     #[error("path component not found: {component}")]
+     NotFound { component: String },
++    #[error("a run of {count} inodes is more than the {max} read at once")]
++    InodeRunTooLong { count: u64, max: u64 },
++    #[error("directory inode {inode} has more than {max} entries")]
++    TooManyEntries { inode: u64, max: usize },
+ }
+ 
+ /// Subset of the superblock we actually use for reading. The full
+@@ -368,8 +389,14 @@ impl<R: Read + Seek> Ufs2Image<R> {
+         if count == 0 {
+             return Ok(Vec::new());
+         }
++        if count > MAX_INODE_RUN {
++            return Err(Ufs2Error::InodeRunTooLong {
++                count,
++                max: MAX_INODE_RUN,
++            });
++        }
+         let per_cg = u64::from(self.superblock.inodes_per_cg);
+-        let last = first + count - 1;
++        let last = first.saturating_add(count - 1);
+         self.check_inode_number(first)?;
+         self.check_inode_number(last)?;
+         if first / per_cg != last / per_cg {
+@@ -436,7 +463,7 @@ impl<R: Read + Seek> Ufs2Image<R> {
+         if !dir.is_dir() {
+             return Ok(Vec::new());
+         }
+-        let bytes = self.read_file(dir, 1024 * 1024)?; // 1 MiB cap on dir size — huge by UFS standards
++        let bytes = self.read_file(dir, MAX_DIR_BYTES)?;
+         let mut out: Vec<DirEntry> = Vec::new();
+         let mut off: usize = 0;
+         while off + 8 <= bytes.len() {
+@@ -460,6 +487,12 @@ impl<R: Read + Seek> Ufs2Image<R> {
+                     .to_string();
+                 let kind = dirent_kind(kind_byte);
+                 if name != "." && name != ".." {
++                    if out.len() == MAX_DIR_ENTRIES {
++                        return Err(Ufs2Error::TooManyEntries {
++                            inode: dir.number,
++                            max: MAX_DIR_ENTRIES,
++                        });
++                    }
+                     out.push(DirEntry { inode, name, kind });
+                 }
+             }
+@@ -999,4 +1032,137 @@ mod tests {
+         assert!(img.read_range(&inode, inode.size, 8).unwrap().is_empty());
+         assert_eq!(img.read_range(&inode, inode.size - 4, 64).unwrap().len(), 4);
+     }
++
++    /// A 4 KiB-block image holding one directory of `count` entries, each named `name_len`
++    /// bytes long, in blocks from fragment 1 on (a single-indirect block after the twelfth).
++    fn big_dir(count: usize, name_len: usize) -> (Ufs2Image<std::io::Cursor<Vec<u8>>>, Inode) {
++        big_dir_in(count, name_len, 4096)
++    }
++
++    /// [`big_dir`] in blocks of `bs` bytes.
++    fn big_dir_in(
++        count: usize,
++        name_len: usize,
++        bs: usize,
++    ) -> (Ufs2Image<std::io::Cursor<Vec<u8>>>, Inode) {
++        use std::io::Cursor;
++        let block_size = bs;
++        let reclen = (8 + name_len + 1).next_multiple_of(4);
++        let per_block = block_size / reclen;
++        let blocks = count.div_ceil(per_block);
++        assert!(blocks <= NDADDR + block_size / 8);
++        let mut image = vec![0u8; (blocks + 2) * block_size];
++        let mut left = count;
++        for b in 0..blocks {
++            let n = left.min(per_block);
++            left -= n;
++            let at = (b + 1) * block_size;
++            for i in 0..n {
++                let e = at + i * reclen;
++                let len = if i + 1 == n {
++                    block_size - i * reclen
++                } else {
++                    reclen
++                };
++                image[e..e + 4].copy_from_slice(&3u32.to_le_bytes());
++                image[e + 4..e + 6].copy_from_slice(&(len as u16).to_le_bytes());
++                image[e + 6] = 8;
++                image[e + 7] = name_len as u8;
++                let name = format!("{:0width$}", b * per_block + i, width = name_len);
++                let name = &name.as_bytes()[name.len() - name_len..];
++                image[e + 8..e + 8 + name_len].copy_from_slice(name);
++            }
++        }
++        let mut direct = [0u64; NDADDR];
++        for (i, slot) in direct.iter_mut().enumerate().take(blocks) {
++            *slot = i as u64 + 1;
++        }
++        let mut indirect = [0u64; NIADDR];
++        if blocks > NDADDR {
++            let ptrs = (blocks + 1) * block_size;
++            indirect[0] = blocks as u64 + 1;
++            for i in NDADDR..blocks {
++                let at = ptrs + (i - NDADDR) * 8;
++                image[at..at + 8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
++            }
++        }
++        let dir = Inode {
++            number: 2,
++            mode: IFDIR,
++            size: (blocks * block_size) as u64,
++            direct,
++            indirect,
++            mtime: 0,
++        };
++        let sb = Superblock {
++            block_size: block_size as u32,
++            fragment_size: block_size as u32,
++            size_fragments: blocks as u64 + 2,
++            cg_count: 1,
++            inodes_per_cg: 64,
++            fragments_per_cg: blocks as u32 + 2,
++            iblkno: 1,
++            volume_name: String::new(),
++        };
++        (
++            Ufs2Image {
++                reader: Cursor::new(image),
++                superblock: sb,
++            },
++            dir,
++        )
++    }
++
++    /// A game directory with thousands of long names is well past 1 MiB, the old limit.
++    #[test]
++    fn a_directory_past_a_mebibyte_lists_every_entry() {
++        let (mut img, dir) = big_dir(6000, 250);
++        assert!(dir.size > 1024 * 1024, "{} bytes", dir.size);
++        let entries = img.list_dir(&dir).unwrap();
++        assert_eq!(entries.len(), 6000);
++        assert_eq!(entries[0].name, format!("{:0250}", 0));
++        assert_eq!(entries[5999].name, format!("{:0250}", 5999));
++        assert!(entries.iter().all(|e| e.inode == 3));
++    }
++
++    /// Short names fit five million records in the byte budget; the entry count stops first.
++    #[test]
++    fn a_directory_over_the_entry_count_is_refused() {
++        let (mut img, dir) = big_dir_in(MAX_DIR_ENTRIES + 1, 1, 32768);
++        assert!(dir.size < MAX_DIR_BYTES);
++        assert!(matches!(
++            img.list_dir(&dir),
++            Err(Ufs2Error::TooManyEntries { .. })
++        ));
++    }
++
++    /// A directory inode claiming more than the budget is refused before anything is read.
++    #[test]
++    fn a_directory_over_the_budget_is_refused() {
++        let (mut img, mut dir) = big_dir(1, 8);
++        dir.size = MAX_DIR_BYTES + 1;
++        assert!(matches!(
++            img.list_dir(&dir),
++            Err(Ufs2Error::FileTooLarge {
++                cap: MAX_DIR_BYTES,
++                ..
++            })
++        ));
++    }
++
++    /// The inode count of a run comes from directory entries; a group that declares a huge
++    /// inode count must not size one read from it.
++    #[test]
++    fn a_run_of_inodes_is_bounded() {
++        let (mut img, _) = big_dir(1, 8);
++        img.superblock.inodes_per_cg = u32::MAX;
++        assert!(matches!(
++            img.read_inodes(1, MAX_INODE_RUN + 1),
++            Err(Ufs2Error::InodeRunTooLong { .. })
++        ));
++        assert!(matches!(
++            img.read_inodes(u64::MAX - 1, MAX_INODE_RUN),
++            Err(Ufs2Error::InodeOutOfRange { .. })
++        ));
++    }
+ }

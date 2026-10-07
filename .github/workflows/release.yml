@@ -1,0 +1,92 @@
+name: Release
+
+# A `v*` tag builds the macOS arm64 release and creates a *draft* GitHub Release with the zip, the
+# source tarball (GPL-3.0: the source ships with every release) and SHA256SUMS; publishing the
+# draft is a manual step on GitHub, after checking its assets.
+# `workflow_dispatch` is a dry run, even on a tag: same build, artifact kept on the run,
+# nothing published.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    # v1 ships Apple Silicon only: PS5 Dump Forge.app + the CLI, ad-hoc signed.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check the versions agree (and match the tag)
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          tauri=$(jq -r .version app/src-tauri/tauri.conf.json)
+          npm=$(jq -r .version app/package.json)
+          echo "Cargo.toml $version, tauri.conf.json $tauri, package.json $npm"
+          if [ "$tauri" != "$version" ] || [ "$npm" != "$version" ]; then
+            echo "::error::versions differ: Cargo.toml $version, tauri.conf.json $tauri, app/package.json $npm"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version"
+            exit 1
+          fi
+      - name: Latest stable Rust (rust-toolchain.toml adds aarch64-apple-darwin)
+        run: |
+          rustup update --no-self-update stable
+          rustup toolchain install --no-self-update
+          rustc -Vv
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      # Builds PS5 Dump Forge.app (tauri build) and the CLI, assembles and verifies the zip, writes the
+      # source tarball and SHA256SUMS into dist/.
+      - run: scripts/release-macos.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: macos
+    # Only a real tag push creates the draft; a workflow_dispatch run stays a dry run.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-macos
+          path: dist
+      - name: Check the checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+      # gh is preinstalled on the runner; no third-party release action needed.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "Apple Silicon (arm64) macOS 11 or later: unzip, then see \"First launch\" in README.md."
+            echo "The app is ad-hoc signed only (no Developer ID, not notarized), so macOS asks you to allow it once."
+            echo
+            echo "The zip holds PS5 Dump Forge.app, the ps5-dump-forge command-line tool, README.md, LICENSE (GPL-3.0) and THIRD-PARTY-NOTICES.md."
+            echo "The source tarball is the complete corresponding source of this release. SHA256SUMS lists both files' SHA-256."
+            case "$GITHUB_REF_NAME" in *-*)
+              echo
+              echo "Test release: not every format has been tested on a console yet. Keep the original dump." ;;
+            esac
+          } > notes.md
+          # A tag with a suffix (v0.0.1-pre) becomes a pre-release.
+          pre=; case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --draft $pre \
+            --verify-tag --title "PS5 Dump Forge $GITHUB_REF_NAME" --notes-file notes.md

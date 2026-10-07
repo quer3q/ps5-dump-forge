@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: progress events, file pickers and the app's own commands. No fs plugin; file access stays in Rust.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "dialog:allow-open",
+    "allow-inspect",
+    "allow-default-output",
+    "allow-generated-output",
+    "allow-start-job",
+    "allow-cancel-job",
+    "allow-stale-parts",
+    "allow-reveal",
+    "allow-quit-app"
+  ]
+}

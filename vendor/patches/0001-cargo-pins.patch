@@ -1,0 +1,32 @@
+diff --git a/ps5upload-fpkg/Cargo.toml b/ps5upload-fpkg/Cargo.toml
+index 175181d..7284ef8 100644
+--- a/ps5upload-fpkg/Cargo.toml
++++ b/ps5upload-fpkg/Cargo.toml
+@@ -1,8 +1,8 @@
+ [package]
+ name = "ps5upload-fpkg"
+-edition.workspace = true
+-license.workspace = true
+-version.workspace = true
++edition = "2021" # upstream ps5upload is 2021; kept to minimise the vendor diff
++license = "GPL-3.0-or-later"
++version = "6.1.2" # pinned upstream tag v6.1.2
+ 
+ [dependencies]
+ # Cross-platform OS randomness for the outer PFS seed. Opening /dev/urandom
+diff --git a/ps5upload-pkg/Cargo.toml b/ps5upload-pkg/Cargo.toml
+index 85a48ba..343bfba 100644
+--- a/ps5upload-pkg/Cargo.toml
++++ b/ps5upload-pkg/Cargo.toml
+@@ -1,8 +1,8 @@
+ [package]
+ name = "ps5upload-pkg"
+-edition.workspace = true
+-license.workspace = true
+-version.workspace = true
++edition = "2021" # upstream ps5upload is 2021; kept to minimise the vendor diff
++license = "GPL-3.0-or-later"
++version = "6.1.2" # pinned upstream tag v6.1.2
+ 
+ [dependencies]
+ blake3.workspace = true

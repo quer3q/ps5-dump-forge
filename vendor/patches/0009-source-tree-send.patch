@@ -1,0 +1,44 @@
+diff --git a/ps5upload-fpkg/src/source.rs b/ps5upload-fpkg/src/source.rs
+index c87ef49..59148f4 100644
+--- a/ps5upload-fpkg/src/source.rs
++++ b/ps5upload-fpkg/src/source.rs
+@@ -14,7 +14,11 @@ pub struct SourceFile {
+ /// The game files to convert, whatever they live in. Sizes are known up front, so the
+ /// plan fixes every offset before the first byte is read. Images seek, so reading takes
+ /// `&mut self`.
+-pub trait SourceTree {
++///
++/// `Send`, so an opened tree (a `Box<dyn SourceTree>` from [`open`]) can move to the worker
++/// thread that builds from it. Every tree here already is: a folder, and images read through
++/// [`crate::ReadSeek`], which is `Send`.
++pub trait SourceTree: Send {
+     fn files(&self) -> &[SourceFile];
+ 
+     /// The whole file at `path`.
+@@ -1185,4 +1189,26 @@ mod tests {
+         assert!(err.contains(".ffpkg"), "{err}");
+         std::fs::remove_dir_all(&dir).ok();
+     }
++
++    /// Every tree, and the box `open` returns, moves to a worker thread.
++    #[test]
++    fn trees_are_send() {
++        fn send<T: Send + ?Sized>() {}
++        send::<FolderSource>();
++        send::<crate::exfat::ExFatSource>();
++        send::<crate::ufs2_source::Ufs2Source>();
++        send::<Box<dyn SourceTree>>();
++        // And a prepared build, which goes with its tree.
++        send::<crate::build::Prepared>();
++
++        let dir = std::env::temp_dir().join(format!("fpkg-send-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("eboot.bin"), b"moved").unwrap();
++        let mut tree = open(&dir).unwrap();
++        let read = std::thread::spawn(move || tree.read("eboot.bin").unwrap())
++            .join()
++            .unwrap();
++        assert_eq!(read, b"moved");
++        std::fs::remove_dir_all(&dir).ok();
++    }
+ }

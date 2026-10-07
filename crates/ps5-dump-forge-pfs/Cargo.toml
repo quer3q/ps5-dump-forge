@@ -1,0 +1,14 @@
+[package]
+name = "ps5-dump-forge-pfs"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ps5upload-fpkg.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+ps5-dump-forge-exfat.workspace = true
+ps5-dump-forge-ufs2.workspace = true

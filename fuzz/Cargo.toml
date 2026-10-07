@@ -1,0 +1,85 @@
+# cargo-fuzz targets for every reader of untrusted images. Its own workspace,
+# not a member of the root one: it builds on nightly with sanitizer flags.
+#
+#   ./seed.sh                                     # seed corpora (stable)
+#   cargo +nightly fuzz run exfat -- -max_total_time=60
+[package]
+name = "ps5-dump-forge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = [".", "seedgen"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ps5upload-fpkg = { path = "../vendor/ps5upload-fpkg" }
+ps5-dump-forge-fpkg = { path = "../crates/ps5-dump-forge-fpkg" }
+ps5-dump-forge-pfs = { path = "../crates/ps5-dump-forge-pfs" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "exfat"
+path = "fuzz_targets/exfat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ufs2"
+path = "fuzz_targets/ufs2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pfsc"
+path = "fuzz_targets/pfsc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pfs"
+path = "fuzz_targets/pfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fih_cnt"
+path = "fuzz_targets/fih_cnt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kraken_descriptor"
+path = "fuzz_targets/kraken_descriptor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kraken_block"
+path = "fuzz_targets/kraken_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fpkg_source"
+path = "fuzz_targets/fpkg_source.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

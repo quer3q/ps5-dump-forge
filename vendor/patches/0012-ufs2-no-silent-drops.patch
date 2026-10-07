@@ -1,0 +1,255 @@
+diff --git a/ps5upload-fpkg/src/ufs2_source.rs b/ps5upload-fpkg/src/ufs2_source.rs
+index 48556fb..77cee3c 100644
+--- a/ps5upload-fpkg/src/ufs2_source.rs
++++ b/ps5upload-fpkg/src/ufs2_source.rs
+@@ -16,6 +16,8 @@ const MAX_ENTRIES: usize = 1_000_000;
+ /// The most path bytes a walk keeps (every file's, every empty directory's). A real game's are
+ /// a few tens of megabytes; deep trees of long names in a corrupt image would be gigabytes.
+ const MAX_PATH_BYTES: usize = 256 << 20;
++/// How many special files an error lists by path; the rest are counted.
++const MAX_SPECIAL_LISTED: usize = 50;
+ 
+ impl From<Ufs2Error> for crate::Error {
+     fn from(e: Ufs2Error) -> Self {
+@@ -53,8 +55,24 @@ impl Ufs2Source {
+             dirs: std::collections::HashSet::from([ROOT_INODE]),
+             path_bytes: 0,
+             listed: 0,
++            special: Vec::new(),
++            special_count: 0,
+         };
+         walk(&mut image, &root, "", 0, &mut tree)?;
++        if tree.special_count > 0 {
++            let more = tree.special_count - tree.special.len();
++            return format_err(format!(
++                "{label} holds {} special file(s) (symlinks, devices, FIFOs, sockets), which a \
++                 package cannot hold:\n  {}{}",
++                tree.special_count,
++                tree.special.join("\n  "),
++                if more > 0 {
++                    format!("\n  ... and {more} more")
++                } else {
++                    String::new()
++                }
++            ));
++        }
+         empty_dirs.sort();
+         if files.is_empty() {
+             return format_err(format!("{label} holds no files"));
+@@ -133,6 +151,11 @@ struct Walk<'a> {
+     /// [`MAX_ENTRIES`]: counted as they are listed, so the entries of directories still being
+     /// walked further up count too.
+     listed: usize,
++    /// Entries that are neither files nor directories, as `path (kind)`: the first
++    /// [`MAX_SPECIAL_LISTED`], refused together once the walk is done.
++    special: Vec<String>,
++    /// How many such entries there are in all.
++    special_count: usize,
+ }
+ 
+ impl Walk<'_> {
+@@ -182,21 +205,19 @@ fn walk(
+                 && entries[i].inode - entries[first].inode < ps5upload_pkg::ufs2::MAX_INODE_RUN
+         });
+         if !fits {
+-            read_run(image, &entries, &run, &mut inodes_by_entry);
++            read_run(image, &entries, &run, prefix, &mut inodes_by_entry)?;
+             run.clear();
+         }
+         run.push(i);
+     }
+-    read_run(image, &entries, &run, &mut inodes_by_entry);
++    read_run(image, &entries, &run, prefix, &mut inodes_by_entry)?;
+ 
+     let mut kept = false;
+     for (i, entry) in entries.iter().enumerate() {
+-        // A directory entry pointing at an unusable inode is the image's problem, not the
+-        // caller's: skip it rather than fail the walk.
+-        let Some(inode) = inodes_by_entry[i].take() else {
+-            continue;
+-        };
+         let path = format!("{prefix}{}", entry.name);
++        let Some(inode) = inodes_by_entry[i].take() else {
++            return format_err(format!("{path}: its inode was not read"));
++        };
+         if inode.is_dir() {
+             if !tree.dirs.insert(inode.number) {
+                 return format_err(format!(
+@@ -217,36 +238,65 @@ fn walk(
+             });
+             tree.inodes.push(inode);
+             kept = true;
++        } else {
++            // Not dropped quietly: the package would lack a path the game may open.
++            tree.special_count += 1;
++            if tree.special.len() < MAX_SPECIAL_LISTED {
++                tree.special
++                    .push(format!("{path} ({})", special_kind(inode.mode)));
++            }
+         }
+     }
+     Ok(kept)
+ }
+ 
++/// What a non-file, non-directory inode is, by its mode's type bits.
++fn special_kind(mode: u16) -> &'static str {
++    match mode & 0xF000 {
++        0x1000 => "FIFO",
++        0x2000 => "character device",
++        0x6000 => "block device",
++        0xA000 => "symlink",
++        0xC000 => "socket",
++        0xE000 => "whiteout",
++        0 => "unallocated inode",
++        _ => "unknown type",
++    }
++}
++
+ /// Reads one run of entries' inodes — a contiguous, same-cylinder-group stretch — in a
+-/// single call, ignoring entries whose inode the image cannot produce.
++/// single call. An inode the image cannot produce is an error: skipping the entry would
++/// leave its file out of the package.
+ fn read_run(
+     image: &mut Ufs2Image<Box<dyn ReadSeek>>,
+     entries: &[ps5upload_pkg::ufs2::DirEntry],
+     run: &[usize],
++    prefix: &str,
+     out: &mut [Option<Inode>],
+-) {
++) -> Result<()> {
+     let Some(&first) = run.first() else {
+-        return;
++        return Ok(());
+     };
+     let start = entries[first].inode;
+     let count = run
+         .last()
+         .map(|&i| entries[i].inode - start + 1)
+         .unwrap_or(0);
+-    let Ok(batch) = image.read_inodes(start, count) else {
+-        return;
+-    };
++    let batch = image.read_inodes(start, count).map_err(|e| {
++        let others = match run.len() - 1 {
++            0 => String::new(),
++            n => format!(" and {n} other entries"),
++        };
++        crate::Error::Format(format!(
++            "cannot read the inode of {prefix}{}{others}: {e}",
++            entries[first].name
++        ))
++    })?;
+     for &i in run {
+         let at = (entries[i].inode - start) as usize;
+-        if let Some(inode) = batch.get(at) {
+-            out[i] = Some(inode.clone());
+-        }
++        out[i] = batch.get(at).cloned();
+     }
++    Ok(())
+ }
+ 
+ #[cfg(test)]
+@@ -444,6 +494,102 @@ mod tests {
+         }
+     }
+ 
++    /// Symlinks, devices, FIFOs, sockets and entries at a free inode are refused together,
++    /// by path, after the walk, not left out of the package.
++    #[test]
++    fn special_files_are_refused_by_path() {
++        let mut img = Image::new(64, 64);
++        img.dir(
++            ROOT_INODE,
++            ROOT_INODE,
++            &[
++                ("eboot.bin", 3),
++                ("link", 4),
++                ("sub", 5),
++                ("pipe", 6),
++                ("free", 9),
++            ],
++        );
++        img.file(3, b"eboot");
++        img.inode(4, 0xA1FF, 0, [0; 12], 0);
++        img.dir(5, ROOT_INODE, &[("tty", 7), ("disk", 8), ("sock", 10)]);
++        img.inode(6, 0x11A4, 0, [0; 12], 0);
++        img.inode(7, 0x21A4, 0, [0; 12], 0);
++        img.inode(8, 0x61A4, 0, [0; 12], 0);
++        img.inode(10, 0xC1ED, 0, [0; 12], 0);
++        let Err(e) = img.open() else {
++            panic!("special files must not walk");
++        };
++        let e = e.to_string();
++        assert!(e.contains("holds 6 special file(s)"), "{e}");
++        for want in [
++            "link (symlink)",
++            "pipe (FIFO)",
++            "free (unallocated inode)",
++            "sub/tty (character device)",
++            "sub/disk (block device)",
++            "sub/sock (socket)",
++        ] {
++            assert!(e.contains(want), "{want}: {e}");
++        }
++        assert!(!e.contains("eboot.bin"), "{e}");
++    }
++
++    /// The list stops at [`MAX_SPECIAL_LISTED`] paths and counts the rest.
++    #[test]
++    fn a_long_list_of_special_files_is_bounded() {
++        let names: Vec<String> = (0..MAX_SPECIAL_LISTED + 10)
++            .map(|i| format!("l{i:03}"))
++            .collect();
++        let mut entries: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 4)).collect();
++        entries.push(("eboot.bin", 3));
++        let mut img = Image::new(64, 64);
++        img.dir(ROOT_INODE, ROOT_INODE, &entries);
++        img.file(3, b"eboot");
++        img.inode(4, 0xA1FF, 0, [0; 12], 0);
++        let Err(e) = img.open() else {
++            panic!("symlinks must not walk");
++        };
++        let e = e.to_string();
++        assert!(e.contains("holds 60 special file(s)"), "{e}");
++        assert_eq!(e.matches("(symlink)").count(), MAX_SPECIAL_LISTED, "{e}");
++        assert!(e.ends_with("... and 10 more"), "{e}");
++    }
++
++    /// An entry whose inode the image cannot produce fails the walk, by path, rather than
++    /// vanishing with the rest of its run.
++    #[test]
++    fn an_unreadable_inode_is_an_error() {
++        // Out of range: the image has 64 inodes.
++        let mut img = Image::new(64, 64);
++        img.dir(ROOT_INODE, ROOT_INODE, &[("eboot.bin", 3), ("data", 4)]);
++        img.file(3, b"eboot");
++        img.dir(4, ROOT_INODE, &[("lost", 64)]);
++        let Err(e) = img.open() else {
++            panic!("an out-of-range inode must not walk");
++        };
++        let e = e.to_string();
++        assert!(e.contains("cannot read the inode of data/lost: "), "{e}");
++        assert!(e.contains("out of range"), "{e}");
++
++        // Past the end of the image, in one run with a good inode: neither is dropped.
++        let mut img = Image::new(64, 64);
++        img.dir(ROOT_INODE, ROOT_INODE, &[("eboot.bin", 3), ("far", 8000)]);
++        img.file(3, b"eboot");
++        // 16,384 inodes in a 1,100-fragment group: inode 8000 lies past the 256 KiB image.
++        let sb = 65536;
++        img.bytes[sb + 184..sb + 188].copy_from_slice(&16_384u32.to_le_bytes());
++        img.bytes[sb + 188..sb + 192].copy_from_slice(&1100u32.to_le_bytes());
++        let Err(e) = img.open() else {
++            panic!("a truncated inode table must not walk");
++        };
++        let e = e.to_string();
++        assert!(
++            e.contains("cannot read the inode of eboot.bin and 1 other entries: io:"),
++            "{e}"
++        );
++    }
++
+     /// Children far apart in a group with many inodes are read in more than one run, and none
+     /// is dropped.
+     #[test]

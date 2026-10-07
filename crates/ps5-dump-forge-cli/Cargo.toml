@@ -1,0 +1,16 @@
+[package]
+name = "ps5-dump-forge-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ps5-dump-forge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+ps5-dump-forge-core.workspace = true

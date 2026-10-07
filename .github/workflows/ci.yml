@@ -1,0 +1,211 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Unpinned and latest on purpose: major action tags, *-latest runners, the latest stable Rust.
+# rust-toolchain.toml selects `stable`, but that does not update the runner's preinstalled
+# stable, so every job runs `rustup update stable` first, then `rustup toolchain install` adds
+# that file's components and targets. No cargo cache.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The v1 platform: everything, the Tauri app included.
+          - os: macos-15
+            gui: true
+            packages: --workspace
+          # Unit tests elsewhere keep the core portable. The app crate needs WebKitGTK on
+          # Linux and WebView2 tooling on Windows, and it ships for macOS only in v1.
+          - os: ubuntu-latest
+            fmt: true
+            packages: --workspace --exclude ps5-dump-forge-gui
+          - os: windows-latest
+            packages: --workspace --exclude ps5-dump-forge-gui
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: |
+          rustup update --no-self-update stable
+          rustup toolchain install --no-self-update
+          rustc --version
+      - if: matrix.fmt
+        run: cargo fmt --all --check
+      # tauri-build needs the built frontend (app/dist) to compile the app crate.
+      - if: matrix.gui
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - if: matrix.gui
+        working-directory: app
+        run: npm ci && npm run build
+      - run: cargo clippy ${{ matrix.packages }} --all-targets --locked -- -D warnings
+      - run: cargo test ${{ matrix.packages }} --locked --release
+      # Every target onto real exFAT and FAT32 volumes (hdiutil, no root): macOS's drivers
+      # renumber a file's inode at its first write and exFAT has no RENAME_EXCL.
+      - if: runner.os == 'macOS'
+        run: cargo test -p ps5-dump-forge-core --test fat_volumes --locked --release -- --ignored
+
+  fsck:
+    # Independent checks: the writers' own read-back can share their bugs,
+    # so exfatprogs' fsck.exfat looks at the .exfat here, fsck-macos at the same image and
+    # FreeBSD's fsck_ufs (fsck-ufs) at the .ffpkg.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: |
+          rustup update --no-self-update stable
+          rustup toolchain install --no-self-update
+          rustc --version
+      - run: cargo build --release --locked -p ps5-dump-forge-cli
+      - name: Fixture game folder
+        run: |
+          g=fixture/game
+          mkdir -p "$g/sce_sys" "$g/data/levels/a/b/c" "$g/data/empty" "$g/data/many"
+          printf '\x4f\x15\x3d\x1d\x00\x01\x01\x12' > "$g/eboot.bin"
+          echo '{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-FORGECIFIXTURE00"}' > "$g/sce_sys/param.json"
+          # 5 MB: past UFS2's 12 direct blocks (single indirect) and many exFAT clusters.
+          head -c 5000000 /dev/urandom > "$g/data/levels/big.bin"
+          echo deep > "$g/data/levels/a/b/c/deep.txt"
+          echo composed > "$g/data/levels/Ünïcødé.txt"
+          : > "$g/data/zero.bin"
+          # 1000 entries: multi-block UFS2 and multi-cluster exFAT directories.
+          for i in $(seq -w 1 1000); do echo "$i" > "$g/data/many/f$i.txt"; done
+      - name: Convert to .exfat and .ffpkg
+        run: |
+          mkdir images
+          for f in exfat ffpkg; do
+            target/release/ps5-dump-forge convert fixture/game --to "$f" -o "images/game.$f" > "images/$f.jsonl"
+          done
+          ls -ls images
+          target/release/ps5-dump-forge inspect images/game.exfat
+          target/release/ps5-dump-forge inspect images/game.ffpkg
+      - name: fsck.exfat (exfatprogs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends exfatprogs
+          fsck.exfat -V || true
+          fsck.exfat -n images/game.exfat
+      # tar keeps the empty directory and the images' holes; an artifact keeps neither.
+      - run: tar -cSzf fsck-images.tar.gz fixture images
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fsck-images
+          path: fsck-images.tar.gz
+          if-no-files-found: error
+
+  fsck-macos:
+    # macOS's own fsck_exfat, plus a read-only mount compared file by file with the source.
+    needs: fsck
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: fsck-images
+      - run: tar -xzf fsck-images.tar.gz
+      - run: scripts/check-exfat.sh images/game.exfat fixture/game
+
+  fsck-ufs:
+    # FreeBSD's fsck_ufs -n on the .ffpkg, in a FreeBSD VM. fsck_ufs -n exits 0 even when it
+    # reports (and declines) a repair, so clean means what scripts/fsck-ufs.sh requires: exit
+    # status 0, the "N files, ..." summary, and no line besides the phase headers and summary.
+    needs: fsck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: fsck-images
+      - name: Keep only the .ffpkg (the workspace is copied into the VM)
+        run: |
+          tar -xzf fsck-images.tar.gz images/game.ffpkg
+          rm fsck-images.tar.gz
+          gzip images/game.ffpkg
+          ls -l images
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          copyback: false
+          run: |
+            set -eu
+            freebsd-version
+            gunzip images/game.ffpkg.gz
+            md=$(mdconfig -a -t vnode -o readonly -f images/game.ffpkg)
+            rc=0
+            fsck_ufs -n "/dev/$md" > fsck.log 2>&1 || rc=$?
+            cat fsck.log
+            echo "FSCK_RC=$rc"
+            dumpfs "/dev/$md" | head -40
+            mdconfig -d -u "$md"
+            if [ "$rc" = 0 ] && grep -qE '^[0-9]+ files, ' fsck.log \
+              && ! grep -vqE '^\*\* (/dev/|Last Mounted|Phase [1-5] )|^[0-9]+ files, ' fsck.log
+            then
+              echo "VERDICT /dev/$md IS CLEAN"
+            else
+              echo "VERDICT /dev/$md NOT CLEAN"
+              exit 1
+            fi
+
+  fuzz:
+    # Every reader of untrusted images, 60 s each from the seed corpora.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: |
+          rustup update --no-self-update stable
+          rustup toolchain install --no-self-update
+          rustup toolchain install --no-self-update --profile minimal nightly
+          rustc +nightly --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fmt --all --check
+        working-directory: fuzz
+      - run: fuzz/seed.sh
+      - run: cargo +nightly fuzz build
+        working-directory: fuzz
+      - name: Run each target for 60 s
+        working-directory: fuzz
+        run: |
+          failed=()
+          for t in $(cargo +nightly fuzz list); do
+            echo "::group::$t"
+            cargo +nightly fuzz run "$t" -- -max_total_time=60 || failed+=("$t")
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::fuzz targets with findings: ${failed[*]} (inputs in the fuzz-artifacts artifact)"
+            exit 1
+          fi
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

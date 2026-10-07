@@ -1,0 +1,596 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index 8f67755..161e4c8 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -254,6 +254,19 @@ impl Stage {
+     }
+ }
+ 
++/// Whether the caller's flag asks for a stop.
++fn stopped(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
++    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
++}
++
++/// Stop with [`crate::Error::Cancelled`] once the caller's flag is set.
++fn check_cancel(control: &BuildControl) -> Result<()> {
++    if stopped(control.cancel) {
++        return Err(crate::Error::Cancelled);
++    }
++    Ok(())
++}
++
+ fn enter(control: &mut BuildControl, stage: Stage) {
+     if let Some(f) = control.stage.as_deref_mut() {
+         f(stage);
+@@ -265,7 +278,8 @@ fn enter(control: &mut BuildControl, stage: Stage) {
+ pub struct BuildControl<'a> {
+     /// Bytes written of the mount image, reported as the write proceeds.
+     pub bytes: Option<&'a mut dyn FnMut(u64, u64)>,
+-    /// Set to abort: the partial file is removed and the error says so.
++    /// Set to abort: the partial file is removed and the error is [`crate::Error::Cancelled`].
++    /// Preparing, compressing, writing and verifying all check it.
+     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+     /// Called as each [`Stage`] begins.
+     pub stage: Option<&'a mut dyn FnMut(Stage)>,
+@@ -509,7 +523,10 @@ fn prepare_with(
+         log.push(line.to_string());
+         progress(line);
+     };
++    // Checked after the stage callback too, which is where a caller may ask for the stop.
++    check_cancel(control)?;
+     enter(control, Stage::Check);
++    check_cancel(control)?;
+     let mut files: Vec<SourceFile> = tree.files().to_vec();
+     if files.is_empty() {
+         return format_err(format!("{} has no files", tree.describe()));
+@@ -543,6 +560,7 @@ fn prepare_with(
+         ));
+     }
+     let readiness = source::readiness(tree);
++    check_cancel(control)?;
+     let warnings: Vec<String> = readiness
+         .warnings()
+         .map(|c| format!("{}: {}", c.name, c.detail))
+@@ -591,6 +609,8 @@ fn prepare_with(
+     let mut repairs: std::collections::HashMap<String, (self_repair::SelfRepair, u64)> =
+         std::collections::HashMap::new();
+     for f in files.iter_mut() {
++        // One header read per file: a quarter of a million of them on a large game.
++        check_cancel(control)?;
+         // A backport's `fakelib/` holds newer system libraries the game loads in place of the
+         // console's own; working releases ship some with the PS4 signature, and every one of
+         // them is used exactly as shipped. Rewriting them is not a repair.
+@@ -666,19 +686,29 @@ fn prepare_with(
+         return format_err("the source has no eboot.bin");
+     }
+     let content_version = source::content_version_word(&param_json).unwrap_or(0);
++    check_cancel(control)?;
+     // The container's payloads, read once: the streaming arm hands them to the writer,
+     // and reading them here keeps the source free for the range reader below.
+     let icon_png = tree.read("sce_sys/icon0.png").unwrap_or_default();
++    check_cancel(control)?;
+     let icon_dds = tree.read("sce_sys/icon0.dds").unwrap_or_default();
+     // Only files still in the package: an excluded one must not reappear in the container.
++    // A stop skips the reads still to come; the check after them reports it.
+     let mut extras = cnt_write::presentation_extras(&mut |path| {
++        if stopped(control.cancel) {
++            return None;
++        }
+         sizes_of(&files, path).and_then(|_| tree.read(path).ok())
+     });
+     // The dump's own title and NP binding files, as protected entries (see `PROTECTED`). They
+     // stay in the image too; the container copy is what the console's launch checks read.
+     extras.extend(cnt_write::protected_extras(&mut |path| {
++        if stopped(control.cancel) {
++            return None;
++        }
+         sizes_of(&files, path).and_then(|_| tree.read(path).ok())
+     }));
++    check_cancel(control)?;
+     // The debug license the console's launch checks need (see `license`), generated for this
+     // content id. A dump's own license files are never used: they belong to another console.
+     extras.extend(cnt_write::license_extras(&content_id));
+@@ -711,6 +741,7 @@ fn prepare_with(
+         .collect();
+     files.retain(|f| !container_only_file(f));
+     let time = request.time.unwrap_or_else(now);
++    check_cancel(control)?;
+     // A libSceAmpr title looks its files up through `ampr_emu.index` at the image root (see
+     // `ampr_index`); a dump without one gets one generated from exactly the files packaged.
+     let mut generated: std::collections::HashMap<String, Vec<u8>> =
+@@ -745,13 +776,20 @@ fn prepare_with(
+         crate::ImageMode::Native => request.seed.unwrap_or_else(random_seed),
+     };
+ 
++    check_cancel(control)?;
+     enter(control, Stage::Plan);
++    check_cancel(control)?;
+     progress(&format!("planning {}", tree.describe()));
+     let mut plan = plan::build_tree(&files, tree.empty_dirs(), request.kraken)?;
++    // Another read per file; once stopped, the rest are skipped and the check below reports it.
++    let cancel = control.cancel;
+     plan.mark_modules(|path| {
+-        tree.read_range(path, 0, 4)
+-            .is_ok_and(|head| plan::is_module_header(&head))
++        !stopped(cancel)
++            && tree
++                .read_range(path, 0, 4)
++                .is_ok_and(|head| plan::is_module_header(&head))
+     });
++    check_cancel(control)?;
+     // Refuse an over-large source here, before a single byte is read.
+     if plan.ndblock > outer_write::max_inner_blocks() {
+         return format_err(format!(
+@@ -858,15 +896,17 @@ fn prepare_with(
+ 
+ /// Write the package `prepared` describes into `out`, then verify it.
+ ///
+-/// `out` is the caller's: created empty, opened for reading **and** writing (a compressed
+-/// image is written in place and read back for its digests), and at `out_path`, which the
+-/// verifier reopens. Nothing here names, renames or removes the output: on an error `out` holds
+-/// a partial package the caller deletes, and on success it holds the whole package, synced,
+-/// which the caller publishes. `tree` is the tree `prepared` came from.
++/// `out` is the caller's: created empty and opened for reading **and** writing (a compressed
++/// image is written in place and read back for its digests). `out_path` is where it lives: it
++/// names the package in the report and in errors, and nothing reopens it. Nothing here names,
++/// renames or removes the output: on an error `out` holds a partial package the caller
++/// deletes, and on success it holds the whole package, synced, which the caller publishes.
++/// `tree` is the tree `prepared` came from.
+ ///
+-/// The package is read back with [`verify::verify_streaming`] and the report is returned in
+-/// [`BuildReport::verify`]; a package that fails a check is an error (whose message carries
+-/// the report), so an `Ok` report always has `verify.ok()`.
++/// The package is read back through `out` itself with [`verify::verify_file_controlled`] and
++/// the report is returned in [`BuildReport::verify`]; a package that fails a check is an error
++/// (whose message carries the report), so an `Ok` report always has `verify.ok()`. A set
++/// [`BuildControl::cancel`] ends any stage with [`crate::Error::Cancelled`].
+ pub fn write_package(
+     prepared: &Prepared,
+     tree: &mut dyn source::SourceTree,
+@@ -875,6 +915,7 @@ pub fn write_package(
+     progress: &mut dyn FnMut(&str),
+     control: &mut BuildControl,
+ ) -> Result<BuildReport> {
++    check_cancel(control)?;
+     if out.metadata()?.len() != 0 {
+         return format_err(format!(
+             "{} is not empty; the package is written into a new file",
+@@ -890,7 +931,7 @@ pub fn write_package(
+         control,
+         Mode::Streaming,
+     )?;
+-    let report = verify_written(prepared, out_path, progress, control)?;
++    let report = verify_written(prepared, out, progress, control)?;
+     let size = out.metadata()?.len();
+     if size != written {
+         return format_err(format!(
+@@ -962,11 +1003,11 @@ fn build_mode(
+         Ok(written) => written,
+         Err(e) => return Err(cleanup(e)),
+     };
+-    drop(file);
+-    let report = match verify_written(&prepared, &partial, progress, control) {
++    let report = match verify_written(&prepared, &file, progress, control) {
+         Ok(report) => report,
+         Err(e) => return Err(cleanup(e)),
+     };
++    drop(file);
+     if final_path.exists() {
+         return Err(cleanup(crate::Error::Format(format!(
+             "output appeared during conversion: {}",
+@@ -986,23 +1027,31 @@ fn build_mode(
+     })
+ }
+ 
+-/// Read the package at `path` back and require every check to pass.
++/// Read the package back through `out`, the handle it was written through, and require every
++/// check to pass.
+ fn verify_written(
+     prepared: &Prepared,
+-    path: &Path,
++    out: &std::fs::File,
+     progress: &mut dyn FnMut(&str),
+     control: &mut BuildControl,
+ ) -> Result<crate::verify::Report> {
+     enter(control, Stage::Verify);
++    let file = crate::PkgFile::from_reader(Box::new(out.try_clone()?), out.metadata()?.len());
+     progress("verifying");
+     // The streaming verifier reads the package block by block, so the self-check of a
+     // 155 GB package does not need 155 GB of memory.
++    let cancel = control.cancel;
+     let mut verify_bytes = |done: u64, total: u64| {
+         if let Some(f) = control.bytes.as_deref_mut() {
+             f(done, total);
+         }
+     };
+-    match verify::verify_streaming(path, &prepared.request.passcode, &mut verify_bytes)? {
++    match verify::verify_file_controlled(
++        file,
++        &prepared.request.passcode,
++        &mut verify_bytes,
++        cancel,
++    )? {
+         report if report.ok() => Ok(report),
+         report => format_err(format!("the built package failed verification:\n{report}")),
+     }
+@@ -1024,11 +1073,6 @@ fn write_mode(
+     let param_json = &prepared.param_json;
+     let content_version = prepared.content_version;
+     let (time, seed) = (prepared.time, prepared.seed);
+-    let cancelled = || {
+-        control
+-            .cancel
+-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+-    };
+ 
+     let written = match mode {
+         Mode::Streaming => {
+@@ -1083,9 +1127,7 @@ fn write_mode(
+             written?.size
+         }
+         Mode::InMemory => {
+-            if cancelled() {
+-                return format_err("the build was cancelled");
+-            }
++            check_cancel(control)?;
+             let mut read = |path: &str| -> Result<Vec<u8>> {
+                 match prepared.sizes.get(path) {
+                     Some(0) => Ok(Vec::new()),
+diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
+index ea27cf8..5b0c3f9 100644
+--- a/ps5upload-fpkg/src/kraken_image.rs
++++ b/ps5upload-fpkg/src/kraken_image.rs
+@@ -259,7 +259,7 @@ pub fn compress(
+                 return Ok(None);
+             };
+             if cancel.load(Ordering::Relaxed) {
+-                return format_err("the build was cancelled");
++                return Err(crate::Error::Cancelled);
+             }
+             let bytes = match (&t.owner, &t.source) {
+                 (Owner::File(_), Some((path, off))) => {
+@@ -293,6 +293,11 @@ pub fn compress(
+             Ok(Some((t, bytes)))
+         },
+         |(t, bytes)| {
++            // A stop asked for while the pool is full ends the blocks still queued, not only the
++            // reading: each one would otherwise be compressed and checked first.
++            if cancel.load(Ordering::Relaxed) {
++                return Err(crate::Error::Cancelled);
++            }
+             // Stored (`PS5UPLOAD_FPKG_KRAKEN_STORE=1`, see `store_only`): every half raw, the same
+             // layout with nothing for the console's decoder to decompress.
+             let halves = if store {
+diff --git a/ps5upload-fpkg/src/lib.rs b/ps5upload-fpkg/src/lib.rs
+index 3908347..4ef80bf 100644
+--- a/ps5upload-fpkg/src/lib.rs
++++ b/ps5upload-fpkg/src/lib.rs
+@@ -75,6 +75,10 @@ pub enum Error {
+     Io(#[from] std::io::Error),
+     #[error("{0}")]
+     Format(String),
++    /// The caller's cancel flag stopped a build or a verification. Its own variant, so a caller
++    /// can tell a stop it asked for from a failure without reading the message.
++    #[error("the build was cancelled")]
++    Cancelled,
+ }
+ 
+ pub type Result<T> = std::result::Result<T, Error>;
+diff --git a/ps5upload-fpkg/src/si.rs b/ps5upload-fpkg/src/si.rs
+index 47299c2..b2debf8 100644
+--- a/ps5upload-fpkg/src/si.rs
++++ b/ps5upload-fpkg/src/si.rs
+@@ -78,9 +78,22 @@ pub fn read(file: &mut PkgFile) -> Result<Option<Si>> {
+ 
+ /// CRC-32C of every 64 KiB block before the SI ZIP, little-endian.
+ pub fn chunk_crc_table(file: &mut PkgFile, zip_start: u64) -> Result<Vec<u8>> {
++    chunk_crc_table_controlled(file, zip_start, None)
++}
++
++/// [`chunk_crc_table`], stopping with [`crate::Error::Cancelled`] once `cancel` is set: the
++/// table reads the whole package.
++pub fn chunk_crc_table_controlled(
++    file: &mut PkgFile,
++    zip_start: u64,
++    cancel: Option<&std::sync::atomic::AtomicBool>,
++) -> Result<Vec<u8>> {
+     let blocks = zip_start.div_ceil(BLOCK);
+     let mut out = Vec::with_capacity(blocks as usize * 4);
+     for i in 0..blocks {
++        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
++            return Err(crate::Error::Cancelled);
++        }
+         let start = i * BLOCK;
+         let len = (zip_start - start).min(BLOCK) as usize;
+         out.extend_from_slice(&crc32c(&file.read_at(start, len)?).to_le_bytes());
+diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
+index e9331ac..7946741 100644
+--- a/ps5upload-fpkg/src/stream.rs
++++ b/ps5upload-fpkg/src/stream.rs
+@@ -178,7 +178,7 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
+ }
+ 
+ fn cancelled() -> crate::Error {
+-    crate::Error::Format("the build was cancelled".to_string())
++    crate::Error::Cancelled
+ }
+ 
+ /// Write the whole package to `out`, which must be empty and seekable.
+@@ -204,6 +204,10 @@ pub fn write_package(
+     // its length, which is only known once every block is compressed.
+     // A stored build passes through this stage at once.
+     (progress.stage)(crate::build::Stage::Compress);
++    // Before the block list and the metadata region are built for the compressor.
++    if cancel.load(Ordering::Relaxed) {
++        return Err(cancelled());
++    }
+     let kraken = match &request.kraken_spool {
+         Some(where_to) => {
+             (progress.phase)("compressing the image");
+@@ -326,6 +330,9 @@ pub fn write_package(
+     };
+ 
+     // ── the outer metadata ───────────────────────────────────────────────────────────
++    if cancel.load(Ordering::Relaxed) {
++        return Err(cancelled());
++    }
+     (progress.phase)("writing the layout");
+     let mut game_digest = [0u8; 32];
+     let mut superblock = Vec::new();
+@@ -338,6 +345,9 @@ pub fn write_package(
+         image_time(request.image_mode, request.time),
+         kraken.as_ref().map(|_| inner_size),
+     )? {
++        if cancel.load(Ordering::Relaxed) {
++            return Err(cancelled());
++        }
+         if index != lay.superblock_block {
+             if let Some(xts) = &xts {
+                 let sector = if index < lay.superblock_block {
+@@ -379,6 +389,9 @@ pub fn write_package(
+     out.write_all(&fih)?;
+ 
+     // ── the container ────────────────────────────────────────────────────────────────
++    if cancel.load(Ordering::Relaxed) {
++        return Err(cancelled());
++    }
+     (progress.phase)("writing the container");
+     // PlayGo maps files to chunks by where their bytes sit in the mount image — for a compressed
+     // image, where their compressed blocks are.
+@@ -447,6 +460,9 @@ pub fn write_package(
+     crc_table.extend_from_slice(&si_write::chunk_crc(&cnt.bytes));
+ 
+     // ── the install metadata ─────────────────────────────────────────────────────────
++    if cancel.load(Ordering::Relaxed) {
++        return Err(cancelled());
++    }
+     (progress.phase)("writing the install metadata");
+     let digests_18 = si_write::InnerDigests {
+         blocks: block_digests,
+@@ -511,6 +527,10 @@ pub fn write_package(
+     let si = si_write::zip(&members, request.time);
+     out.seek(SeekFrom::Start(cnt_offset + cnt.bytes.len() as u64))?;
+     out.write_all(&si)?;
++    // Flushing a large package to disk takes a while; a stop asked for by now skips it.
++    if cancel.load(Ordering::Relaxed) {
++        return Err(cancelled());
++    }
+     out.sync_all()?;
+ 
+     let size = cnt_offset + cnt.bytes.len() as u64 + si.len() as u64;
+diff --git a/ps5upload-fpkg/src/verify.rs b/ps5upload-fpkg/src/verify.rs
+index 1437ba6..580ca03 100644
+--- a/ps5upload-fpkg/src/verify.rs
++++ b/ps5upload-fpkg/src/verify.rs
+@@ -2,6 +2,7 @@
+ 
+ use std::fmt;
+ use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use crate::cnt::{self, EntryDigest};
+ use crate::crypto::sha3;
+@@ -370,7 +371,39 @@ pub fn verify_streaming(
+     passcode: &str,
+     progress: &mut dyn FnMut(u64, u64),
+ ) -> Result<Report> {
+-    let mut file = PkgFile::open(path)?;
++    verify_streaming_controlled(path, passcode, progress, None)
++}
++
++/// [`verify_streaming`], stopping with [`crate::Error::Cancelled`] once `cancel` is set. A
++/// verification reads the whole package (twice: the block sweep and the CRC table), minutes
++/// for a large game, so every block read checks the flag.
++pub fn verify_streaming_controlled(
++    path: &Path,
++    passcode: &str,
++    progress: &mut dyn FnMut(u64, u64),
++    cancel: Option<&AtomicBool>,
++) -> Result<Report> {
++    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
++        return Err(crate::Error::Cancelled);
++    }
++    verify_file_controlled(PkgFile::open(path)?, passcode, progress, cancel)
++}
++
++/// [`verify_streaming_controlled`] over a package already open, e.g. through the handle it was
++/// just written with, so the bytes checked are that file's whatever its path now names.
++pub fn verify_file_controlled(
++    mut file: PkgFile,
++    passcode: &str,
++    progress: &mut dyn FnMut(u64, u64),
++    cancel: Option<&AtomicBool>,
++) -> Result<Report> {
++    let stop = || -> Result<()> {
++        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
++            return Err(crate::Error::Cancelled);
++        }
++        Ok(())
++    };
++    stop()?;
+     let fih_block = file.read_at(0, BLOCK as usize)?;
+     let fih = fih::parse(&fih_block)?;
+     let cnt = cnt::read(&mut file, fih.cnt_offset)?;
+@@ -420,6 +453,7 @@ pub fn verify_streaming(
+     // The sector rule the samples follow: data blocks carry their own index, metadata
+     // blocks set bit 47, and the superblock is not encrypted at all.
+     let read_block = |file: &mut PkgFile, index: u64| -> Result<Vec<u8>> {
++        stop()?;
+         let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
+         if index == sb_index {
+             return Ok(raw);
+@@ -463,6 +497,7 @@ pub fn verify_streaming(
+     let mut bad = 0u64;
+     let mut done = 0u64;
+     for index in 0..count {
++        stop()?;
+         // The superblock is not encrypted; it was matched against the game digest above.
+         if index != sb_index {
+             let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
+@@ -542,7 +577,7 @@ pub fn verify_streaming(
+             match s.members.iter().find(|m| m.name == crc_name) {
+                 Some(m) => {
+                     let stored = file.read_at(m.offset, m.size as usize)?;
+-                    let expected = si::chunk_crc_table(&mut file, s.zip_start)?;
++                    let expected = si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
+                     r.push(
+                         "si playgo-chunk.crc",
+                         stored == expected,
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index 173d0bc..d0e0161 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -453,3 +453,133 @@ fn a_thread_cap_builds_the_same_package() {
+     };
+     assert!(built(Some(1), "threads-one") == built(None, "threads-all"));
+ }
++
++/// A stop asked for at a stage's start ends the build with `Error::Cancelled`, at every
++/// stage: preparing, compressing, writing and verifying.
++#[test]
++fn every_stage_stops_when_cancelled() {
++    use build::Stage;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    let src = TempDir::new("cancel-src");
++    write_tree(src.path());
++    for stop_at in [
++        Stage::Check,
++        Stage::Plan,
++        Stage::Compress,
++        Stage::Write,
++        Stage::Verify,
++    ] {
++        let mut tree = FolderSource::open(src.path()).unwrap();
++        let flag = AtomicBool::new(false);
++        let mut on_stage = |s: Stage| {
++            if s == stop_at {
++                flag.store(true, Ordering::Relaxed);
++            }
++        };
++        let mut control = BuildControl {
++            cancel: Some(&flag),
++            stage: Some(&mut on_stage),
++            ..BuildControl::default()
++        };
++        let result =
++            build::prepare(&mut tree, &request(src.path()), &mut control).and_then(|prepared| {
++                let path = src.path().join(format!("{}.part", stop_at.id()));
++                let mut file = std::fs::OpenOptions::new()
++                    .read(true)
++                    .write(true)
++                    .create_new(true)
++                    .open(&path)
++                    .unwrap();
++                build::write_package(
++                    &prepared,
++                    &mut tree,
++                    &mut file,
++                    &path,
++                    &mut |_| {},
++                    &mut control,
++                )
++            });
++        match result {
++            Err(ps5upload_fpkg::Error::Cancelled) => {}
++            Err(e) => panic!("stopping at {stop_at:?}: {e}"),
++            Ok(_) => panic!("stopping at {stop_at:?} still built a package"),
++        }
++    }
++}
++
++/// The verifier on its own: a set flag stops it, a clear one changes nothing.
++#[test]
++fn a_verification_can_be_cancelled() {
++    use ps5upload_fpkg::verify;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    let src = TempDir::new("verify-cancel-src");
++    let out = TempDir::new("verify-cancel-out");
++    write_tree(src.path());
++    let built = build::build(
++        &BuildRequest {
++            output_dir: out.path().to_path_buf(),
++            ..request(src.path())
++        },
++        &mut |_| {},
++    )
++    .unwrap();
++    let flag = AtomicBool::new(false);
++    let report = verify::verify_streaming_controlled(
++        &built.path,
++        DEFAULT_PASSCODE,
++        &mut |_, _| {},
++        Some(&flag),
++    )
++    .unwrap();
++    assert!(report.ok(), "{report}");
++    assert_eq!(
++        report.checks.len(),
++        verify::verify_streaming(&built.path, DEFAULT_PASSCODE, &mut |_, _| {})
++            .unwrap()
++            .checks
++            .len()
++    );
++    // Stopped from the progress callback, i.e. halfway through the block sweep.
++    let mut stop = |_: u64, _: u64| flag.store(true, Ordering::Relaxed);
++    flag.store(false, Ordering::Relaxed);
++    let stopped =
++        verify::verify_streaming_controlled(&built.path, DEFAULT_PASSCODE, &mut stop, Some(&flag));
++    assert!(matches!(stopped, Err(ps5upload_fpkg::Error::Cancelled)));
++}
++
++/// The verification reads the package through the caller's handle: what is checked is what
++/// was written, whatever the path names by then (here, nothing at all).
++#[test]
++fn the_written_handle_is_what_gets_verified() {
++    let src = TempDir::new("handle-src");
++    let out = TempDir::new("handle-out");
++    write_tree(src.path());
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let path = out.path().join("handle.part");
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .unwrap();
++    let moved = out.path().join("elsewhere.part");
++    std::fs::rename(&path, &moved).unwrap();
++    let report = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    assert!(report.verify.ok(), "{}", report.verify);
++    assert_eq!(report.path, path);
++    assert_eq!(report.size, std::fs::metadata(&moved).unwrap().len());
++}

@@ -1,0 +1,13 @@
+[package]
+name = "ps5-dump-forge-ufs2"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ps5upload-fpkg.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+ps5upload-pkg.workspace = true

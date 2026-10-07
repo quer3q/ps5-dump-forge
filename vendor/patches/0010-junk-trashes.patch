@@ -1,0 +1,21 @@
+diff --git a/ps5upload-fpkg/src/source.rs b/ps5upload-fpkg/src/source.rs
+index 59148f4..b530c43 100644
+--- a/ps5upload-fpkg/src/source.rs
++++ b/ps5upload-fpkg/src/source.rs
+@@ -169,6 +169,7 @@ pub(crate) fn is_junk(name: &str) -> bool {
+         || lower == "system volume information"
+         || lower == ".fseventsd"
+         || lower == ".spotlight-v100"
++        || lower == ".trashes"
+         || name.starts_with("._")
+ }
+ 
+@@ -1028,6 +1029,8 @@ mod tests {
+         std::fs::write(dir.join("._eboot.bin"), [0u8; 3]).unwrap();
+         std::fs::create_dir_all(dir.join(".Spotlight-V100")).unwrap();
+         std::fs::write(dir.join(".Spotlight-V100/x"), [0u8; 3]).unwrap();
++        std::fs::create_dir_all(dir.join(".Trashes/501")).unwrap();
++        std::fs::write(dir.join(".Trashes/501/x"), [0u8; 3]).unwrap();
+         let files = scan(&dir).unwrap();
+         std::fs::remove_dir_all(&dir).ok();
+         assert_eq!(

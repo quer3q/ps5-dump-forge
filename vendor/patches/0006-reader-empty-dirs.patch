@@ -1,0 +1,415 @@
+diff --git a/ps5upload-fpkg/src/exfat.rs b/ps5upload-fpkg/src/exfat.rs
+index 37c1d49..2fbf7ff 100644
+--- a/ps5upload-fpkg/src/exfat.rs
++++ b/ps5upload-fpkg/src/exfat.rs
+@@ -120,12 +120,20 @@ impl ExFat {
+ 
+     /// Every file of the volume, `/`-separated, junk skipped, sorted by path.
+     pub fn walk(&mut self) -> Result<Vec<ExFatFile>> {
++        Ok(self.walk_tree()?.0)
++    }
++
++    /// [`ExFat::walk`], plus the directories left with nothing in them once junk is skipped
++    /// (sorted), as [`crate::source::scan_tree`] reports them for a folder.
++    pub fn walk_tree(&mut self) -> Result<(Vec<ExFatFile>, Vec<String>)> {
+         let mut files = Vec::new();
++        let mut empty = Vec::new();
+         let root = self.root_cluster;
+         let bytes = self.chain_stream(root)?;
+-        self.walk_dir(&bytes, "", 0, &mut files)?;
++        self.walk_dir(&bytes, "", 0, &mut files, &mut empty)?;
+         files.sort_by(|a, b| a.path.cmp(&b.path));
+-        Ok(files)
++        empty.sort();
++        Ok((files, empty))
+     }
+ 
+     /// Up to `len` bytes at `offset` of a walked file.
+@@ -137,24 +145,30 @@ impl ExFat {
+         self.read_stream(f.first_cluster, f.no_fat_chain, &f.path, offset, want)
+     }
+ 
++    /// Walks one directory; returns whether anything under it was kept.
+     fn walk_dir(
+         &mut self,
+         bytes: &[u8],
+         prefix: &str,
+         depth: u32,
+         out: &mut Vec<ExFatFile>,
+-    ) -> Result<()> {
++        empty: &mut Vec<String>,
++    ) -> Result<bool> {
+         if depth > MAX_DEPTH {
+             return format_err(format!("{prefix} nests deeper than {MAX_DEPTH} levels"));
+         }
++        let mut kept = false;
+         for e in parse_dir(bytes)? {
++            kept = true;
+             let path = format!("{prefix}{}", e.name);
+             if e.is_dir {
+                 if out.len() > MAX_ENTRIES {
+                     return format_err("the volume holds more than a million files");
+                 }
+                 let bytes = self.read_dir_stream(&e, &path)?;
+-                self.walk_dir(&bytes, &format!("{path}/"), depth + 1, out)?;
++                if !self.walk_dir(&bytes, &format!("{path}/"), depth + 1, out, empty)? {
++                    empty.push(path);
++                }
+             } else {
+                 out.push(ExFatFile {
+                     path,
+@@ -164,7 +178,7 @@ impl ExFat {
+                 });
+             }
+         }
+-        Ok(())
++        Ok(kept)
+     }
+ 
+     /// A directory's bytes: its own stream length and its own chain flag, but at least
+@@ -326,6 +340,7 @@ pub struct ExFatSource {
+     volume: ExFat,
+     files: Vec<SourceFile>,
+     inner: Vec<ExFatFile>,
++    empty_dirs: Vec<String>,
+ }
+ 
+ impl ExFatSource {
+@@ -337,7 +352,7 @@ impl ExFatSource {
+ 
+     /// A volume already opened; `label` is what [`SourceTree::describe`] leads with.
+     pub fn from_volume(mut volume: ExFat, label: String) -> Result<Self> {
+-        let inner = volume.walk()?;
++        let (inner, empty_dirs) = volume.walk_tree()?;
+         let files = inner
+             .iter()
+             .map(|f| SourceFile {
+@@ -350,6 +365,7 @@ impl ExFatSource {
+             volume,
+             files,
+             inner,
++            empty_dirs,
+         })
+     }
+ 
+@@ -365,6 +381,12 @@ impl SourceTree for ExFatSource {
+         &self.files
+     }
+ 
++    /// A game image keeps its empty directories as a folder does: a build from the image
++    /// must lay out the same tree as a build from the folder it was made of.
++    fn empty_dirs(&self) -> &[String] {
++        &self.empty_dirs
++    }
++
+     fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+         let i = self.at(path)?;
+         let file = self.inner[i].clone();
+@@ -728,6 +750,51 @@ mod tests {
+         std::fs::remove_file(&path).ok();
+     }
+ 
++    /// [`synthetic_image`] with three more clusters and four directories in its root:
++    /// `empty` (cluster 6, no entries), `junk` (cluster 8, only a `.DS_Store`), `nest`
++    /// (cluster 9) holding `deeper` (cluster 10, no entries).
++    fn image_with_dirs() -> Vec<u8> {
++        const SECTOR: usize = 512;
++        const CLUSTER: usize = 4096;
++        const HEAP: usize = 2 * SECTOR;
++        const CLUSTERS: u32 = 9;
++        let mut img = synthetic_image();
++        img.resize(HEAP + CLUSTERS as usize * CLUSTER, 0);
++        let sectors = (img.len() / SECTOR) as u64;
++        img[72..80].copy_from_slice(&sectors.to_le_bytes());
++        img[92..96].copy_from_slice(&CLUSTERS.to_le_bytes());
++        let dir = |name: &str, first: u32| {
++            let mut records = file_bytes(name, first, CLUSTER as u64);
++            records[0][4..6].copy_from_slice(&0x10u16.to_le_bytes());
++            flat(records)
++        };
++        let mut put = |cluster: u32, at: usize, bytes: &[u8]| {
++            let at = HEAP + (cluster as usize - 2) * CLUSTER + at;
++            img[at..at + bytes.len()].copy_from_slice(bytes);
++        };
++        // The root already holds two file groups of three records each.
++        let mut root = dir("empty", 6);
++        root.extend(dir("junk", 8));
++        root.extend(dir("nest", 9));
++        put(4, 6 * 32, &root);
++        put(8, 0, &flat(file_bytes(".DS_Store", 7, 10)));
++        put(9, 0, &dir("deeper", 10));
++        img
++    }
++
++    #[test]
++    fn empty_directories_are_kept() {
++        let path =
++            std::env::temp_dir().join(format!("fpkg-exfat-{}-empty-dirs", std::process::id()));
++        std::fs::write(&path, image_with_dirs()).unwrap();
++        let source = ExFatSource::open(&path).unwrap();
++        std::fs::remove_file(&path).ok();
++        let files: Vec<&str> = source.files().iter().map(|f| f.path.as_str()).collect();
++        assert_eq!(files, ["big.bin", "chain.bin"]);
++        // A directory holding only junk is empty; one holding an empty directory is not.
++        assert_eq!(source.empty_dirs(), ["empty", "junk", "nest/deeper"]);
++    }
++
+     #[test]
+     fn a_stream_that_runs_off_the_volume_is_an_error() {
+         let (path, mut volume) = synthetic_at("short");
+diff --git a/ps5upload-fpkg/src/ufs2_source.rs b/ps5upload-fpkg/src/ufs2_source.rs
+index cb7e7f4..22453e9 100644
+--- a/ps5upload-fpkg/src/ufs2_source.rs
++++ b/ps5upload-fpkg/src/ufs2_source.rs
+@@ -22,6 +22,7 @@ pub struct Ufs2Source {
+     image: Ufs2Image<Box<dyn ReadSeek>>,
+     files: Vec<SourceFile>,
+     inodes: Vec<Inode>,
++    empty_dirs: Vec<String>,
+ }
+ 
+ impl Ufs2Source {
+@@ -36,8 +37,15 @@ impl Ufs2Source {
+             .map_err(|e| crate::Error::Format(format!("{label}: {e}")))?;
+         let mut files = Vec::new();
+         let mut inodes = Vec::new();
++        let mut empty_dirs = Vec::new();
+         let root = image.read_inode(ROOT_INODE)?;
+-        walk(&mut image, &root, "", 0, &mut files, &mut inodes)?;
++        let mut tree = Walk {
++            files: &mut files,
++            inodes: &mut inodes,
++            empty: &mut empty_dirs,
++        };
++        walk(&mut image, &root, "", 0, &mut tree)?;
++        empty_dirs.sort();
+         if files.is_empty() {
+             return format_err(format!("{label} holds no files"));
+         }
+@@ -53,6 +61,7 @@ impl Ufs2Source {
+             image,
+             files,
+             inodes,
++            empty_dirs,
+         })
+     }
+ 
+@@ -68,6 +77,12 @@ impl SourceTree for Ufs2Source {
+         &self.files
+     }
+ 
++    /// A game image keeps its empty directories as a folder does: a build from the image
++    /// must lay out the same tree as a build from the folder it was made of.
++    fn empty_dirs(&self) -> &[String] {
++        &self.empty_dirs
++    }
++
+     fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+         let i = self.at(path)?;
+         let inode = self.inodes[i].clone();
+@@ -93,14 +108,21 @@ impl SourceTree for Ufs2Source {
+     }
+ }
+ 
++/// What a walk collects: files with their inodes, in the same order, and empty directories.
++struct Walk<'a> {
++    files: &'a mut Vec<SourceFile>,
++    inodes: &'a mut Vec<Inode>,
++    empty: &'a mut Vec<String>,
++}
++
++/// Walks one directory; returns whether anything under it was kept.
+ fn walk(
+     image: &mut Ufs2Image<Box<dyn ReadSeek>>,
+     dir: &Inode,
+     prefix: &str,
+     depth: u32,
+-    files: &mut Vec<SourceFile>,
+-    inodes: &mut Vec<Inode>,
+-) -> Result<()> {
++    tree: &mut Walk,
++) -> Result<bool> {
+     if depth > MAX_DEPTH {
+         return format_err(format!("{prefix} nests deeper than {MAX_DEPTH} levels"));
+     }
+@@ -128,6 +150,7 @@ fn walk(
+     }
+     read_run(image, &entries, &run, &mut inodes_by_entry);
+ 
++    let mut kept = false;
+     for (i, entry) in entries.iter().enumerate() {
+         // A directory entry pointing at an unusable inode is the image's problem, not the
+         // caller's: skip it rather than fail the walk.
+@@ -136,16 +159,20 @@ fn walk(
+         };
+         let path = format!("{prefix}{}", entry.name);
+         if inode.is_dir() {
+-            walk(image, &inode, &format!("{path}/"), depth + 1, files, inodes)?;
++            if !walk(image, &inode, &format!("{path}/"), depth + 1, tree)? {
++                tree.empty.push(path);
++            }
++            kept = true;
+         } else if inode.is_file() {
+-            files.push(SourceFile {
++            tree.files.push(SourceFile {
+                 path,
+                 size: inode.size,
+             });
+-            inodes.push(inode);
++            tree.inodes.push(inode);
++            kept = true;
+         }
+     }
+-    Ok(())
++    Ok(kept)
+ }
+ 
+ /// Reads one run of entries' inodes — a contiguous, same-cylinder-group stretch — in a
+@@ -174,3 +201,147 @@ fn read_run(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const FS: usize = 4096;
++    const IBLKNO: usize = 20;
++
++    /// A one-cylinder-group UFS2 image built in memory: 4 KiB blocks and fragments, the inode
++    /// table at fragment 20, data allocated after it.
++    pub(crate) struct Image {
++        pub bytes: Vec<u8>,
++        next: usize,
++    }
++
++    impl Image {
++        pub fn new(inodes_per_cg: u32, frags: usize) -> Self {
++            let mut bytes = vec![0u8; frags * FS];
++            let sb = 65536;
++            let mut put32 = |at: usize, v: u32| {
++                bytes[sb + at..sb + at + 4].copy_from_slice(&v.to_le_bytes());
++            };
++            put32(16, IBLKNO as u32);
++            put32(44, 1);
++            put32(48, FS as u32);
++            put32(52, FS as u32);
++            put32(184, inodes_per_cg);
++            put32(188, frags as u32);
++            put32(1372, ps5upload_pkg::ufs2::UFS2_MAGIC);
++            bytes[sb + 1080..sb + 1088].copy_from_slice(&(frags as u64).to_le_bytes());
++            let table = (inodes_per_cg as usize * 256).div_ceil(FS);
++            Self {
++                bytes,
++                next: IBLKNO + table,
++            }
++        }
++
++        /// Blocks holding `data`, with a single-indirect block past the twelfth.
++        fn store(&mut self, data: &[u8]) -> ([u64; 12], u64) {
++            let mut blocks = Vec::new();
++            for chunk in data.chunks(FS) {
++                let at = self.next * FS;
++                self.bytes[at..at + chunk.len()].copy_from_slice(chunk);
++                blocks.push(self.next as u64);
++                self.next += 1;
++            }
++            let mut direct = [0u64; 12];
++            for (slot, b) in direct.iter_mut().zip(&blocks) {
++                *slot = *b;
++            }
++            let mut indirect = 0;
++            if blocks.len() > 12 {
++                assert!(
++                    blocks.len() - 12 <= FS / 8,
++                    "the fixture has one indirect block"
++                );
++                indirect = self.next as u64;
++                let at = self.next * FS;
++                for (i, b) in blocks[12..].iter().enumerate() {
++                    self.bytes[at + i * 8..at + i * 8 + 8].copy_from_slice(&b.to_le_bytes());
++                }
++                self.next += 1;
++            }
++            (direct, indirect)
++        }
++
++        fn inode(&mut self, n: u64, mode: u16, size: u64, direct: [u64; 12], indirect: u64) {
++            let at = IBLKNO * FS + n as usize * 256;
++            let raw = &mut self.bytes[at..at + 256];
++            raw[0..2].copy_from_slice(&mode.to_le_bytes());
++            raw[16..24].copy_from_slice(&size.to_le_bytes());
++            for (i, b) in direct.iter().enumerate() {
++                raw[112 + i * 8..120 + i * 8].copy_from_slice(&b.to_le_bytes());
++            }
++            raw[208..216].copy_from_slice(&indirect.to_le_bytes());
++        }
++
++        pub fn file(&mut self, n: u64, data: &[u8]) {
++            let (direct, indirect) = self.store(data);
++            self.inode(n, 0x81A4, data.len() as u64, direct, indirect);
++        }
++
++        /// A directory: `.`, `..`, then `entries` as `(name, inode)`, the last record running
++        /// to the end of its block as UFS lays them out.
++        pub fn dir(&mut self, n: u64, parent: u64, entries: &[(&str, u64)]) {
++            let mut data = Vec::new();
++            let mut last = 0;
++            let all = [(".", n), ("..", parent)];
++            for (name, ino) in all.iter().copied().chain(entries.iter().copied()) {
++                let reclen = (8 + name.len() + 1).next_multiple_of(4);
++                if data.len() / FS != (data.len() + reclen - 1) / FS {
++                    // A record never crosses a block: the previous one takes up the slack.
++                    let pad = data.len().next_multiple_of(FS) - data.len();
++                    let grown = u16::from_le_bytes([data[last + 4], data[last + 5]]) as usize + pad;
++                    data[last + 4..last + 6].copy_from_slice(&(grown as u16).to_le_bytes());
++                    data.resize(data.len() + pad, 0);
++                }
++                last = data.len();
++                data.extend_from_slice(&(ino as u32).to_le_bytes());
++                data.extend_from_slice(&(reclen as u16).to_le_bytes());
++                data.push(if name.starts_with('.') && name.len() <= 2 {
++                    4
++                } else {
++                    8
++                });
++                data.push(name.len() as u8);
++                data.extend_from_slice(name.as_bytes());
++                data.resize(last + reclen, 0);
++            }
++            let pad = data.len().next_multiple_of(FS) - data.len();
++            let grown = u16::from_le_bytes([data[last + 4], data[last + 5]]) as usize + pad;
++            data[last + 4..last + 6].copy_from_slice(&(grown as u16).to_le_bytes());
++            data.resize(data.len() + pad, 0);
++            let (direct, indirect) = self.store(&data);
++            self.inode(n, 0x41ED, data.len() as u64, direct, indirect);
++        }
++
++        pub fn open(self) -> Result<Ufs2Source> {
++            Ufs2Source::from_reader(Box::new(std::io::Cursor::new(self.bytes)), "test".into())
++        }
++    }
++
++    #[test]
++    fn empty_directories_are_kept() {
++        let mut img = Image::new(64, 64);
++        img.dir(
++            ROOT_INODE,
++            ROOT_INODE,
++            &[("eboot.bin", 3), ("empty", 4), ("junk", 5), ("nest", 7)],
++        );
++        img.file(3, b"eboot");
++        img.dir(4, ROOT_INODE, &[]);
++        img.dir(5, ROOT_INODE, &[(".DS_Store", 6)]);
++        img.file(6, b"junk");
++        img.dir(7, ROOT_INODE, &[("deeper", 8)]);
++        img.dir(8, 7, &[]);
++        let mut source = img.open().unwrap();
++        let files: Vec<&str> = source.files().iter().map(|f| f.path.as_str()).collect();
++        assert_eq!(files, ["eboot.bin"]);
++        // A directory holding only junk is empty; one holding an empty directory is not.
++        assert_eq!(source.empty_dirs(), ["empty", "junk", "nest/deeper"]);
++        assert_eq!(source.read("eboot.bin").unwrap(), b"eboot");
++    }
++}
