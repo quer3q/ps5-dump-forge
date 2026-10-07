@@ -254,26 +254,26 @@ impl Walk {
                     self.empty_dirs.push(path);
                 }
             } else if kind.is_file() {
-                if hard_link_count(&meta) > 1 {
-                    self.hard_links.push(path);
-                } else if let Err(e) = open_nofollow(&entry.path()).and_then(|f| {
+                match open_nofollow(&entry.path()).and_then(|f| {
                     // The entry may have been swapped since it was listed.
-                    if f.metadata()?.is_file() {
-                        Ok(())
-                    } else {
-                        Err(io::Error::other("no longer a regular file"))
+                    let now = f.metadata()?;
+                    if !now.is_file() {
+                        return Err(io::Error::other("no longer a regular file"));
                     }
+                    hard_link_count(&f, &now)
                 }) {
-                    self.unreadable.push(format!("{path}: {e}"));
-                } else {
-                    let stamp = Stamp::of(&meta);
-                    self.files.push((
-                        SourceFile {
-                            path,
-                            size: stamp.size,
-                        },
-                        stamp,
-                    ));
+                    Err(e) => self.unreadable.push(format!("{path}: {e}")),
+                    Ok(links) if links > 1 => self.hard_links.push(path),
+                    Ok(_) => {
+                        let stamp = Stamp::of(&meta);
+                        self.files.push((
+                            SourceFile {
+                                path,
+                                size: stamp.size,
+                            },
+                            stamp,
+                        ));
+                    }
                 }
             } else {
                 self.special
@@ -304,17 +304,22 @@ pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
+/// How many names the open file `file` (whose metadata is `meta`) has.
 #[cfg(unix)]
-fn hard_link_count(meta: &Metadata) -> u64 {
+fn hard_link_count(_: &File, meta: &Metadata) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
-    meta.nlink()
+    Ok(meta.nlink())
 }
 
-// ponytail: Windows link counts need GetFileInformationByHandle (std's is unstable); hard
-// links are not detected there until that is wired.
-#[cfg(not(unix))]
-fn hard_link_count(_: &Metadata) -> u64 {
-    1
+#[cfg(windows)]
+fn hard_link_count(file: &File, _: &Metadata) -> io::Result<u64> {
+    crate::win::link_count(file)
+}
+
+// ponytail: other OSes have no link count wired; hard links are not detected there.
+#[cfg(not(any(unix, windows)))]
+fn hard_link_count(_: &File, _: &Metadata) -> io::Result<u64> {
+    Ok(1)
 }
 
 #[cfg(windows)]
@@ -484,5 +489,28 @@ mod tests {
         for name in ["eboot.bin", "_x", ".dsstore", "sce_sys"] {
             assert!(!is_junk(name), "{name}");
         }
+    }
+
+    #[test]
+    fn hard_links_are_refused() {
+        let dir = crate::test_dir("scan-hard-links");
+        std::fs::write(dir.join("a.bin"), b"a").unwrap();
+        std::fs::write(dir.join("c.bin"), b"c").unwrap();
+        std::fs::hard_link(dir.join("a.bin"), dir.join("b.bin")).unwrap();
+        let file = open_nofollow(&dir.join("a.bin")).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(hard_link_count(&file, &meta).unwrap(), 2);
+        drop(file);
+        let err = ScannedFolder::scan(&dir, &AtomicBool::new(false))
+            .err()
+            .unwrap()
+            .to_string();
+        for name in ["a.bin", "b.bin"] {
+            assert!(
+                err.contains(&format!("hard link (more than one name): {name}")),
+                "{err}"
+            );
+        }
+        assert!(!err.contains("c.bin"), "{err}");
     }
 }

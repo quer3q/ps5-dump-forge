@@ -106,7 +106,8 @@ export const api = {
   cancelJob: (id: JobId) => invoke<void>("cancel_job", { id }),
   /** Leftover `.part` files in these folders (deduplicated, missing ones skipped). */
   staleParts: (dirs: string[]) => invoke<string[]>("stale_parts", { dirs }),
-  /** Show a finished job's output in Finder (Rust looks the path up by job id). */
+  /** Show a finished job's output in Finder, Explorer or its folder (Rust looks the path up by
+   * job id). */
   reveal: (id: JobId) => invoke<void>("reveal", { id }),
   /** Cancel every job, wait for cleanup, exit. */
   quitApp: () => invoke<void>("quit_app"),

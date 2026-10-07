@@ -59,7 +59,6 @@ Grouped by area; the first section blocks a release.
 
 ## App
 - [ ] Batch queue screen, History, Library.
-- [ ] Upload to console (or hand off to ps5upload).
 - [ ] Inspect: a **Verify** action for an existing image or package (core has no standalone verify API yet).
 - [ ] Leftover `.part` files: offer deletion (today list-only on Inspect), limited to this app's
   `<name>.<job>-<pid>.part` pattern, never while a job runs.

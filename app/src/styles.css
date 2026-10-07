@@ -116,6 +116,11 @@ img { display: block; }
   max-width: 1200px; margin: 0 auto; padding: 16px 28px 32px;
   display: flex; flex-direction: column; gap: 16px;
 }
+/* Convert, while a job queue shows: the screen is at least the rest of the window tall, so the
+   queue (.card.jobs) grows to the bottom instead of leaving blank space under short cards. If
+   the cards plus the queue's own minimum are taller than that, the screen grows past it and the
+   page scrolls, same as any other screen. */
+.screen.with-jobs { min-height: calc(100vh - var(--top)); }
 .cols { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
 .stack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 @media (min-width: 880px) {
@@ -369,11 +374,23 @@ ul.findings li.info .icon { color: var(--accent-ink); }
 .field-error { margin: 6px 0 0 14px; font-size: 12px; }
 
 /* ---------- Jobs ---------- */
-/* Jobs: one card under Target, a row per job (newest first). */
-.card.jobs { padding: 12px 20px 4px; }
-.card.jobs .card-head { margin-bottom: 2px; }
+/* Jobs: one card below the other cards, full width, a row per job (newest first). It grows to
+   fill the rest of the window (see .screen.with-jobs) and scrolls inside .job-list once the
+   list is taller than that, never below min-height. The 0px basis keeps the list's own height
+   out of the screen's size (`auto` grows the card to the whole list and the page scrolls
+   instead; `flex: 1`'s 0% basis acts like `auto` against the screen's indefinite height). */
+.card.jobs {
+  display: flex; flex-direction: column; flex: 1 1 0px; min-height: 240px;
+  padding: 12px 20px 4px;
+}
+.card.jobs .card-head { margin-bottom: 2px; flex: none; }
+/* Positioned, so the rows' absolutely positioned bits (.visually-hidden) are clipped by this
+   scroll box too; otherwise those from hidden rows stretch the page below the window. */
+.job-list { flex: 1; min-height: 0; overflow: auto; position: relative; }
 .head-note { font-size: 12.5px; }
-.job { padding: 8px 0 14px; scroll-margin: calc(var(--top) + 12px) 0 12px; }
+/* A new job scrolls into .job-list, not the page (that box always scrolls internally), so no
+   sticky-header offset is needed here, unlike a page-level scroll target. */
+.job { padding: 8px 0 14px; scroll-margin: 12px 0; }
 .job + .job { border-top: 1px solid var(--line); }
 .job-head { display: flex; align-items: flex-start; gap: 10px; }
 .job-head > .tag { margin-top: 1px; }

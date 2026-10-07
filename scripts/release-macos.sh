@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Build and package the macOS arm64 release:
+# Build and package the macOS releases:
 #
-#   dist/ps5-dump-forge-<ver>-macos-arm64.zip     one folder: PS5 Dump Forge.app, ps5-dump-forge (CLI),
-#                                                 README.md, LICENSE, THIRD-PARTY-NOTICES.md
-#   dist/ps5-dump-forge-<ver>-source.tar.gz       `git archive HEAD` (GPL: the source ships with it)
+#   dist/ps5-dump-forge-<ver>-macos-arm64.zip      one folder: PS5 Dump Forge.app, ps5-dump-forge (CLI),
+#                                                   README.md, LICENSE, THIRD-PARTY-NOTICES.md (arm64-only)
+#   dist/ps5-dump-forge-<ver>-macos-universal.zip  same, but the app and the CLI are arm64+x86_64 universal
+#                                                   binaries (lipo-joined for the CLI, `tauri build
+#                                                   --target universal-apple-darwin` for the app)
+#   dist/ps5-dump-forge-<ver>-source.tar.gz        `git archive HEAD` (GPL: the source ships with it)
 #   dist/SHA256SUMS
 #
 # Ad-hoc signed only (no Developer ID, no notarization): Tauri signs "PS5 Dump Forge.app" with
@@ -21,42 +24,84 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 [[ $(uname -s) == Darwin ]] || { echo "release-macos.sh: needs macOS (codesign, ditto)" >&2; exit 1; }
 
-target=aarch64-apple-darwin
+arm=aarch64-apple-darwin
+intel=x86_64-apple-darwin
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
 [[ -n $version ]] || { echo "release-macos.sh: no version in Cargo.toml" >&2; exit 1; }
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 [[ $target_dir == /* ]] || target_dir=$root/$target_dir
 export CARGO_TARGET_DIR=$target_dir
 dist=${DIST_DIR:-$root/dist}
-name=ps5-dump-forge-$version-macos-arm64
 
 if [[ ${SKIP_BUILD:-} != 1 ]]; then
-  echo "== PS5 Dump Forge.app ($target)"
+  echo "== PS5 Dump Forge.app ($arm)"
   # npm ci only into a fresh checkout: it deletes node_modules, which a running dev server uses.
   [[ -d app/node_modules ]] || (cd app && npm ci)
-  (cd app && npx tauri build --ci --target "$target" --bundles app)
-  echo "== CLI ($target)"
-  cargo build --release --locked -p ps5-dump-forge-cli --target "$target"
+  (cd app && npx tauri build --ci --target "$arm" --bundles app)
+  echo "== PS5 Dump Forge.app (universal)"
+  (cd app && npx tauri build --ci --target universal-apple-darwin --bundles app)
+  echo "== CLI ($arm, $intel)"
+  cargo build --release --locked -p ps5-dump-forge-cli --target "$arm"
+  cargo build --release --locked -p ps5-dump-forge-cli --target "$intel"
 fi
 
-app="$target_dir/$target/release/bundle/macos/PS5 Dump Forge.app"
-cli=$target_dir/$target/release/ps5-dump-forge
-for f in "$app" "$cli"; do
+arm_app="$target_dir/$arm/release/bundle/macos/PS5 Dump Forge.app"
+universal_app="$target_dir/universal-apple-darwin/release/bundle/macos/PS5 Dump Forge.app"
+arm_cli=$target_dir/$arm/release/ps5-dump-forge
+intel_cli=$target_dir/$intel/release/ps5-dump-forge
+for f in "$arm_app" "$universal_app" "$arm_cli" "$intel_cli"; do
   [[ -e "$f" ]] || { echo "release-macos.sh: $f is missing (build first)" >&2; exit 1; }
 done
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-pkg=$stage/$name
-mkdir "$pkg"
-ditto "$app" "$pkg/PS5 Dump Forge.app"
-cp "$cli" "$pkg/ps5-dump-forge"
-cp README.md LICENSE THIRD-PARTY-NOTICES.md "$pkg/"
-codesign --force -s - "$pkg/ps5-dump-forge"
 
+universal_cli=$stage/ps5-dump-forge-universal
+lipo -create -output "$universal_cli" "$arm_cli" "$intel_cli"
+
+# minos_at_most_11 <bin> <arch>: the slice's minimum OS must be <= 11.0 (tauri.conf.json's
+# bundle.macOS.minimumSystemVersion), on top of whatever Rust itself defaults to. The CLI's
+# x86_64 slice gets the older LC_VERSION_MIN_MACOSX (its `version` field) instead of
+# LC_BUILD_VERSION (`minos`) because its implied deployment target is below 10.14.
+minos_at_most_11() {
+  local bin=$1 a=$2 ver major minor
+  ver=$(vtool -arch "$a" -show-build "$bin" | awk '
+    /cmd LC_BUILD_VERSION/     { mode = "build" }
+    /cmd LC_VERSION_MIN_MACOSX/ { mode = "min" }
+    mode == "build" && /^ *minos /   { print $2; exit }
+    mode == "min"   && /^ *version / { print $2; exit }
+  ')
+  [[ -n $ver ]] || { echo "release-macos.sh: $bin ($a): no minimum OS found" >&2; exit 1; }
+  major=${ver%%.*} minor=${ver#*.}
+  (( major < 11 || (major == 11 && minor == 0) )) ||
+    { echo "release-macos.sh: $bin ($a): minimum OS $ver exceeds 11.0" >&2; exit 1; }
+}
+
+# run_cli_slices <cli_bin>: exercise each universal slice with a real `inspect`, through `arch`, on a
+# tiny generated fixture folder. x86_64 only skips (with a note) when Rosetta is not installed.
+run_cli_slices() {
+  local cli_bin=$1 a fixture
+  fixture=$(mktemp -d "$stage/fixture.XXXXXX")
+  mkdir "$fixture/sce_sys"
+  : > "$fixture/eboot.bin"
+  echo '{}' > "$fixture/sce_sys/param.json"
+  for a in arm64 x86_64; do
+    if [[ $a == x86_64 ]] && ! arch -x86_64 /usr/bin/true &>/dev/null; then
+      echo "release-macos.sh: no Rosetta, skipping the x86_64 slice run" >&2
+      continue
+    fi
+    echo "== exec $cli_bin ($a)"
+    arch "-$a" "$cli_bin" inspect "$fixture" > /dev/null
+  done
+}
+
+# check <dir> <variant> <arch>...: codesign + arch checks for the packaged app and CLI. For the
+# universal variant, also every slice's minimum OS and a real run of each slice (see above).
 check() {
-  local dir=$1
-  echo "== verify $dir"
+  local dir=$1 variant=$2
+  shift 2
+  local expected=("$@")
+  echo "== verify $dir ($variant)"
   codesign --verify --deep --strict --verbose=2 "$dir/PS5 Dump Forge.app"
   codesign --verify --strict --verbose=2 "$dir/ps5-dump-forge"
   codesign -dv "$dir/PS5 Dump Forge.app" 2>&1 | grep -E '^(Identifier|Format|Signature)='
@@ -64,34 +109,70 @@ check() {
   # mainBinaryName/productName can't silently pick up a stale binary.
   local exe
   exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$dir/PS5 Dump Forge.app/Contents/Info.plist")
-  for bin in "$dir/PS5 Dump Forge.app/Contents/MacOS/$exe" "$dir/ps5-dump-forge"; do
-    [[ $(lipo -archs "$bin") == arm64 ]] || { echo "release-macos.sh: $bin is not arm64-only" >&2; exit 1; }
+  local app_bin="$dir/PS5 Dump Forge.app/Contents/MacOS/$exe"
+  local cli_bin="$dir/ps5-dump-forge"
+  local want
+  want=$(printf '%s\n' "${expected[@]}" | sort | tr '\n' ' ')
+  local bin
+  for bin in "$app_bin" "$cli_bin"; do
+    local actual
+    actual=$(lipo -archs "$bin" | tr ' ' '\n' | sort | tr '\n' ' ')
+    [[ $actual == "$want" ]] ||
+      { echo "release-macos.sh: $bin has archs [$actual], want [$want]" >&2; exit 1; }
   done
+  if [[ $variant == universal ]]; then
+    local a
+    for bin in "$app_bin" "$cli_bin"; do
+      for a in "${expected[@]}"; do
+        minos_at_most_11 "$bin" "$a"
+      done
+    done
+    run_cli_slices "$cli_bin"
+  fi
   for f in README.md LICENSE THIRD-PARTY-NOTICES.md; do
     [[ -s "$dir/$f" ]] || { echo "release-macos.sh: $f missing" >&2; exit 1; }
   done
 }
-check "$pkg"
+
+# package_and_check <name> <variant> <app> <cli> <arch>...: stage the folder, sign the CLI, verify it,
+# zip it, then unzip and verify again (what a user actually gets).
+package_and_check() {
+  local name=$1 variant=$2 app=$3 cli=$4
+  shift 4
+  local pkg=$stage/$name
+  mkdir "$pkg"
+  ditto "$app" "$pkg/PS5 Dump Forge.app"
+  cp "$cli" "$pkg/ps5-dump-forge"
+  codesign --force -s - "$pkg/ps5-dump-forge"
+  cp README.md LICENSE THIRD-PARTY-NOTICES.md "$pkg/"
+  check "$pkg" "$variant" "$@"
+
+  local zip=$dist/$name.zip
+  # ditto keeps the bundle's symlinks, permissions and signature intact (zip(1) can break them).
+  # No extended attributes or resource forks: they would land in the zip as `._*` files, and an
+  # ad-hoc signature does not need them.
+  (cd "$stage" && ditto -c -k --norsrc --noextattr --noacl --keepParent "$name" "$zip")
+
+  mkdir "$stage/unzipped-$name"
+  ditto -x -k "$zip" "$stage/unzipped-$name"
+  check "$stage/unzipped-$name/$name" "$variant" "$@"
+}
+
+arm_name=ps5-dump-forge-$version-macos-arm64
+universal_name=ps5-dump-forge-$version-macos-universal
+src=$dist/ps5-dump-forge-$version-source.tar.gz
 
 mkdir -p "$dist"
-zip=$dist/$name.zip
-src=$dist/ps5-dump-forge-$version-source.tar.gz
-rm -f "$zip" "$src" "$dist/SHA256SUMS"
-# ditto keeps the bundle's symlinks, permissions and signature intact (zip(1) can break them).
-# No extended attributes or resource forks: they would land in the zip as `._*` files, and an
-# ad-hoc signature does not need them.
-(cd "$stage" && ditto -c -k --norsrc --noextattr --noacl --keepParent "$name" "$zip")
+rm -f "$dist/$arm_name.zip" "$dist/$universal_name.zip" "$src" "$dist/SHA256SUMS"
 
-# What a user gets: unpack the zip again and check it the same way.
-mkdir "$stage/unzipped"
-ditto -x -k "$zip" "$stage/unzipped"
-check "$stage/unzipped/$name"
+package_and_check "$arm_name" arm64 "$arm_app" "$arm_cli" arm64
+package_and_check "$universal_name" universal "$universal_app" "$universal_cli" arm64 x86_64
 
 [[ -z $(git status --porcelain) ]] ||
   echo "release-macos.sh: warning: uncommitted changes; the source tarball holds HEAD only" >&2
 git archive --format=tar.gz --prefix="ps5-dump-forge-$version/" -o "$src" HEAD
 
-(cd "$dist" && shasum -a 256 "$(basename "$zip")" "$(basename "$src")" > SHA256SUMS)
+(cd "$dist" && shasum -a 256 "$arm_name.zip" "$universal_name.zip" "$(basename "$src")" > SHA256SUMS)
 echo "== $dist"
-ls -l "$zip" "$src"
+ls -l "$dist/$arm_name.zip" "$dist/$universal_name.zip" "$src"
 cat "$dist/SHA256SUMS"

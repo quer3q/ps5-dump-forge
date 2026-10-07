@@ -119,8 +119,8 @@ pub(crate) struct SourceStamp {
     seen: Option<Seen>,
 }
 
-/// (length, modification time, (device, inode)).
-type Seen = (u64, Option<SystemTime>, Option<(u64, u64)>);
+/// (length, modification time, identity).
+type Seen = (u64, Option<SystemTime>, crate::finalize::FileId);
 
 impl SourceStamp {
     pub(crate) fn take(path: &Path, kind: Kind) -> anyhow::Result<Self> {
@@ -135,15 +135,27 @@ impl SourceStamp {
     }
 
     fn seen(path: &Path) -> anyhow::Result<Seen> {
-        let meta = std::fs::metadata(path).with_context(|| format!("{}", path.display()))?;
+        let shown = || format!("{}", path.display());
         #[cfg(unix)]
-        let id = {
-            use std::os::unix::fs::MetadataExt;
-            Some((meta.dev(), meta.ino()))
+        let (meta, id) = {
+            let meta = std::fs::metadata(path).with_context(shown)?;
+            let id = crate::finalize::meta_id(&meta);
+            (meta, id)
         };
-        // ponytail: Windows file ids need GetFileInformationByHandle; length and mtime only.
+        // Identities come from a handle there; one handle answers both.
         #[cfg(not(unix))]
-        let id = None;
+        let (meta, id) = {
+            let file = File::open(path).with_context(shown)?;
+            let meta = file.metadata().with_context(shown)?;
+            // ponytail: a source on a volume that reports file id 0 (some NAS/SMB) is still read;
+            // its stamp then catches a swap by length and mtime only. Ceiling: a same-size,
+            // same-mtime replacement there goes unnoticed.
+            #[cfg(windows)]
+            let id = crate::win::raw_file_id(&file);
+            #[cfg(not(windows))]
+            let id = crate::finalize::handle_id(&file);
+            (meta, id.with_context(shown)?)
+        };
         Ok((meta.len(), meta.modified().ok(), id))
     }
 
@@ -835,7 +847,6 @@ mod tests {
         assert_eq!(max % IMAGE_ALIGN, 0);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_changed_image_source_is_caught() {
         let dir = crate::test_dir("stamp");

@@ -28,19 +28,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Every platform that ships builds and tests the whole workspace, the Tauri app included
+      # (on WebKitGTK on Linux, with its WebView2 startup code on Windows).
       matrix:
         include:
-          # The v1 platform: everything, the Tauri app included.
           - os: macos-15
-            gui: true
-            packages: --workspace
-          # Unit tests elsewhere keep the core portable. The app crate needs WebKitGTK on
-          # Linux and WebView2 tooling on Windows, and it ships for macOS only in v1.
           - os: ubuntu-latest
             fmt: true
-            packages: --workspace --exclude ps5-dump-forge-gui
           - os: windows-latest
-            packages: --workspace --exclude ps5-dump-forge-gui
     steps:
       - uses: actions/checkout@v7
         with:
@@ -51,16 +46,20 @@ jobs:
           rustc --version
       - if: matrix.fmt
         run: cargo fmt --all --check
+      # Tauri v2's Linux build deps, as the release's linux job installs them.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libayatana-appindicator3-dev patchelf file
       # tauri-build needs the built frontend (app/dist) to compile the app crate.
-      - if: matrix.gui
-        uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      - if: matrix.gui
-        working-directory: app
+      - working-directory: app
         run: npm ci && npm run build
-      - run: cargo clippy ${{ matrix.packages }} --all-targets --locked -- -D warnings
-      - run: cargo test ${{ matrix.packages }} --locked --release
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked --release
       # Every target onto real exFAT and FAT32 volumes (hdiutil, no root): macOS's drivers
       # renumber a file's inode at its first write and exFAT has no RENAME_EXCL.
       - if: runner.os == 'macOS'

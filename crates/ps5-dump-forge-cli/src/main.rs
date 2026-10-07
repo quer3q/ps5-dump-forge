@@ -111,9 +111,11 @@ fn default_output(source: &Path, format: Format) -> Result<PathBuf, String> {
 }
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// Set once the job is cancelled or done and its `.part` cleaned up; Windows' close
+/// handler waits for it.
+static CLEANED_UP: AtomicBool = AtomicBool::new(false);
 
-// ponytail: a plain signal handler that only sets a flag; the main loop polls it. Windows
-// Ctrl-C ends the process without cleanup (the `.part` stays and `stale_parts` lists it).
+// ponytail: a plain signal handler that only sets a flag; the main loop polls it.
 #[cfg(unix)]
 fn on_ctrl_c() {
     extern "C" fn handler(_: libc::c_int) {
@@ -126,7 +128,40 @@ fn on_ctrl_c() {
     }
 }
 
-#[cfg(not(unix))]
+/// Ctrl-C and Ctrl-Break only set the flag. Closing the console, logging off or shutting
+/// down ends the process once the handler returns (or about 5 s later), so the handler
+/// waits there, up to 4 s, for the main loop to cancel the job and clean up.
+// ponytail: a cleanup slower than the 4 s wait is cut off by Windows; the `.part` survives
+// and `stale_parts` lists it.
+#[cfg(windows)]
+fn on_ctrl_c() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(handler: extern "system" fn(u32) -> i32, add: i32) -> i32;
+    }
+    extern "system" fn handler(event: u32) -> i32 {
+        const CTRL_BREAK_EVENT: u32 = 1;
+        INTERRUPTED.store(true, Ordering::Relaxed);
+        if event > CTRL_BREAK_EVENT {
+            let start = std::time::Instant::now();
+            while !CLEANED_UP.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(4) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        1
+    }
+    // SAFETY: the handler is a plain function for the life of the process; it runs on a
+    // thread of its own and touches only atomics.
+    if unsafe { SetConsoleCtrlHandler(handler, 1) } == 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "ps5-dump-forge: no Ctrl-C handler ({}); an interrupted job leaves its .part",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn on_ctrl_c() {}
 
 fn main() -> ExitCode {
@@ -246,15 +281,17 @@ fn convert(request: ConvertRequest) -> ExitCode {
             Ok(result) => break result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !cancelled && INTERRUPTED.load(Ordering::Relaxed) {
-                    eprintln!("ps5-dump-forge: cancelling...");
+                    // Cancel first; a closing console can fail the write, which must not panic.
                     jobs.cancel(job);
                     cancelled = true;
+                    let _ = writeln!(std::io::stderr(), "ps5-dump-forge: cancelling...");
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break Err("job vanished".to_string()),
         }
     };
     jobs.cancel_all_and_wait();
+    CLEANED_UP.store(true, Ordering::Relaxed);
     match result {
         Ok(report) => {
             eprintln!(

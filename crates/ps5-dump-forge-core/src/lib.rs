@@ -20,6 +20,8 @@ mod preflight;
 mod scan;
 mod sdk;
 mod verify;
+#[cfg(windows)]
+mod win;
 
 pub use dlc::Dlc;
 pub use extract::extraction_findings;

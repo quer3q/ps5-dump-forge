@@ -4,7 +4,7 @@
 //! fallback only where no exclusive rename exists (macOS exFAT, see [`rename_no_replace`]).
 
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, FileType, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -37,8 +37,9 @@ pub(crate) fn part_path(output: &Path, job: JobId) -> PathBuf {
 pub(crate) struct Part {
     path: PathBuf,
     dir: bool,
-    id: Option<FileId>,
-    /// Unix only, and only ever used for `fstat`: it shares the caller's cursor.
+    /// Captured at creation; a file part uses it only until it holds `handle`.
+    id: FileId,
+    /// Only ever used for its identity: it shares the caller's cursor.
     handle: Option<File>,
     published: bool,
 }
@@ -46,13 +47,17 @@ pub(crate) struct Part {
 impl Part {
     pub(crate) fn create_file(path: &Path) -> anyhow::Result<(Self, File)> {
         let file = create_new(path).with_context(|| format!("creating {}", path.display()))?;
+        let id = match handle_id(&file) {
+            Ok(id) => id,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(e).with_context(|| format!("identifying {}", path.display()));
+            }
+        };
         // The guard exists before the fallible clone, so a failed clone still cleans up.
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut part = Self::new(path, false, file_id(&file.metadata()?));
-        #[cfg(unix)]
-        {
-            part.handle = Some(file.try_clone().context("duplicating the .part handle")?);
-        }
+        let mut part = Self::new(path, false, id);
+        part.handle = Some(file.try_clone().context("duplicating the .part handle")?);
         Ok((part, file))
     }
 
@@ -60,15 +65,15 @@ impl Part {
         std::fs::create_dir(path).with_context(|| format!("creating {}", path.display()))?;
         // ponytail: mkdir and this lstat are two steps; a swap in between (by a process
         // that can write the output folder) would be adopted. Every later step checks it.
-        let meta = path.symlink_metadata()?;
-        let part = Self::new(path, true, file_id(&meta));
-        if !meta.is_dir() {
+        let (id, kind) = path_id(path)?;
+        let part = Self::new(path, true, id);
+        if !kind.is_dir() {
             anyhow::bail!("{} was replaced right after it was created", path.display());
         }
         Ok(part)
     }
 
-    fn new(path: &Path, dir: bool, id: Option<FileId>) -> Self {
+    fn new(path: &Path, dir: bool, id: FileId) -> Self {
         Self {
             path: path.to_path_buf(),
             dir,
@@ -82,32 +87,25 @@ impl Part {
         &self.path
     }
 
-    /// Whether `meta` (of an open handle) is this part. Always true where identities are
-    /// not available.
-    pub(crate) fn is(&self, meta: &std::fs::Metadata) -> bool {
+    /// What this job created, as it is now.
+    fn held(&self) -> io::Result<FileId> {
         match &self.handle {
-            Some(handle) => handle
-                .metadata()
-                .is_ok_and(|held| file_id(&held) == file_id(meta)),
-            None => self.id.is_none() || file_id(meta) == self.id,
+            Some(handle) => handle_id(handle),
+            None => Ok(self.id),
         }
     }
 
-    /// Whether the path still names the object this job created. Any metadata error means
-    /// it does not.
+    /// Whether `id` (of an open handle) is this part.
+    pub(crate) fn is(&self, id: FileId) -> bool {
+        self.held().is_ok_and(|held| held == id)
+    }
+
+    /// Whether the path still names the object this job created. Any error means it does
+    /// not.
     fn still_ours(&self) -> bool {
-        match &self.handle {
-            Some(handle) => match (handle.metadata(), self.path.symlink_metadata()) {
-                (Ok(held), Ok(at)) => at.is_file() && file_id(&held) == file_id(&at),
-                _ => false,
-            },
-            None => {
-                self.id.is_none()
-                    || self
-                        .path
-                        .symlink_metadata()
-                        .is_ok_and(|m| file_id(&m) == self.id)
-            }
+        match (self.held(), path_id(&self.path)) {
+            (Ok(held), Ok((at, kind))) => held == at && (self.dir || kind.is_file()),
+            _ => false,
         }
     }
 
@@ -147,20 +145,90 @@ impl Drop for Part {
     }
 }
 
-/// (device, inode): what a path names, independent of its spelling.
-type FileId = (u64, u64);
+/// What a path names, independent of its spelling: (device, inode) on Unix, (volume
+/// serial, file id) on Windows.
+pub(crate) type FileId = (u64, u128);
 
 #[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
+pub(crate) fn meta_id(meta: &std::fs::Metadata) -> FileId {
     use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
+    (meta.dev(), u128::from(meta.ino()))
 }
 
-// ponytail: Windows file ids need GetFileInformationByHandle (volume serial + file index,
-// compared fresh as on Unix since FAT ids change there too); parts are trusted by path there.
-#[cfg(not(unix))]
-fn file_id(_: &std::fs::Metadata) -> Option<FileId> {
-    None
+/// The identity of an open handle.
+#[cfg(unix)]
+pub(crate) fn handle_id(file: &File) -> io::Result<FileId> {
+    Ok(meta_id(&file.metadata()?))
+}
+
+/// What `path` names now, and its type; a link at `path` is not followed.
+#[cfg(unix)]
+pub(crate) fn path_id(path: &Path) -> io::Result<(FileId, FileType)> {
+    let meta = path.symlink_metadata()?;
+    Ok((meta_id(&meta), meta.file_type()))
+}
+
+/// What `path` names, following links.
+#[cfg(unix)]
+pub(crate) fn followed_id(path: &Path) -> io::Result<FileId> {
+    Ok(meta_id(&path.metadata()?))
+}
+
+#[cfg(windows)]
+pub(crate) fn handle_id(file: &File) -> io::Result<FileId> {
+    crate::win::file_id(file)
+}
+
+#[cfg(windows)]
+pub(crate) fn path_id(path: &Path) -> io::Result<(FileId, FileType)> {
+    let file = open_attributes(path, false)?;
+    Ok((handle_id(&file)?, file.metadata()?.file_type()))
+}
+
+#[cfg(windows)]
+pub(crate) fn followed_id(path: &Path) -> io::Result<FileId> {
+    handle_id(&open_attributes(path, true)?)
+}
+
+/// Opens a file or folder for its attributes only. It shares everything, so it never
+/// stands in the way of a rename or a delete; `follow: false` opens a link itself.
+#[cfg(windows)]
+fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if !follow {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(flags)
+        .open(path)
+}
+
+// Elsewhere there are no identities, so no path is ever recognised as a part: nothing is
+// published or deleted (and `rename_no_replace` refuses there anyway).
+#[cfg(not(any(unix, windows)))]
+fn no_ids() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "no file identities on this OS")
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn handle_id(_: &File) -> io::Result<FileId> {
+    Err(no_ids())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn path_id(_: &Path) -> io::Result<(FileId, FileType)> {
+    Err(no_ids())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn followed_id(_: &Path) -> io::Result<FileId> {
+    Err(no_ids())
 }
 
 /// Creates a file that must not exist yet, without following a link at `path`.
@@ -350,9 +418,8 @@ mod tests {
     }
 
     /// The identity captured at creation, gone stale as on macOS exFAT/FAT volumes.
-    #[cfg(unix)]
     fn stale(part: &mut Part) {
-        part.id = Some((u64::MAX, u64::MAX - 6));
+        part.id = (u64::MAX, u128::MAX - 6);
     }
 
     #[test]
@@ -364,14 +431,17 @@ mod tests {
         assert!(!dir.join("a.part").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_stale_creation_id_still_publishes_and_cleans_up() {
         let dir = crate::test_dir("part-stale");
         let mut part = written(&dir, "a.part", b"image");
         stale(&mut part);
-        let meta = std::fs::metadata(dir.join("a.part")).unwrap();
-        assert!(part.is(&meta), "an open handle on the part is recognised");
+        let open = File::open(dir.join("a.part")).unwrap();
+        assert!(
+            part.is(handle_id(&open).unwrap()),
+            "an open handle on the part is recognised"
+        );
+        drop(open);
         part.publish(&dir.join("a.exfat")).unwrap();
         assert_eq!(std::fs::read(dir.join("a.exfat")).unwrap(), b"image");
 
@@ -407,7 +477,6 @@ mod tests {
 
     /// Moves the part aside and plants `plant` at its path. Neither publish nor drop may
     /// touch the planted entry, the moved original or the output name.
-    #[cfg(unix)]
     fn replaced_part_is_left_alone(name: &str, plant: impl Fn(&Path, &Path)) {
         let dir = crate::test_dir(name);
         for publish in [true, false] {
@@ -430,7 +499,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_file_planted_at_the_part_is_left_alone() {
         replaced_part_is_left_alone("part-plant-file", |at, _| {
@@ -438,7 +506,6 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_dir_planted_at_the_part_is_left_alone() {
         replaced_part_is_left_alone("part-plant-dir", |at, _| {
@@ -495,6 +562,36 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("free")).unwrap(), b"ours");
         let err = imp::checked_rename(&dir.join("free"), &dir.join("no/such/dir")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_dir_part_swapped_for_another_dir_is_left_alone() {
+        let dir = crate::test_dir("part-dir-swap");
+        let (path, aside) = (dir.join("a.part"), dir.join("a.aside"));
+        let part = Part::create_dir(&path).unwrap();
+        std::fs::rename(&path, &aside).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = part.publish(&dir.join("out")).unwrap_err().to_string();
+        assert!(err.contains("was replaced after it was verified"), "{err}");
+        assert!(path.is_dir() && aside.is_dir());
+        assert!(!dir.join("out").exists());
+    }
+
+    #[test]
+    fn identities_follow_the_file_not_its_name() {
+        let dir = crate::test_dir("file-ids");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        std::fs::hard_link(&a, dir.join("a2")).unwrap();
+        let id = |p: &Path| path_id(p).unwrap().0;
+        assert_eq!(id(&a), id(&dir.join(".").join("a")), "another spelling");
+        assert_eq!(id(&a), id(&dir.join("a2")), "another name");
+        assert_eq!(id(&a), handle_id(&File::open(&a).unwrap()).unwrap());
+        assert_eq!(id(&a), followed_id(&a).unwrap());
+        assert_ne!(id(&a), id(&b), "another file");
+        assert!(path_id(&dir).unwrap().1.is_dir());
+        assert!(path_id(&dir.join("missing")).is_err());
     }
 
     #[test]

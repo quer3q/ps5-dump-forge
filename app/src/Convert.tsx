@@ -1,4 +1,4 @@
-// Convert: source → target format → output → Build, then one row per job under the target.
+// Convert: source → target format → output → Build, then one row per job below the cards.
 
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -26,7 +26,7 @@ import {
   SEPARATORS,
   SourceCard,
 } from "./common";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
 import type { Action, Job } from "./jobs";
 
 /** The target a new source starts with. */
@@ -280,9 +280,10 @@ export function Convert(props: {
   const formatWarn = ins
     ? ins.findings.filter((l) => classify(l).formats?.includes(format)).length
     : 0;
+  const hasJobs = props.jobs.length > 0;
 
   return (
-    <div className="screen">
+    <div className={hasJobs ? "screen with-jobs" : "screen"}>
       <div className="cols">
         <SourceCard
           path={source}
@@ -292,161 +293,162 @@ export function Convert(props: {
           ins={ins}
         />
 
-        {/* Target, then the jobs under it: a new job shows next to the choices that made it. */}
-        <div className="stack">
-          <section className="card" aria-labelledby="c-target">
-            <CardHead icon="target" title="Target" id="c-target" />
-            <FormatPicker
-              name="target-format"
-              label="Target format"
-              value={format}
-              onChange={pickFormat}
-              disabled={(f) => f === "folder" && source !== null && !sourceIsImage}
-            />
-            <p className="muted desc">{FORMAT_INFO[format]}</p>
-            {format === "ffpfsc" && (
-              <div className="field inner">
-                {/* The radio group's own label says the same to a screen reader. */}
-                <span className="label" aria-hidden="true">
-                  Image inside
-                </span>
-                <FormatPicker
-                  name="inner-format"
-                  label="Image inside the .ffpfsc"
-                  className="inner"
-                  formats={INNER_FORMATS}
-                  value={inner}
-                  onChange={setInner}
-                />
-                <p className="muted hint">{INNER_INFO[inner]}</p>
-              </div>
-            )}
-            <button className="link" onClick={props.onCompare}>
-              <Icon name="table" />
-              Compare formats
-            </button>
-            {format === "pkg" && ins && (
-              <p className="alert-bar warn">
-                <Icon name="warn" />
-                <span>Estimated build time for this game: {pkgBuildTime(ins.total_bytes)}.</span>
-              </p>
-            )}
-            <div className="field" role="group" aria-labelledby="c-output-label">
-              <div className="label-row">
-                <span className="label" id="c-output-label">
-                  Output
-                </span>
-                <button className="small" onClick={chooseOutput} disabled={!source}>
-                  Change…
-                </button>
-              </div>
-              {generate ? (
-                // A generated name: shown whole (it wraps), only its folder is chosen.
-                <p className="out-box" id="c-output">
-                  {output ? (
-                    name
-                  ) : (
-                    <span className="muted">{source ? "Naming…" : "Choose a source first"}</span>
-                  )}
-                </p>
-              ) : (
-                // A typed name: the file name only; the folder stays the one below.
-                <input
-                  id="c-output"
-                  className="mono out-input"
-                  aria-labelledby="c-output-label"
-                  aria-describedby={named.error ? "c-output-error c-output-dir" : "c-output-dir"}
-                  aria-invalid={named.error ? true : undefined}
-                  value={name}
-                  onChange={(e) => typeName(e.target.value)}
-                  placeholder={source ? "File name" : "Choose a source first"}
-                  disabled={!source}
-                  spellCheck={false}
-                />
-              )}
-              {named.error && (
-                <p className="bad field-error" id="c-output-error">
-                  {named.error}
-                </p>
-              )}
-              {source && (
-                <p className="out-dir path" id="c-output-dir">
-                  {named.name !== name && !named.error && <>saved as {named.name} </>}in{" "}
-                  {outDir.current}
-                </p>
-              )}
+        <section className="card" aria-labelledby="c-target">
+          <CardHead icon="target" title="Target" id="c-target" />
+          <FormatPicker
+            name="target-format"
+            label="Target format"
+            value={format}
+            onChange={pickFormat}
+            disabled={(f) => f === "folder" && source !== null && !sourceIsImage}
+          />
+          <p className="muted desc">{FORMAT_INFO[format]}</p>
+          {format === "ffpfsc" && (
+            <div className="field inner">
+              {/* The radio group's own label says the same to a screen reader. */}
+              <span className="label" aria-hidden="true">
+                Image inside
+              </span>
+              <FormatPicker
+                name="inner-format"
+                label="Image inside the .ffpfsc"
+                className="inner"
+                formats={INNER_FORMATS}
+                value={inner}
+                onChange={setInner}
+              />
+              <p className="muted hint">{INNER_INFO[inner]}</p>
             </div>
-            <div className="build-row">
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  className="visually-hidden"
-                  checked={generate}
-                  onChange={(e) => toggleGenerate(e.target.checked)}
-                />
-                <span className="switch-track" aria-hidden="true" />
-                <span>
-                  Generate name based on content
-                  {/* When on, the Output box shows the generated name itself. */}
-                  {!generate && (
-                    <span className="muted mono hint">[game name]-[title ID]-[firmware]</span>
-                  )}
-                </span>
-              </label>
-              <button
-                className="primary"
-                onClick={build}
-                disabled={!source || !target || !!named.error || !!blockReason || submitting}
-              >
-                <Icon name="bolt" />
-                Build
+          )}
+          <button className="link" onClick={props.onCompare}>
+            <Icon name="table" />
+            Compare formats
+          </button>
+          {format === "pkg" && ins && (
+            <p className="alert-bar warn">
+              <Icon name="warn" />
+              <span>Estimated build time for this game: {pkgBuildTime(ins.total_bytes)}.</span>
+            </p>
+          )}
+          <div className="field" role="group" aria-labelledby="c-output-label">
+            <div className="label-row">
+              <span className="label" id="c-output-label">
+                Output
+              </span>
+              <button className="small" onClick={chooseOutput} disabled={!source}>
+                Change…
               </button>
             </div>
-            {(blockReason || formatWarn > 0 || dupe || error) && (
-              <div className="build-notes">
-                {error && <p className="bad">{error}</p>}
-                {blockReason && (
-                  <p className="note-line block">
-                    <Icon name="alert" />
-                    <span>{blockReason}</span>
-                  </p>
+            {generate ? (
+              // A generated name: shown whole (it wraps), only its folder is chosen.
+              <p className="out-box" id="c-output">
+                {output ? (
+                  name
+                ) : (
+                  <span className="muted">{source ? "Naming…" : "Choose a source first"}</span>
                 )}
-                {!blockReason && formatWarn > 0 && (
-                  <p className="note-line warn">
-                    <Icon name="warn" />
-                    <span>
-                      Likely to fail as {kindLabel(format)}: it refuses file names listed in Source.
-                    </span>
-                  </p>
-                )}
-                {dupe && (
-                  <p className="note-line muted">
-                    <Icon name="info" />
-                    <span>
-                      {collides
-                        ? "A job is already writing this file: Build again would fail. Pick another name."
-                        : `Already building this game as ${kindLabel(format)}; Build again makes a second copy.`}
-                    </span>
-                  </p>
-                )}
-              </div>
+              </p>
+            ) : (
+              // A typed name: the file name only; the folder stays the one below.
+              <input
+                id="c-output"
+                className="mono out-input"
+                aria-labelledby="c-output-label"
+                aria-describedby={named.error ? "c-output-error c-output-dir" : "c-output-dir"}
+                aria-invalid={named.error ? true : undefined}
+                value={name}
+                onChange={(e) => typeName(e.target.value)}
+                placeholder={source ? "File name" : "Choose a source first"}
+                disabled={!source}
+                spellCheck={false}
+              />
             )}
-          </section>
-
-          {props.jobs.length > 0 && (
-            <section className="card jobs" aria-labelledby="c-jobs">
-              <CardHead icon="jobs" title="Jobs" id="c-jobs">
-                <span className="muted head-note">
-                  {pending > 0 ? `${pending} running or queued` : "all finished"}
-                </span>
-              </CardHead>
-              {[...props.jobs].reverse().map((j) => (
-                <JobCard key={j.id} job={j} dispatch={props.dispatch} />
-              ))}
-            </section>
+            {named.error && (
+              <p className="bad field-error" id="c-output-error">
+                {named.error}
+              </p>
+            )}
+            {source && (
+              <p className="out-dir path" id="c-output-dir">
+                {named.name !== name && !named.error && <>saved as {named.name} </>}in{" "}
+                {outDir.current}
+              </p>
+            )}
+          </div>
+          <div className="build-row">
+            <label className="switch">
+              <input
+                type="checkbox"
+                className="visually-hidden"
+                checked={generate}
+                onChange={(e) => toggleGenerate(e.target.checked)}
+              />
+              <span className="switch-track" aria-hidden="true" />
+              <span>
+                Generate name based on content
+                {/* When on, the Output box shows the generated name itself. */}
+                {!generate && (
+                  <span className="muted mono hint">[game name]-[title ID]-[firmware]</span>
+                )}
+              </span>
+            </label>
+            <button
+              className="primary"
+              onClick={build}
+              disabled={!source || !target || !!named.error || !!blockReason || submitting}
+            >
+              <Icon name="bolt" />
+              Build
+            </button>
+          </div>
+          {(blockReason || formatWarn > 0 || dupe || error) && (
+            <div className="build-notes">
+              {error && <p className="bad">{error}</p>}
+              {blockReason && (
+                <p className="note-line block">
+                  <Icon name="alert" />
+                  <span>{blockReason}</span>
+                </p>
+              )}
+              {!blockReason && formatWarn > 0 && (
+                <p className="note-line warn">
+                  <Icon name="warn" />
+                  <span>
+                    Likely to fail as {kindLabel(format)}: it refuses file names listed in Source.
+                  </span>
+                </p>
+              )}
+              {dupe && (
+                <p className="note-line muted">
+                  <Icon name="info" />
+                  <span>
+                    {collides
+                      ? "A job is already writing this file: Build again would fail. Pick another name."
+                      : `Already building this game as ${kindLabel(format)}; Build again makes a second copy.`}
+                  </span>
+                </p>
+              )}
+            </div>
           )}
-        </div>
+        </section>
       </div>
+
+      {/* Below all the cards, full width: a new job shows next to the choices that made it,
+          and the queue grows to fill the rest of the window (scrolling inside itself). */}
+      {hasJobs && (
+        <section className="card jobs" aria-labelledby="c-jobs">
+          <CardHead icon="jobs" title="Jobs" id="c-jobs">
+            <span className="muted head-note">
+              {pending > 0 ? `${pending} running or queued` : "all finished"}
+            </span>
+          </CardHead>
+          <div className="job-list">
+            {[...props.jobs].reverse().map((j) => (
+              <JobCard key={j.id} job={j} dispatch={props.dispatch} />
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -481,6 +483,14 @@ function rateLabel(stage: string): string {
   if (stage === "verify") return "read";
   if (stage === "compress") return "compress";
   return "write";
+}
+
+/** A finished job's button names the platform's file manager; only Finder gets its face. */
+const IS_MAC = navigator.userAgent.includes("Mac");
+const REVEAL_ICON: IconName = IS_MAC ? "finder" : "folder";
+function revealLabel(): string {
+  if (IS_MAC) return "Show in Finder";
+  return navigator.userAgent.includes("Windows") ? "Show in Explorer" : "Show in folder";
 }
 
 function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void }) {
@@ -527,7 +537,7 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
   else [status, tone] = [STAGES[job.stage] ?? job.stage, "blue"];
   const running = !result && job.stage !== undefined;
 
-  // A new job scrolls into view (it lands under Target, which may end near the fold).
+  // A new job scrolls into view inside the job list, which may already be scrolled.
   const ref = useRef<HTMLElement>(null);
   useEffect(() => {
     ref.current?.scrollIntoView({ block: "nearest" });
@@ -543,8 +553,8 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
         </div>
         {result && "Ok" in result && (
           <button className="small" onClick={reveal}>
-            <Icon name="finder" />
-            Show in Finder
+            <Icon name={REVEAL_ICON} />
+            {revealLabel()}
           </button>
         )}
         {result ? (
@@ -629,7 +639,7 @@ function FailureText({ err, format }: { err: string; format?: Format }) {
   );
 }
 
-/** Collapsed until asked for: the job's card stays short enough to sit beside the form. */
+/** Collapsed until asked for: the job's row stays short in the list. */
 function Log({ lines }: { lines: string[] }) {
   const [el, setEl] = useState<HTMLPreElement | null>(null);
   // Follow the tail as lines arrive.

@@ -200,8 +200,9 @@ async fn reveal(app: AppHandle, id: JobId) -> Result<(), String> {
     .await
 }
 
-// ponytail: v1 ships for macOS (`open -R` selects the file in Finder); the Windows and Linux
-// branches compile but are untested: Explorer's `/select,` and the folder in `xdg-open`.
+// macOS (`open -R`) and Windows (Explorer's `/select,`) select the file; Linux has no portable
+// way to, so `xdg-open` opens its folder. ponytail: the Windows and Linux branches are untested
+// on real machines.
 fn reveal_path(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -220,6 +221,7 @@ fn reveal_path(path: &Path) -> std::io::Result<()> {
     let mut cmd = {
         let mut c = std::process::Command::new("xdg-open");
         c.arg(path.parent().unwrap_or(path));
+        host_env(&mut c);
         c
     };
     let status = cmd.status()?;
@@ -229,6 +231,26 @@ fn reveal_path(path: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("{status}")));
     }
     Ok(())
+}
+
+/// Started by the release's forge.sh from its AppDir (`APPDIR` set), the app inherits library,
+/// GTK and GLib paths into the AppDir, which break host tools (tauri-apps/tauri#10617). forge.sh
+/// names them in `FORGE_HOST_VARS` and keeps each one's earlier value in `FORGE_HOST_<name>`
+/// (absent: it was unset); `cmd` gets those back. Any other run leaves `cmd` as it is.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn host_env(cmd: &mut std::process::Command) {
+    let Some(vars) = std::env::var_os("APPDIR").and(std::env::var_os("FORGE_HOST_VARS")) else {
+        return;
+    };
+    for name in vars.to_string_lossy().split_whitespace() {
+        let saved = format!("FORGE_HOST_{name}");
+        match std::env::var_os(&saved) {
+            Some(value) => cmd.env(name, value),
+            None => cmd.env_remove(name),
+        };
+        cmd.env_remove(saved);
+    }
+    cmd.env_remove("FORGE_HOST_VARS");
 }
 
 /// The user confirmed closing while jobs run: cancel them, wait for their cleanup, exit.
@@ -304,7 +326,247 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     Menu::with_items(app, &[&forge, &edit, &window])
 }
 
+/// WebView2 on Windows: the runtime bundled in a `WebView2` folder next to the exe (the
+/// `-webview2.zip`), else the installed Evergreen one. Every failure ends in a native message
+/// box and exit code 1: a release build has no console to print to.
+#[cfg(windows)]
+mod webview2 {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::ptr::null_mut;
+
+    use webview2_com::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2BrowserVersionString;
+    use webview2_com::{CoTaskMemPWSTR, take_pwstr};
+
+    /// Microsoft's Evergreen bootstrapper.
+    const EVERGREEN: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+    /// The Windows 10 sandbox fix for fixed runtimes >= 120 (Microsoft's WebView2 distribution
+    /// docs): read/execute for ALL RESTRICTED APPLICATION PACKAGES and ALL APPLICATION PACKAGES.
+    const GRANTS: [&str; 2] = ["*S-1-15-2-2:(OI)(CI)(RX)", "*S-1-15-2-1:(OI)(CI)(RX)"];
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            kind: u32,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u16; 128],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumePathNameW(path: *const u16, volume: *mut u16, len: u32) -> i32;
+        fn GetVolumeInformationW(
+            root: *const u16,
+            name: *mut u16,
+            name_len: u32,
+            serial: *mut u32,
+            max_component: *mut u32,
+            flags: *mut u32,
+            fs_name: *mut u16,
+            fs_name_len: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        /// Unlike `GetVersionExW`, not shimmed by the app manifest.
+        fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    }
+
+    /// Runs first in `main`, before Tauri or any other thread: picks the runtime, fixes its
+    /// ACLs on Windows 10, and stops here when no runtime can start.
+    pub fn prepare() {
+        let Some(dir) = bundled() else {
+            if !available(None) {
+                fail(&no_runtime());
+            }
+            return;
+        };
+        // SAFETY: the first thing `main` does; no other thread exists yet.
+        unsafe { std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &dir) };
+        if windows_10() {
+            grant_sandbox_access(&dir);
+        }
+        if !available(Some(&dir)) {
+            fail(&bundled_broken(&dir, "no usable runtime found in it"));
+        }
+    }
+
+    /// The window (or the app) could not be created even though a runtime was found.
+    pub fn startup_failed(err: &dyn std::fmt::Display) -> ! {
+        match bundled() {
+            Some(dir) => fail(&bundled_broken(&dir, &err.to_string())),
+            None if !available(None) => fail(&no_runtime()),
+            None => fail(&format!(
+                "PS5 Dump Forge could not open its window:\n\n{err}\n\n\
+                 It keeps its WebView data in the \"data\" folder next to PS5 Dump Forge.exe, so \
+                 that folder must be writable: extract the zip to a folder of your own (not \
+                 Program Files) and start it from there."
+            )),
+        }
+    }
+
+    /// `WebView2` next to the exe. No fallback to Evergreen once it exists: a broken bundled
+    /// runtime is reported, not silently replaced.
+    fn bundled() -> Option<PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.join("WebView2");
+        dir.is_dir().then_some(dir)
+    }
+
+    /// A runtime is installed (`folder: None`) or `folder` holds one.
+    fn available(folder: Option<&Path>) -> bool {
+        // An empty string makes a null pointer: "look for an installed runtime".
+        let folder = folder.map(|f| f.to_string_lossy()).unwrap_or_default();
+        let wide = CoTaskMemPWSTR::from(&*folder);
+        let folder = wide.as_ref();
+        let mut version = CoTaskMemPWSTR::default().take();
+        // SAFETY: `folder` is null or a NUL-terminated wide string that outlives the call;
+        // `version` receives a CoTaskMem string (or stays null) that `take_pwstr` frees.
+        let found = unsafe {
+            GetAvailableCoreWebView2BrowserVersionString(*folder.as_pcwstr(), &mut version)
+        };
+        let version = take_pwstr(version);
+        // No runtime: an error, or (older loaders) success with no version string.
+        found.is_ok() && !version.is_empty()
+    }
+
+    /// Windows 10 (build < 22000; Windows 11 shares major version 10).
+    fn windows_10() -> bool {
+        let mut info = OsVersionInfoW {
+            size: size_of::<OsVersionInfoW>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        // SAFETY: `info` is a valid OSVERSIONINFOW with its size set.
+        unsafe { RtlGetVersion(&mut info) == 0 && info.major == 10 && info.build < 22000 }
+    }
+
+    /// Grants the sandbox read/execute on the bundled runtime: a zip carries no ACLs, and
+    /// without them its processes fail to start on Windows 10.
+    // ponytail: runs on each Windows 10 launch (idempotent, re-applying the same entries);
+    // remembering that it was done would need a marker file.
+    fn grant_sandbox_access(dir: &Path) {
+        // FAT32 and exFAT keep no ACLs (icacls fails there), and need none.
+        if persistent_acls(dir) == Some(false) {
+            return;
+        }
+        // System32's icacls, not whatever a search of the exe's own folder finds first.
+        let icacls = std::env::var_os("SystemRoot")
+            .map(|root| PathBuf::from(root).join(r"System32\icacls.exe"))
+            .unwrap_or_else(|| "icacls.exe".into());
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = Command::new(icacls)
+            .arg(dir)
+            .arg("/grant")
+            .args(GRANTS)
+            .arg("/Q")
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let detail = match out {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+                    + "\n"
+                    + String::from_utf8_lossy(&out.stderr).trim()
+            }
+            Err(e) => e.to_string(),
+        };
+        fail(&format!(
+            "PS5 Dump Forge could not give the WebView2 runtime in\n{}\nthe permissions it needs on \
+             Windows 10:\n\n{}\n\nRun this in a Command Prompt, then start the app again:\n\n\
+             icacls \"{}\" /grant \"{}\" \"{}\"\n\n\
+             The folder must be on a local drive (not a network share) and one you can change.",
+            dir.display(),
+            detail.trim(),
+            dir.display(),
+            GRANTS[0],
+            GRANTS[1],
+        ));
+    }
+
+    /// Whether `dir`'s volume stores ACLs (`FILE_PERSISTENT_ACLS`); `None` if the query fails.
+    fn persistent_acls(dir: &Path) -> Option<bool> {
+        const FILE_PERSISTENT_ACLS: u32 = 0x8;
+        let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut root = [0u16; 1024];
+        let mut flags = 0;
+        // SAFETY: `path` is NUL-terminated, `root` is writable for its length (the call
+        // NUL-terminates it), and the unused out-parameters are null with zero lengths.
+        let ok = unsafe {
+            GetVolumePathNameW(path.as_ptr(), root.as_mut_ptr(), root.len() as u32) != 0
+                && GetVolumeInformationW(
+                    root.as_ptr(),
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    null_mut(),
+                    &mut flags,
+                    null_mut(),
+                    0,
+                ) != 0
+        };
+        ok.then_some(flags & FILE_PERSISTENT_ACLS != 0)
+    }
+
+    fn no_runtime() -> String {
+        format!(
+            "PS5 Dump Forge needs the Microsoft Edge WebView2 Runtime, and it is not installed.\n\n\
+             Install it from\n{EVERGREEN}\n\nor use ps5-dump-forge-{}-windows-x64-webview2.zip \
+             instead, which carries the runtime in its WebView2 folder.",
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn bundled_broken(dir: &Path, detail: &str) -> String {
+        format!(
+            "The WebView2 runtime bundled in\n{}\nfailed to start:\n\n{detail}\n\n\
+             Delete the WebView2 folder and extract it again from the zip, or use \
+             ps5-dump-forge-{}-windows-x64.zip with the installed WebView2 Runtime ({EVERGREEN}).\n\n\
+             The app's folder must also be writable (its WebView data lives in the \"data\" folder \
+             beside it) and on a local drive.",
+            dir.display(),
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn fail(text: &str) -> ! {
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+        let (text, caption) = (wide(text), wide("PS5 Dump Forge"));
+        const MB_ICONERROR: u32 = 0x10;
+        // SAFETY: both are valid NUL-terminated wide strings; no owner window.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_ICONERROR,
+            )
+        };
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    webview2::prepare();
     let builder = tauri::Builder::default();
     #[cfg(target_os = "macos")]
     let builder = builder.menu(macos_menu).on_menu_event(|app, event| {
@@ -341,6 +603,13 @@ fn main() {
                 Some(dir) => window.data_directory(dir),
                 None => window,
             };
+            // Tauri runs this hook from its event loop and would only panic on an error,
+            // which a Windows release build never shows.
+            #[cfg(windows)]
+            if let Err(err) = window.build() {
+                webview2::startup_failed(&err);
+            }
+            #[cfg(not(windows))]
             window.build()?;
             Ok(())
         })
@@ -361,8 +630,11 @@ fn main() {
             reveal,
             quit_app,
         ])
-        .build(tauri::generate_context!())
-        .expect("failed to build the app");
+        .build(tauri::generate_context!());
+    #[cfg(windows)]
+    let app = app.unwrap_or_else(|err| webview2::startup_failed(&err));
+    #[cfg(not(windows))]
+    let app = app.expect("failed to build the app");
 
     app.run(|app, event| match event {
         // Last window gone (`code: None`); `quit_app` and our Quit exit with `Some(0)`.

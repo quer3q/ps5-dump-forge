@@ -9,6 +9,7 @@ use ps5upload_fpkg::source::{SourceTree, title_id_from_content_id};
 use serde_json::Value;
 
 use crate::Format;
+use crate::finalize::followed_id;
 
 /// The largest file FAT32 (`msdos`) can hold.
 pub(crate) const FAT_MAX_FILE: u64 = 4 * 1024 * 1024 * 1024 - 1;
@@ -190,19 +191,12 @@ fn inside(path: &Path, dir: &Path) -> bool {
     if path.starts_with(dir) {
         return true;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(dir) = dir.metadata() else {
-            return false;
-        };
-        path.ancestors().skip(1).any(|a| {
-            a.metadata()
-                .is_ok_and(|m| m.dev() == dir.dev() && m.ino() == dir.ino())
-        })
-    }
-    #[cfg(not(unix))]
-    false
+    let Ok(dir) = followed_id(dir) else {
+        return false;
+    };
+    path.ancestors()
+        .skip(1)
+        .any(|a| followed_id(a).is_ok_and(|id| id == dir))
 }
 
 /// Directory levels below the root an `.exfat`/`.ffpkg` output can hold.
@@ -255,11 +249,16 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64) -> (Vec<String>, 
                     free / MIB
                 ));
             }
-            if fat && largest > FAT_MAX_FILE {
-                findings.push(format!(
+            match fat {
+                Ok(true) if largest > FAT_MAX_FILE => findings.push(format!(
                     "{} is FAT32, which cannot hold a file over 4 GiB ({largest} bytes needed)",
                     dir.display()
-                ));
+                )),
+                Ok(_) => {}
+                Err(e) => notes.push(format!(
+                    "filesystem type not checked for {}: {e}",
+                    dir.display()
+                )),
             }
         }
         Err(e) => notes.push(format!(
@@ -277,9 +276,10 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path holds a NUL byte"))
 }
 
-/// (free bytes for an unprivileged user, whether the filesystem is FAT).
+/// (free bytes for an unprivileged user, whether the filesystem is FAT). The FAT answer can
+/// fail on its own (Windows asks the volume root separately).
 #[cfg(target_os = "macos")]
-fn fs_stat(dir: &Path) -> io::Result<(u64, bool)> {
+fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     let c = c_path(dir)?;
     // SAFETY: `c` is a valid C string and `st` a properly sized out-parameter.
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -293,12 +293,12 @@ fn fs_stat(dir: &Path) -> io::Result<(u64, bool)> {
         .map(|&c| c as u8)
         .collect();
     let free = st.f_bavail.saturating_mul(u64::from(st.f_bsize));
-    Ok((free, name == b"msdos"))
+    Ok((free, Ok(name == b"msdos")))
 }
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_cast)] // field widths differ between Linux targets
-fn fs_stat(dir: &Path) -> io::Result<(u64, bool)> {
+fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
     let c = c_path(dir)?;
     // SAFETY: `c` is a valid C string and both out-parameters are properly sized.
@@ -311,13 +311,21 @@ fn fs_stat(dir: &Path) -> io::Result<(u64, bool)> {
         return Err(io::Error::last_os_error());
     }
     let free = (vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64);
-    Ok((free, fs.f_type as i64 == MSDOS_SUPER_MAGIC))
+    Ok((free, Ok(fs.f_type as i64 == MSDOS_SUPER_MAGIC)))
 }
 
-// ponytail: Windows (GetDiskFreeSpaceExW + GetVolumeInformationW) is not wired; the job
-// logs that the checks were skipped and ENOSPC still fails the write.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn fs_stat(_: &Path) -> io::Result<(u64, bool)> {
+/// FAT12/16/32 report `FAT` or `FAT32`; exFAT has no 4 GiB limit.
+#[cfg(windows)]
+fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
+    let free = crate::win::free_bytes(dir)?;
+    let fat = crate::win::fs_name(dir).map(|name| matches!(name.as_str(), "FAT" | "FAT32"));
+    Ok((free, fat))
+}
+
+// ponytail: other OSes are not wired; the job logs that the checks were skipped and ENOSPC
+// still fails the write.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn fs_stat(_: &Path) -> io::Result<(u64, io::Result<bool>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "not implemented on this OS",
@@ -383,8 +391,22 @@ mod tests {
     #[test]
     fn free_space_is_known_here() {
         if cfg!(any(target_os = "macos", target_os = "linux")) {
-            let (free, _) = fs_stat(Path::new(".")).unwrap();
+            let (free, fat) = fs_stat(Path::new(".")).unwrap();
             assert!(free > 0);
+            fat.unwrap();
+        }
+    }
+
+    /// CI's temp folder is on NTFS; the canonical form is a `\\?\` path.
+    #[cfg(windows)]
+    #[test]
+    fn windows_free_space_and_fat() {
+        let temp = std::env::temp_dir();
+        let unicode = crate::test_dir("fs-stat-ünïcødé");
+        for dir in [temp.clone(), temp.canonicalize().unwrap(), unicode] {
+            let (free, fat) = fs_stat(&dir).unwrap();
+            assert!(free > 0, "{}", dir.display());
+            assert!(!fat.unwrap(), "{}", dir.display());
         }
     }
 }

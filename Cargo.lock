@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-cli"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "anyhow",
  "libc",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-core"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-exfat"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "ps5upload-fpkg",
  "unicode-normalization",
@@ -2443,25 +2443,26 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-fpkg"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "ps5upload-fpkg",
 ]
 
 [[package]]
 name = "ps5-dump-forge-gui"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "anyhow",
  "ps5-dump-forge-core",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "webview2-com",
 ]
 
 [[package]]
 name = "ps5-dump-forge-pfs"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "flate2",
  "ps5-dump-forge-exfat",
@@ -2471,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-ufs2"
-version = "0.0.1-pre"
+version = "0.0.1-pre2"
 dependencies = [
  "ps5upload-fpkg",
  "ps5upload-pkg",

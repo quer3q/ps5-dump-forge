@@ -104,7 +104,7 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   | Kind | Class | Use |
   |---|---|---|
   | Primary | `.primary` | White. One per card (Build). |
-  | Secondary | default | Dark. Choose folder…, Change…, Show in Finder. |
+  | Secondary | default | Dark. Choose folder…, Change…, Show in Finder (Explorer, folder). |
   | Danger | `.danger` | Red tint. "Stop job?", "Cancel jobs and quit". |
   | Small | `.small` | Job rows. |
   | Link | `.link` | Quiet text action ("Compare formats"). |
@@ -125,8 +125,8 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
 - **Folds** (`details.fold`): the DLC list, backport files, job logs, verified checks and folders
   checked. They are collapsed by default; a list inside one that can grow is a scrollable, focusable box.
 - **Job row** (`.job`): format tag, name, `from` path, progress bar (`progress`, blue gradient), status
-  tag, meta line (`%` · speed · time left). Once finished, the row shows Show in Finder, the error box or
-  "Verified: N checks passed".
+  tag, meta line (`%` · speed · time left). Once finished, the row shows Show in Finder (Show in Explorer
+  on Windows, Show in folder on Linux), the error box or "Verified: N checks passed".
 - **Rating chip** (`.chip.good` / `.ok` / `.bad`): used in the About formats table. Tint, icon and text
   together, every text ≥ 8.9:1.
 - **Empty state** (`.empty`): an inset well with a round blue icon, a title, one line of help, the

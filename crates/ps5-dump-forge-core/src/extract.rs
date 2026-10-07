@@ -164,7 +164,7 @@ impl Dest {
     fn open(part: &Part) -> anyhow::Result<Self> {
         let root = at::open_root(part.path())
             .with_context(|| format!("opening {}", part.path().display()))?;
-        if !part.is(&at::metadata(&root)?) {
+        if !part.is(at::id(&root)?) {
             bail!("{} was replaced while extracting", part.path().display());
         }
         Ok(Self {
@@ -223,7 +223,7 @@ impl Dest {
 #[cfg(unix)]
 mod at {
     use std::ffi::CString;
-    use std::fs::{File, Metadata};
+    use std::fs::File;
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -281,8 +281,8 @@ mod at {
         dir.try_clone()
     }
 
-    pub(super) fn metadata(dir: &Dir) -> io::Result<Metadata> {
-        File::from(dir.try_clone()?).metadata()
+    pub(super) fn id(dir: &Dir) -> io::Result<crate::finalize::FileId> {
+        crate::finalize::handle_id(&File::from(dir.try_clone()?))
     }
 
     pub(super) fn sync(dir: &Dir) -> io::Result<()> {
@@ -295,7 +295,7 @@ mod at {
 // needs NtCreateFile with a root directory handle.
 #[cfg(not(unix))]
 mod at {
-    use std::fs::{File, Metadata};
+    use std::fs::File;
     use std::io;
     use std::path::{Path, PathBuf};
 
@@ -321,8 +321,8 @@ mod at {
         Ok(dir.clone())
     }
 
-    pub(super) fn metadata(dir: &Dir) -> io::Result<Metadata> {
-        dir.symlink_metadata()
+    pub(super) fn id(dir: &Dir) -> io::Result<crate::finalize::FileId> {
+        crate::finalize::path_id(dir).map(|(id, _)| id)
     }
 
     pub(super) fn sync(_: &Dir) -> io::Result<()> {

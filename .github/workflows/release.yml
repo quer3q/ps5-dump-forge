@@ -1,8 +1,10 @@
 name: Release
 
-# A `v*` tag builds the macOS arm64 release and creates a *draft* GitHub Release with the zip, the
-# source tarball (GPL-3.0: the source ships with every release) and SHA256SUMS; publishing the
-# draft is a manual step on GitHub, after checking its assets.
+# A `v*` tag builds the macOS, Windows and Linux releases and creates a *draft* GitHub Release with
+# the macOS arm64 zip, the macOS universal (arm64 + Intel) zip, the two Windows x64 zips (with and
+# without a bundled WebView2 runtime), the Linux x64 tarball, the source tarball (GPL-3.0: the source
+# ships with every release) and SHA256SUMS; publishing the draft is a manual step on GitHub, after
+# checking its assets.
 # `workflow_dispatch` is a dry run, even on a tag: same build, artifact kept on the run,
 # nothing published.
 on:
@@ -18,27 +20,16 @@ env:
 
 jobs:
   macos:
-    # v1 ships Apple Silicon only: PS5 Dump Forge.app + the CLI, ad-hoc signed.
+    # PS5 Dump Forge.app + the CLI, ad-hoc signed, as an arm64-only zip and a universal
+    # (arm64 + Intel) zip.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Check the versions agree (and match the tag)
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
-          tauri=$(jq -r .version app/src-tauri/tauri.conf.json)
-          npm=$(jq -r .version app/package.json)
-          echo "Cargo.toml $version, tauri.conf.json $tauri, package.json $npm"
-          if [ "$tauri" != "$version" ] || [ "$npm" != "$version" ]; then
-            echo "::error::versions differ: Cargo.toml $version, tauri.conf.json $tauri, app/package.json $npm"
-            exit 1
-          fi
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match version $version"
-            exit 1
-          fi
-      - name: Latest stable Rust (rust-toolchain.toml adds aarch64-apple-darwin)
+        run: scripts/check-versions.sh
+      - name: Latest stable Rust (rust-toolchain.toml adds aarch64-apple-darwin and x86_64-apple-darwin)
         run: |
           rustup update --no-self-update stable
           rustup toolchain install --no-self-update
@@ -46,8 +37,9 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      # Builds PS5 Dump Forge.app (tauri build) and the CLI, assembles and verifies the zip, writes the
-      # source tarball and SHA256SUMS into dist/.
+      # Builds PS5 Dump Forge.app (tauri build, arm64 and universal) and the CLI (both targets,
+      # lipo-joined for the universal zip), assembles and verifies both zips, writes the source
+      # tarball and SHA256SUMS into dist/.
       - run: scripts/release-macos.sh
       - uses: actions/upload-artifact@v7
         with:
@@ -55,20 +47,93 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  windows:
+    # PS5 Dump Forge.exe + the CLI (x64, MSVC), unsigned: one zip for the installed WebView2 Runtime,
+    # one that carries Microsoft's Fixed Version runtime next to the exe.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # LF checkout: the runner's Git converts to CRLF, which breaks the bash scripts (and the zips
+      # would carry CRLF docs).
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check the versions agree (and match the tag)
+        run: scripts/check-versions.sh
+      - name: Latest stable Rust (the host, x86_64-pc-windows-msvc, is the release target)
+        run: |
+          rustup update --no-self-update stable
+          rustup toolchain install --no-self-update
+          rustc -Vv
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      # Builds PS5 Dump Forge.exe (tauri build --no-bundle) and the CLI, downloads and checks the
+      # pinned WebView2 Fixed Version .cab, assembles and verifies both zips into dist/.
+      - run: scripts/release-windows.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    # The extracted AppImage (an AppDir) + forge.sh + the CLI (x64), unsigned, as one tarball.
+    # ubuntu-22.04, not -latest: the binaries need the build host's glibc (2.35) or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check the versions agree (and match the tag)
+        run: scripts/check-versions.sh
+      # Tauri v2's Linux build deps; xvfb for the script's GUI launch check.
+      - name: WebKitGTK and the AppImage tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libayatana-appindicator3-dev patchelf file xvfb
+      - name: Latest stable Rust (the host, x86_64-unknown-linux-gnu, is the release target)
+        run: |
+          rustup update --no-self-update stable
+          rustup toolchain install --no-self-update
+          rustc -Vv
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      # Builds the AppImage (tauri build) and the CLI, extracts the AppImage into the AppDir,
+      # assembles the tarball into dist/ and verifies it after a round trip (CLI run, GUI launch).
+      - run: scripts/release-linux.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-linux
+          path: dist/*
+          if-no-files-found: error
+
   publish:
-    needs: macos
+    # One array entry per platform job.
+    needs: [macos, windows, linux]
     # Only a real tag push creates the draft; a workflow_dispatch run stays a dry run.
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # Every platform job uploads a `release-*` artifact; merge them all into dist/.
       - uses: actions/download-artifact@v8
         with:
-          name: release-macos
+          pattern: release-*
           path: dist
-      - name: Check the checksums
-        run: cd dist && sha256sum -c SHA256SUMS
+          merge-multiple: true
+      - name: Recompute SHA256SUMS over every platform's archives
+        run: |
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
       # gh is preinstalled on the runner; no third-party release action needed.
       - name: Create the GitHub Release
         env:
@@ -76,11 +141,20 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           {
-            echo "Apple Silicon (arm64) macOS 11 or later: unzip, then see \"First launch\" in README.md."
+            echo "Apple Silicon (arm64) macOS 11 or later: unzip the arm64 zip, then see \"First launch\" in README.md."
+            echo "Intel or Apple Silicon macOS 11 or later: the universal zip works on both instead."
             echo "The app is ad-hoc signed only (no Developer ID, not notarized), so macOS asks you to allow it once."
             echo
-            echo "The zip holds PS5 Dump Forge.app, the ps5-dump-forge command-line tool, README.md, LICENSE (GPL-3.0) and THIRD-PARTY-NOTICES.md."
-            echo "The source tarball is the complete corresponding source of this release. SHA256SUMS lists both files' SHA-256."
+            echo "Windows 10 or 11 (x64): the windows-x64 zip uses the Microsoft Edge WebView2 Runtime, which Windows 11 and most Windows 10 PCs already have."
+            echo "No WebView2 Runtime (or not allowed to install it)? The windows-x64-webview2 zip is larger but carries its own copy in its WebView2 folder."
+            echo "Unzip to a folder you can write to (the app keeps its WebView data beside it), then run PS5 Dump Forge.exe."
+            echo "The app is not signed, so SmartScreen may stop the first launch: choose \"More info\", then \"Run anyway\"."
+            echo
+            echo "Linux (x64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer): extract the linux-x64 tarball (tar -xzf) to a folder you can write to (the app keeps its WebView data beside it), then run ./forge.sh."
+            echo "It needs no FUSE and no install; keep the PS5 Dump Forge.AppDir folder next to forge.sh."
+            echo
+            echo "Each archive holds the app (PS5 Dump Forge.app, PS5 Dump Forge.exe or PS5 Dump Forge.AppDir with forge.sh), the ps5-dump-forge command-line tool, README.md, LICENSE (GPL-3.0) and THIRD-PARTY-NOTICES.md."
+            echo "The source tarball is the complete corresponding source of this release. SHA256SUMS lists every archive's SHA-256."
             case "$GITHUB_REF_NAME" in *-*)
               echo
               echo "Test release: not every format has been tested on a console yet. Keep the original dump." ;;
