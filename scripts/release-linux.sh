@@ -178,6 +178,9 @@ fi
 exec "$here/PS5 Dump Forge.AppDir/AppRun" "$@"
 EOF
 chmod 755 "$pkg/forge.sh"
+# Nothing group/other-writable or setuid/setgid: a non-root `tar -x` (a user, the CI runner)
+# applies its umask and drops those bits, so they would not survive the round trip (root keeps them).
+chmod -R go-w,ug-s "$pkg"
 check "$pkg"
 
 mkdir -p "$dist"
@@ -195,8 +198,10 @@ mkdir "$out"
 tar -xzf "$tgz" -C "$out"
 top=$(ls -A "$out")
 [[ $top == "$name" ]] || { echo "release-linux.sh: $tgz holds [$top], want [$name]" >&2; exit 1; }
-[[ $(tree "$pkg") == "$(tree "$out/$name")" ]] ||
-  { echo "release-linux.sh: $tgz does not restore the staged tree (types, modes, symlinks)" >&2; exit 1; }
+if ! diff <(tree "$pkg") <(tree "$out/$name") >&2; then
+  echo "release-linux.sh: $tgz does not restore the staged tree (types, modes, symlinks)" >&2
+  exit 1
+fi
 check "$out/$name"
 run_gui "$out/$name"
 
