@@ -770,10 +770,14 @@ fn ufs2_geometry<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use ps5upload_fpkg::source::SourceFile;
 
+    /// Only the unix-only geometry test uses it.
+    #[cfg(unix)]
     struct Mem(Vec<SourceFile>);
 
+    #[cfg(unix)]
     impl SourceTree for Mem {
         fn files(&self) -> &[SourceFile] {
             &self.0

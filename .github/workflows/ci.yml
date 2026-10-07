@@ -182,13 +182,16 @@ jobs:
           rustup toolchain install --no-self-update
           rustup toolchain install --no-self-update --profile minimal nightly
           rustc +nightly --version
+          # The prebuilt cargo-fuzz is a musl binary and defaults to its own target
+          # (x86_64-unknown-linux-musl), where the sanitizer cannot run; build for the host.
+          echo "FUZZ_TARGET=$(rustc +nightly -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - run: cargo fmt --all --check
         working-directory: fuzz
       - run: fuzz/seed.sh
-      - run: cargo +nightly fuzz build
+      - run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
         working-directory: fuzz
       - name: Run each target for 60 s
         working-directory: fuzz
@@ -196,7 +199,7 @@ jobs:
           failed=()
           for t in $(cargo +nightly fuzz list); do
             echo "::group::$t"
-            cargo +nightly fuzz run "$t" -- -max_total_time=60 || failed+=("$t")
+            cargo +nightly fuzz run --target "$FUZZ_TARGET" "$t" -- -max_total_time=60 || failed+=("$t")
             echo "::endgroup::"
           done
           if [ ${#failed[@]} -gt 0 ]; then
