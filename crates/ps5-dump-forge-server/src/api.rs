@@ -232,6 +232,7 @@ impl Server {
             }
             (true, "stale_parts") => self.stale_parts(body),
             (true, "list_dir") => self.list_dir(body),
+            #[cfg(target_env = "ps5")]
             (true, "debug_bench") if crate::debug::ENABLED => {
                 #[derive(Deserialize)]
                 struct Q {
@@ -244,6 +245,7 @@ impl Server {
                     &q.source, &q.dir, q.mib,
                 )))
             }
+            #[cfg(target_env = "ps5")]
             (true, "debug") if crate::debug::ENABLED => {
                 #[derive(Deserialize)]
                 struct Q {
@@ -498,6 +500,8 @@ mod tests {
             .unwrap_or_else(|r| r)
     }
 
+    // Only the Unix-only admission test needs a folder.
+    #[cfg(unix)]
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forge-api-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

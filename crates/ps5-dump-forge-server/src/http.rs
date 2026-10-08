@@ -73,7 +73,7 @@ impl Response {
         r
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))] // used by the Unix-only admission test
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }

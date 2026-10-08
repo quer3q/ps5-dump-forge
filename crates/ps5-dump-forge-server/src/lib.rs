@@ -8,6 +8,8 @@
 //! can reach it on the network.
 
 mod api;
+// PS5 bring-up only (and only with FORGE_DEBUG_API set): never built for a desktop target.
+#[cfg(target_env = "ps5")]
 mod debug;
 mod http;
 mod paths;

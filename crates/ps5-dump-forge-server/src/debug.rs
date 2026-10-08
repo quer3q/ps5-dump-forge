@@ -121,18 +121,11 @@ pub(crate) fn bench(source: &str, dir: &str, mib: u64) -> Value {
     run().unwrap_or_else(|e| json!({ "error": e.to_string() }))
 }
 
-#[cfg(unix)]
 fn mode(m: &fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
     m.mode()
 }
 
-#[cfg(not(unix))]
-fn mode(_: &fs::Metadata) -> u32 {
-    0
-}
-
-#[cfg(unix)]
 mod raw {
     use super::*;
 
@@ -215,14 +208,5 @@ mod raw {
             "realpath": realpath(&c),
             "readdir": readdir(&c),
         })
-    }
-}
-
-#[cfg(not(unix))]
-mod raw {
-    use super::*;
-
-    pub(super) fn probe(_: &str) -> Value {
-        json!({ "error": "unix only" })
     }
 }
