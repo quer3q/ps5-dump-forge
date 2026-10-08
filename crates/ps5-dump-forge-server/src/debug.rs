@@ -196,7 +196,7 @@ mod raw {
                     .to_string_lossy()
                     .into_owned();
                 out.push(json!({ "hex32": hex(head), "d_reclen": (*e).d_reclen,
-                    "d_type": (*e).d_type, "d_namlen": (*e).d_namlen, "name": name }));
+                    "d_type": (*e).d_type, "name": name }));
             }
             libc::closedir(dir);
             json!(out)
