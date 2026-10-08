@@ -26,6 +26,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       # Every platform that ships builds and tests the whole workspace, the Tauri app included
@@ -70,6 +71,7 @@ jobs:
     # so exfatprogs' fsck.exfat looks at the .exfat here, fsck-macos at the same image and
     # FreeBSD's fsck_ufs (fsck-ufs) at the .ffpkg.
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -119,6 +121,7 @@ jobs:
     # macOS's own fsck_exfat, plus a read-only mount compared file by file with the source.
     needs: fsck
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -135,6 +138,7 @@ jobs:
     # status 0, the "N files, ..." summary, and no line besides the phase headers and summary.
     needs: fsck
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -172,6 +176,7 @@ jobs:
   fuzz:
     # Every reader of untrusted images, 60 s each from the seed corpora.
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
