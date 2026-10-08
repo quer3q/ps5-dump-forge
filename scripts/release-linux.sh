@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build and package the Linux x64 release (e.g. on GitHub's ubuntu-22.04):
+# Build and package the Linux release (e.g. on GitHub's ubuntu-22.04 and ubuntu-22.04-arm):
 #
-#   dist/ps5-dump-forge-<ver>-linux-x64.tar.gz  one folder: PS5 Dump Forge.AppDir (Tauri's AppImage,
+#   dist/ps5-dump-forge-<ver>-linux-<arch>.tar.gz  one folder: PS5 Dump Forge.AppDir (Tauri's AppImage,
 #                                                extracted whole), forge.sh (the launcher), ps5-dump-forge
 #                                                (CLI), README.md, LICENSE, THIRD-PARTY-NOTICES.md
 #
@@ -9,8 +9,7 @@
 # in data/ next to forge.sh (core's app_dir: the folder holding the *.AppDir). The AppDir is kept
 # exactly as `--appimage-extract` wrote it (AppRun, its hooks, the wrapped binary, symlinks); tar keeps
 # the symlinks and modes. The binaries need the build host's glibc or newer (ubuntu-22.04: 2.35).
-# Unsigned. The arch label comes from `uname -m`, so an arm64 host builds a linux-arm64 tarball, but
-# only x64 ships.
+# Unsigned. The arch label comes from `uname -m` (x86-64 or arm64): every build is for its host.
 #
 # app/src-tauri/tauri.linux.conf.json names the Linux app binary ps5-dump-forge-gui: the AppImage
 # bundler copies a main binary whose name has a space ("PS5 Dump Forge") to its kebab-case name,
@@ -33,7 +32,7 @@ cd "$root"
 [[ $(uname -s) == Linux ]] || { echo "release-linux.sh: needs Linux" >&2; exit 1; }
 
 case $(uname -m) in
-  x86_64) arch=x64 elf_machine=3e00 ;;
+  x86_64) arch=x86-64 elf_machine=3e00 ;;
   aarch64) arch=arm64 elf_machine=b700 ;;
   *) echo "release-linux.sh: unsupported machine $(uname -m)" >&2; exit 1 ;;
 esac
@@ -166,11 +165,19 @@ export FORGE_HOST_VARS
 # WebKitGTK's DMA-BUF renderer shows a blank window on many GPU/driver setups.
 export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-1}"
 # On Wayland the bundled libwayland-client can crash against the host's driver stack (NVIDIA,
-# Mesa): prefer the host's own x86-64 copy when ldconfig knows one.
+# Mesa): prefer the host's own copy for this machine's architecture when ldconfig knows one.
 if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
-  ldconfig=$(command -v ldconfig || echo /sbin/ldconfig)
-  lib=$("$ldconfig" -p 2>/dev/null |
-    awk '$1 == "libwayland-client.so.0" && /x86-64/ { print $NF; exit }') || lib=
+  case $(uname -m) in
+    x86_64) tag=x86-64 ;;
+    aarch64) tag=AArch64 ;;
+    *) tag= ;;
+  esac
+  lib=
+  if [ -n "$tag" ]; then
+    ldconfig=$(command -v ldconfig || echo /sbin/ldconfig)
+    lib=$("$ldconfig" -p 2>/dev/null |
+      awk -v tag="$tag" '$1 == "libwayland-client.so.0" && index($0, tag) { print $NF; exit }') || lib=
+  fi
   if [ -n "$lib" ] && [ -e "$lib" ]; then
     export LD_PRELOAD="$lib${LD_PRELOAD:+:$LD_PRELOAD}"
   fi
@@ -184,7 +191,7 @@ chmod -R go-w,ug-s "$pkg"
 check "$pkg"
 
 mkdir -p "$dist"
-rm -f "$tgz"
+rm -f "$dist"/ps5-dump-forge-*-linux-*.tar.gz
 # tar keeps the AppDir's symlinks and modes; owner and group are not the builder's.
 tar -czf "$tgz" -C "$stage" --owner=0 --group=0 --numeric-owner "$name"
 

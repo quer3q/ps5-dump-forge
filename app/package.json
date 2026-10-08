@@ -2,7 +2,7 @@
   "name": "forge-app",
   "private": true,
   "type": "module",
-  "version": "0.0.1-pre2",
+  "version": "0.0.1-pre3",
   "license": "GPL-3.0-or-later",
   "scripts": {
     "dev": "vite",

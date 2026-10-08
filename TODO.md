@@ -39,8 +39,8 @@ Grouped by area; the first section blocks a release.
 - [ ] Optional user-supplied FPKG key file (all key use already sits behind vendored `keys.rs`).
 
 ## Platforms (after v1)
-- [ ] **Intel macOS**: `macos-15-intel` runner, or a universal build.
-- [ ] **Windows x64, then arm64**: zip with `PS5 Dump Forge.exe` (frontend embedded).
+- [x] **Intel macOS**: done, the macOS release is one universal zip.
+- [ ] **Windows (x86-64 and arm64)**: zip with `PS5 Dump Forge.exe` (frontend embedded).
   - Detect a missing WebView2 at startup and show a native message box linking the Evergreen bootstrapper.
   - Optional "offline" zip with the fixed-version runtime (+~180 MB): set the browser path before the
     webview is created (`webviewInstallMode: fixedRuntime` or `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`); on
@@ -51,11 +51,16 @@ Grouped by area; the first section blocks a release.
     (`FILE_FLAG_OPEN_REPARSE_POINT`), CLI Ctrl-C, image-source stability compares only length + mtime.
     `MoveFileExW` no-replace rename compiles but is untested.
   - Point the WebView data dir at `<app dir>/data/webview`.
-- [ ] **Linux x64, then arm64**: `.tar.gz` with an extracted AppDir (`AppRun` + bundled WebKitGTK/GTK libs)
+- [ ] **Linux (x86-64 and arm64)**: `.tar.gz` with an extracted AppDir (`AppRun` + bundled WebKitGTK/GTK libs)
   and a `forge.sh` launcher (no FUSE, no `/tmp` self-extraction). Keep `WEBKIT_DISABLE_DMABUF_RENDERER=1`
   and ps5upload's NVIDIA/Wayland `libwayland-client` preload. Build on `ubuntu-22.04` (glibc 2.35 floor).
-- [ ] CI runners per target (`ubuntu-22.04`, `ubuntu-22.04-arm`, `windows-2022`, `windows-11-arm`); Tauri
-  doesn't cross-compile between OSes. Test each **published archive** on a clean VM.
+- [x] CI runners per target (`ubuntu-22.04`, `ubuntu-22.04-arm`, `windows-latest`, `windows-11-arm`, `macos-15`);
+  Tauri doesn't cross-compile between OSes.
+- [ ] Test each **published archive** on a clean VM.
+- [ ] Test the arm64 archives on real hardware (and a `workflow_dispatch` dry run of the release workflow on the
+  arm64 runners).
+- [ ] GitHub deprecated the `ubuntu-22.04` and `ubuntu-22.04-arm` runner images (retirement 2027-04-17): before then, keep the glibc 2.35
+  floor (e.g. build in an ubuntu:22.04 container on a newer runner) or raise it and say so in README.
 
 ## App
 - [ ] Batch queue screen, History, Library.

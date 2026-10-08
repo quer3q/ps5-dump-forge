@@ -37,6 +37,8 @@ jobs:
           - os: ubuntu-latest
             fmt: true
           - os: windows-latest
+          - os: windows-11-arm
+          - os: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v7
         with:

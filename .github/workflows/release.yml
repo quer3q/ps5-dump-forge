@@ -1,10 +1,10 @@
 name: Release
 
 # A `v*` tag builds the macOS, Windows and Linux releases and creates a *draft* GitHub Release with
-# the macOS arm64 zip, the macOS universal (arm64 + Intel) zip, the two Windows x64 zips (with and
-# without a bundled WebView2 runtime), the Linux x64 tarball, the source tarball (GPL-3.0: the source
-# ships with every release) and SHA256SUMS; publishing the draft is a manual step on GitHub, after
-# checking its assets.
+# the macOS universal (arm64 + Intel) zip, the two Windows x86-64 zips (with and without a bundled
+# WebView2 runtime), the Windows arm64 zip, the Linux x86-64 and arm64 tarballs, the source tarball
+# (GPL-3.0: the source ships with every release) and SHA256SUMS; publishing the draft is a manual
+# step on GitHub, after checking its assets.
 # `workflow_dispatch` is a dry run, even on a tag: same build, artifact kept on the run,
 # nothing published.
 on:
@@ -20,8 +20,7 @@ env:
 
 jobs:
   macos:
-    # PS5 Dump Forge.app + the CLI, ad-hoc signed, as an arm64-only zip and a universal
-    # (arm64 + Intel) zip.
+    # PS5 Dump Forge.app + the CLI, ad-hoc signed, as one universal (arm64 + Intel) zip.
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -38,8 +37,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      # Builds PS5 Dump Forge.app (tauri build, arm64 and universal) and the CLI (both targets,
-      # lipo-joined for the universal zip), assembles and verifies both zips, writes the source
+      # Builds PS5 Dump Forge.app (tauri build, universal) and the CLI (both targets,
+      # lipo-joined), assembles and verifies the zip, writes the source
       # tarball and SHA256SUMS into dist/.
       - run: scripts/release-macos.sh
       - uses: actions/upload-artifact@v7
@@ -49,9 +48,19 @@ jobs:
           if-no-files-found: error
 
   windows:
-    # PS5 Dump Forge.exe + the CLI (x64, MSVC), unsigned: one zip for the installed WebView2 Runtime,
-    # one that carries Microsoft's Fixed Version runtime next to the exe.
-    runs-on: windows-latest
+    # PS5 Dump Forge.exe + the CLI (MSVC, built natively on each runner), unsigned. x86-64: one zip
+    # for the installed WebView2 Runtime, one that carries Microsoft's Fixed Version runtime next to
+    # the exe. arm64: one zip for the installed runtime (Windows 11 ships it).
+    name: windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x86-64
+          - os: windows-11-arm
+            arch: arm64
     timeout-minutes: 60
     defaults:
       run:
@@ -65,7 +74,7 @@ jobs:
           persist-credentials: false
       - name: Check the versions agree (and match the tag)
         run: scripts/check-versions.sh
-      - name: Latest stable Rust (the host, x86_64-pc-windows-msvc, is the release target)
+      - name: Latest stable Rust (the host, x86_64 or aarch64 pc-windows-msvc, is the release target)
         run: |
           rustup update --no-self-update stable
           rustup toolchain install --no-self-update
@@ -73,19 +82,29 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      # Builds PS5 Dump Forge.exe (tauri build --no-bundle) and the CLI, downloads and checks the
-      # pinned WebView2 Fixed Version .cab, assembles and verifies both zips into dist/.
+      # Builds PS5 Dump Forge.exe (tauri build --no-bundle) and the CLI, (x86-64 only) downloads and
+      # checks the pinned WebView2 Fixed Version .cab, assembles and verifies the zips into dist/.
       - run: scripts/release-windows.sh
       - uses: actions/upload-artifact@v7
         with:
-          name: release-windows
+          name: release-windows-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
   linux:
-    # The extracted AppImage (an AppDir) + forge.sh + the CLI (x64), unsigned, as one tarball.
+    # The extracted AppImage (an AppDir) + forge.sh + the CLI, unsigned, as one tarball per arch,
+    # built natively on each runner.
     # ubuntu-22.04, not -latest: the binaries need the build host's glibc (2.35) or newer.
-    runs-on: ubuntu-22.04
+    name: linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: x86-64
+          - os: ubuntu-22.04-arm
+            arch: arm64
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -99,7 +118,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev \
             librsvg2-dev libayatana-appindicator3-dev patchelf file xvfb
-      - name: Latest stable Rust (the host, x86_64-unknown-linux-gnu, is the release target)
+      - name: Latest stable Rust (the host, x86_64 or aarch64 unknown-linux-gnu, is the release target)
         run: |
           rustup update --no-self-update stable
           rustup toolchain install --no-self-update
@@ -112,12 +131,12 @@ jobs:
       - run: scripts/release-linux.sh
       - uses: actions/upload-artifact@v7
         with:
-          name: release-linux
+          name: release-linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
   publish:
-    # One array entry per platform job.
+    # One array entry per platform job (the windows and linux matrix legs all upload release-* artifacts).
     needs: [macos, windows, linux]
     # Only a real tag push creates the draft; a workflow_dispatch run stays a dry run.
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -136,6 +155,18 @@ jobs:
         run: |
           cd dist
           rm -f SHA256SUMS
+          # merge-multiple lets a mislabelled leg overwrite another's archive, or a leg go missing:
+          # require exactly the seven archives of this tag before checksumming.
+          ver=${GITHUB_REF_NAME#v}
+          printf '%s\n' \
+            "ps5-dump-forge-$ver-linux-arm64.tar.gz" \
+            "ps5-dump-forge-$ver-linux-x86-64.tar.gz" \
+            "ps5-dump-forge-$ver-macos-universal.zip" \
+            "ps5-dump-forge-$ver-source.tar.gz" \
+            "ps5-dump-forge-$ver-windows-arm64.zip" \
+            "ps5-dump-forge-$ver-windows-x86-64-webview2.zip" \
+            "ps5-dump-forge-$ver-windows-x86-64.zip" | LC_ALL=C sort > ../expected.txt
+          printf '%s\n' * | LC_ALL=C sort | diff ../expected.txt - || { echo "::error::dist/ does not hold exactly the expected archives"; exit 1; }
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       # gh is preinstalled on the runner; no third-party release action needed.
@@ -145,16 +176,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           {
-            echo "Apple Silicon (arm64) macOS 11 or later: unzip the arm64 zip, then see \"First launch\" in README.md."
-            echo "Intel or Apple Silicon macOS 11 or later: the universal zip works on both instead."
+            echo "macOS 11 or later (Intel and Apple Silicon): unzip the universal zip, then see \"First launch\" in README.md."
             echo "The app is ad-hoc signed only (no Developer ID, not notarized), so macOS asks you to allow it once."
             echo
-            echo "Windows 10 or 11 (x64): the windows-x64 zip uses the Microsoft Edge WebView2 Runtime, which Windows 11 and most Windows 10 PCs already have."
-            echo "No WebView2 Runtime (or not allowed to install it)? The windows-x64-webview2 zip is larger but carries its own copy in its WebView2 folder."
+            echo "Windows 10 or 11 (x86-64): the windows-x86-64 zip uses the Microsoft Edge WebView2 Runtime, which Windows 11 and most Windows 10 PCs already have."
+            echo "No WebView2 Runtime (or not allowed to install it)? The windows-x86-64-webview2 zip is larger but carries its own copy in its WebView2 folder."
+            echo "Windows 11 (arm64): the windows-arm64 zip uses the installed WebView2 Runtime, which Windows 11 ships."
             echo "Unzip to a folder you can write to (the app keeps its WebView data beside it), then run PS5 Dump Forge.exe."
             echo "The app is not signed, so SmartScreen may stop the first launch: choose \"More info\", then \"Run anyway\"."
             echo
-            echo "Linux (x64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer): extract the linux-x64 tarball (tar -xzf) to a folder you can write to (the app keeps its WebView data beside it), then run ./forge.sh."
+            echo "Linux (x86-64 or arm64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer): extract the linux-x86-64 or linux-arm64 tarball (tar -xzf) to a folder you can write to (the app keeps its WebView data beside it), then run ./forge.sh."
             echo "It needs no FUSE and no install; keep the PS5 Dump Forge.AppDir folder next to forge.sh."
             echo
             echo "Each archive holds the app (PS5 Dump Forge.app, PS5 Dump Forge.exe or PS5 Dump Forge.AppDir with forge.sh), the ps5-dump-forge command-line tool, README.md, LICENSE (GPL-3.0) and THIRD-PARTY-NOTICES.md."

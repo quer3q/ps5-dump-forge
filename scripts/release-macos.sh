@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build and package the macOS releases:
+# Build and package the macOS release:
 #
-#   dist/ps5-dump-forge-<ver>-macos-arm64.zip      one folder: PS5 Dump Forge.app, ps5-dump-forge (CLI),
-#                                                   README.md, LICENSE, THIRD-PARTY-NOTICES.md (arm64-only)
-#   dist/ps5-dump-forge-<ver>-macos-universal.zip  same, but the app and the CLI are arm64+x86_64 universal
-#                                                   binaries (lipo-joined for the CLI, `tauri build
-#                                                   --target universal-apple-darwin` for the app)
+#   dist/ps5-dump-forge-<ver>-macos-universal.zip  one folder: PS5 Dump Forge.app, ps5-dump-forge (CLI),
+#                                                   README.md, LICENSE, THIRD-PARTY-NOTICES.md; the app and
+#                                                   the CLI are arm64+x86_64 universal binaries (lipo-joined
+#                                                   for the CLI, `tauri build --target
+#                                                   universal-apple-darwin` for the app)
 #   dist/ps5-dump-forge-<ver>-source.tar.gz        `git archive HEAD` (GPL: the source ships with it)
 #   dist/SHA256SUMS
 #
@@ -34,30 +34,27 @@ export CARGO_TARGET_DIR=$target_dir
 dist=${DIST_DIR:-$root/dist}
 
 if [[ ${SKIP_BUILD:-} != 1 ]]; then
-  echo "== PS5 Dump Forge.app ($arm)"
+  echo "== PS5 Dump Forge.app (universal)"
   # npm ci only into a fresh checkout: it deletes node_modules, which a running dev server uses.
   [[ -d app/node_modules ]] || (cd app && npm ci)
-  (cd app && npx tauri build --ci --target "$arm" --bundles app)
-  echo "== PS5 Dump Forge.app (universal)"
   (cd app && npx tauri build --ci --target universal-apple-darwin --bundles app)
   echo "== CLI ($arm, $intel)"
   cargo build --release --locked -p ps5-dump-forge-cli --target "$arm"
   cargo build --release --locked -p ps5-dump-forge-cli --target "$intel"
 fi
 
-arm_app="$target_dir/$arm/release/bundle/macos/PS5 Dump Forge.app"
-universal_app="$target_dir/universal-apple-darwin/release/bundle/macos/PS5 Dump Forge.app"
+app="$target_dir/universal-apple-darwin/release/bundle/macos/PS5 Dump Forge.app"
 arm_cli=$target_dir/$arm/release/ps5-dump-forge
 intel_cli=$target_dir/$intel/release/ps5-dump-forge
-for f in "$arm_app" "$universal_app" "$arm_cli" "$intel_cli"; do
+for f in "$app" "$arm_cli" "$intel_cli"; do
   [[ -e "$f" ]] || { echo "release-macos.sh: $f is missing (build first)" >&2; exit 1; }
 done
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
-universal_cli=$stage/ps5-dump-forge-universal
-lipo -create -output "$universal_cli" "$arm_cli" "$intel_cli"
+cli=$stage/ps5-dump-forge-universal
+lipo -create -output "$cli" "$arm_cli" "$intel_cli"
 
 # minos_at_most_11 <bin> <arch>: the slice's minimum OS must be <= 11.0 (tauri.conf.json's
 # bundle.macOS.minimumSystemVersion), on top of whatever Rust itself defaults to. The CLI's
@@ -77,8 +74,8 @@ minos_at_most_11() {
     { echo "release-macos.sh: $bin ($a): minimum OS $ver exceeds 11.0" >&2; exit 1; }
 }
 
-# run_cli_slices <cli_bin>: exercise each universal slice with a real `inspect`, through `arch`, on a
-# tiny generated fixture folder. x86_64 only skips (with a note) when Rosetta is not installed.
+# run_cli_slices <cli_bin>: exercise each slice with a real `inspect`, through `arch`, on a tiny
+# generated fixture folder. x86_64 only skips (with a note) when Rosetta is not installed.
 run_cli_slices() {
   local cli_bin=$1 a fixture
   fixture=$(mktemp -d "$stage/fixture.XXXXXX")
@@ -95,13 +92,12 @@ run_cli_slices() {
   done
 }
 
-# check <dir> <variant> <arch>...: codesign + arch checks for the packaged app and CLI. For the
-# universal variant, also every slice's minimum OS and a real run of each slice (see above).
+# check <dir>: codesign + arch checks for the packaged app and CLI, every slice's minimum OS and a
+# real run of each slice (see above).
 check() {
-  local dir=$1 variant=$2
-  shift 2
-  local expected=("$@")
-  echo "== verify $dir ($variant)"
+  local dir=$1
+  local expected=(arm64 x86_64)
+  echo "== verify $dir"
   codesign --verify --deep --strict --verbose=2 "$dir/PS5 Dump Forge.app"
   codesign --verify --strict --verbose=2 "$dir/ps5-dump-forge"
   codesign -dv "$dir/PS5 Dump Forge.app" 2>&1 | grep -E '^(Identifier|Format|Signature)='
@@ -120,59 +116,49 @@ check() {
     [[ $actual == "$want" ]] ||
       { echo "release-macos.sh: $bin has archs [$actual], want [$want]" >&2; exit 1; }
   done
-  if [[ $variant == universal ]]; then
-    local a
-    for bin in "$app_bin" "$cli_bin"; do
-      for a in "${expected[@]}"; do
-        minos_at_most_11 "$bin" "$a"
-      done
+  local a
+  for bin in "$app_bin" "$cli_bin"; do
+    for a in "${expected[@]}"; do
+      minos_at_most_11 "$bin" "$a"
     done
-    run_cli_slices "$cli_bin"
-  fi
+  done
+  run_cli_slices "$cli_bin"
   for f in README.md LICENSE THIRD-PARTY-NOTICES.md; do
     [[ -s "$dir/$f" ]] || { echo "release-macos.sh: $f missing" >&2; exit 1; }
   done
 }
 
-# package_and_check <name> <variant> <app> <cli> <arch>...: stage the folder, sign the CLI, verify it,
-# zip it, then unzip and verify again (what a user actually gets).
-package_and_check() {
-  local name=$1 variant=$2 app=$3 cli=$4
-  shift 4
-  local pkg=$stage/$name
-  mkdir "$pkg"
-  ditto "$app" "$pkg/PS5 Dump Forge.app"
-  cp "$cli" "$pkg/ps5-dump-forge"
-  codesign --force -s - "$pkg/ps5-dump-forge"
-  cp README.md LICENSE THIRD-PARTY-NOTICES.md "$pkg/"
-  check "$pkg" "$variant" "$@"
-
-  local zip=$dist/$name.zip
-  # ditto keeps the bundle's symlinks, permissions and signature intact (zip(1) can break them).
-  # No extended attributes or resource forks: they would land in the zip as `._*` files, and an
-  # ad-hoc signature does not need them.
-  (cd "$stage" && ditto -c -k --norsrc --noextattr --noacl --keepParent "$name" "$zip")
-
-  mkdir "$stage/unzipped-$name"
-  ditto -x -k "$zip" "$stage/unzipped-$name"
-  check "$stage/unzipped-$name/$name" "$variant" "$@"
-}
-
-arm_name=ps5-dump-forge-$version-macos-arm64
-universal_name=ps5-dump-forge-$version-macos-universal
+# Stage the folder, sign the CLI, verify it, zip it, then unzip and verify again (what a user
+# actually gets).
+name=ps5-dump-forge-$version-macos-universal
 src=$dist/ps5-dump-forge-$version-source.tar.gz
+zip=$dist/$name.zip
 
 mkdir -p "$dist"
-rm -f "$dist/$arm_name.zip" "$dist/$universal_name.zip" "$src" "$dist/SHA256SUMS"
+rm -f "$dist"/ps5-dump-forge-*-macos-*.zip "$src" "$dist/SHA256SUMS"
 
-package_and_check "$arm_name" arm64 "$arm_app" "$arm_cli" arm64
-package_and_check "$universal_name" universal "$universal_app" "$universal_cli" arm64 x86_64
+pkg=$stage/$name
+mkdir "$pkg"
+ditto "$app" "$pkg/PS5 Dump Forge.app"
+cp "$cli" "$pkg/ps5-dump-forge"
+codesign --force -s - "$pkg/ps5-dump-forge"
+cp README.md LICENSE THIRD-PARTY-NOTICES.md "$pkg/"
+check "$pkg"
+
+# ditto keeps the bundle's symlinks, permissions and signature intact (zip(1) can break them).
+# No extended attributes or resource forks: they would land in the zip as `._*` files, and an
+# ad-hoc signature does not need them.
+(cd "$stage" && ditto -c -k --norsrc --noextattr --noacl --keepParent "$name" "$zip")
+
+mkdir "$stage/unzipped"
+ditto -x -k "$zip" "$stage/unzipped"
+check "$stage/unzipped/$name"
 
 [[ -z $(git status --porcelain) ]] ||
   echo "release-macos.sh: warning: uncommitted changes; the source tarball holds HEAD only" >&2
 git archive --format=tar.gz --prefix="ps5-dump-forge-$version/" -o "$src" HEAD
 
-(cd "$dist" && shasum -a 256 "$arm_name.zip" "$universal_name.zip" "$(basename "$src")" > SHA256SUMS)
+(cd "$dist" && shasum -a 256 "$name.zip" "$(basename "$src")" > SHA256SUMS)
 echo "== $dist"
-ls -l "$dist/$arm_name.zip" "$dist/$universal_name.zip" "$src"
+ls -l "$zip" "$src"
 cat "$dist/SHA256SUMS"

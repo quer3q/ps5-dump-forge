@@ -327,8 +327,8 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
 }
 
 /// WebView2 on Windows: the runtime bundled in a `WebView2` folder next to the exe (the
-/// `-webview2.zip`), else the installed Evergreen one. Every failure ends in a native message
-/// box and exit code 1: a release build has no console to print to.
+/// x86-64 `-webview2.zip`), else the installed Evergreen one. Every failure ends in a native
+/// message box and exit code 1: a release build has no console to print to.
 #[cfg(windows)]
 mod webview2 {
     use std::os::windows::ffi::OsStrExt;
@@ -527,23 +527,41 @@ mod webview2 {
     }
 
     fn no_runtime() -> String {
+        // Only the x86-64 release has a zip with the runtime in it.
+        let bundled_zip = if cfg!(target_arch = "x86_64") {
+            format!(
+                "\n\nor use ps5-dump-forge-{}-windows-x86-64-webview2.zip instead, which carries \
+                 the runtime in its WebView2 folder.",
+                env!("CARGO_PKG_VERSION")
+            )
+        } else {
+            String::new()
+        };
         format!(
             "PS5 Dump Forge needs the Microsoft Edge WebView2 Runtime, and it is not installed.\n\n\
-             Install it from\n{EVERGREEN}\n\nor use ps5-dump-forge-{}-windows-x64-webview2.zip \
-             instead, which carries the runtime in its WebView2 folder.",
-            env!("CARGO_PKG_VERSION")
+             Install it from\n{EVERGREEN}{bundled_zip}"
         )
     }
 
     fn bundled_broken(dir: &Path, detail: &str) -> String {
+        // Only the x86-64 webview2 zip ships the folder; anywhere else it was added by hand.
+        let fix = if cfg!(target_arch = "x86_64") {
+            format!(
+                "Delete the WebView2 folder and extract it again from the zip, or use \
+                 ps5-dump-forge-{}-windows-x86-64.zip with the installed WebView2 Runtime \
+                 ({EVERGREEN}).",
+                env!("CARGO_PKG_VERSION")
+            )
+        } else {
+            format!(
+                "Delete the WebView2 folder to use the installed WebView2 Runtime ({EVERGREEN})."
+            )
+        };
         format!(
-            "The WebView2 runtime bundled in\n{}\nfailed to start:\n\n{detail}\n\n\
-             Delete the WebView2 folder and extract it again from the zip, or use \
-             ps5-dump-forge-{}-windows-x64.zip with the installed WebView2 Runtime ({EVERGREEN}).\n\n\
+            "The WebView2 runtime bundled in\n{}\nfailed to start:\n\n{detail}\n\n{fix}\n\n\
              The app's folder must also be writable (its WebView data lives in the \"data\" folder \
              beside it) and on a local drive.",
-            dir.display(),
-            env!("CARGO_PKG_VERSION")
+            dir.display()
         )
     }
 

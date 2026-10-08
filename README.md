@@ -22,7 +22,7 @@ macOS, Windows and Linux apps + command-line tool. Offline, no settings.</p>
 - **Fast**: an 89 GB game becomes `.exfat`/`.ffpkg` in about 2–2.5 min (write + verify) on an Apple Silicon
   Mac; `.pkg` takes ≈ 20 min (Kraken compression).
 
-> **v0.0.1-pre2 is a test release.** Not every format has been hardware-tested on a console yet; keep the
+> **v0.0.1-pre3 is a test release.** Not every format has been hardware-tested on a console yet; keep the
 > original dump.
 
 ## Formats
@@ -56,8 +56,8 @@ write to.
 
 ### macOS (11 or later)
 
-Get `ps5-dump-forge-<version>-macos-arm64.zip` (Apple Silicon only) or `ps5-dump-forge-<version>-macos-universal.zip`
-(Apple Silicon and Intel, in one zip) from Releases and unzip it anywhere.
+Get `ps5-dump-forge-<version>-macos-universal.zip` (Apple Silicon and Intel, in one zip) from Releases and
+unzip it anywhere.
 
 #### First launch
 
@@ -86,12 +86,13 @@ The zip also has `ps5-dump-forge`:
 ./ps5-dump-forge convert ~/Games/PPSA01234 --to ffpfsc --inner exfat   # inner: exfat (default) | ffpkg | ffpfs
 ```
 
-### Windows (10 or 11, x64)
+### Windows (10 or 11 on x86-64, 11 on arm64)
 
-Get `ps5-dump-forge-<version>-windows-x64.zip` from Releases; it uses the Microsoft Edge WebView2
+On x86-64 (Windows 10 or 11), get `ps5-dump-forge-<version>-windows-x86-64.zip` from Releases; it uses the Microsoft Edge WebView2
 Runtime, which Windows 11 and most Windows 10 PCs already have. If yours doesn't (or you can't install
-it), get `ps5-dump-forge-<version>-windows-x64-webview2.zip` instead: larger, but it carries its own copy
-of the runtime in a `WebView2` folder next to the exe. Extract the zip to a folder you can write to (not
+it), get `ps5-dump-forge-<version>-windows-x86-64-webview2.zip` instead: larger, but it carries its own copy
+of the runtime in a `WebView2` folder next to the exe. On arm64 (Windows 11 only), get
+`ps5-dump-forge-<version>-windows-arm64.zip`; it uses the installed WebView2 Runtime, which Windows 11 ships. Extract the zip to a folder you can write to (not
 Program Files, not a network share) — `PS5 Dump Forge.exe` keeps its WebView data in a `data/webview`
 folder beside itself, and that folder needs to be writable.
 
@@ -108,9 +109,10 @@ ps5-dump-forge.exe inspect PPSA01234.exfat
 ps5-dump-forge.exe convert C:\Games\PPSA01234 --to ffpkg
 ```
 
-### Linux (x64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer)
+### Linux (x86-64 or arm64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer)
 
-Get `ps5-dump-forge-<version>-linux-x64.tar.gz` from Releases and extract it (`tar -xzf`) to a folder you
+Get `ps5-dump-forge-<version>-linux-x86-64.tar.gz` or
+`ps5-dump-forge-<version>-linux-arm64.tar.gz` from Releases and extract it (`tar -xzf`) to a folder you
 can write to, then run `./forge.sh`. It needs no FUSE and no install; keep the `PS5 Dump Forge.AppDir`
 folder next to `forge.sh` (the app keeps its WebView data in a `data/webview` folder beside it, same as
 Windows).
@@ -146,7 +148,6 @@ See `AGENTS.md` for the layout and the format rules, and `DESIGN.md` for the UI 
 
 - Hardware-test every format on a console before the first release
 - Run the Windows and Linux builds on real machines (not just the CI runners that produce them)
-- Windows arm64, Linux arm64 builds
 - FPKG patches and DLC; extracting packages from other builders
 - Batch queue, history and library screens; upload to console
 - Replace the vendored ps5upload crates with this project's own implementation

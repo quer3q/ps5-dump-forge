@@ -3,8 +3,8 @@
 ps5-dump-forge: converts a PS5 game between a folder and every image format ShadowMountPlus 1.7
 mounts (`.exfat`, `.ffpkg` UFS2, `.ffpfs` PFS, `.ffpfsc` compressed PFS container; read and write), plus
 debug FPKG `.pkg` (create and extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`) and
-a CLI (`ps5-dump-forge`). v1 ships macOS (arm64 + a universal zip), Windows x64 and Linux x64; arm64
-Windows/Linux and hardware tests are still open. `TODO.md` lists what's left (arm64 ports, hardware
+a CLI (`ps5-dump-forge`). v1 ships macOS (one universal zip), Windows x86-64 and arm64, and Linux x86-64 and arm64; hardware
+tests and real arm64 machine tests are still open. `TODO.md` lists what's left (hardware and arm64
 tests, replacing `vendor/`).
 
 ## Layout
@@ -95,9 +95,9 @@ cargo run --release -p ps5-dump-forge-pfs --example pfs_tool -- ffpfs <dir> <out
 scripts/check-exfat.sh <img.exfat> [src_dir]   # macOS fsck_exfat + mount compare + exfatprogs (Docker)
 scripts/fsck-ufs.sh <img.ffpkg>...             # FreeBSD fsck_ufs -n in qemu (Docker, ~1 min)
 scripts/check-versions.sh                      # Cargo.toml/tauri.conf.json/package.json versions agree
-scripts/release-macos.sh                       # arm64 + universal zips: PS5 Dump Forge.app + CLI, ad-hoc signed
-scripts/release-windows.sh                     # Git Bash on Windows: x64 zip + x64-webview2 zip
-scripts/release-linux.sh                       # Linux: x64 tarball (extracted AppDir + forge.sh + CLI)
+scripts/release-macos.sh                       # universal zip: PS5 Dump Forge.app + CLI, ad-hoc signed
+scripts/release-windows.sh                     # Git Bash on Windows: x86-64 zip + x86-64-webview2 zip, or one arm64 zip
+scripts/release-linux.sh                       # Linux: x86-64 or arm64 tarball by host (extracted AppDir + forge.sh + CLI)
 ```
 `tauri build` needs an absolute `CARGO_TARGET_DIR` if you set one.
 
