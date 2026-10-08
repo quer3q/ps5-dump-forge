@@ -1,6 +1,7 @@
 # TODO
 
-What is left after v1 (Apple Silicon macOS: folder ⇄ `.exfat` / `.ffpkg` / `.ffpfs` / `.ffpfsc` / `.pkg`).
+What is left after v1 (folder ⇄ `.exfat` / `.ffpkg` / `.ffpfs` / `.ffpfsc` / `.pkg` on macOS universal, Windows
+x86-64 and arm64, Linux x86-64 and arm64; v0.0.1-pre3 built and passed CI on every target).
 Grouped by area; the first section blocks a release.
 
 ## Before the first release
@@ -13,19 +14,17 @@ Grouped by area; the first section blocks a release.
 - [ ] **zlib on the console**: `.ffpfsc` blocks come from `flate2`'s `miniz_oxide`, not the zlib backends MkPFS uses.
   MkPFS reports that ISA-L output can crash the console's hardware decompressor; a standard zlib stream should be
   fine, but only a console run of a whole game (every block read) proves miniz's streams are accepted.
-- [ ] Run CI on GitHub once and fix what breaks: the Linux/Windows test legs, the FreeBSD `fsck_ufs` job
-  (`vmactions/freebsd-vm`, memory-disk attach untested), the new macOS `fat_volumes` step
-  (`cargo test -p ps5-dump-forge-core --test fat_volumes -- --ignored`, hdiutil ExFAT/FAT32), the fuzz job
-  (`cargo-fuzz` install path), and the release workflow (dry run).
+- [x] Run CI on GitHub once and fix what breaks: every test leg (macOS, Linux and Windows on x86-64 and
+  arm64), the FreeBSD `fsck_ufs` job, the macOS `fat_volumes` step, the fuzz job, and the release workflow
+  (the v0.0.1-pre3 tag: all five targets built, verified and drafted).
 - [ ] External review (Codex) of the whole tree; per-crate reviews were done during development, the final
   integration pass was not.
 - [ ] Test the published zip on a clean Mac: quarantine instructions, running from a read-only
   (App Translocation) location.
 - [ ] Write real 4 GiB+ files in tests (just under and just over 4 GiB); today they are only planned, not
   written. Add a real triple-indirect UFS2 file test (or keep the unit test of the pointer math and say so).
-- [ ] Release from a clean tagged commit: `scripts/release-macos.sh`'s source tarball is `git archive
-  HEAD`, so a release built from an uncommitted tree ships an incomplete source (the script already warns
-  about this).
+- [x] Release from a clean tagged commit: the release workflow builds from the tag's checkout (a local
+  `scripts/release-macos.sh` run still warns when the tree has uncommitted changes).
 
 ## Formats
 - [ ] `.ffpfs` names are ASCII only (MkPFS's limit, and the only layout known to boot); widen to UTF-8 only
@@ -40,25 +39,20 @@ Grouped by area; the first section blocks a release.
 
 ## Platforms (after v1)
 - [x] **Intel macOS**: done, the macOS release is one universal zip.
-- [ ] **Windows (x86-64 and arm64)**: zip with `PS5 Dump Forge.exe` (frontend embedded).
-  - Detect a missing WebView2 at startup and show a native message box linking the Evergreen bootstrapper.
-  - Optional "offline" zip with the fixed-version runtime (+~180 MB): set the browser path before the
-    webview is created (`webviewInstallMode: fixedRuntime` or `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`); on
-    Windows 10, runtime ≥ 120 needs the documented folder ACLs; the runtime gets no updates unless shipped.
-  - Unsigned: SmartScreen warns on first run; document it.
-  - Core gaps marked `ponytail:` for Windows: free-space and FAT32 checks, file identity (stability and
-    `.part` identity), hard-link and reparse-point detection in the scanner, handle-relative extraction
-    (`FILE_FLAG_OPEN_REPARSE_POINT`), CLI Ctrl-C, image-source stability compares only length + mtime.
-    `MoveFileExW` no-replace rename compiles but is untested.
-  - Point the WebView data dir at `<app dir>/data/webview`.
-- [ ] **Linux (x86-64 and arm64)**: `.tar.gz` with an extracted AppDir (`AppRun` + bundled WebKitGTK/GTK libs)
-  and a `forge.sh` launcher (no FUSE, no `/tmp` self-extraction). Keep `WEBKIT_DISABLE_DMABUF_RENDERER=1`
-  and ps5upload's NVIDIA/Wayland `libwayland-client` preload. Build on `ubuntu-22.04` (glibc 2.35 floor).
+- [x] **Windows (x86-64 and arm64)**: zip with `PS5 Dump Forge.exe` (frontend embedded); the WebView2 check
+  with a native message box, the x86-64 `-webview2` zip with the Fixed Version runtime, SmartScreen in README,
+  WebView data in `<app dir>/data/webview`.
+- [ ] Windows core gaps marked `ponytail:`: free-space and FAT32 checks, file identity (stability and
+  `.part` identity), hard-link and reparse-point detection in the scanner, handle-relative extraction
+  (`FILE_FLAG_OPEN_REPARSE_POINT`), CLI Ctrl-C, image-source stability compares only length + mtime.
+  `MoveFileExW` no-replace rename compiles but is untested.
+- [x] **Linux (x86-64 and arm64)**: `.tar.gz` with an extracted AppDir and a `forge.sh` launcher (no FUSE),
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1`, the arch-aware Wayland `libwayland-client` preload, built on
+  `ubuntu-22.04` (glibc 2.35 floor).
 - [x] CI runners per target (`ubuntu-22.04`, `ubuntu-22.04-arm`, `windows-latest`, `windows-11-arm`, `macos-15`);
   Tauri doesn't cross-compile between OSes.
-- [ ] Test each **published archive** on a clean VM.
-- [ ] Test the arm64 archives on real hardware (and a `workflow_dispatch` dry run of the release workflow on the
-  arm64 runners).
+- [ ] Test each **published archive** on a clean VM or real machine, arm64 included (CI only builds them, runs
+  the CLI and, on Linux, starts the GUI under Xvfb; the Windows GUI has not been started from a release zip).
 - [ ] GitHub deprecated the `ubuntu-22.04` and `ubuntu-22.04-arm` runner images (retirement 2027-04-17): before then, keep the glibc 2.35
   floor (e.g. build in an ubuntu:22.04 container on a newer runner) or raise it and say so in README.
 
