@@ -229,6 +229,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         compression_threads: None,
         inner: None,
         remove_backport: false,
+        full_verify: false,
     }
 }
 

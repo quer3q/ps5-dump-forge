@@ -1,6 +1,7 @@
 /target
 /app/node_modules
 /app/dist
+/app/dist-http
 /app/src-tauri/gen
 /dist
 .DS_Store

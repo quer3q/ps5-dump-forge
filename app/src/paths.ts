@@ -2,7 +2,15 @@
 // (TypeScript type stripping).
 
 // `\` is a legal name character on macOS and Linux; only Windows uses it as a separator.
-const WINDOWS = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+let WINDOWS = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+
+/** The http build: paths are the server's, split and joined by its separator (`GET
+ * /api/session`'s `separator`), never by the viewer's OS. `"/"`: slash only (the PS5, a
+ * macOS/Linux host); `"\\"`: the Windows rules. */
+export function setServerSeparator(separator: string): void {
+  WINDOWS = separator === "\\";
+  SEPARATORS = WINDOWS ? /[\\/]/ : /\//;
+}
 
 function lastSep(p: string): number {
   return WINDOWS ? Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")) : p.lastIndexOf("/");
@@ -35,4 +43,4 @@ export function joinPath(dir: string, name: string): string {
 }
 
 /** The separator characters a file name can't contain. */
-export const SEPARATORS = WINDOWS ? /[\\/]/ : /\//;
+export let SEPARATORS = WINDOWS ? /[\\/]/ : /\//;

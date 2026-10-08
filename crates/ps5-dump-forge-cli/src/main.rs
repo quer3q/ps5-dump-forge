@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ps5_dump_forge_core::{ConvertRequest, Event, Format, Jobs};
+use ps5_dump_forge_core::{ConvertRequest, Event, Format, Jobs, VerifyMode};
 
 const USAGE: &str = "\
 usage: ps5-dump-forge inspect <path> [--json]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc|pkg
                          [--inner exfat|ffpkg|ffpfs] [-o <output>] [--threads N]
-                         [--remove-backport]
+                         [--remove-backport] [--full-verify]
+       ps5-dump-forge serve [--port N] --root <dir> [--root <dir>]...
 
   inspect   describe a game folder or image (.exfat, .ffpkg, .ffpfs, .ffpfsc, .pkg)
   convert   convert a source; progress is printed as JSON lines on stdout
@@ -29,12 +30,20 @@ usage: ps5-dump-forge inspect <path> [--json]
   --remove-backport
             leave out fakelib's backport libraries, keeping its emulators (AMPR, DLC,
             PlayGo); refused when eboot.bin's SDK was lowered
+  --full-verify
+            re-read every byte of the output to verify it (takes longer); by default
+            verification is fast: every structural check, small files whole and a random
+            sample of the rest. A pkg is always verified in full
+  serve     the web UI on http://<this computer>:<port> (default 8095); the file browser
+            starts at the --root folders (on the PS5: /data, /mnt/usb0..7, /mnt/ext0..1,
+            no --root). No protections: anyone on the network can use it
   -h, --help";
 
 #[derive(Debug)]
 enum Cli {
     Inspect { path: PathBuf, json: bool },
     Convert(ConvertRequest),
+    Serve { port: u16, roots: Vec<PathBuf> },
     Help,
 }
 
@@ -46,9 +55,13 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     if matches!(command.as_str(), "-h" | "--help" | "help") {
         return Ok(Cli::Help);
     }
+    if command == "serve" {
+        return parse_serve(args);
+    }
     let mut positional = Vec::new();
     let (mut json, mut to, mut output) = (false, None, None);
     let (mut threads, mut inner, mut remove_backport) = (None, None, false);
+    let mut full_verify = false;
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         let text = |v: OsString| v.into_string().map_err(|_| "option values must be text");
@@ -56,6 +69,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             "-h" | "--help" => return Ok(Cli::Help),
             "--json" => json = true,
             "--remove-backport" => remove_backport = true,
+            "--full-verify" => full_verify = true,
             "--to" => to = Some(parse_format(&text(value("--to")?)?)?),
             "--inner" => inner = Some(parse_format(&text(value("--inner")?)?)?),
             "-o" | "--output" => output = Some(PathBuf::from(value("-o")?)),
@@ -96,10 +110,38 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                 compression_threads: threads,
                 inner,
                 remove_backport,
+                full_verify,
             }))
         }
         other => Err(format!("unknown command {other:?}")),
     }
+}
+
+fn parse_serve(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> {
+    let (mut port, mut roots) = (ps5_dump_forge_server::DEFAULT_PORT, Vec::new());
+    while let Some(arg) = args.next() {
+        let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
+        match arg.to_str().unwrap_or("") {
+            "-h" | "--help" => return Ok(Cli::Help),
+            "--port" => {
+                port = value("--port")?
+                    .to_str()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or("--port needs a number")?
+            }
+            "--root" => roots.push(PathBuf::from(value("--root")?)),
+            other => return Err(format!("unknown argument {other:?} for serve")),
+        }
+    }
+    // The PS5 serves its fixed folders; a computer only what it is told to.
+    if cfg!(target_env = "ps5") {
+        if !roots.is_empty() {
+            return Err("--root is not used on the PS5".into());
+        }
+    } else if roots.is_empty() {
+        return Err("serve needs at least one --root".into());
+    }
+    Ok(Cli::Serve { port, roots })
 }
 
 fn parse_format(s: &str) -> Result<Format, String> {
@@ -115,6 +157,20 @@ fn default_output(source: &Path, format: Format) -> Result<PathBuf, String> {
         .unwrap_or(Path::new("."));
     ps5_dump_forge_core::default_output(source, format, dir).map_err(|e| format!("{e:#}"))
 }
+
+// scripts/release-ps5.sh looks for the server's marker in the PS5 ELF to check that it is this
+// version; this keeps it linked in every build (one literal: the self copy slices its prefix).
+#[used]
+static VERSION_MARKER: &&[u8] = &ps5_dump_forge_server::VERSION_MARKER;
+
+// The PS5 kernel fills FreeBSD 11 structs; libc's default FreeBSD 12 layouts read every field
+// at the wrong offset (found on hardware: every path looked like neither a file nor a folder).
+// ps5/build.sh selects the FreeBSD 11 ABI; these fail the build if that is ever lost.
+#[cfg(target_env = "ps5")]
+const _: () = {
+    assert!(std::mem::size_of::<libc::stat>() == 120);
+    assert!(std::mem::size_of::<libc::dirent>() == 264);
+};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// Set once the job is cancelled or done and its `.part` cleaned up; Windows' close
@@ -182,7 +238,45 @@ fn main() -> ExitCode {
         Cli::Help => print_out(&format!("{USAGE}\n")),
         Cli::Inspect { path, json } => inspect(&path, json),
         Cli::Convert(request) => convert(request),
+        Cli::Serve { port, roots } => serve(port, roots),
     }
+}
+
+fn serve(port: u16, roots: Vec<PathBuf>) -> ExitCode {
+    use ps5_dump_forge_server::{Options, PS5_ROOTS, Platform};
+    // `parse_serve` refuses `--root` on the PS5, which serves its fixed folders.
+    let (roots, platform) = if cfg!(target_env = "ps5") {
+        (PS5_ROOTS.iter().map(PathBuf::from).collect(), Platform::Ps5)
+    } else {
+        (roots, Platform::Host)
+    };
+    let mut opts = Options::new(port, roots, platform, notify);
+    on_ctrl_c();
+    opts.interrupt = Some(&INTERRUPTED);
+    match ps5_dump_forge_server::serve(opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("ps5-dump-forge: serve: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A PS5 notification (`ps5/entry.c`).
+#[cfg(target_env = "ps5")]
+fn notify(line: &str) {
+    unsafe extern "C" {
+        fn ps5_notify(message: *const std::ffi::c_char) -> std::ffi::c_int;
+    }
+    eprintln!("{line}");
+    let text = std::ffi::CString::new(line.replace('\0', "")).unwrap_or_default();
+    // SAFETY: a NUL-terminated string that outlives the call; entry.c copies it.
+    unsafe { ps5_notify(text.as_ptr()) };
+}
+
+#[cfg(not(target_env = "ps5"))]
+fn notify(line: &str) {
+    eprintln!("{line}");
 }
 
 fn inspect(path: &Path, json: bool) -> ExitCode {
@@ -324,6 +418,18 @@ fn convert(request: ConvertRequest) -> ExitCode {
             for check in &report.checks {
                 eprintln!("  ok: {check}");
             }
+            let v = &report.verify;
+            match v.mode {
+                VerifyMode::Fast => eprintln!(
+                    "ps5-dump-forge: Fast verification passed: {} of {} bytes in {} samples \
+                     (seed {}); --full-verify re-reads every byte",
+                    v.checked_bytes, v.total_bytes, v.samples, v.seed
+                ),
+                VerifyMode::Full => eprintln!(
+                    "ps5-dump-forge: Full verification passed: {} bytes",
+                    v.checked_bytes
+                ),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -362,11 +468,17 @@ mod tests {
         };
         assert_eq!((r.format, r.inner), (Format::Ffpfsc, Some(Format::Ffpkg)));
         assert!(!r.remove_backport);
+        assert!(!r.full_verify, "fast by default");
         let Ok(Cli::Convert(r)) = parse_args(args("convert /g --to folder --remove-backport -o x"))
         else {
             panic!("not a convert");
         };
         assert!(r.remove_backport);
+        let Ok(Cli::Convert(r)) = parse_args(args("convert /g --to ffpkg --full-verify -o x"))
+        else {
+            panic!("not a convert");
+        };
+        assert!(r.full_verify);
     }
 
     #[test]
@@ -380,10 +492,28 @@ mod tests {
         assert!(parse_args(args("inspect a b")).is_err());
         assert!(parse_args(args("frob /g")).is_err());
         assert!(parse_args(args("inspect /g --bogus")).is_err());
+        assert!(parse_args(args("convert /g --to exfat --full-verify=yes -o x")).is_err());
         assert!(matches!(
             parse_args(args("inspect /g --json")),
             Ok(Cli::Inspect { path, json: true }) if path == Path::new("/g")
         ));
         assert!(matches!(parse_args(args("help")), Ok(Cli::Help)));
+    }
+
+    #[cfg(not(target_env = "ps5"))]
+    #[test]
+    fn parses_serve() {
+        assert!(matches!(
+            parse_args(args("serve --port 9000 --root /a --root /b")),
+            Ok(Cli::Serve { port: 9000, roots }) if roots == [Path::new("/a"), Path::new("/b")]
+        ));
+        assert!(matches!(
+            parse_args(args("serve --root /a")),
+            Ok(Cli::Serve { port: 8095, .. })
+        ));
+        assert!(parse_args(args("serve")).is_err());
+        assert!(parse_args(args("serve --root")).is_err());
+        assert!(parse_args(args("serve --port x --root /a")).is_err());
+        assert!(parse_args(args("serve /a")).is_err());
     }
 }

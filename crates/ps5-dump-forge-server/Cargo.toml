@@ -1,0 +1,30 @@
+[package]
+name = "ps5-dump-forge-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ps5-dump-forge-core.workspace = true
+
+# The self copy (src/self_copy.rs): only the PS5 payload unpacks it, only tests on a host.
+[target.'cfg(target_env = "ps5")'.dependencies]
+flate2 = "1"
+sha2 = "0.11"
+
+[dev-dependencies]
+flate2 = "1"
+sha2 = "0.11"
+
+[build-dependencies]
+flate2 = "1"
+sha2 = "0.11"
+
+[lints.rust]
+# `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` (README.md, "PS5 payload internals").
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_env, values("ps5"))'] }

@@ -496,7 +496,13 @@ mod tests {
         let dir = crate::test_dir("scan-hard-links");
         std::fs::write(dir.join("a.bin"), b"a").unwrap();
         std::fs::write(dir.join("c.bin"), b"c").unwrap();
-        std::fs::hard_link(dir.join("a.bin"), dir.join("b.bin")).unwrap();
+        // FAT32 (FreeBSD's msdosfs) cannot hold a hard link, so there is nothing to refuse.
+        if !crate::supported(
+            std::fs::hard_link(dir.join("a.bin"), dir.join("b.bin")),
+            "hard_link",
+        ) {
+            return;
+        }
         let file = open_nofollow(&dir.join("a.bin")).unwrap();
         let meta = file.metadata().unwrap();
         assert_eq!(hard_link_count(&file, &meta).unwrap(), 2);

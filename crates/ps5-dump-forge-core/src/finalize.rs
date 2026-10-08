@@ -42,6 +42,12 @@ pub(crate) struct Part {
     /// Only ever used for its identity: it shares the caller's cursor.
     handle: Option<File>,
     published: bool,
+    /// From the destination probe: publish a file by hard link (U3).
+    #[cfg(target_os = "freebsd")]
+    hard_links: bool,
+    /// The device the probe saw the output folder on.
+    #[cfg(target_os = "freebsd")]
+    dev: Option<u64>,
 }
 
 impl Part {
@@ -80,7 +86,19 @@ impl Part {
             id,
             handle: None,
             published: false,
+            #[cfg(target_os = "freebsd")]
+            hard_links: false,
+            #[cfg(target_os = "freebsd")]
+            dev: None,
         }
+    }
+
+    /// What the job's destination probe saw, so publishing acts on it without probing again.
+    /// In place: the caller's `file` must still drop before its part (U6).
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn set_dest(&mut self, dest: &crate::dest::Dest) {
+        self.hard_links = dest.hard_links;
+        self.dev = Some(dest.dev);
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -120,11 +138,47 @@ impl Part {
                 self.path.display()
             );
         }
-        rename_no_replace(&self.path, output)
-            .with_context(|| format!("renaming {} to {}", self.path.display(), output.display()))?;
+        #[cfg(target_os = "freebsd")]
+        return self.publish_here(output);
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            rename_no_replace(&self.path, output).with_context(|| {
+                format!("renaming {} to {}", self.path.display(), output.display())
+            })?;
+            self.published = true;
+            if let Some(parent) = output.parent() {
+                fsync_dir(parent).with_context(|| format!("syncing {}", parent.display()))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// U3: the device guard, then a hard link (a file, where the probe saw hard links) or a
+    /// checked rename. Once the output name exists the job has succeeded: removing the
+    /// part's own name and syncing the folder are best effort.
+    #[cfg(target_os = "freebsd")]
+    fn publish_here(&mut self, output: &Path) -> anyhow::Result<()> {
+        let (from, to) = (self.path.display(), output.display());
+        imp::same_device(&self.path, output, self.dev)
+            .with_context(|| format!("publishing {from} as {to}"))?;
+        // By file type, never by errno: UFS refuses to link a directory with EPERM.
+        let link = !self.dir && self.hard_links;
+        if link {
+            imp::link_no_replace(&self.path, output)
+                .with_context(|| format!("linking {from} to {to}"))?;
+        } else {
+            checked_rename(&self.path, output)
+                .with_context(|| format!("renaming {from} to {to}"))?;
+        }
         self.published = true;
+        if link {
+            // ponytail: a failed unlink leaves a second name of the output, which
+            // `stale_parts` lists; deleting it leaves the output intact. Part has no log.
+            self.handle = None;
+            let _ = std::fs::remove_file(&self.path);
+        }
         if let Some(parent) = output.parent() {
-            fsync_dir(parent).with_context(|| format!("syncing {}", parent.display()))?;
+            let _ = fsync_dir(parent);
         }
         Ok(())
     }
@@ -136,12 +190,20 @@ impl Drop for Part {
         if self.published || !self.still_ours() {
             return;
         }
+        // U6: an open handle can hold back the space a delete frees.
+        #[cfg(target_os = "freebsd")]
+        drop(self.handle.take());
         // `remove_dir_all` does not follow links, so a link planted inside cannot widen it.
         let _ = if self.dir {
             std::fs::remove_dir_all(&self.path)
         } else {
             std::fs::remove_file(&self.path)
         };
+        // Sony's exFAT shows freed space as used until the folder is synced (U6).
+        #[cfg(target_os = "freebsd")]
+        if let Some(parent) = self.path.parent() {
+            let _ = fsync_dir(parent);
+        }
     }
 }
 
@@ -248,9 +310,18 @@ pub(crate) fn create_new(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "freebsd")))]
 pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// With ps5upload's retries; a filesystem without directory fsync is fine (U4).
+#[cfg(target_os = "freebsd")]
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    use std::sync::atomic::AtomicBool;
+    // The retries take under a second; publish and cleanup are past a cancel.
+    static NO_CANCEL: AtomicBool = AtomicBool::new(false);
+    crate::durable::sync_retry(&File::open(dir)?, true, &NO_CANCEL).map(drop)
 }
 
 // ponytail: Windows has no directory fsync through std (it needs FILE_FLAG_BACKUP_SEMANTICS);
@@ -265,6 +336,36 @@ pub(crate) fn fsync_dir(_: &Path) -> io::Result<()> {
 /// exclusive rename (macOS exFAT), where it checks `to` and then renames.
 pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename_no_replace(from, to)
+}
+
+/// For volumes without an exclusive rename (macOS exFAT; FreeBSD has none at all). macOS's
+/// kernel lookup still fails an existing `to` (in any case) with `EEXIST` before asking the
+/// driver, so there this check only catches what appeared since: nothing at `to`, in any
+/// case, since the lookup follows the volume's case rules, then rename. Nothing is created at
+/// `to` first, so a crash leaves only the `.part`.
+// ponytail: an entry created at `to` by another process between the check and the rename
+// is replaced (a window of microseconds, the one the user accepted). macOS offers no way to
+// close it on exFAT today: link(), RENAME_EXCL and clonefile are all unsupported; FreeBSD has
+// no RENAME_EXCL, and a file there is published by hard link where the folder has them.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn checked_rename(from: &Path, to: &Path) -> io::Result<()> {
+    match to.symlink_metadata() {
+        Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
+        Err(e) if !missing(&e) => return Err(e),
+        Err(_) => {}
+    }
+    std::fs::rename(from, to)
+}
+
+#[cfg(target_os = "macos")]
+fn missing(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound
+}
+
+/// Sony's 0x8002xxxx form of ENOENT has no `ErrorKind`.
+#[cfg(target_os = "freebsd")]
+fn missing(e: &io::Error) -> bool {
+    crate::durable::errno(e) == Some(libc::ENOENT)
 }
 
 #[cfg(target_os = "macos")]
@@ -282,23 +383,6 @@ mod imp {
             return checked_rename(from, to);
         }
         Err(err)
-    }
-
-    /// macOS's exFAT driver has no `RENAME_EXCL`. The kernel's own lookup still fails an
-    /// existing `to` (in any case) with `EEXIST` before asking the driver, so this check only
-    /// catches what appeared since: nothing at `to`, in any case, since the lookup follows the
-    /// volume's case rules, then rename. Nothing is created at `to` first, so a crash leaves
-    /// only the `.part`.
-    // ponytail: an entry created at `to` by another process between the check and the rename
-    // is replaced (a window of microseconds, only where RENAME_EXCL is missing). macOS offers
-    // no way to close it on exFAT today: link(), RENAME_EXCL and clonefile are all unsupported.
-    pub(super) fn checked_rename(from: &Path, to: &Path) -> io::Result<()> {
-        match to.symlink_metadata() {
-            Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            Err(_) => {}
-        }
-        std::fs::rename(from, to)
     }
 
     fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
@@ -361,8 +445,62 @@ mod imp {
     }
 }
 
+/// FreeBSD (the PS5) has no no-replace rename, and a cross-device `rename` panics the PS5
+/// kernel instead of failing with `EXDEV` (ps5upload `ftp_server.c:738`).
+#[cfg(target_os = "freebsd")]
+mod imp {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// The device guard, then the checked rename. No probe here, so no hard links.
+    pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+        same_device(from, to, None)?;
+        checked_rename(from, to)
+    }
+
+    /// Refuses unless `from` (not followed) and the folder `to` goes in are on one device,
+    /// and on `dev` when the probe saw one. Any stat error refuses too.
+    pub(super) fn same_device(from: &Path, to: &Path, dev: Option<u64>) -> io::Result<()> {
+        let parent = match to.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let (a, b) = (from.symlink_metadata()?.dev(), parent.metadata()?.dev());
+        if a != b || dev.is_some_and(|d| d != b) {
+            return Err(io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                format!(
+                    "{} (device {a}) and {} (device {b}{}) are not on one device; a rename \
+                     across devices would panic the console",
+                    from.display(),
+                    parent.display(),
+                    dev.map_or(String::new(), |d| format!(", probed as {d}"))
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The link is the publication: it fails if `to` exists, and nothing replaces it.
+    pub(super) fn link_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::hard_link(from, to).map_err(|e| {
+            // Sony's 0x8002xxxx form of EEXIST, as the plain one.
+            if crate::durable::errno(&e) == Some(libc::EEXIST) {
+                io::Error::from_raw_os_error(libc::EEXIST)
+            } else {
+                e
+            }
+        })
+    }
+}
+
 // ponytail: other Unixes (BSDs) have no portable no-replace rename; refuse rather than race.
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    windows,
+    target_os = "freebsd"
+)))]
 mod imp {
     use super::*;
 
@@ -517,6 +655,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_link_to_the_part_planted_at_its_path_is_left_alone() {
+        // FAT32 (FreeBSD's msdosfs) has no symlinks.
+        let probe = crate::test_dir("part-plant-link-probe");
+        if !crate::supported(
+            std::os::unix::fs::symlink("nowhere", probe.join("link")),
+            "symlink",
+        ) {
+            return;
+        }
         // The link resolves to the very file this job wrote; it is still not the part.
         replaced_part_is_left_alone("part-plant-link", |at, original| {
             std::os::unix::fs::symlink(original, at).unwrap()
@@ -524,8 +670,8 @@ mod tests {
     }
 
     /// The exFAT fallback's check, run here directly: on a volume with `RENAME_EXCL` the
-    /// kernel answers first, and on exFAT only a race reaches it.
-    #[cfg(target_os = "macos")]
+    /// kernel answers first, and on exFAT only a race reaches it. FreeBSD's only rename.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn the_checked_rename_never_replaces() {
         let dir = crate::test_dir("checked-rename");
@@ -533,14 +679,21 @@ mod tests {
         std::fs::write(&from, b"ours").unwrap();
         std::fs::write(dir.join("file"), b"theirs").unwrap();
         std::fs::create_dir(dir.join("dir")).unwrap();
-        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).unwrap();
+        // FAT32 (FreeBSD's msdosfs) has no symlinks; anywhere else the case is required.
+        let links = crate::supported(
+            std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")),
+            "symlink",
+        );
         // A case-insensitive volume (the default on macOS) also catches the other case.
-        let mut taken = vec!["file", "dir", "dangling"];
+        let mut taken = vec!["file", "dir"];
+        if links {
+            taken.push("dangling");
+        }
         if dir.join("FILE").exists() {
             taken.push("FILE");
         }
         for to in taken {
-            let err = imp::checked_rename(&from, &dir.join(to)).unwrap_err();
+            let err = checked_rename(&from, &dir.join(to)).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{to}");
             assert_eq!(
                 err.raw_os_error(),
@@ -552,16 +705,73 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"theirs");
         assert!(dir.join("dir").is_dir());
         assert!(
-            dir.join("dangling")
-                .symlink_metadata()
-                .unwrap()
-                .is_symlink()
+            !links
+                || dir
+                    .join("dangling")
+                    .symlink_metadata()
+                    .unwrap()
+                    .is_symlink()
         );
 
-        imp::checked_rename(&from, &dir.join("free")).unwrap();
+        checked_rename(&from, &dir.join("free")).unwrap();
         assert_eq!(std::fs::read(dir.join("free")).unwrap(), b"ours");
-        let err = imp::checked_rename(&dir.join("free"), &dir.join("no/such/dir")).unwrap_err();
+        let err = checked_rename(&dir.join("free"), &dir.join("no/such/dir")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// U3 on FreeBSD: a file is published by hard link, the link refuses a taken name, and a
+    /// part on another device than the probe saw is never renamed.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_publishes_by_link_behind_the_device_guard() {
+        let dir = crate::test_dir("part-link");
+        let dev = path_id(&dir).unwrap().0.0;
+        let linked = |name: &str, dev: u64| {
+            let mut part = written(&dir, name, b"ours");
+            part.hard_links = true;
+            part.dev = Some(dev);
+            part
+        };
+        // FAT32 (FreeBSD's msdosfs) has no hard links, so the probe would never ask for one.
+        std::fs::write(dir.join("t"), b"").unwrap();
+        let links = crate::supported(
+            std::fs::hard_link(dir.join("t"), dir.join("t2")),
+            "hard_link",
+        );
+        for name in ["t", "t2"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        if links {
+            linked("a.part", dev).publish(&dir.join("a.exfat")).unwrap();
+            assert_eq!(std::fs::read(dir.join("a.exfat")).unwrap(), b"ours");
+            assert!(
+                !dir.join("a.part").exists(),
+                "the part's own name is removed"
+            );
+
+            std::fs::write(dir.join("b.exfat"), b"theirs").unwrap();
+            let err = linked("b.part", dev)
+                .publish(&dir.join("b.exfat"))
+                .unwrap_err();
+            let io = err.downcast_ref::<io::Error>().expect("an io error");
+            assert_eq!(io.kind(), io::ErrorKind::AlreadyExists, "{err:#}");
+            assert_eq!(std::fs::read(dir.join("b.exfat")).unwrap(), b"theirs");
+            assert!(
+                !dir.join("b.part").exists(),
+                "the failed publish drops its part"
+            );
+        }
+
+        let err = linked("c.part", dev ^ 1)
+            .publish(&dir.join("c.exfat"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not on one device"), "{err:#}");
+        assert!(!dir.join("c.exfat").exists());
+
+        let mut part = Part::create_dir(&dir.join("d.part")).unwrap();
+        (part.hard_links, part.dev) = (true, Some(dev)); // a directory is renamed all the same
+        part.publish(&dir.join("d")).unwrap();
+        assert!(dir.join("d").is_dir() && !dir.join("d.part").exists());
     }
 
     #[test]
@@ -583,10 +793,13 @@ mod tests {
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, b"a").unwrap();
         std::fs::write(&b, b"b").unwrap();
-        std::fs::hard_link(&a, dir.join("a2")).unwrap();
+        // FAT32 (FreeBSD's msdosfs) has no hard links: no second name to compare.
+        let linked = crate::supported(std::fs::hard_link(&a, dir.join("a2")), "hard_link");
         let id = |p: &Path| path_id(p).unwrap().0;
         assert_eq!(id(&a), id(&dir.join(".").join("a")), "another spelling");
-        assert_eq!(id(&a), id(&dir.join("a2")), "another name");
+        if linked {
+            assert_eq!(id(&a), id(&dir.join("a2")), "another name");
+        }
         assert_eq!(id(&a), handle_id(&File::open(&a).unwrap()).unwrap());
         assert_eq!(id(&a), followed_id(&a).unwrap());
         assert_ne!(id(&a), id(&b), "another file");

@@ -4,7 +4,11 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+#[cfg(any(target_os = "freebsd", test))]
+use std::io;
 use std::path::Path;
+#[cfg(any(target_os = "freebsd", test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail};
 use ps5_dump_forge_fpkg::FpkgSource;
@@ -17,7 +21,7 @@ use crate::convert::SourceStamp;
 use crate::finalize::{Part, part_path};
 use crate::jobs::Ctx;
 use crate::preflight::{self, GameInfo, listing};
-use crate::verify::{self, HashingTree};
+use crate::verify::{self, HashingTree, Mode};
 use crate::{ConvertRequest, JobReport};
 
 /// Shown on every package job: a plaintext debug package installs nowhere else.
@@ -171,12 +175,89 @@ pub(crate) fn prepared_findings(prepared: &Prepared) -> Vec<String> {
         .collect()
 }
 
-/// The vendored error as the job reports it; a stop the job asked for is `cancelled`.
+/// The vendored error as the job reports it; a stop the job asked for is `cancelled`. The
+/// error stays in the chain, so U7 finds its errno.
 fn fpkg(what: &str) -> impl Fn(Error) -> anyhow::Error + '_ {
     move |e| match e {
         Error::Cancelled => anyhow!("cancelled"),
-        e => anyhow!("{what}: {e}"),
+        e => anyhow::Error::new(e).context(what.to_string()),
     }
+}
+
+/// `.pkg` output on FreeBSD (U5): the vendored builder writes the file itself, so a thread
+/// beside `build` syncs it through `file` (a clone of the builder's handle) with `sync` once it
+/// has grown by `every` bytes, or each second it grew at all. The build's control watches
+/// `abort`, not the job's `cancel`: the syncer mirrors a cancel into it, and sets it on its
+/// first failure, after which it stops, so the build stops writing unsynced data. Returns
+/// what `build` returned and that failure; the syncer stops promptly once `build` returns, and
+/// `file` is closed by then (U6).
+// ponytail: asynchronous, with no backpressure (the verify pass still hashes every packaged
+// file); the upgrade is a vendor patch threading `durable::Output`
+// through `build::write_package` and `kraken_image::compress`.
+#[cfg(any(target_os = "freebsd", test))]
+fn sync_beside<T>(
+    file: std::fs::File,
+    every: u64,
+    cancel: &AtomicBool,
+    abort: &AtomicBool,
+    sync: impl Fn(&std::fs::File, &AtomicBool) -> io::Result<()> + Send,
+    build: impl FnOnce() -> T,
+) -> io::Result<(T, io::Result<()>)> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+    std::thread::scope(|s| {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let syncer = std::thread::Builder::new()
+            .name("forge-pkg-sync".into())
+            .spawn_scoped(s, move || {
+                let (mut synced, mut since) = (0u64, Instant::now());
+                let result = loop {
+                    if stopped.recv_timeout(Duration::from_millis(100))
+                        != Err(RecvTimeoutError::Timeout)
+                    {
+                        break Ok(());
+                    }
+                    if cancel.load(Ordering::Relaxed) {
+                        abort.store(true, Ordering::Relaxed);
+                    }
+                    let grown = match file.metadata() {
+                        Ok(meta) => meta.len().saturating_sub(synced),
+                        Err(e) => break Err(e),
+                    };
+                    if grown >= every || (grown > 0 && since.elapsed() >= Duration::from_secs(1)) {
+                        if let Err(e) = sync(&file, cancel) {
+                            break Err(e);
+                        }
+                        (synced, since) = (synced + grown, Instant::now());
+                    }
+                };
+                if result.is_err() {
+                    abort.store(true, Ordering::Relaxed);
+                }
+                result
+            })?;
+        let built = build();
+        drop(stop);
+        let synced = syncer
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("the package syncer panicked")));
+        Ok((built, synced))
+    })
+}
+
+/// What a build beside [`sync_beside`] reports: a sync failure is the error (its errno at the
+/// root, for U7), with the build's own error, if any, as context; else the build's result.
+#[cfg(any(target_os = "freebsd", test))]
+fn synced_build<T>(built: ps5upload_fpkg::Result<T>, synced: io::Result<()>) -> anyhow::Result<T> {
+    let Err(e) = synced else {
+        return built.map_err(fpkg("writing the package"));
+    };
+    let e = anyhow::Error::new(e).context("syncing the package while it was written");
+    Err(match built {
+        // Stopped by the syncer itself (or a cancel, which the job reports as such).
+        Ok(_) | Err(Error::Cancelled) => e,
+        Err(b) => e.context(format!("writing the package failed ({b})")),
+    })
 }
 
 pub(crate) fn run(
@@ -231,6 +312,9 @@ pub(crate) fn run(
         }
         ctx.progress(stage.get(), done, total)
     };
+    // What the package write watches instead of the job's cancel (`sync_beside`).
+    #[cfg(target_os = "freebsd")]
+    let abort = AtomicBool::new(false);
     let mut control = BuildControl {
         bytes: Some(&mut on_bytes),
         cancel: Some(ctx.cancel),
@@ -247,14 +331,21 @@ pub(crate) fn run(
     let size = prepared.estimated_size();
     estimate.set(size);
     let need = size.saturating_add(size / 100).saturating_add(64 * MIB);
-    let (space, notes) = preflight::destination(dir, need, size);
-    findings.extend(space);
-    for note in notes {
+    // U7: so a probe that fails because the drive went away says so.
+    #[cfg(target_os = "freebsd")]
+    ctx.watch(dir);
+    let checked = preflight::destination(dir, need, size, ctx.cancel);
+    findings.extend(checked.findings);
+    for note in checked.notes {
         ctx.log(note);
     }
     if !findings.is_empty() {
         bail!("preflight failed:\n  {}", findings.join("\n  "));
     }
+    #[cfg(target_os = "freebsd")]
+    let dest = checked
+        .dest
+        .ok_or_else(|| anyhow!("the destination was not probed"))?;
     ctx.check()?;
     ctx.log(format!(
         "package: content id {}, about {} MiB",
@@ -262,8 +353,13 @@ pub(crate) fn run(
         size.div_ceil(MIB)
     ));
 
-    let (part, mut file) = Part::create_file(&part_path(out, ctx.job))?;
+    // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
+    #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+    let (mut part, mut file) = Part::create_file(&part_path(out, ctx.job))?;
+    #[cfg(target_os = "freebsd")]
+    part.set_dest(&dest);
     let mut hashing = HashingTree::new(tree);
+    #[cfg(not(target_os = "freebsd"))]
     let report = build::write_package(
         &prepared,
         &mut hashing,
@@ -273,6 +369,35 @@ pub(crate) fn run(
         &mut control,
     )
     .map_err(fpkg("writing the package"))?;
+    // ponytail: the builder's last `sync_all` (vendor `stream.rs:534`) has no U4 retries, so a
+    // transient fsync error there fails the job: safe, nothing is lost or published. Upgrade: a
+    // numbered vendor patch with a final-sync callback.
+    #[cfg(target_os = "freebsd")]
+    let report = {
+        use anyhow::Context;
+        control.cancel = Some(&abort);
+        let every = crate::durable::Cadence::new().n();
+        let handle = file.try_clone().context("cloning the package's handle")?;
+        // A retried sync fails the build, as it fails `SyncEvery`.
+        let sync = |f: &std::fs::File, cancel: &AtomicBool| match crate::durable::sync_retry(
+            f, false, cancel,
+        )? {
+            crate::durable::Synced::Retried => Err(crate::durable::retried_sync()),
+            _ => Ok(()),
+        };
+        let (built, synced) = sync_beside(handle, every, ctx.cancel, &abort, sync, || {
+            build::write_package(
+                &prepared,
+                &mut hashing,
+                &mut file,
+                part.path(),
+                &mut |line| ctx.log(format!("fpkg: {line}")),
+                &mut control,
+            )
+        })
+        .context("starting the package syncer")?;
+        synced_build(built, synced)?
+    };
     ctx.check()?;
     let mut checks: Vec<String> = report
         .verify
@@ -292,14 +417,18 @@ pub(crate) fn run(
     // Verification: the expected manifest is what the package must carry, each file hashed as the
     // builder serves it; files the build passed through keep the hash of the source read.
     ctx.progress("verify", 0, 1);
-    let source_hashes = hashing.into_hashes();
+    // ponytail: a `.pkg` is always verified in full, whatever `full_verify` says; the builder's
+    // own verify sweeps every block anyway. Upgrade: a numbered vendor patch with a sampling
+    // policy in vendor verify, then `Mode::Fast` here.
+    let mode = Mode::Full;
+    let source_hashes = hashing.into_digests();
     let mut packaged = Packaged::new(&prepared, tree);
-    let known: HashMap<String, blake3::Hash> = packaged
+    let known: HashMap<String, verify::Digest> = packaged
         .unchanged
         .iter()
-        .filter_map(|p| source_hashes.get(p).map(|h| (p.clone(), *h)))
+        .filter_map(|p| source_hashes.get(p).map(|h| (p.clone(), h.clone())))
         .collect();
-    let expected = verify::expected_from(&mut packaged, &known, ctx)?;
+    let expected = verify::expected_from(&mut packaged, &known, ctx, mode)?;
     checks.push(source_summary(&prepared));
     ctx.check()?;
 
@@ -307,12 +436,12 @@ pub(crate) fn run(
     let len = file.metadata()?.len();
     let label = part.path().display().to_string();
     let mut back = FpkgSource::from_reader(Box::new(file.try_clone()?), len, label, None)
-        .map_err(|e| anyhow!("reading the package back: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("reading the package back"))?;
     checks.push(format!("reader: {}", back.describe()));
     for line in back.conflicts() {
         ctx.log(format!("package reader: {line}"));
     }
-    checks.extend(verify::compare(&expected, &mut back, ctx)?);
+    checks.extend(verify::compare(&expected, &mut back, ctx, mode)?);
     drop(back);
     checks.push(CONSOLE.to_string());
     for line in &checks {
@@ -332,6 +461,7 @@ pub(crate) fn run(
         bytes: report.size,
         files: expected.files.len() as u64,
         checks,
+        verify: verify::summary(&expected.files, mode),
     })
 }
 
@@ -453,6 +583,81 @@ impl SourceTree for Packaged<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// The builder stand-in: writes until `abort` is set (or 10 s pass); returns the bytes.
+    fn writing(file: &mut std::fs::File, abort: &AtomicBool) -> u64 {
+        let (started, mut wrote) = (Instant::now(), 0);
+        while !abort.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(10) {
+            file.write_all(&[7; 1024]).unwrap();
+            wrote += 1024;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        wrote
+    }
+
+    #[test]
+    fn a_failed_background_sync_stops_the_build() {
+        let dir = crate::test_dir("pkg-sync-fails");
+        let mut file = std::fs::File::create(dir.join("p.part")).unwrap();
+        let handle = file.try_clone().unwrap();
+        let (cancel, abort) = (AtomicBool::new(false), AtomicBool::new(false));
+        let started = Instant::now();
+        let fail = |_: &std::fs::File, _: &AtomicBool| Err(io::Error::other("the drive is gone"));
+        let (wrote, synced) = sync_beside(handle, 1, &cancel, &abort, fail, || {
+            writing(&mut file, &abort)
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the build was not stopped"
+        );
+        assert!(wrote > 0 && abort.load(Ordering::Relaxed));
+        assert_eq!(synced.unwrap_err().to_string(), "the drive is gone");
+    }
+
+    #[test]
+    fn a_cancel_reaches_the_build_through_the_syncer() {
+        let dir = crate::test_dir("pkg-sync-cancel");
+        let mut file = std::fs::File::create(dir.join("p.part")).unwrap();
+        let handle = file.try_clone().unwrap();
+        let (cancel, abort) = (AtomicBool::new(true), AtomicBool::new(false));
+        let fine = |_: &std::fs::File, _: &AtomicBool| Ok(());
+        let started = Instant::now();
+        let (_, synced) = sync_beside(handle, 1, &cancel, &abort, fine, || {
+            writing(&mut file, &abort)
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cancel did not stop it"
+        );
+        synced.unwrap();
+    }
+
+    #[test]
+    fn a_sync_failure_is_the_error_the_job_reports() {
+        let eio = || io::Error::other("Input/output error");
+        let msg = |r: anyhow::Result<()>| format!("{:#}", r.unwrap_err());
+        assert_eq!(
+            msg(synced_build(Err(Error::Cancelled), Err(eio()))),
+            "syncing the package while it was written: Input/output error"
+        );
+        let both = synced_build::<()>(Err(Error::Format("bad block".into())), Err(eio()));
+        let root = both.as_ref().unwrap_err().root_cause().to_string();
+        assert_eq!(root, "Input/output error");
+        assert_eq!(
+            msg(both),
+            "writing the package failed (bad block): syncing the package while it was written: \
+             Input/output error"
+        );
+        assert_eq!(
+            msg(synced_build(Err(Error::Format("bad block".into())), Ok(()))),
+            "writing the package: bad block"
+        );
+        assert_eq!(synced_build(Ok(3), Ok(())).unwrap(), 3);
+    }
 
     /// A tree in memory: case-colliding names cannot be made on a case-insensitive disk.
     struct Mem(Vec<SourceFile>, HashMap<String, Vec<u8>>);

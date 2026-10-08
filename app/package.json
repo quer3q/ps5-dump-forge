@@ -2,11 +2,12 @@
   "name": "forge-app",
   "private": true,
   "type": "module",
-  "version": "0.0.1-pre3",
+  "version": "0.0.1-pre4",
   "license": "GPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:http": "tsc && vite build --mode http",
     "tauri": "tauri"
   },
   "dependencies": {

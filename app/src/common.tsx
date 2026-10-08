@@ -1,9 +1,8 @@
 // Pieces shared by the screens.
 
 import { useEffect, useRef, type KeyboardEvent, type ReactNode } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 
-import { prettyBytes, type Format, type Inspection, type Kind } from "./api";
+import { pick, prettyBytes, type Format, type Inspection, type Kind } from "./api";
 import { basename, trimSep } from "./paths";
 import { useCoverGlow } from "./glow";
 import { Icon, type IconName } from "./icons";
@@ -184,15 +183,17 @@ export function PathLine({ path, prefix }: { path: string; prefix?: string }) {
 /** "Choose folder…" / "Choose image…": a game folder or an image file. */
 function PickButtons(props: { onPick: (path: string, isImage: boolean) => void; big?: boolean }) {
   const pickFolder = async () => {
-    const p = await open({ directory: true, title: "Game folder" });
-    if (typeof p === "string") props.onPick(p, false);
+    const p = await pick({ directory: true, title: "Game folder" });
+    if (p !== null) props.onPick(p, false);
   };
   const pickImage = async () => {
-    const p = await open({
+    const p = await pick({
+      directory: false,
       title: "Game image",
-      filters: [{ name: "PS5 image or package", extensions: IMAGE_EXTENSIONS }],
+      filterName: "PS5 image or package",
+      extensions: IMAGE_EXTENSIONS,
     });
-    if (typeof p === "string") props.onPick(p, true);
+    if (p !== null) props.onPick(p, true);
   };
   return (
     <>

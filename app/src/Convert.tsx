@@ -1,16 +1,19 @@
 // Convert: source → target format → output → Build, then one row per job below the cards.
 
 import { useEffect, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 
 import {
   api,
   errorText,
+  pick,
+  web,
   prettyBytes,
   prettyDuration,
   type Format,
   type InnerFormat,
   type Inspection,
+  type JobReport,
+  type VerifyReport,
 } from "./api";
 import {
   basename,
@@ -114,6 +117,8 @@ export function Convert(props: {
   const [generate, setGenerate] = useState(true);
   /** Leave the backport libraries out; offered only for a source that has some. */
   const [removeBackport, setRemoveBackport] = useState(false);
+  /** Re-read every byte instead of sampling; kept across sources and targets. */
+  const [fullVerify, setFullVerify] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
@@ -233,8 +238,8 @@ export function Convert(props: {
     if (!source) return;
     const choice = choiceSeq.current;
     const title = format === "folder" ? "Extract into this folder" : "Save into this folder";
-    const dir = await open({ directory: true, title });
-    if (typeof dir !== "string" || choice !== choiceSeq.current) return;
+    const dir = await pick({ directory: true, title });
+    if (dir === null || choice !== choiceSeq.current) return;
     outDir.current = dir;
     if (!generate && name) {
       outputSeq.current++;
@@ -255,6 +260,7 @@ export function Convert(props: {
       compression_threads: null,
       inner: format === "ffpfsc" ? inner : null,
       remove_backport: removable && removeBackport,
+      full_verify: format === "pkg" || fullVerify,
     };
     submittingRef.current = true;
     setSubmitting(true);
@@ -359,6 +365,30 @@ export function Convert(props: {
               )}
             </div>
           )}
+          <div className="field verify">
+            <label className="switch">
+              <input
+                type="checkbox"
+                className="visually-hidden"
+                checked={format === "pkg" || fullVerify}
+                disabled={format === "pkg"}
+                onChange={(e) => setFullVerify(e.target.checked)}
+              />
+              <span className="switch-track" aria-hidden="true" />
+              <span>
+                Full verification
+                {format !== "pkg" && (
+                  <span className="muted hint">Re-reads every byte to check the output. Takes longer.</span>
+                )}
+              </span>
+            </label>
+            {format === "pkg" && (
+              <p className="note-line muted">
+                <Icon name="info" />
+                <span>Packages are always fully verified.</span>
+              </p>
+            )}
+          </div>
           <button className="link" onClick={props.onCompare}>
             <Icon name="table" />
             Compare formats
@@ -532,10 +562,12 @@ function rateLabel(stage: string): string {
   return "write";
 }
 
-/** A finished job's button names the platform's file manager; only Finder gets its face. */
-const IS_MAC = navigator.userAgent.includes("Mac");
-const REVEAL_ICON: IconName = IS_MAC ? "finder" : "folder";
+/** A finished job's button names the platform's file manager; only Finder gets its face. The
+ * http build has none on the console: it shows the path, selected, to copy. */
+const IS_MAC = !web && navigator.userAgent.includes("Mac");
+const REVEAL_ICON: IconName = IS_MAC ? "finder" : web ? "file" : "folder";
 function revealLabel(): string {
+  if (web) return "Show path";
   if (IS_MAC) return "Show in Finder";
   return navigator.userAgent.includes("Windows") ? "Show in Explorer" : "Show in folder";
 }
@@ -545,6 +577,15 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
   // A running job's Cancel asks once ("Stop job?") for a few seconds; a second click stops it.
   const [confirming, setConfirming] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
+  /** http build: the output path, shown and selected (no clipboard API over plain HTTP). */
+  const [pathShown, setPathShown] = useState(false);
+  const pathBox = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    const el = pathBox.current;
+    if (!pathShown || !el) return;
+    el.focus();
+    window.getSelection()?.selectAllChildren(el);
+  }, [pathShown]);
   const name = job.request ? basename(job.request.output) : `Job ${job.id}`;
   const result = job.result;
   const cancel = async () => {
@@ -566,6 +607,15 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
     return () => clearTimeout(t);
   }, [confirming]);
   const reveal = async () => {
+    if (web) {
+      const el = pathBox.current;
+      if (!el) setPathShown(true);
+      else {
+        el.focus();
+        window.getSelection()?.selectAllChildren(el);
+      }
+      return;
+    }
     setRevealError(null);
     try {
       await api.reveal(job.id);
@@ -639,6 +689,11 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
           </span>
         )}
       </p>
+      {pathShown && result && "Ok" in result && (
+        <p className="out-box path-shown" ref={pathBox} tabIndex={-1} aria-label="Output path">
+          {result.Ok.output}
+        </p>
+      )}
       {revealError && (
         <p className="bad" role="alert">
           {revealError}
@@ -648,10 +703,15 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
         <details className="fold verified">
           <summary>
             <Icon name="checkCircle" />
-            Verified: {result.Ok.checks.length} check{result.Ok.checks.length === 1 ? "" : "s"}{" "}
-            passed
+            {verifiedTitle(result.Ok)}
           </summary>
           <ul className="checks" aria-label="Checks">
+            {result.Ok.verify?.mode === "fast" && (
+              <li>
+                <Icon name="check" />
+                <span>{coverage(result.Ok.verify)}</span>
+              </li>
+            )}
             {result.Ok.checks.map((c, i) => (
               <li key={i}>
                 <Icon name="check" />
@@ -667,6 +727,18 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
       {job.log.length > 0 && <Log lines={job.log} />}
     </article>
   );
+}
+
+/** The verified fold's title: the mode (when the report has one) and the checks passed. */
+function verifiedTitle(r: JobReport): string {
+  const n = `${r.checks.length} check${r.checks.length === 1 ? "" : "s"}`;
+  if (!r.verify) return `Verified: ${n} passed`;
+  return `${r.verify.mode === "full" ? "Full" : "Fast"} verification passed: ${n}`;
+}
+
+/** Fast verification's coverage: "checked 2.1 GiB of 80.9 GiB in 41 samples". */
+function coverage(v: VerifyReport): string {
+  return `Checked ${prettyBytes(v.checked_bytes)} of ${prettyBytes(v.total_bytes)} in ${v.samples.toLocaleString()} sample${v.samples === 1 ? "" : "s"}`;
 }
 
 /** How long "Stop job?" waits for the second click. */

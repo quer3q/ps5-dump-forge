@@ -41,6 +41,9 @@ h2, h3, p { margin: 0; }
 p + p { margin-top: 8px; }
 img { display: block; }
 
+/* `overflow-wrap: anywhere` (Safari 15.4+) follows `break-word` everywhere: older WebKit keeps
+   the first, so long paths still wrap instead of running out of their box. */
+
 /* Keyboard focus: a ring on every control. Safari < 15.4 drops the :not() rule and keeps
    the ring on every focus. */
 :focus { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -48,10 +51,10 @@ img { display: block; }
 
 .icon { width: 18px; height: 18px; flex: none; }
 .mono, .path { font-family: var(--mono); }
-.path { font-size: 12px; overflow-wrap: anywhere; }
+.path { font-size: 12px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .muted { color: var(--muted); }
 .good { color: var(--good); }
-.bad { color: var(--bad); white-space: pre-wrap; overflow-wrap: anywhere; }
+.bad { color: var(--bad); white-space: pre-wrap; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .visually-hidden {
   position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
@@ -145,13 +148,16 @@ img { display: block; }
 }
 /* The game card's glow in the corner: brand blue and orange, or the cover's colours
    (glow.ts sets --glow-*, never brighter than these). It fades in once its colours are known
-   (`.lit`), so a cover's colours never follow a flash of the brand ones. */
+   (`.lit`), so a cover's colours never follow a flash of the brand ones. Old WebKit (the PS5's
+   browser): the four offsets, not `inset` (Safari 14.1+; without it the layer is 0x0), and
+   `z-index: 0` makes the stacking context that keeps the z-index -1 layer above the card's
+   background even where `isolation` is unknown. */
 .card.hero {
-  position: relative; isolation: isolate;
+  position: relative; z-index: 0; isolation: isolate;
   --glow-1: rgba(61, 107, 255, 0.13); --glow-2: rgba(255, 122, 47, 0.08);
 }
 .card.hero::before {
-  content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none;
+  content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: -1; border-radius: inherit; pointer-events: none;
   background-image:
     radial-gradient(85% 70% at 100% 0%, var(--glow-1), transparent 72%),
     radial-gradient(45% 40% at 96% 0%, var(--glow-2), transparent 72%);
@@ -202,7 +208,7 @@ input[type="search"] { -webkit-appearance: none; appearance: none; }
 .out-box {
   min-height: 36px; padding: 9px 14px; border-radius: 18px;
   background: var(--inset); border: 1px solid var(--line-hi);
-  font: 12px/16px var(--mono); color: var(--fg); overflow-wrap: anywhere;
+  font: 12px/16px var(--mono); color: var(--fg); overflow-wrap: break-word; overflow-wrap: anywhere;
 }
 .out-box > .muted { font: 13px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
 .out-dir { margin: 6px 0 0 14px; color: var(--muted); font-size: 11.5px; }
@@ -225,7 +231,7 @@ input[type="search"] { -webkit-appearance: none; appearance: none; }
 /* A refused switch: the track dims, the label keeps its contrast (the reason sits below it). */
 .switch:has(input:disabled) { cursor: not-allowed; }
 .switch input:disabled + .switch-track { opacity: .4; }
-.field.backport > .note-line { margin-top: 8px; }
+.field.backport > .note-line, .field.verify > .note-line { margin-top: 8px; }
 .hint { display: block; margin-top: 2px; font-size: 11.5px; }
 
 .build-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
@@ -300,7 +306,7 @@ button.link .icon { width: 15px; height: 15px; }
 .cover.none .icon { width: 28px; height: 28px; }
 .game-text { flex: 1; min-width: 0; }
 .title-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
-.title { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; overflow-wrap: anywhere; margin-right: 2px; }
+.title { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; overflow-wrap: break-word; overflow-wrap: anywhere; margin-right: 2px; }
 .title.pending { font-size: 16px; font-weight: 500; color: var(--muted); }
 .card > .bad { margin-top: 12px; }
 
@@ -321,7 +327,7 @@ button.link .icon { width: 15px; height: 15px; }
 }
 .tile dt { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
 .tile dd { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
-.value { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.value { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .value.mono { font-size: 15px; font-weight: 500; }
 .tile.wide { grid-column: 1 / -1; }
 .tile.wide .value.mono { font-size: 14px; }
@@ -344,7 +350,7 @@ details.fold[open] > summary::before { transform: rotate(45deg); margin-top: -3p
 details.fold > :not(summary) { margin-top: 6px; }
 
 ul.rows { list-style: none; margin: 0; padding: 0; }
-ul.rows > li { padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere; }
+ul.rows > li { padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 ul.rows > li:last-child { border-bottom: 0; }
 ul.rows.path > li, ul.rows > li.path { font-size: 12px; }
 ul.rows .row-title { display: block; }
@@ -352,14 +358,14 @@ ul.rows .row-title .path { color: var(--muted); }
 ul.rows > li > .muted { display: block; margin-top: 2px; font-size: 12px; }
 ul.scroll { max-height: 240px; overflow: auto; }
 
-.status-line { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; overflow-wrap: anywhere; }
+.status-line { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .status-line .icon { margin-top: 0; }
 .status-line .path { color: var(--fg-2); }
 ul.findings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 ul.findings li {
   display: flex; align-items: flex-start; gap: 8px; padding: 9px 12px; border-radius: 10px;
   background: rgba(255, 181, 71, 0.07); border: 1px solid rgba(255, 181, 71, 0.18);
-  font-size: 13px; overflow-wrap: anywhere;
+  font-size: 13px; overflow-wrap: break-word; overflow-wrap: anywhere;
 }
 ul.findings .icon { color: var(--warn); width: 17px; height: 17px; margin-top: 1px; }
 /* Fails every target. */
@@ -371,7 +377,7 @@ ul.findings li.info .icon { color: var(--accent-ink); }
 
 /* Why Build is off, or what to expect from it. */
 .build-notes { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
-.note-line { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; overflow-wrap: anywhere; }
+.note-line { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .note-line .icon { width: 15px; height: 15px; margin-top: 1px; }
 .note-line.block { color: #ff9b9b; }
 .note-line.warn { color: #ffcf8a; }
@@ -399,10 +405,10 @@ ul.findings li.info .icon { color: var(--accent-ink); }
 .job-head { display: flex; align-items: flex-start; gap: 10px; }
 .job-head > .tag { margin-top: 1px; }
 .job-name { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.job-name strong { font-size: 13.5px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.job-name strong { font-size: 13.5px; font-weight: 600; line-height: 1.35; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .job-name .pathline { font-size: 11.5px; }
 .job progress { margin-top: 10px; }
-.job-status { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; font-size: 12.5px; overflow-wrap: anywhere; }
+.job-status { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; font-size: 12.5px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .job-status .path { color: var(--fg-2); }
 progress {
   display: block; width: 100%; height: 8px; border: 0; border-radius: 999px;
@@ -418,20 +424,20 @@ progress::-moz-progress-bar { border-radius: 999px; background: linear-gradient(
 .meta strong { color: var(--fg); font-weight: 600; }
 .fold.verified > summary .icon { width: 15px; height: 15px; color: var(--good); }
 ul.checks { list-style: none; margin: 0; padding: 12px 14px; display: grid; gap: 5px; border-radius: 12px; background: var(--inset); }
-ul.checks li { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--fg-2); overflow-wrap: anywhere; min-width: 0; }
+ul.checks li { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; color: var(--fg-2); overflow-wrap: break-word; overflow-wrap: anywhere; min-width: 0; }
 ul.checks li > span { min-width: 0; }
 ul.checks .icon { width: 15px; height: 15px; color: var(--good); margin-top: 2px; }
 .error-box {
   margin-top: 14px; padding: 12px 14px; border-radius: 12px;
   background: rgba(255, 93, 93, 0.08); border: 1px solid rgba(255, 93, 93, 0.25);
-  color: #ffb4b4; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere;
+  color: #ffb4b4; font-size: 13px; white-space: pre-wrap; overflow-wrap: break-word; overflow-wrap: anywhere;
 }
 .error-title { display: block; margin-bottom: 2px; color: #ffd6d6; font-weight: 600; white-space: normal; }
 .job details.fold { margin-top: 10px; }
 .job details.fold > summary { padding: 5px 10px; font-size: 12.5px; }
 pre.log, pre.code {
   margin: 0; font: 12px/1.5 var(--mono); color: var(--fg-2);
-  white-space: pre-wrap; overflow-wrap: anywhere;
+  white-space: pre-wrap; overflow-wrap: break-word; overflow-wrap: anywhere;
 }
 pre.log {
   max-height: 240px; overflow: auto; padding: 12px 14px; border-radius: 10px;
@@ -463,7 +469,7 @@ pre.code { padding: 14px 16px; }
 
 /* ---------- Quit prompt ---------- */
 .modal-backdrop {
-  position: fixed; inset: 0; z-index: 10; padding: 16px;
+  position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 10; padding: 16px;
   display: flex; align-items: center; justify-content: center;
   background: rgba(5, 5, 10, 0.62);
   -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
@@ -475,7 +481,7 @@ pre.code { padding: 14px 16px; }
 .quit-jobs { list-style: none; margin: 14px 0 0; padding: 4px 14px; border-radius: 12px; background: var(--inset); }
 .quit-jobs li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; padding: 8px 0; font-size: 13px; }
 .quit-jobs li + li { border-top: 1px solid var(--line); }
-.quit-name { font-weight: 500; overflow-wrap: anywhere; min-width: 0; }
+.quit-name { font-weight: 500; overflow-wrap: break-word; overflow-wrap: anywhere; min-width: 0; }
 .spinner {
   width: 18px; height: 18px; border-radius: 50%; flex: none;
   border: 2px solid rgba(255, 255, 255, 0.18); border-top-color: #fff;
@@ -528,3 +534,33 @@ table.compare td:nth-child(5) .chip { white-space: nowrap; } /* "~20 min" stays 
   .chip { padding: 3px 6px; gap: 4px; }
   .chip .icon { width: 12px; height: 12px; }
 }
+
+/* ---------- http build (PS5 web UI) ---------- */
+/* The header's right column: an offline notice and "Stop PS5 Dump Forge". */
+.top-actions { justify-self: end; display: flex; align-items: center; gap: 8px; }
+/* A finished job's output path, shown selected to copy (no clipboard over plain HTTP). */
+.out-box.path-shown { margin-top: 10px; color: var(--fg-2); }
+/* The folder browser: the quit modal's frame, wider, its list in an inset well. */
+.modal.picker { width: 560px; display: flex; flex-direction: column; max-height: calc(100vh - 32px); }
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin: 12px 0 10px; font: 12px var(--mono); }
+.crumbs button.link { margin: 0; padding: 2px; font: inherit; white-space: normal; overflow-wrap: break-word; overflow-wrap: anywhere; text-align: left; }
+.crumbs .here { color: var(--fg); overflow-wrap: break-word; overflow-wrap: anywhere; }
+ul.rows.pick-list {
+  flex: 0 1 auto; min-height: 120px; max-height: 420px; overflow: auto;
+  border-radius: 12px; background: var(--inset); border: 1px solid rgba(255, 255, 255, 0.04);
+}
+ul.rows.pick-list > li { padding: 0; }
+ul.rows.pick-list > li.muted { padding: 12px; }
+button.pick-row {
+  width: 100%; height: auto; min-height: 38px; padding: 8px 12px; gap: 10px; border-radius: 0;
+  justify-content: flex-start; text-align: left; white-space: normal;
+  background: transparent; font-size: 13px; font-weight: 400;
+}
+button.pick-row:hover:not(:disabled) { background: var(--raise); }
+button.pick-row:focus { outline-offset: -2px; }
+button.pick-row .icon { color: var(--muted); }
+.pick-name { flex: 1; min-width: 0; overflow-wrap: break-word; overflow-wrap: anywhere; }
+.pick-name.mono { font-size: 12px; }
+button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; }
+.modal p.pick-error { margin: 10px 0 0; font-size: 12.5px; }
+.pick-foot { margin-top: 16px; }

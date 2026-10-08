@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use ps5_dump_forge_core::{
-    ConvertRequest, DataDirs, Event, Format, JobReport, Jobs, ScannedFolder, default_output,
-    extraction_findings, inspect, rename_no_replace, stale_parts,
+    ConvertRequest, DataDirs, Event, Format, JobReport, Jobs, ScannedFolder, VerifyMode,
+    default_output, extraction_findings, inspect, rename_no_replace, stale_parts,
 };
 use ps5upload_fpkg::source::SourceTree;
 
@@ -50,6 +50,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         compression_threads: None,
         inner: None,
         remove_backport: false,
+        full_verify: false,
     }
 }
 
@@ -286,12 +287,29 @@ fn folder_round_trip_verifies_with_blake3() {
     );
     assert_eq!(report.output, out.canonicalize().unwrap());
     assert_eq!(report.files, 4);
-    assert!(
-        report
-            .checks
-            .iter()
-            .any(|c| c.starts_with("blake3: 4 files"))
+    // Fast by default; files this small are all compared whole (the empty one by its size).
+    let v = report.verify;
+    assert_eq!(v.mode, VerifyMode::Fast);
+    assert_eq!((v.samples, v.checked_bytes), (3, v.total_bytes), "{v:?}");
+    assert!(v.seed < 1 << 53);
+    let fast = format!(
+        "blake3: 3 samples, {0} of {0} bytes in 4 files, match",
+        v.total_bytes
     );
+    assert!(
+        report.checks.iter().any(|c| c.starts_with(&fast)),
+        "{:?}",
+        report.checks
+    );
+    let logged = |events: &[Event], want: &str| {
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Log { line, .. } if line.starts_with(want)))
+    };
+    assert!(logged(
+        &events,
+        "verify: fast, 9.0 MiB of 9.0 MiB in 3 samples (seed "
+    ));
     assert!(report.checks.iter().any(|c| c == "empty dirs: 1 match"));
     assert_eq!(tree_bytes(&src), tree_bytes(&out));
     assert!(out.join("data/empty").is_dir());
@@ -310,6 +328,28 @@ fn folder_round_trip_verifies_with_blake3() {
     // Every event serializes the way the app forwards it.
     let line = serde_json::to_string(events.last().unwrap()).unwrap();
     assert!(line.starts_with(r#"{"kind":"done""#), "{line}");
+    assert!(
+        line.contains(r#""verify":{"mode":"fast","checked_bytes":"#),
+        "{line}"
+    );
+
+    let out = root.join("out-full");
+    let (events, result) = run(ConvertRequest {
+        full_verify: true,
+        ..request(&src, Format::Folder, &out)
+    });
+    let report = result.unwrap();
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c == "blake3: 4 files match the source")
+    );
+    let v = report.verify;
+    assert_eq!(v.mode, VerifyMode::Full);
+    assert_eq!((v.checked_bytes, v.samples, v.seed), (v.total_bytes, 0, 0));
+    assert!(logged(&events, "verify: full, 9.0 MiB of 9.0 MiB"));
+    assert_eq!(tree_bytes(&src), tree_bytes(&out));
 }
 
 #[test]
@@ -707,6 +747,11 @@ fn image_round_trip(
     // Empty dirs the image readers must report back: a nested one, and one holding junk only.
     std::fs::create_dir_all(src.join("deep/a/b")).unwrap();
     write(&src, "only-junk/.DS_Store", b"junk");
+    // Over 16 MiB, so fast verification compares it by 8 MiB slices; the last one is short.
+    let large: Vec<u8> = (0..24 * 1024 * 1024 + 5)
+        .map(|i| (i * 7 % 253) as u8)
+        .collect();
+    write(&src, "data/large.bin", &large);
     let image = root.join(format!("PPSA01234.{ext}"));
     let before = snapshot(&src);
     let report = run(ConvertRequest {
@@ -720,7 +765,19 @@ fn image_round_trip(
         before,
         "the source, junk included, is never touched"
     );
-    assert!(report.checks.iter().any(|c| c.starts_with("blake3:")));
+    // Three small files whole, all four slices of the large one (its first, last, one
+    // interior and one random).
+    let v = report.verify;
+    assert_eq!(v.mode, VerifyMode::Fast);
+    assert_eq!((v.samples, v.checked_bytes), (7, v.total_bytes), "{v:?}");
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.starts_with("blake3: 7 samples")),
+        "{:?}",
+        report.checks
+    );
     assert!(
         report.checks.iter().any(|c| c == "empty dirs: 3 match"),
         "{:?}",
@@ -777,6 +834,10 @@ fn image_round_trip(
     let back = root.join("back");
     let report = run(request(&image, Format::Folder, &back)).1.unwrap();
     assert!(report.checks.iter().any(|c| c == "empty dirs: 3 match"));
+    assert_eq!(
+        (report.verify.mode, report.verify.samples),
+        (VerifyMode::Fast, 7)
+    );
     assert_eq!(tree_bytes(&src), tree_bytes(&back));
     assert!(back.join("deep/a/b").is_dir() && back.join("only-junk").is_dir());
     assert!(stale_parts(&root).is_empty());

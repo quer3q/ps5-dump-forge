@@ -48,11 +48,28 @@ export function useCoverGlow(cover: string | null | undefined): Glow {
   return { style: last.current, ready: true };
 }
 
+/** The decoded cover. `onload`, not `HTMLImageElement.decode()`, which old WebKit (the PS5's
+ * browser) may lack or never settle; a load that never ends fails after 5 s. */
+function load(src: string): Promise<HTMLImageElement> {
+  return new Promise((ok, fail) => {
+    const img = new Image();
+    const timer = setTimeout(() => fail(new Error("cover load timed out")), 5000);
+    img.onload = () => {
+      clearTimeout(timer);
+      ok(img);
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      fail(new Error("cover did not load"));
+    };
+    img.src = src;
+  });
+}
+
+/** The cover's glow; null (the brand glow) when anything fails. */
 async function coverGlow(src: string): Promise<CSSProperties | null> {
   try {
-    const img = new Image();
-    img.src = src;
-    await img.decode();
+    const img = await load(src);
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = SIZE;
     const ctx = canvas.getContext("2d");

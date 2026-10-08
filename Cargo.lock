@@ -2408,20 +2408,22 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-cli"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "anyhow",
  "libc",
  "ps5-dump-forge-core",
+ "ps5-dump-forge-server",
  "serde_json",
 ]
 
 [[package]]
 name = "ps5-dump-forge-core"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "anyhow",
  "blake3",
+ "getrandom 0.4.3",
  "libc",
  "ps5-dump-forge-exfat",
  "ps5-dump-forge-fpkg",
@@ -2435,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-exfat"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "ps5upload-fpkg",
  "unicode-normalization",
@@ -2443,14 +2445,14 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-fpkg"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "ps5upload-fpkg",
 ]
 
 [[package]]
 name = "ps5-dump-forge-gui"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "anyhow",
  "ps5-dump-forge-core",
@@ -2462,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-pfs"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "flate2",
  "ps5-dump-forge-exfat",
@@ -2471,8 +2473,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps5-dump-forge-server"
+version = "0.0.1-pre4"
+dependencies = [
+ "flate2",
+ "getrandom 0.4.3",
+ "libc",
+ "ps5-dump-forge-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "ps5-dump-forge-ufs2"
-version = "0.0.1-pre3"
+version = "0.0.1-pre4"
 dependencies = [
  "ps5upload-fpkg",
  "ps5upload-pkg",

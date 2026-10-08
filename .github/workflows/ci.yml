@@ -175,6 +175,22 @@ jobs:
               exit 1
             fi
 
+  ps5:
+    # The PS5 payload, built and checked as the release builds it (scripts/release-ps5.sh), and a
+    # host check of its entry.c. The FreeBSD VM tests (scripts/test-freebsd.sh) are left out: under
+    # TCG they take 80+ minutes on a runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - run: scripts/release-ps5.sh
+      - run: ps5/test-entry.sh
+
   fuzz:
     # Every reader of untrusted images, 60 s each from the seed corpora.
     runs-on: ubuntu-latest

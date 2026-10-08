@@ -17,7 +17,6 @@
 //! if it does not shrink: a stream cannot be re-read to store the image raw instead.
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -117,12 +116,13 @@ fn encode_block(raw: &[u8], level: u32, min_gain: u8) -> io::Result<Vec<u8>> {
 }
 
 /// Build a `.ffpfsc` holding `inner_name` (whose name tells SMP the filesystem) into `out`, an
-/// empty file the caller owns, fsyncs and renames. `fill` writes the inner image into the
+/// empty file (or a wrapper around one) the caller owns, fsyncs and renames. Every byte of the
+/// output is written through `out`, zeros included. `fill` writes the inner image into the
 /// [`Stream`]: exactly `raw_size` bytes, forward only. Returns what `fill` returned.
-pub fn wrap<T>(
+pub fn wrap<T, W: Write + Seek>(
     inner_name: &str,
     raw_size: u64,
-    out: &mut File,
+    out: &mut W,
     opts: &WrapOptions,
     cancel: &AtomicBool,
     fill: impl FnOnce(&mut Stream<'_>) -> Result<T>,
@@ -134,10 +134,10 @@ pub fn wrap<T>(
 
 type Encode = dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Sync;
 
-fn wrap_with<T>(
+fn wrap_with<T, W: Write + Seek>(
     inner_name: &str,
     raw_size: u64,
-    out: &mut File,
+    out: &mut W,
     opts: &WrapOptions,
     cancel: &AtomicBool,
     encode: &Encode,
@@ -184,7 +184,7 @@ fn wrap_with<T>(
             .collect();
         drop(queue);
         let mut stream = Stream {
-            out: BufWriter::with_capacity(8 << 20, &mut *out),
+            out: BufWriter::with_capacity(8 << 20, &mut *out as &mut dyn Write),
             work,
             pending: VecDeque::with_capacity(limit),
             limit,
@@ -244,8 +244,20 @@ fn wrap_with<T>(
     sink.w.flush()?;
     drop(sink);
     let image_size = img.ndblock * BLOCK;
-    // The zero tail of the container's last block.
-    out.set_len(image_size)?;
+    // The zero tail of the container's last block, written rather than `set_len`, so an output
+    // that bounds its unsynced data sees every byte.
+    let end = base + stored;
+    if end > image_size {
+        return Err(err(format!(
+            "internal error: the container ends at byte {end} of a {image_size}-byte image"
+        )));
+    }
+    if end < image_size {
+        out.seek(SeekFrom::Start(end))?;
+        let mut sink = Sink::new(&mut *out, cancel);
+        sink.zeros_to(image_size - end)?;
+        sink.w.flush()?;
+    }
     Ok((
         value,
         WrapReport {
@@ -293,7 +305,7 @@ fn worker(queue: &Mutex<Receiver<Job>>, encode: &Encode) {
 /// Seeking forward writes zeros (cancellable per block); `End(0)` is the current position;
 /// going back is an error.
 pub struct Stream<'a> {
-    out: BufWriter<&'a mut File>,
+    out: BufWriter<&'a mut dyn Write>,
     work: SyncSender<Job>,
     /// Replies in submission order.
     pending: VecDeque<Receiver<io::Result<Vec<u8>>>>,
@@ -439,6 +451,7 @@ fn too_big() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;

@@ -1,7 +1,8 @@
 # TODO
 
 What is left after v1 (folder ⇄ `.exfat` / `.ffpkg` / `.ffpfs` / `.ffpfsc` / `.pkg` on macOS universal, Windows
-x86-64 and arm64, Linux x86-64 and arm64; v0.0.1-pre3 built and passed CI on every target).
+x86-64 and arm64, Linux x86-64 and arm64; v0.0.1-pre3 built and passed CI on every target; v0.0.1-pre4 adds
+the PS5 payload, whose CI and release jobs have not run yet).
 Grouped by area; the first section blocks a release.
 
 ## Before the first release
@@ -11,6 +12,8 @@ Grouped by area; the first section blocks a release.
 - [ ] **`.ffpfs` and `.ffpfsc` on a console**: SMP 1.7 mounts and boots a `.ffpfs` (under `/data`, and on USB) and a
   `.ffpfsc` with each inner format (`.exfat`, `.ffpkg`, `.ffpfs`). Both follow MkPFS's layouts, but neither
   has been booted from this builder.
+- [ ] **PS5 payload**: SMP 1.7 mounts and boots an image Forge made on the console (only conversions and
+  their checks have run there, no mount). See "PS5 payload" below for the rest.
 - [ ] **zlib on the console**: `.ffpfsc` blocks come from `flate2`'s `miniz_oxide`, not the zlib backends MkPFS uses.
   MkPFS reports that ISA-L output can crash the console's hardware decompressor; a standard zlib stream should be
   fine, but only a console run of a whole game (every block read) proves miniz's streams are accepted.
@@ -71,8 +74,8 @@ Grouped by area; the first section blocks a release.
   English finding text (`// ponytail:` at `classify` in `app/src/common.tsx`).
 - [ ] UI checks run in Playwright WebKit with a mocked bridge; drive the real app (WKWebView, native
   dialogs, Show in Finder, Cmd+Q during a job) once per release.
-- [ ] No frontend test runner in the repo. `app/src/paths.ts` (path helpers, including the trailing-`\`
-  macOS case) is import-free and ready for one. The UI was checked this session with a throwaway
+- [ ] No frontend test runner in the repo; `app/scripts/` has plain-node checks (`check-paths`,
+  `check-poller`, `check-launcher`, `smoke` against the real `serve`), run by hand. The UI was checked this session with a throwaway
   Playwright WebKit screenshot harness (mocked Tauri bridge fed by real CLI data, prod build served with
   the real CSP) that isn't in the repo; consider adding a small dev-only version of it.
 - [ ] `.fpkg`'s build-time estimate (~80 MB/s effective) is approximate, from a partial real build.
@@ -112,6 +115,55 @@ Grouped by area; the first section blocks a release.
   on tiny games; `scripts/check-exfat.sh`'s Docker step and `scripts/fsck-ufs.sh` keep deleted images open
   in Docker Desktop's VM until it restarts; `ps5-dump-forge inspect --help` / `convert --help` print the
   generic top-level usage instead of subcommand help.
+
+## PS5 payload
+Done on hardware (PS5, firmware 13.60, elfldr on 9021, sources and outputs on `/data`): the payload starts,
+`inspect`, `.ffpkg` → `.exfat`/folder (full verification) and folder → `.exfat` (fast), publish by
+checked rename (`/data` is nullfs, no hard links), clean cancels, the tile, the self copy and its start
+through elfldr, the release ELF without debug routes, the cover glow in the PS5 browser. Results in README.md.
+- [ ] **Other outputs on the console**: `.ffpkg`, `.ffpfs`, `.ffpfsc` (each inner) and `.pkg` built on the PS5,
+  then mounted/installed and booted. Cancel mid-job leaves no `.part` for each.
+- [ ] **USB output on hardware** (Sony `exfatfs`, and FAT32, whose fs name is unconfirmed, probably `msdosfs`).
+  Experimental until then; the probe's `destination ...` log line makes the first run a diagnostic. Then tune
+  `SyncEvery`'s constants (start 32 MiB, ~1 s, 16..256 MiB; on `/data` the fsync cadence costs nothing).
+- [ ] **CI and release jobs never ran on GitHub**: `ci.yml` `ps5` (`release-ps5.sh` + `test-entry.sh`) and
+  `release.yml` `ps5` + the `publish` asset list; the cold Docker build time (image, SDK, build-std) is
+  unknown. The FreeBSD VM tests stay out of CI (TCG takes 80+ min); run `scripts/test-freebsd.sh` locally
+  before a hardware run that touches the FreeBSD paths.
+- [ ] **Faster exFAT and PFS readers** (the same fix as vendor patch 0015 for UFS2: contiguous runs in one read,
+  cached metadata): full verification and `.exfat`/`.ffpfs`/`.ffpfsc` sources read in small syscalls, and a
+  64 KiB read costs ~0.35 ms on the console (150 MB/s vs 912 MB/s at 8 MiB).
+- [ ] **Forced drive-removal VM test**: `mdconfig -d -u <unit> -o force` during a small write, last and under a
+  timeout (U7's decision is unit-tested and its `statfs` lookup VM-tested; the removal run is not written).
+- [ ] **Verification switch on Windows and Linux**: drive the desktop UI once on each (via CI) with the "Full
+  verification" switch on and off, `.fpkg` showing it on and disabled.
+- [x] The tile across a real restart: after a reboot and the autoloader, the tile starts Forge from its saved
+  copy (also after the tile was removed and Forge loaded fresh again).
+- [ ] Hardware, not yet recorded: reload restoring a running job in the PS5 browser, the Stop button (the
+  `/api/quit` route itself ended the payload cleanly), a second load answering "already running".
+- [ ] A 100 GB+ job on `/data` with no kernel panic (87 GB ran clean); rest mode during a job
+  (`sceSystemServicePowerTick` links but is untested; rest entered by hand has no clean-failure guarantee).
+- [ ] `panic=abort`: a job panic ends the payload (its `.part` stays, listed on the next start). Try
+  `panic-strategy: unwind` with `-Z build-std=std,panic_unwind` (`.eh_frame` present, `_Unwind_*` resolved,
+  but the shim's `dl_iterate_phdr` returns `ENOSYS`); pass only if a panicking job fails, its `.part` is
+  deleted and the next job runs.
+- [ ] Measure on hardware: thread stacks (main from elfldr; job and compression threads ask for 2 MiB),
+  `available_parallelism`, heap limits. Don't stack compression, hashing and server thread pools.
+- [ ] Fast `.pkg` verification: needs a numbered vendor patch with a sampling policy (the builder's verify
+  sweeps every block).
+- [ ] `ponytail:`s: the `.pkg` background syncer has no backpressure (upgrade: a vendor patch threading
+  `Output` through `build::write_package` and `kraken_image::compress`), and the builder's final `sync_all`
+  has no retries (a transient error fails the job, nothing is published); `Part` is path-based (upgrade:
+  descriptor-relative ops); the shown IP comes from a UDP `connect` (`sceNetCtlGetInfo` if it proves wrong).
+- [ ] Re-audit vendor entry points before core calls any new one on the PS5: the vendor `build_mode` space gate
+  (`statvfs`) and `estimate`'s `probe_write_rate` are not on any core path today.
+- [ ] FAT32 limits in the tests: link/symlink fixtures skip on `EOPNOTSUPP`; a same-size rename-over within
+  2 s is not caught on msdosfs (`SourceStamp`).
+- [ ] Nits: on a PC the "has stopped" dialog says "Start the payload on the PS5"; no favicon (a 404); the CLI's
+  `signal()` doesn't check `SIG_ERR`.
+- [ ] Later, not planned: in-app updates (stage beside the target `O_EXCL|O_NOFOLLOW` + fsync, a copy-based
+  rotated `.prev` since USB has no hard links, rename + folder fsync; fetching needs TLS in the payload, a
+  browser upload doesn't) and signatures (ed25519, only if releases come from more than one place).
 
 ## Replace the vendored ps5upload crates
 Not scheduled; v1 ships with `vendor/` (ps5upload v6.1.2 + `vendor/patches/`). ps5upload stays the reference

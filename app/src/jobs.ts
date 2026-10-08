@@ -1,6 +1,16 @@
-// Job list state, fed by `job://*` events. Lives in App so it survives tab switches.
+// Job list state, fed by `job://*` events (and, in the http build, rebuilt from the server's
+// job list). Lives in App so it survives tab switches.
 
-import type { ConvertRequest, DoneEvent, JobId, JobResult, LogEvent, ProgressEvent } from "./api";
+import type {
+  ConvertRequest,
+  DoneEvent,
+  JobId,
+  JobResult,
+  JobsRestore,
+  LogEvent,
+  ProgressEvent,
+  SnapshotJob,
+} from "./api";
 
 const LOG_LINES = 500;
 
@@ -30,10 +40,24 @@ export type Action =
   | { type: "progress"; e: ProgressEvent; at: number }
   | { type: "log"; e: LogEvent }
   | { type: "done"; e: DoneEvent }
+  | { type: "restore"; e: JobsRestore; at: number }
   | { type: "dismiss"; id: JobId };
 
 function blank(id: JobId): Job {
   return { id, done: 0, total: 0, shown: 0, stageAt: 0, stageDone: 0, log: [] };
+}
+
+/** A job as the server's list has it: request, last progress, log tail and result. */
+function fromSnapshot(j: Job, s: SnapshotJob, at: number): Job {
+  let k: Job = { ...j, request: s.request ?? j.request, log: s.log.slice(-LOG_LINES) };
+  const p = s.progress;
+  if (p) {
+    const shown = Math.max(j.shown, p.total > 0 ? Math.min(1, p.done / p.total) : 0);
+    k = { ...k, stage: p.stage, done: p.done, total: p.total, shown, stageAt: at, stageDone: p.done };
+    k = { ...k, etaMs: undefined, speed: undefined };
+  }
+  if (s.done) k = { ...k, result: s.done.result, etaMs: undefined, speed: undefined };
+  return k;
 }
 
 function update(jobs: Job[], id: JobId, f: (j: Job) => Job): Job[] {
@@ -80,6 +104,14 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
         etaMs: undefined,
         speed: undefined,
       }));
+    case "restore": {
+      // `replace`: the server's list is the whole truth (a reload, or the payload restarted,
+      // which reuses ids), so each job is only what the snapshot says.
+      if (a.e.replace) return a.e.jobs.map((s) => fromSnapshot(blank(s.id), s, a.at));
+      let next = jobs;
+      for (const s of a.e.jobs) next = update(next, s.id, (j) => fromSnapshot(j, s, a.at));
+      return next;
+    }
     case "dismiss":
       return jobs.filter((j) => j.id !== a.id);
   }

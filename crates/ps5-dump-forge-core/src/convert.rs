@@ -16,9 +16,10 @@ use ps5upload_fpkg::{PkgFile, ReadSeek};
 
 use crate::finalize::{Part, part_path};
 use crate::jobs::Ctx;
+use crate::prefetch::Prefetch;
 use crate::preflight::{self, GameInfo};
 use crate::scan::{JunkFiltered, ScannedFolder};
-use crate::verify::{self, HashingTree};
+use crate::verify::{self, HashingTree, Mode};
 use crate::{ConvertRequest, Format, JobReport};
 
 /// Every SMP image size and cluster is a multiple of this.
@@ -107,13 +108,17 @@ fn plain(e: ps5upload_fpkg::Error) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
+/// The vendored error stays in the chain, so U7 finds its errno.
 fn reopen(e: ps5upload_fpkg::Error) -> anyhow::Error {
-    anyhow::anyhow!("reading the output back: {e}")
+    anyhow::Error::new(e).context("reading the output back")
 }
 
 /// What an image source file looked like when the job opened it. Checked again before
 /// publishing, so an image rewritten mid-conversion fails the job; a folder source checks
 /// each file on every read instead.
+// ponytail: on FAT (FreeBSD's msdosfs) a file's id comes from its directory slot and mtimes
+// have 2-second steps, so a same-size file renamed over the source within 2 s goes unnoticed.
+// Upgrade: also hash a sample of the contents.
 pub(crate) struct SourceStamp {
     path: PathBuf,
     seen: Option<Seen>,
@@ -274,6 +279,47 @@ enum Plan {
 }
 
 pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
+    // U7: a failure on a drive that went away says so.
+    #[cfg(target_os = "freebsd")]
+    ctx.watch(&req.source);
+    #[cfg(target_os = "freebsd")]
+    return convert(req, ctx).map_err(|e| {
+        crate::durable::explain_removal(e, &ctx.mounts.borrow(), crate::dest::mount_state)
+    });
+    #[cfg(not(target_os = "freebsd"))]
+    convert(req, ctx)
+}
+
+/// U5 on FreeBSD: `write` puts every byte of the image through `SyncEvery`, sharing the
+/// job's `cadence`; its finish is the image's sync.
+#[cfg(target_os = "freebsd")]
+fn synced<T>(
+    file: &mut File,
+    cadence: &mut crate::durable::Cadence,
+    ctx: &Ctx,
+    write: impl FnOnce(&mut crate::durable::SyncEvery<'_, &mut File>) -> ps5upload_fpkg::Result<T>,
+) -> anyhow::Result<T> {
+    let mut out = crate::durable::SyncEvery::new(file, cadence, ctx.cancel);
+    let value = write(&mut out)?;
+    out.finish().context("syncing the image")?;
+    log_cadence(cadence, ctx);
+    Ok(value)
+}
+
+/// Logs the last change of the sync cadence's N, if any (U5).
+#[cfg(target_os = "freebsd")]
+pub(crate) fn log_cadence(cadence: &mut crate::durable::Cadence, ctx: &Ctx) {
+    if let Some((old, new)) = cadence.take_change() {
+        let mib = |n: u64| n.div_ceil(1 << 20);
+        ctx.log(format!(
+            "sync cadence: every {} MiB (was {} MiB)",
+            mib(new),
+            mib(old)
+        ));
+    }
+}
+
+fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     ctx.progress("scan", 0, 1);
     let kind = Kind::of(&req.source)?;
     // Before the open: a change after this point, however early, fails the publish.
@@ -329,12 +375,16 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     };
     let plan = match req.format {
         Format::Folder => {
-            let paths: Vec<String> = source.files().iter().map(|f| f.path.clone()).collect();
-            findings.extend(crate::extract::extraction_findings(
-                &paths,
-                source.empty_dirs(),
-                crate::extract::CASE_INSENSITIVE,
-            ));
+            // On FreeBSD the names are checked once the probe has seen the destination.
+            #[cfg(not(target_os = "freebsd"))]
+            {
+                let paths: Vec<String> = source.files().iter().map(|f| f.path.clone()).collect();
+                findings.extend(crate::extract::extraction_findings(
+                    &paths,
+                    source.empty_dirs(),
+                    crate::extract::CASE_INSENSITIVE,
+                ));
+            }
             largest = source.files().iter().map(|f| f.size).max().unwrap_or(0);
             Some(Plan::Folder)
         }
@@ -389,44 +439,99 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
         largest = size;
     }
     let dir = out.parent().expect("output_path gives a parent");
-    let (space, notes) = preflight::destination(dir, need, largest);
-    findings.extend(space);
-    for note in notes {
+    // U7: so a probe that fails because the drive went away says so.
+    #[cfg(target_os = "freebsd")]
+    ctx.watch(dir);
+    let checked = preflight::destination(dir, need, largest, ctx.cancel);
+    findings.extend(checked.findings);
+    for note in checked.notes {
         ctx.log(note);
+    }
+    // U2: folder names as the destination folds them; with no probe, as if it folds.
+    #[cfg(target_os = "freebsd")]
+    if let Some(Plan::Folder) = &plan {
+        let paths: Vec<String> = source.files().iter().map(|f| f.path.clone()).collect();
+        let (folds, ascii_only) = checked
+            .dest
+            .as_ref()
+            .map_or((true, false), |d| (d.folds_names, d.ascii_only));
+        findings.extend(preflight::folder_names(
+            &paths,
+            source.empty_dirs(),
+            folds,
+            ascii_only,
+        ));
     }
     let Some(plan) = plan.filter(|_| findings.is_empty()) else {
         bail!("preflight failed:\n  {}", findings.join("\n  "));
     };
+    #[cfg(target_os = "freebsd")]
+    let dest = checked.dest.context("the destination was not probed")?;
     ctx.progress("preflight", 1, 1);
-    // Write reads every source byte once, verify reads them back once.
+    // The UFS2 indirect-block seam is sampled in a `.ffpkg`, alone or inside a `.ffpfsc`.
+    let mode = if req.full_verify {
+        Mode::Full
+    } else {
+        Mode::Fast {
+            seed: verify::fresh_seed()?,
+            seam: matches!(
+                plan,
+                Plan::Image(Image::Ffpkg(_)) | Plan::Ffpfsc(Image::Ffpkg(_), _)
+            ),
+        }
+    };
+    let summary = verify::summary(source.files(), mode);
+    // Write reads every source byte once, verify reads back what `mode` samples.
     let file_bytes = source
         .files()
         .iter()
         .fold(0u64, |sum, f| sum.saturating_add(f.size));
-    ctx.expect_rest(file_bytes.saturating_mul(2));
+    ctx.expect_rest(file_bytes.saturating_add(summary.checked_bytes));
 
     let part_path = part_path(&out, ctx.job);
-    let mut hashing = HashingTree::new(source.as_mut());
+    // Reads run one range ahead on their own thread; hashing stays here, and `HashingTree`
+    // sees exactly the calls and bytes it would without read-ahead.
+    let mut ahead = Prefetch::new(source).context("starting the read-ahead thread")?;
+    let mut hashing = HashingTree::new(&mut ahead);
+    #[cfg(target_os = "freebsd")]
+    let mut cadence = crate::durable::Cadence::new();
     // The image `.part` stays open from creation to verification, so what is verified is
     // the file this job wrote, whatever happens to its name meanwhile.
     let (part, image, bytes, wrapped) = match &plan {
         Plan::Folder => {
-            let part = Part::create_dir(&part_path)?;
+            #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+            let mut part = Part::create_dir(&part_path)?;
+            #[cfg(target_os = "freebsd")]
+            part.set_dest(&dest);
             let bytes = crate::extract::write(&mut hashing, &part, ctx)?;
             (part, None, bytes, None)
         }
         Plan::Image(image) => {
-            let (part, mut file) = Part::create_file(&part_path)?;
+            // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
+            #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+            let (mut part, mut file) = Part::create_file(&part_path)?;
+            #[cfg(target_os = "freebsd")]
+            part.set_dest(&dest);
+            #[cfg(not(target_os = "freebsd"))]
             let (size, line) = image.write(&mut hashing, &mut file, ctx)?;
+            #[cfg(target_os = "freebsd")]
+            let (size, line) = synced(&mut file, &mut cadence, ctx, |out| {
+                image.write(&mut hashing, out, ctx)
+            })?;
             ctx.log(format!("wrote {line}"));
             (part, Some(file), size, None)
         }
         Plan::Ffpfsc(image, name) => {
-            let (part, mut file) = Part::create_file(&part_path)?;
+            // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
+            #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+            let (mut part, mut file) = Part::create_file(&part_path)?;
+            #[cfg(target_os = "freebsd")]
+            part.set_dest(&dest);
             let opts = WrapOptions {
                 threads: req.compression_threads.unwrap_or(0),
                 ..WrapOptions::default()
             };
+            #[cfg(not(target_os = "freebsd"))]
             let (line, report) = ps5_dump_forge_pfs::wrap(
                 name,
                 image.size(),
@@ -435,6 +540,12 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
                 ctx.cancel,
                 |stream| Ok(image.write(&mut hashing, stream, ctx)?.1),
             )?;
+            #[cfg(target_os = "freebsd")]
+            let (line, report) = synced(&mut file, &mut cadence, ctx, |out| {
+                ps5_dump_forge_pfs::wrap(name, image.size(), out, &opts, ctx.cancel, |stream| {
+                    Ok(image.write(&mut hashing, stream, ctx)?.1)
+                })
+            })?;
             ctx.log(format!(
                 "wrote .ffpfsc: {} bytes holding {name} ({line}); {} of {} blocks compressed",
                 report.image_size, report.compressed_blocks, report.blocks
@@ -442,13 +553,15 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             (part, Some(file), report.image_size, Some(report))
         }
     };
+    // On FreeBSD `synced` has synced it.
+    #[cfg(not(target_os = "freebsd"))]
     if let Some(file) = &image {
         file.sync_all().context("syncing the image")?;
     }
     ctx.check()?;
 
     ctx.progress("verify", 0, 1);
-    let expected = hashing.expected(ctx)?;
+    let expected = hashing.expected(ctx, mode)?;
     ctx.check()?;
     let label = part.path().display().to_string();
     let mut checks = match (&plan, image) {
@@ -461,7 +574,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             if tree.root() != part.path() {
                 bail!("{} was replaced while verifying", part.path().display());
             }
-            verify::compare(&expected, &mut tree, ctx)?
+            verify::compare(&expected, &mut tree, ctx, mode)?
         }
         (Plan::Image(Image::Exfat(_)), Some(file)) => {
             let mut checks = image_checks(&file, bytes)?;
@@ -472,7 +585,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             ctx.check()?;
             let mut tree =
                 ExFatSource::from_volume(volume, format!("exfat {label}")).map_err(reopen)?;
-            checks.extend(verify::compare(&expected, &mut tree, ctx)?);
+            checks.extend(verify::compare(&expected, &mut tree, ctx, mode)?);
             checks
         }
         (Plan::Image(Image::Ffpkg(layout)), Some(file)) => {
@@ -481,7 +594,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             let mut tree = Ufs2Source::from_reader(Box::new(file), format!("ffpkg {label}"))
                 .map_err(reopen)?;
             checks.push(format!("reader: {}", tree.describe()));
-            checks.extend(verify::compare(&expected, &mut tree, ctx)?);
+            checks.extend(verify::compare(&expected, &mut tree, ctx, mode)?);
             checks
         }
         (Plan::Image(Image::Ffpfs(_)), Some(file)) => {
@@ -489,7 +602,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             let mut tree =
                 PfsSource::from_reader(Box::new(file), format!("ffpfs {label}")).map_err(reopen)?;
             checks.push(pfs_geometry(tree.header())?);
-            checks.extend(verify::compare(&expected, &mut tree, ctx)?);
+            checks.extend(verify::compare(&expected, &mut tree, ctx, mode)?);
             checks
         }
         (Plan::Ffpfsc(inner, name), Some(file)) => {
@@ -508,7 +621,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             let geometry = image_geometry(inner, Box::new(nested), &format!("{label} ({name})"))?;
             checks.extend(geometry.into_iter().map(|c| format!("inner image {c}")));
             ctx.check()?;
-            checks.extend(verify::compare(&expected, tree.as_mut(), ctx)?);
+            checks.extend(verify::compare(&expected, tree.as_mut(), ctx, mode)?);
             checks
         }
         _ => unreachable!("image plans keep their file"),
@@ -530,6 +643,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
         bytes,
         files: expected.files.len() as u64,
         checks,
+        verify: summary,
     })
 }
 
@@ -892,7 +1006,14 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
         std::fs::rename(&other, &path).unwrap();
-        assert!(stamp.check().is_err());
+        // Not on msdosfs: the renamed file takes the old slot's id (see `SourceStamp`).
+        #[cfg(target_os = "freebsd")]
+        let fat = crate::dest::fstype_of(&dir).unwrap() == "msdosfs";
+        #[cfg(not(target_os = "freebsd"))]
+        let fat = false;
+        if !fat {
+            assert!(stamp.check().is_err());
+        }
         // A folder source is checked per file by the scanner instead.
         SourceStamp::take(&dir, Kind::Folder)
             .unwrap()

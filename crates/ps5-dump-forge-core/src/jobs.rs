@@ -100,6 +100,8 @@ impl Inner {
         // job can arrive before this job's Done. A panicking `emit` still dequeues.
         let _leave = Leave(self, job);
         let result = self.wait_turn(job, cancel).and_then(|()| {
+            #[cfg(target_env = "ps5")]
+            let _awake = PowerTick::start();
             let ctx = Ctx::new(job, &self.emit, cancel);
             match catch_unwind(AssertUnwindSafe(|| crate::convert::run(request, &ctx))) {
                 Ok(result) => result,
@@ -150,6 +152,51 @@ impl Drop for Leave<'_> {
     }
 }
 
+/// U8: holds off the console's auto rest mode while a job runs, by calling
+/// `sceSystemServicePowerTick` now and every [`PowerTick::EVERY`] on a thread of its own.
+/// Dropping it (the job ended, or unwound) stops and joins the thread at once. Rest mode
+/// entered by hand is not held off.
+#[cfg(target_env = "ps5")]
+struct PowerTick(Option<(std::sync::mpsc::Sender<()>, JoinHandle<()>)>);
+
+#[cfg(target_env = "ps5")]
+impl PowerTick {
+    const EVERY: Duration = Duration::from_secs(30);
+
+    fn start() -> Self {
+        unsafe extern "C" {
+            /// libSceSystemService: resets the idle timer auto rest mode counts.
+            fn sceSystemServicePowerTick() -> i32;
+        }
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        // ponytail: a thread that fails to start, or a failing tick, goes unreported: the job
+        // still runs, and auto rest mode may cut it short.
+        let thread = std::thread::Builder::new()
+            .name("forge-power-tick".into())
+            .spawn(move || {
+                use std::sync::mpsc::RecvTimeoutError;
+                loop {
+                    // SAFETY: no arguments, no memory handed over.
+                    let _ = unsafe { sceSystemServicePowerTick() };
+                    if stopped.recv_timeout(Self::EVERY) != Err(RecvTimeoutError::Timeout) {
+                        return;
+                    }
+                }
+            });
+        Self(thread.ok().map(|t| (stop, t)))
+    }
+}
+
+#[cfg(target_env = "ps5")]
+impl Drop for PowerTick {
+    fn drop(&mut self) {
+        if let Some((stop, thread)) = self.0.take() {
+            drop(stop); // wakes the ticker's wait as disconnected
+            let _ = thread.join();
+        }
+    }
+}
+
 /// How often progress for the same stage is passed on. Writers report per chunk and per
 /// file; a quarter of a million events would only flood the UI.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
@@ -167,6 +214,9 @@ pub(crate) struct Ctx<'a> {
     base: Cell<u64>,
     /// (done, total) of the running pass.
     pass: Cell<(u64, u64)>,
+    /// U7: the source's and destination's mount points, with their `st_dev` at job start.
+    #[cfg(target_os = "freebsd")]
+    pub mounts: RefCell<Vec<crate::durable::Watched>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -180,6 +230,25 @@ impl<'a> Ctx<'a> {
             expected: Cell::new(0),
             base: Cell::new(0),
             pass: Cell::new((0, 0)),
+            #[cfg(target_os = "freebsd")]
+            mounts: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Records the mount point `path` is on (`statfs`), once, with its `st_dev`, for the
+    /// drive-removal check (U7); `path` itself where `statfs` fails. A path that cannot be
+    /// stat'ed is skipped: the job fails on it anyway.
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn watch(&self, path: &std::path::Path) {
+        let (path, mount) = match crate::dest::mount_of(path) {
+            Ok(mount) => (mount, true),
+            Err(_) => (path.to_path_buf(), false),
+        };
+        let mut watched = self.mounts.borrow_mut();
+        if watched.iter().all(|w| w.path != path)
+            && let Ok((dev, _)) = crate::dest::mount_state(&path)
+        {
+            watched.push(crate::durable::Watched { path, dev, mount });
         }
     }
 

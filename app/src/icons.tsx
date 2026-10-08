@@ -17,6 +17,8 @@ const PATHS = {
   info: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 11v5.5M12 7.7v.3",
   finder: "M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5zM12 4v16M8 9v1.5M16 9v1.5M8.5 15.5c2 1.3 5 1.3 7 0",
   file: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5",
+  up: "M12 19V5M6 11l6-6 6 6",
+  power: "M12 3v8M7.1 6.2a7.5 7.5 0 1 0 9.8 0",
 } as const;
 
 export type IconName = keyof typeof PATHS;

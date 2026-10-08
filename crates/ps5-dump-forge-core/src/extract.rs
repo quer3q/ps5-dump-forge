@@ -212,9 +212,9 @@ impl Dest {
         let dirs: Vec<String> = self.created.iter().cloned().collect();
         for rel in dirs {
             ctx.check()?;
-            at::sync(&self.dir(&rel)?).with_context(|| format!("syncing {rel}/"))?;
+            at::sync(&self.dir(&rel)?, ctx.cancel).with_context(|| format!("syncing {rel}/"))?;
         }
-        at::sync(&self.root).context("syncing the .part folder")
+        at::sync(&self.root, ctx.cancel).context("syncing the .part folder")
     }
 }
 
@@ -228,6 +228,7 @@ mod at {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
 
     pub(super) type Dir = OwnedFd;
 
@@ -285,8 +286,15 @@ mod at {
         crate::finalize::handle_id(&File::from(dir.try_clone()?))
     }
 
-    pub(super) fn sync(dir: &Dir) -> io::Result<()> {
+    #[cfg(not(target_os = "freebsd"))]
+    pub(super) fn sync(dir: &Dir, _: &AtomicBool) -> io::Result<()> {
         File::from(dir.try_clone()?).sync_all()
+    }
+
+    /// With ps5upload's retries; a filesystem without directory fsync is fine (U4).
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn sync(dir: &Dir, cancel: &AtomicBool) -> io::Result<()> {
+        crate::durable::sync_retry(&File::from(dir.try_clone()?), true, cancel).map(drop)
     }
 }
 
@@ -298,6 +306,7 @@ mod at {
     use std::fs::File;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
 
     pub(super) type Dir = PathBuf;
 
@@ -325,7 +334,7 @@ mod at {
         crate::finalize::path_id(dir).map(|(id, _)| id)
     }
 
-    pub(super) fn sync(_: &Dir) -> io::Result<()> {
+    pub(super) fn sync(_: &Dir, _: &AtomicBool) -> io::Result<()> {
         Ok(())
     }
 }
@@ -341,9 +350,16 @@ pub(crate) fn write(tree: &mut dyn SourceTree, part: &Part, ctx: &Ctx) -> anyhow
         .context("total size overflows")?;
     let mut dest = Dest::open(part)?;
     let mut done = 0u64;
+    // The job's one cadence (U5): what one file measured carries over to the next. Each file
+    // is synced when it is complete, so no dirty bytes carry across files.
+    #[cfg(target_os = "freebsd")]
+    let mut cadence = crate::durable::Cadence::new();
     for file in &files {
         ctx.check()?;
+        #[cfg_attr(target_os = "freebsd", allow(unused_mut))]
         let mut out = dest.create(&file.path)?;
+        #[cfg(target_os = "freebsd")]
+        let mut out = crate::durable::SyncEvery::new(out, &mut cadence, ctx.cancel);
         let mut offset = 0u64;
         while offset < file.size {
             ctx.check()?;
@@ -369,8 +385,15 @@ pub(crate) fn write(tree: &mut dyn SourceTree, part: &Part, ctx: &Ctx) -> anyhow
             done += buf.len() as u64;
             ctx.progress("write", done, total);
         }
+        #[cfg(not(target_os = "freebsd"))]
         out.sync_all()
             .with_context(|| format!("syncing {}", file.path))?;
+        #[cfg(target_os = "freebsd")]
+        {
+            out.finish()
+                .with_context(|| format!("syncing {}", file.path))?;
+            crate::convert::log_cadence(&mut cadence, ctx);
+        }
     }
     for dir in &empty_dirs {
         ctx.check()?;

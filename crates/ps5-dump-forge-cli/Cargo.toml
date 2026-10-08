@@ -14,3 +14,8 @@ anyhow.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 ps5-dump-forge-core.workspace = true
+ps5-dump-forge-server.workspace = true
+
+[lints.rust]
+# `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` (README.md, "PS5 payload internals").
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_env, values("ps5"))'] }

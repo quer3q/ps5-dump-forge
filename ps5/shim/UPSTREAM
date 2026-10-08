@@ -1,0 +1,9 @@
+Every file in this folder, plus ../x86_64-ps5-freebsd.json and ../prepare-rust-std.py, is copied
+unchanged from ps5-ai-cli (GPL-3.0-or-later):
+
+  https://github.com/saawant12/ps5-ai-cli  commit eb1d494 (2026-10-04)
+  platform/{freebsd11.c, its #included .c files, compat.h, syscalls.S, syscalls.link}
+  targets/x86_64-ps5-freebsd.json, tools/prepare-rust-std.py
+
+It verified this set on a PS5 at firmware 13.60 (Rust std: threads, files, Tokio). Keep it
+byte-identical; carry our own changes in ../entry.c and ../linker.sh.

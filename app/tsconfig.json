@@ -11,6 +11,8 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "types": ["vite/client"],
+    // vite.config.ts points this at transport-http.tsx for `--mode http`.
+    "paths": { "forge-transport": ["./src/transport-tauri.tsx"] },
     "noEmit": true
   },
   "include": ["src", "vite.config.ts"]

@@ -10,13 +10,20 @@ use serde::{Deserialize, Serialize};
 
 mod backport;
 mod convert;
+// The PS5 (FreeBSD) destination probe; also built for macOS tests.
+#[cfg(any(target_os = "freebsd", all(test, target_os = "macos")))]
+mod dest;
 mod dlc;
+// Wired into the PS5 (FreeBSD) build only; tested everywhere.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+mod durable;
 mod extract;
 mod finalize;
 mod inspect;
 mod jobs;
 mod package;
 mod portable;
+mod prefetch;
 mod preflight;
 mod scan;
 mod sdk;
@@ -67,6 +74,10 @@ pub struct ConvertRequest {
     /// ([`Inspection::backport`]). Preflight refuses when [`Inspection::backport_blocked`] would.
     #[serde(default)]
     pub remove_backport: bool,
+    /// Re-read every byte of the output; unset, verification is fast: every structural check
+    /// and a seeded sample of the content ([`VerifySummary`]). A `.pkg` is always verified in full.
+    #[serde(default)]
+    pub full_verify: bool,
 }
 
 pub type JobId = u64;
@@ -103,6 +114,32 @@ pub struct JobReport {
     pub files: u64,
     /// Verification lines, one per check.
     pub checks: Vec<String>,
+    pub verify: VerifySummary,
+}
+
+/// How a job's output content was verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyMode {
+    /// Small files whole, a seeded sample of the slices of larger ones.
+    Fast,
+    /// Every byte.
+    Full,
+}
+
+/// What the content comparison read back. Structural checks (geometry, manifest, sizes, empty
+/// dirs, the `.ffpfsc` container) run in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct VerifySummary {
+    pub mode: VerifyMode,
+    /// Bytes of file content read back and compared.
+    pub checked_bytes: u64,
+    /// Bytes of file content the output holds.
+    pub total_bytes: u64,
+    /// Ranges compared (whole files and 8 MiB slices); 0 in full mode.
+    pub samples: u64,
+    /// The sample plan's seed, below 2^53 so JSON readers keep it exact; 0 in full mode.
+    pub seed: u64,
 }
 
 /// Runs jobs on worker threads: one heavy job at a time, the rest queue.
@@ -249,4 +286,21 @@ pub(crate) fn test_dir(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Whether a test's hard link or symlink `made` it: false only where the volume cannot make
+/// one at all (EOPNOTSUPP/ENOTSUP, FreeBSD's msdosfs); any other error fails the test.
+#[cfg(test)]
+pub(crate) fn supported(made: std::io::Result<()>, what: &str) -> bool {
+    match made {
+        Ok(()) => true,
+        #[cfg(unix)]
+        Err(e)
+            if crate::durable::errno(&e)
+                .is_some_and(|c| c == libc::EOPNOTSUPP || c == libc::ENOTSUP) =>
+        {
+            false
+        }
+        Err(e) => panic!("{what}: {e}"),
+    }
 }

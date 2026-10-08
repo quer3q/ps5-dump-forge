@@ -1,7 +1,13 @@
-// Typed IPC for app/src-tauri/src/main.rs. Types mirror crates/ps5-dump-forge-core/src/lib.rs.
+// Typed IPC for app/src-tauri/src/main.rs, or the same commands over HTTP
+// (crates/ps5-dump-forge-server) in the http build. Types mirror
+// crates/ps5-dump-forge-core/src/lib.rs.
 
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { transport } from "forge-transport";
+import type { PickOptions, Unlisten } from "./transport";
+
+type UnlistenFn = Unlisten;
+const invoke = transport.call;
+const listen = transport.listen;
 
 export type Format = "folder" | "exfat" | "ffpkg" | "ffpfs" | "ffpfsc" | "pkg";
 /** What a source can be: every target format is also read. */
@@ -21,6 +27,18 @@ export interface ConvertRequest {
   /** Leave the backport libraries (not the emulators) out of fakelib/; refused when the
    * executables' SDK was lowered. */
   remove_backport: boolean;
+  /** Re-read every byte of the output; `false`: fast (sampled) verification. A `.pkg` is
+   * always fully verified. */
+  full_verify: boolean;
+}
+
+/** How the output was verified. `samples` and `seed` are 0 for full. */
+export interface VerifyReport {
+  mode: "fast" | "full";
+  checked_bytes: number;
+  total_bytes: number;
+  samples: number;
+  seed: number;
 }
 
 export interface JobReport {
@@ -28,6 +46,8 @@ export interface JobReport {
   bytes: number;
   files: number;
   checks: string[];
+  /** Missing from older servers and restored reports. */
+  verify?: VerifyReport;
 }
 
 /** serde's externally tagged `Result<JobReport, String>`. */
@@ -109,6 +129,34 @@ export interface Inspection {
   findings: string[];
 }
 
+/** One job in `GET /api/jobs` (http build): what a reloaded page rebuilds its list from. */
+export interface SnapshotJob {
+  id: JobId;
+  request: ConvertRequest | null;
+  progress: ProgressEvent | null;
+  done: DoneEvent | null;
+  /** The last lines (the server keeps 200). */
+  log: string[];
+  /** Lines ever logged; `log` ends at this count. */
+  log_total: number;
+}
+
+/** Jobs the page doesn't know yet; `replace`: the whole list (first snapshot after loading, or
+ * after the payload restarted). */
+export interface JobsRestore {
+  replace: boolean;
+  jobs: SnapshotJob[];
+}
+
+/** The http build: a browser on the LAN, paths are the server's, nothing is revealed locally. */
+export const web = transport.web;
+
+/** A folder or file chosen in the native dialog, or (http build) the server's folder browser. */
+export const pick = (o: PickOptions): Promise<string | null> => transport.pick(o);
+
+/** The server can't be reached (http build); polling goes on. */
+export const useOffline = transport.useOffline;
+
 export const api = {
   inspect: (path: string) => invoke<Inspection>("inspect", { path }),
   defaultOutput: (source: string, format: Format, dir: string) =>
@@ -125,21 +173,25 @@ export const api = {
   /** Leftover `.part` files in these folders (deduplicated, missing ones skipped). */
   staleParts: (dirs: string[]) => invoke<string[]>("stale_parts", { dirs }),
   /** Show a finished job's output in Finder, Explorer or its folder (Rust looks the path up by
-   * job id). */
+   * job id). The http build does nothing here: the job row shows the path instead. */
   reveal: (id: JobId) => invoke<void>("reveal", { id }),
-  /** Cancel every job, wait for cleanup, exit. */
+  /** Cancel every job, wait for cleanup, exit. http build: resolves once the server is gone. */
   quitApp: () => invoke<void>("quit_app"),
 };
 
 export const events = {
   progress: (f: (e: ProgressEvent) => void): Promise<UnlistenFn> =>
-    listen<ProgressEvent>("job://progress", (e) => f(e.payload)),
+    listen<ProgressEvent>("job://progress", f),
   log: (f: (e: LogEvent) => void): Promise<UnlistenFn> =>
-    listen<LogEvent>("job://log", (e) => f(e.payload)),
+    listen<LogEvent>("job://log", f),
   done: (f: (e: DoneEvent) => void): Promise<UnlistenFn> =>
-    listen<DoneEvent>("job://done", (e) => f(e.payload)),
-  /** A close/quit was held back because jobs are running. */
+    listen<DoneEvent>("job://done", f),
+  /** A close/quit was held back because jobs are running. Never in the http build. */
   closeRequested: (f: () => void): Promise<UnlistenFn> => listen("close-requested", () => f()),
+  /** http build: jobs from the server's list (after loading, a payload restart, or another
+   * browser's Build). Never in the app. */
+  restore: (f: (e: JobsRestore) => void): Promise<UnlistenFn> =>
+    listen<JobsRestore>("jobs://restore", f),
 };
 
 /** Invoke errors arrive as the command's `String` error. */

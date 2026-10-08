@@ -1,9 +1,11 @@
 // Shell: header with tabs, the job list (fed by events), and the close-while-running prompt.
-// Nothing is saved: what the screens remember lasts until the app closes.
+// Nothing is saved: what the screens remember lasts until the app closes. The http build adds
+// "Stop PS5 Dump Forge" to the header (there's no window to close) and rebuilds the job list
+// from the server's.
 
 import { useEffect, useReducer, useState } from "react";
 
-import { api, events, prettyDuration } from "./api";
+import { api, errorText, events, prettyDuration, useOffline, web } from "./api";
 import logo from "./assets/logo.png";
 import { basename, dirname, panelId, tabId, TabList } from "./common";
 import { Convert } from "./Convert";
@@ -17,7 +19,8 @@ type Tab = "convert" | "inspect" | "formats";
 export function App() {
   const [tab, setTab] = useState<Tab>("convert");
   const [jobs, dispatch] = useReducer(jobsReducer, []);
-  const [closing, setClosing] = useState<"ask" | "stopping" | null>(null);
+  const [closing, setClosing] = useState<"ask" | "stopping" | "stopped" | "failed" | null>(null);
+  const offline = useOffline();
 
   useEffect(() => {
     const subs = [
@@ -25,23 +28,32 @@ export function App() {
       events.log((e) => dispatch({ type: "log", e })),
       events.done((e) => dispatch({ type: "done", e })),
       events.closeRequested(() => setClosing((c) => c ?? "ask")),
+      events.restore((e) => dispatch({ type: "restore", e, at: Date.now() })),
     ];
     return () => {
       subs.forEach((p) => p.then((unlisten) => unlisten()));
     };
   }, []);
 
-  const quit = async () => {
-    setClosing("stopping");
-    try {
-      await api.quitApp();
-    } catch {
-      setClosing("ask");
-    }
-  };
-
   const unfinished = jobs.filter((j) => !j.result);
   const active = unfinished.length;
+
+  const [quitError, setQuitError] = useState<string | null>(null);
+  const quit = async () => {
+    setClosing("stopping");
+    setQuitError(null);
+    try {
+      await api.quitApp();
+      // The app exits on its own; the http build's page stays, saying so.
+      if (web) setClosing("stopped");
+    } catch (e) {
+      if (!web) return setClosing("ask");
+      setQuitError(errorText(e));
+      setClosing("failed");
+    }
+  };
+  // http build: stopping the payload asks first only while jobs run.
+  const askStop = () => (active > 0 ? setClosing("ask") : void quit());
 
   // Folders this session wrote outputs to: interrupted jobs leave `.part` files there.
   const [outputDirs, setOutputDirs] = useState<string[]>([]);
@@ -91,6 +103,19 @@ export function App() {
                 { id: "formats", label: "About formats" },
               ]}
             />
+            {web && (
+              <div className="top-actions">
+                {offline && (
+                  <span className="tag orange" role="status">
+                    Offline, retrying…
+                  </span>
+                )}
+                <button className="small" onClick={askStop}>
+                  <Icon name="power" />
+                  Stop PS5 Dump Forge
+                </button>
+              </div>
+            )}
           </div>
         </header>
         {/* Screens stay mounted so a half-filled form survives a tab switch. */}
@@ -162,8 +187,8 @@ export function App() {
                     ))}
                   </ul>
                   <p className="muted">
-                    Quitting stops {unfinished.length === 1 ? "it" : "them"} and deletes the
-                    unfinished output.
+                    {web ? "Stopping PS5 Dump Forge" : "Quitting"} stops{" "}
+                    {unfinished.length === 1 ? "it" : "them"} and deletes the unfinished output.
                   </p>
                 </div>
                 <div className="row end">
@@ -171,17 +196,57 @@ export function App() {
                     Keep running
                   </button>
                   <button className="danger" onClick={quit}>
-                    {unfinished.length === 1 ? "Stop job and quit" : "Stop jobs and quit"}
+                    {web
+                      ? "Stop PS5 Dump Forge"
+                      : unfinished.length === 1
+                        ? "Stop job and quit"
+                        : "Stop jobs and quit"}
+                  </button>
+                </div>
+              </>
+            ) : closing === "stopping" ? (
+              <div className="modal-head">
+                <span className="spinner" aria-hidden="true" />
+                <h2 id="quit-title">
+                  <span id="quit-text">
+                    {active > 0 || !web ? "Stopping jobs and cleaning up…" : "Stopping PS5 Dump Forge…"}
+                  </span>
+                </h2>
+              </div>
+            ) : closing === "failed" ? (
+              <>
+                <div className="modal-head">
+                  <span className="head-icon warn">
+                    <Icon name="alert" />
+                  </span>
+                  <h2 id="quit-title">Couldn't stop PS5 Dump Forge</h2>
+                </div>
+                <p className="muted" id="quit-text">
+                  {quitError}
+                </p>
+                <div className="row end">
+                  <button autoFocus onClick={() => setClosing(null)}>
+                    Close
+                  </button>
+                  <button className="danger" onClick={quit}>
+                    Try again
                   </button>
                 </div>
               </>
             ) : (
-              <div className="modal-head">
-                <span className="spinner" aria-hidden="true" />
-                <h2 id="quit-title">
-                  <span id="quit-text">Stopping jobs and cleaning up…</span>
-                </h2>
-              </div>
+              <>
+                <div className="modal-head">
+                  <span className="head-icon">
+                    <Icon name="power" />
+                  </span>
+                  <h2 id="quit-title" tabIndex={-1} ref={(el) => el?.focus()}>
+                    PS5 Dump Forge has stopped
+                  </h2>
+                </div>
+                <p className="muted" id="quit-text">
+                  Start the payload on the PS5 again to use it, then reload this page.
+                </p>
+              </>
             )}
           </div>
         </div>

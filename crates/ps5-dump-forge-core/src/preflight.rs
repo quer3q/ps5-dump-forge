@@ -1,8 +1,10 @@
 //! Checks made before anything is written. Each returns findings, so a
 //! job can report every problem at once instead of failing on the first.
 
+#[cfg(not(target_os = "freebsd"))]
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, bail};
 use ps5upload_fpkg::source::{SourceTree, title_id_from_content_id};
@@ -234,9 +236,20 @@ pub(crate) fn estimate(tree: &dyn SourceTree) -> u64 {
     files.saturating_add(files / 50).saturating_add(64 * MIB)
 }
 
+/// What [`destination`] found: findings refuse the job, notes are logged.
+pub(crate) struct Destination {
+    pub findings: Vec<String>,
+    pub notes: Vec<String>,
+    /// What the probe saw, for folder findings and publishing; None when it failed (then
+    /// `findings` says why).
+    #[cfg(target_os = "freebsd")]
+    pub dest: Option<crate::dest::Dest>,
+}
+
 /// Free space and the 4 GiB file limit, on the folder the output goes to. `largest` is the
 /// biggest single file the output creates.
-pub(crate) fn destination(dir: &Path, need: u64, largest: u64) -> (Vec<String>, Vec<String>) {
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -> Destination {
     let mut findings = Vec::new();
     let mut notes = Vec::new();
     match fs_stat(dir) {
@@ -266,10 +279,81 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64) -> (Vec<String>, 
             dir.display()
         )),
     }
-    (findings, notes)
+    Destination { findings, notes }
 }
 
-#[cfg(unix)]
+/// The same checks on what the destination probe saw (U1 in README.md). A USB drive is
+/// never tested on hardware, so this fails closed: a probe that fails refuses the job.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBool) -> Destination {
+    let dest = match crate::dest::probe(dir, cancel) {
+        Ok(dest) => dest,
+        Err(e) => {
+            return Destination {
+                findings: vec![format!("{e:#}")],
+                notes: Vec::new(),
+                dest: None,
+            };
+        }
+    };
+    let mut findings = Vec::new();
+    let mut notes = vec![dest.describe()];
+    notes.extend(dest.notes.iter().cloned());
+    if need > dest.free {
+        // Sony's exFAT shows space a delete freed as used for a while (U6).
+        findings.push(format!(
+            "not enough space in {}: about {} MiB needed, {} MiB free (space a delete just \
+             freed may still be being freed; try again in a minute)",
+            dir.display(),
+            need.div_ceil(MIB),
+            dest.free / MIB
+        ));
+    }
+    if largest > dest.max_file {
+        let limit = if dest.max_file == FAT_MAX_FILE {
+            "4 GiB".to_string()
+        } else {
+            format!("{} bytes", dest.max_file)
+        };
+        findings.push(format!(
+            "{} ({}) cannot hold a file over {limit} ({largest} bytes needed)",
+            dir.display(),
+            dest.fstype
+        ));
+    }
+    Destination {
+        findings,
+        notes,
+        dest: Some(dest),
+    }
+}
+
+/// Folder output's name findings on a destination that `folds` names, plus every non-ASCII
+/// path when it refuses non-ASCII names (U2).
+#[cfg(any(target_os = "freebsd", test))]
+pub(crate) fn folder_names(
+    files: &[String],
+    empty_dirs: &[String],
+    folds: bool,
+    ascii_only: bool,
+) -> Vec<String> {
+    let mut findings = crate::extract::extraction_findings(files, empty_dirs, folds);
+    if ascii_only {
+        let bad: Vec<String> = files
+            .iter()
+            .chain(empty_dirs)
+            .filter(|p| !p.is_ascii())
+            .cloned()
+            .collect();
+        findings.extend(listing(
+            "name not ASCII (the output folder refuses non-ASCII names)",
+            &bad,
+        ));
+    }
+    findings
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -323,8 +407,13 @@ fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
 }
 
 // ponytail: other OSes are not wired; the job logs that the checks were skipped and ENOSPC
-// still fails the write.
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+// still fails the write. FreeBSD (the PS5) probes the folder instead.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    windows,
+    target_os = "freebsd"
+)))]
 fn fs_stat(_: &Path) -> io::Result<(u64, io::Result<bool>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -388,13 +477,34 @@ mod tests {
         assert!(lines.last().unwrap().contains("5 more"));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn free_space_is_known_here() {
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
-            let (free, fat) = fs_stat(Path::new(".")).unwrap();
-            assert!(free > 0);
-            fat.unwrap();
-        }
+        let (free, fat) = fs_stat(Path::new(".")).unwrap();
+        assert!(free > 0);
+        fat.unwrap();
+    }
+
+    #[test]
+    fn folder_names_follow_the_probe() {
+        let paths = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let pair = paths(&["Eboot.bin", "eboot.bin"]);
+        assert_eq!(folder_names(&pair, &[], true, false).len(), 1);
+        assert!(folder_names(&pair, &[], false, false).is_empty());
+        // NFC and NFD spellings collide only where names fold.
+        let nfc = paths(&["caf\u{e9}", "cafe\u{301}"]);
+        assert_eq!(folder_names(&nfc, &[], true, false).len(), 1);
+        assert!(folder_names(&nfc, &[], false, false).is_empty());
+        let files = paths(&["eboot.bin", "sce_sys/caf\u{e9}.png", "\u{e9}/a"]);
+        let dirs = paths(&["data/\u{fc}"]);
+        assert!(folder_names(&files, &dirs, true, false).is_empty());
+        let found = folder_names(&files, &dirs, false, true);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found.iter().all(|l| l.contains("name not ASCII")),
+            "{found:?}"
+        );
+        assert!(found[2].ends_with("data/\u{fc}"), "{found:?}");
     }
 
     /// CI's temp folder is on NTFS; the canonical form is a `\\?\` path.

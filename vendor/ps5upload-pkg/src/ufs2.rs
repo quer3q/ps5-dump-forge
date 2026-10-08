@@ -339,7 +339,13 @@ pub struct DirEntry {
 pub struct Ufs2Image<R: Read + Seek> {
     reader: R,
     pub superblock: Superblock,
+    /// The last pointer block read at each indirection depth (0 = the one naming data
+    /// blocks), keyed by its fragment (0 = empty). Consecutive [`Ufs2Image::read_range`]
+    /// lookups land in the same pointer block, so they cost no I/O.
+    ptr_cache: PtrCache,
 }
+
+type PtrCache = [(u64, Vec<u8>); NIADDR];
 
 impl Ufs2Image<File> {
     /// Open a `.ffpkg` (or any UFS2 image) by path. Cheap — only
@@ -356,6 +362,7 @@ impl<R: Read + Seek> Ufs2Image<R> {
         Ok(Self {
             reader,
             superblock: sb,
+            ptr_cache: PtrCache::default(),
         })
     }
 }
@@ -623,6 +630,11 @@ impl<R: Read + Seek> Ufs2Image<R> {
     /// Reads past the file's end stop at the end, as a short read rather
     /// than an error. Holes read as zeros, exactly as `read_file`
     /// returns them.
+    ///
+    /// Blocks that lie back to back on disk are read together, one seek and
+    /// one read per run: UFS2 lays a file out contiguously, and a block at a
+    /// time (with its pointer lookups) held a large conversion to ~105 MB/s
+    /// on a PS5.
     pub fn read_range(
         &mut self,
         inode: &Inode,
@@ -638,29 +650,47 @@ impl<R: Read + Seek> Ufs2Image<R> {
                 cap: usize::MAX as u64,
             })?;
         let bsize = self.superblock.block_size as u64;
-        let mut out = Vec::with_capacity(want);
-        let mut pos = offset;
-        while out.len() < want {
+        let frags_per_block = bsize / u64::from(self.superblock.fragment_size).max(1);
+        let mut out = vec![0u8; want];
+        let mut done = 0usize;
+        while done < want {
+            let pos = offset + done as u64;
             let within = pos % bsize;
-            let take = (bsize - within).min((want - out.len()) as u64);
+            let take = (bsize - within).min((want - done) as u64);
             let frag = self.block_ptr(inode.number, inode, pos / bsize)?;
             if frag == 0 {
-                out.resize(out.len() + take as usize, 0);
-            } else {
-                if frag >= self.superblock.size_fragments {
-                    return Err(Ufs2Error::BlockOutOfRange {
-                        inode: inode.number,
-                        block: frag,
-                        total_blocks: self.superblock.size_fragments,
-                    });
-                }
-                let at = self.superblock.frag_offset(frag) + within;
-                let from = out.len();
-                out.resize(from + take as usize, 0);
-                self.reader.seek(SeekFrom::Start(at))?;
-                self.reader.read_exact(&mut out[from..])?;
+                // A hole: `out` is already zeros.
+                done += take as usize;
+                continue;
             }
-            pos += take;
+            if frag >= self.superblock.size_fragments {
+                return Err(Ufs2Error::BlockOutOfRange {
+                    inode: inode.number,
+                    block: frag,
+                    total_blocks: self.superblock.size_fragments,
+                });
+            }
+            // Extend the run while the next block follows this one on disk. Anything
+            // else (a hole, a jump, a bad pointer, a failed lookup) ends the run, and
+            // the next pass meets it after this run is read, as a block-at-a-time read
+            // would.
+            let mut run = take;
+            let mut last = frag;
+            while done as u64 + run < want as u64 {
+                let next = last.saturating_add(frags_per_block);
+                match self.block_ptr(inode.number, inode, (pos + run) / bsize) {
+                    Ok(f) if f == next && f < self.superblock.size_fragments => {
+                        run += bsize.min(want as u64 - done as u64 - run);
+                        last = f;
+                    }
+                    _ => break,
+                }
+            }
+            let at = self.span(inode.number, frag, within, run)?;
+            self.reader.seek(SeekFrom::Start(at))?;
+            self.reader
+                .read_exact(&mut out[done..done + run as usize])?;
+            done += run as usize;
         }
         Ok(out)
     }
@@ -693,12 +723,8 @@ impl<R: Read + Seek> Ufs2Image<R> {
                         total_blocks: self.superblock.size_fragments,
                     });
                 }
-                let at =
-                    self.superblock.frag_offset(block) + ((index / ptrs.pow(depth)) % ptrs) * 8;
-                self.reader.seek(SeekFrom::Start(at))?;
-                let mut raw = [0u8; 8];
-                self.reader.read_exact(&mut raw)?;
-                block = read_u64(&raw, 0);
+                let slot = ((index / ptrs.pow(depth)) % ptrs) as usize;
+                block = self.pointer(inode_num, depth as usize, block, slot)?;
             }
             return Ok(block);
         }
@@ -706,6 +732,50 @@ impl<R: Read + Seek> Ufs2Image<R> {
         // pointers. Zero reads as a hole, which keeps the size check in
         // read_range in charge.
         Ok(0)
+    }
+
+    /// Entry `slot` of the pointer block at fragment `block`, `depth` levels above the
+    /// data. The whole block is read once and kept, one per depth, so the next lookup in
+    /// it costs no I/O. `block` is already checked against the image.
+    fn pointer(
+        &mut self,
+        inode_num: u64,
+        depth: usize,
+        block: u64,
+        slot: usize,
+    ) -> Result<u64, Ufs2Error> {
+        let bsize = self.superblock.block_size as usize;
+        if self.ptr_cache[depth].0 != block || self.ptr_cache[depth].1.len() != bsize {
+            let at = self.span(inode_num, block, 0, bsize as u64)?;
+            let (cached, buf) = &mut self.ptr_cache[depth];
+            // Empty until the read succeeds, so a failed one is never served.
+            *cached = 0;
+            buf.resize(bsize, 0);
+            self.reader.seek(SeekFrom::Start(at))?;
+            self.reader.read_exact(buf)?;
+            *cached = block;
+        }
+        Ok(read_u64(&self.ptr_cache[depth].1, slot * 8))
+    }
+
+    /// The byte offset `within` bytes into fragment `frag`, if the `len` bytes there lie
+    /// inside the image's declared size. A forged `fs_size` lets a huge pointer pass the
+    /// fragment check; saturated offset math then wrapped to the image's first bytes (or
+    /// panicked with overflow checks on), so every step is checked instead.
+    fn span(&self, inode_num: u64, frag: u64, within: u64, len: u64) -> Result<u64, Ufs2Error> {
+        let fsize = u64::from(self.superblock.fragment_size);
+        let at = frag.checked_mul(fsize).and_then(|b| b.checked_add(within));
+        let end = at.and_then(|a| a.checked_add(len));
+        // A declared size past u64 bytes bounds nothing a u64 offset can reach.
+        let limit = self.superblock.size_fragments.checked_mul(fsize);
+        match (at, end) {
+            (Some(at), Some(end)) if limit.is_none_or(|limit| end <= limit) => Ok(at),
+            _ => Err(Ufs2Error::BlockOutOfRange {
+                inode: inode_num,
+                block: frag,
+                total_blocks: self.superblock.size_fragments,
+            }),
+        }
     }
 
     // 8 args: this is a tight recursive block-walker — `inode_num` is
@@ -1005,6 +1075,7 @@ mod tests {
             Ufs2Image {
                 reader: Cursor::new(image),
                 superblock: sb,
+                ptr_cache: PtrCache::default(),
             },
             inode,
             file,
@@ -1133,6 +1204,7 @@ mod tests {
             Ufs2Image {
                 reader: Cursor::new(image),
                 superblock: sb,
+                ptr_cache: PtrCache::default(),
             },
             dir,
         )
@@ -1216,5 +1288,434 @@ mod tests {
             img.read_inodes(u64::MAX - 1, MAX_INODE_RUN),
             Err(Ufs2Error::InodeOutOfRange { .. })
         ));
+    }
+
+    /// `read_range` as it was before runs and the pointer cache: one block per pass, its
+    /// pointer found with an 8-byte read per indirect level. The new one must match it.
+    fn read_range_by_block<R: Read + Seek>(
+        img: &mut Ufs2Image<R>,
+        inode: &Inode,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, Ufs2Error> {
+        if offset >= inode.size || len == 0 {
+            return Ok(Vec::new());
+        }
+        let want = len.min(inode.size - offset) as usize;
+        let sb = img.superblock.clone();
+        let bsize = sb.block_size as u64;
+        let ptrs = bsize / 8;
+        let mut out = Vec::with_capacity(want);
+        let mut pos = offset;
+        while out.len() < want {
+            let within = pos % bsize;
+            let take = (bsize - within).min((want - out.len()) as u64);
+            let frag = 'ptr: {
+                let index = pos / bsize;
+                if index < NDADDR as u64 {
+                    break 'ptr inode.direct[index as usize];
+                }
+                let mut index = index - NDADDR as u64;
+                for (level, root) in inode.indirect.iter().enumerate() {
+                    let span = ptrs.pow(level as u32 + 1);
+                    if index >= span {
+                        index -= span;
+                        continue;
+                    }
+                    let mut block = *root;
+                    for depth in (0..=level as u32).rev() {
+                        if block == 0 {
+                            break 'ptr 0;
+                        }
+                        if block >= sb.size_fragments {
+                            return Err(Ufs2Error::BlockOutOfRange {
+                                inode: inode.number,
+                                block,
+                                total_blocks: sb.size_fragments,
+                            });
+                        }
+                        let at = sb.frag_offset(block) + ((index / ptrs.pow(depth)) % ptrs) * 8;
+                        img.reader.seek(SeekFrom::Start(at))?;
+                        let mut raw = [0u8; 8];
+                        img.reader.read_exact(&mut raw)?;
+                        block = read_u64(&raw, 0);
+                    }
+                    break 'ptr block;
+                }
+                0
+            };
+            if frag == 0 {
+                out.resize(out.len() + take as usize, 0);
+            } else {
+                if frag >= sb.size_fragments {
+                    return Err(Ufs2Error::BlockOutOfRange {
+                        inode: inode.number,
+                        block: frag,
+                        total_blocks: sb.size_fragments,
+                    });
+                }
+                let from = out.len();
+                out.resize(from + take as usize, 0);
+                img.reader
+                    .seek(SeekFrom::Start(sb.frag_offset(frag) + within))?;
+                img.reader.read_exact(&mut out[from..])?;
+            }
+            pos += take;
+        }
+        Ok(out)
+    }
+
+    /// A file of `blocks` blocks of `bs` bytes (fragments of `fs`), the last holding `tail`
+    /// bytes, in an image of its own; with the file's expected bytes (holes as zeros). Every
+    /// data byte depends on its fragment and offset, so a block read from the wrong place
+    /// shows. `messy` breaks runs the ways an image can: pointer blocks in line before the
+    /// data they map (as FFS puts them), a gap every 29 blocks, a block put back into an
+    /// earlier gap every 41, holes at blocks 3, 12 and the second to last, and a whole hole
+    /// pointer block (the double-indirect level's second). Otherwise the data is one run
+    /// from fragment `fs / bs` on, the pointer blocks after it.
+    fn layered(
+        bs: u64,
+        fs: u64,
+        blocks: u64,
+        tail: u64,
+        messy: bool,
+    ) -> (Ufs2Image<std::io::Cursor<Vec<u8>>>, Inode, Vec<u8>) {
+        use std::collections::HashMap;
+        use std::io::Cursor;
+        let fpb = bs / fs;
+        let ptrs = bs / 8;
+        let pattern = |frag: u64, j: u64| ((frag * 131 + j * 7 + j / 251) % 256) as u8;
+        let hole = |i: u64| {
+            messy
+                && (i == 3
+                    || i == 12
+                    || i + 2 == blocks
+                    || (NDADDR as u64 + 2 * ptrs..NDADDR as u64 + 3 * ptrs).contains(&i))
+        };
+        // Fragment 0 means a hole, so nothing lives in the first block.
+        let mut next = fpb;
+        let mut ptr_next = fpb * (blocks + 1);
+        let mut gaps = Vec::new();
+        let mut tables: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut new_table = |tables: &mut HashMap<u64, Vec<u64>>, next: &mut u64| {
+            let at = if messy { &mut *next } else { &mut ptr_next };
+            let frag = *at;
+            *at += fpb;
+            tables.insert(frag, vec![0; ptrs as usize]);
+            frag
+        };
+        let mut direct = [0u64; NDADDR];
+        let mut indirect = [0u64; NIADDR];
+        let mut placed = Vec::new();
+        for i in 0..blocks {
+            if hole(i) {
+                continue;
+            }
+            // The table that names block i, made (with its parents) on first use.
+            let mut table = None;
+            if i >= NDADDR as u64 {
+                let mut idx = i - NDADDR as u64;
+                let mut level = 0;
+                while idx >= ptrs.pow(level as u32 + 1) {
+                    idx -= ptrs.pow(level as u32 + 1);
+                    level += 1;
+                }
+                if indirect[level] == 0 {
+                    indirect[level] = new_table(&mut tables, &mut next);
+                }
+                let mut cur = indirect[level];
+                for depth in (1..=level as u32).rev() {
+                    let slot = ((idx / ptrs.pow(depth)) % ptrs) as usize;
+                    if tables[&cur][slot] == 0 {
+                        let t = new_table(&mut tables, &mut next);
+                        tables.get_mut(&cur).unwrap()[slot] = t;
+                    }
+                    cur = tables[&cur][slot];
+                }
+                table = Some((cur, (idx % ptrs) as usize));
+            }
+            if messy && i % 29 == 28 {
+                gaps.push(next);
+                next += fpb;
+            }
+            let frag = match gaps.pop() {
+                Some(gap) if messy && i % 41 == 40 => gap,
+                other => {
+                    gaps.extend(other);
+                    next += fpb;
+                    next - fpb
+                }
+            };
+            match table {
+                None => direct[i as usize] = frag,
+                Some((t, slot)) => tables.get_mut(&t).unwrap()[slot] = frag,
+            }
+            placed.push((i, frag));
+        }
+        let end = next.max(ptr_next);
+        let mut image = vec![0u8; (end * fs) as usize];
+        let size = (blocks - 1) * bs + tail;
+        let mut file = vec![0u8; size as usize];
+        for (i, frag) in placed {
+            let at = (frag * fs) as usize;
+            for j in 0..bs {
+                image[at + j as usize] = pattern(frag, j);
+                if i * bs + j < size {
+                    file[(i * bs + j) as usize] = pattern(frag, j);
+                }
+            }
+        }
+        for (frag, table) in &tables {
+            let at = (frag * fs) as usize;
+            for (k, ptr) in table.iter().enumerate() {
+                image[at + k * 8..at + k * 8 + 8].copy_from_slice(&ptr.to_le_bytes());
+            }
+        }
+        let inode = Inode {
+            number: 3,
+            mode: IFREG,
+            size,
+            direct,
+            indirect,
+            mtime: 0,
+        };
+        let sb = Superblock {
+            block_size: bs as u32,
+            fragment_size: fs as u32,
+            size_fragments: end,
+            cg_count: 1,
+            inodes_per_cg: 64,
+            fragments_per_cg: end as u32,
+            iblkno: 1,
+            volume_name: String::new(),
+        };
+        (
+            Ufs2Image {
+                reader: Cursor::new(image),
+                superblock: sb,
+                ptr_cache: PtrCache::default(),
+            },
+            inode,
+            file,
+        )
+    }
+
+    /// Ranges over every seam (direct, single, double and triple indirect, holes, a hole
+    /// pointer block, gaps, a block out of order, a partial tail, past the end) read the same
+    /// bytes as a block at a time did, in run-breaking and contiguous layouts.
+    #[test]
+    fn read_range_in_runs_matches_a_block_at_a_time() {
+        for (bs, fs, messy) in [
+            (512, 128, true),
+            (512, 512, true),
+            (512, 128, false),
+            (1024, 1024, true),
+        ] {
+            let ptrs = bs / 8;
+            let triple = NDADDR as u64 + ptrs + ptrs * ptrs;
+            let blocks = triple + 150;
+            let (mut img, inode, file) = layered(bs, fs, blocks, bs / 5, messy);
+            assert!(inode.indirect[2] != 0, "the file reaches the triple level");
+            let mut seams = vec![0u64, 2, 3, 4, 11, 12, 13, 28, 29, 40, 41, 81];
+            for at in [
+                NDADDR as u64 + ptrs,
+                NDADDR as u64 + 2 * ptrs,
+                NDADDR as u64 + 3 * ptrs,
+                triple,
+            ] {
+                seams.extend([at - 1, at, at + 1]);
+            }
+            seams.extend([blocks - 3, blocks - 2, blocks - 1]);
+            let mut offsets: Vec<u64> = seams
+                .iter()
+                .flat_map(|b| [b * bs, b * bs + 1, b * bs + bs - 1])
+                .collect();
+            offsets.extend([inode.size - 1, inode.size, inode.size + 5]);
+            for &offset in &offsets {
+                for len in [1u64, 7, bs, bs + 1, 3 * bs - 5, 70 * bs, 300 * bs, u64::MAX] {
+                    let start = (offset as usize).min(file.len());
+                    let want = &file[start..start + (len as usize).min(file.len() - start)];
+                    let got = img.read_range(&inode, offset, len).unwrap();
+                    assert!(
+                        got == want,
+                        "bs {bs} fs {fs} messy {messy} offset {offset} len {len}"
+                    );
+                    let old = read_range_by_block(&mut img, &inode, offset, len).unwrap();
+                    assert!(
+                        old == got,
+                        "bs {bs} fs {fs} messy {messy} offset {offset} len {len}"
+                    );
+                }
+            }
+            // A size past what the pointers can name reads as zeros there, as it did.
+            let mut long = inode.clone();
+            let end = (triple + ptrs * ptrs * ptrs) * bs;
+            long.size = end + 10 * bs;
+            for (offset, len) in [(end - 2 * bs - 3, 4 * bs), (end + 1, 3 * bs)] {
+                let got = img.read_range(&long, offset, len).unwrap();
+                assert_eq!(
+                    got,
+                    read_range_by_block(&mut img, &long, offset, len).unwrap()
+                );
+            }
+            assert_eq!(
+                img.read_range(&long, end, 2 * bs).unwrap(),
+                vec![0u8; 2 * bs as usize]
+            );
+        }
+    }
+
+    /// A corrupt or truncated image fails a run with the error a block at a time gave.
+    #[test]
+    fn read_range_in_runs_fails_as_a_block_at_a_time() {
+        let bs = 512u64;
+        type Corrupt = fn(&mut Ufs2Image<std::io::Cursor<Vec<u8>>>, &mut Inode);
+        let cases: [Corrupt; 5] = [
+            // A data pointer past the image, in the middle of a run.
+            |img, inode| {
+                let at = (inode.indirect[0] * 128 + 10 * 8) as usize;
+                let past = img.superblock.size_fragments + 5;
+                img.reader.get_mut()[at..at + 8].copy_from_slice(&past.to_le_bytes());
+            },
+            // A pointer block past the image.
+            |img, inode| inode.indirect[1] = img.superblock.size_fragments,
+            // A direct pointer past the image.
+            |img, inode| inode.direct[5] = img.superblock.size_fragments + 1,
+            // The image cut in the middle of a data run.
+            |img, _| {
+                let keep = img.reader.get_ref().len() / 3;
+                img.reader.get_mut().truncate(keep);
+            },
+            // The image cut inside a pointer block.
+            |img, inode| {
+                let keep = (inode.indirect[1] * 128 + 40) as usize;
+                img.reader.get_mut().truncate(keep);
+            },
+        ];
+        for (n, corrupt) in cases.iter().enumerate() {
+            let (mut img, mut inode, _) = layered(bs, 128, 12 + 64 + 300, bs, false);
+            corrupt(&mut img, &mut inode);
+            let new = img.read_range(&inode, 0, inode.size).unwrap_err();
+            let old = read_range_by_block(&mut img, &inode, 0, inode.size).unwrap_err();
+            assert_eq!(new.to_string(), old.to_string(), "case {n}");
+            if n < 3 {
+                assert!(
+                    matches!(new, Ufs2Error::BlockOutOfRange { .. }),
+                    "case {n}: {new}"
+                );
+            }
+        }
+    }
+
+    /// A forged `fs_size` lets a huge pointer pass the fragment check; its byte offset must
+    /// not saturate and wrap to the image's first bytes (or panic with overflow checks on),
+    /// and a block or pointer block reaching past the declared size is refused too.
+    #[test]
+    fn read_range_refuses_offsets_that_overflow_or_pass_the_image() {
+        let (mut img, inode, _) = layered(512, 128, 12 + 64 + 10, 512, false);
+        let declared = img.superblock.size_fragments;
+        img.superblock.size_fragments = u64::MAX;
+        // frag * 128 overflows; frag * 128 fits but + within overflows; the run's end does.
+        for (frag, offset, len) in [
+            (u64::MAX / 128 + 1, 0, 8),
+            (u64::MAX / 128, 200, 8),
+            (u64::MAX / 128 - 1, 0, 512),
+        ] {
+            let mut bad = inode.clone();
+            bad.direct[0] = frag;
+            let err = img.read_range(&bad, offset, len).unwrap_err();
+            assert!(matches!(err, Ufs2Error::BlockOutOfRange { block, .. } if block == frag));
+        }
+        let mut bad = inode.clone();
+        bad.indirect[0] = u64::MAX / 128 + 1;
+        let err = img.read_range(&bad, 12 * 512, 8).unwrap_err();
+        assert!(matches!(err, Ufs2Error::BlockOutOfRange { .. }), "{err}");
+
+        // Inside the fragment count but straddling the declared end: a data block and a
+        // pointer block in the last fragment.
+        img.superblock.size_fragments = declared;
+        let mut bad = inode.clone();
+        bad.direct[0] = declared - 1;
+        let err = img.read_range(&bad, 0, 512).unwrap_err();
+        assert!(matches!(err, Ufs2Error::BlockOutOfRange { .. }), "{err}");
+        assert_eq!(img.read_range(&bad, 0, 128).unwrap().len(), 128);
+        let mut bad = inode.clone();
+        bad.indirect[0] = declared - 1;
+        let err = img.read_range(&bad, 12 * 512, 8).unwrap_err();
+        assert!(matches!(err, Ufs2Error::BlockOutOfRange { .. }), "{err}");
+    }
+
+    /// Counts the reads and seeks that reach the image.
+    struct Counted<R> {
+        inner: R,
+        reads: usize,
+        seeks: usize,
+    }
+
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: Seek> Seek for Counted<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.seeks += 1;
+            self.inner.seek(pos)
+        }
+    }
+
+    /// An 8 MiB read of a contiguous file (what the exFAT writer asks for) is a pointer
+    /// block per level and one data read, not three syscall pairs per block; at SMP's
+    /// 64 KiB blocks (single indirect, as a double-indirect file needs a 512 MiB image
+    /// here) and at 16 KiB blocks deep in the double-indirect range.
+    #[test]
+    fn a_contiguous_read_takes_a_handful_of_reads() {
+        const CHUNK: u64 = 8 * 1024 * 1024;
+        for (bs, first, blocks, levels) in [
+            (65536u64, 20u64, 12 + 300, 1),
+            (16384, 12 + 2048 + 16, 12 + 2048 + 600, 2),
+        ] {
+            let (img, inode, file) = layered(bs, bs, blocks, bs, false);
+            let mut img = Ufs2Image {
+                reader: Counted {
+                    inner: img.reader,
+                    reads: 0,
+                    seeks: 0,
+                },
+                superblock: img.superblock,
+                ptr_cache: PtrCache::default(),
+            };
+            let offset = first * bs;
+            let range = offset as usize..(offset + CHUNK) as usize;
+            let old = read_range_by_block(&mut img, &inode, offset, CHUNK).unwrap();
+            let (old_reads, old_seeks) = (img.reader.reads, img.reader.seeks);
+            img.reader.reads = 0;
+            img.reader.seeks = 0;
+            let new = img.read_range(&inode, offset, CHUNK).unwrap();
+            let (new_reads, new_seeks) = (img.reader.reads, img.reader.seeks);
+            assert!(old == file[range.clone()] && new == file[range]);
+            eprintln!(
+                "{bs}-byte blocks, 8 MiB: {old_reads} reads + {old_seeks} seeks by block, \
+                 {new_reads} + {new_seeks} in runs"
+            );
+            assert_eq!(
+                new_reads,
+                levels + 1,
+                "a pointer block per level and one data read"
+            );
+            assert_eq!(new_seeks, levels + 1);
+            assert!(old_reads >= (CHUNK / bs) as usize * (levels + 1));
+            // The pointer blocks stay cached: the next chunk is one read.
+            img.reader.reads = 0;
+            img.reader.seeks = 0;
+            let next = img.read_range(&inode, offset + CHUNK, bs * 8).unwrap();
+            assert_eq!(
+                next,
+                file[(offset + CHUNK) as usize..(offset + CHUNK + bs * 8) as usize]
+            );
+            assert_eq!((img.reader.reads, img.reader.seeks), (1, 1));
+        }
     }
 }
