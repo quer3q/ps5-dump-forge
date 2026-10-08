@@ -55,7 +55,7 @@ gradient notice bar) and the app icon (near-black navy with a blue edge and an o
 
 **Semantic tags.** `.tag.blue`, `.tag.green`, `.tag.red`, `.tag.orange` and `.tag.violet` are tinted
 pills for states: Writing (blue), Done (green), Failed (red), Backport (orange), DLC (violet).
-A plain `.tag` is neutral.
+A plain `.tag` is neutral: Emulators (a `fakelib/` that holds only AMPR, DLC or PlayGo emulators).
 
 **Type.** System font (SF Pro on macOS), 14px/1.45 body. Scale:
 
@@ -112,7 +112,9 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   Every button is a pill and may lead with an icon.
 - **Inputs**: pill, `--inset` fill, mono font for paths. A generated output name shows whole in
   `.out-box`, with its folder on the `.out-dir` line below it. Never clip a file name.
-- **Switch** (`.switch`): a native checkbox drawn as a switch, blue when on.
+- **Switch** (`.switch`): a native checkbox drawn as a switch, blue when on. A disabled switch dims
+  its track only; the reason sits under it as a `.note-line.warn` ("Remove backport", shown under the
+  format picker only for a source with backport libraries, is disabled when core refuses removal).
 - **Tags** (`.tag`, `.tag.fmt`, semantic colours): 22px pills, 12px/500.
 - **Stat tiles** (`.tiles`, `.tile`, `.value`, `.note`): two per row (four per row at medium widths);
   `.tile.wide` spans the row.
@@ -122,8 +124,8 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   - The warn variant is amber and is used for the `.fpkg` requirements and build time.
 - **Findings** (`ul.findings`): `li` warns (amber), `li.block` fails every target (red), `li.info` is
   good news (blue).
-- **Folds** (`details.fold`): the DLC list, backport files, job logs, verified checks and folders
-  checked. They are collapsed by default; a list inside one that can grow is a scrollable, focusable box.
+- **Folds** (`details.fold`): the DLC list, backport files, emulators in fakelib, job logs, verified
+  checks and folders checked. They are collapsed by default; a list inside one that can grow is a scrollable, focusable box.
 - **Job row** (`.job`): format tag, name, `from` path, progress bar (`progress`, blue gradient), status
   tag, meta line (`%` · speed · time left). Once finished, the row shows Show in Finder (Show in Explorer
   on Windows, Show in folder on Linux), the error box or "Verified: N checks passed".

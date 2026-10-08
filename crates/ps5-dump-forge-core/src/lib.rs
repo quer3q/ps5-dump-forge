@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+mod backport;
 mod convert;
 mod dlc;
 mod extract;
@@ -62,6 +63,10 @@ pub struct ConvertRequest {
     /// format fails preflight. Ignored for every other target.
     #[serde(default)]
     pub inner: Option<Format>,
+    /// Leave the backport out: the `fakelib`/`fakelib2` files that are not a known emulator
+    /// ([`Inspection::backport`]). Preflight refuses when [`Inspection::backport_blocked`] would.
+    #[serde(default)]
+    pub remove_backport: bool,
 }
 
 pub type JobId = u64;
@@ -144,11 +149,18 @@ pub struct Inspection {
     pub firmware: Option<String>,
     /// The SDK it was built with (`sdkVersion`), e.g. `7.00`.
     pub sdk: Option<String>,
-    /// Backport files (`fakelib/*`, plus `ampr_emu.index` next to them): set for a game
-    /// patched for older firmware.
+    /// Backport libraries: the `fakelib`/`fakelib2` files that are not a known emulator
+    /// (system libraries from newer firmware).
     pub backport: Vec<String>,
-    /// For a backport: the lowest firmware its executables allow (their highest PS5 SDK,
-    /// `fakelib` left out), e.g. `4.50`. `None` without a backport or a readable param.
+    /// The emulators in `fakelib`/`fakelib2` (AMPR, DLC, PlayGo); removing the backport
+    /// keeps them.
+    pub emulators: Vec<Emulator>,
+    /// With backport libraries: why removing them is refused (the executables' SDK was
+    /// lowered, or can't be compared). `None` when removable or there is no backport.
+    pub backport_blocked: Option<String>,
+    /// With a `fakelib`/`fakelib2`: the lowest firmware the executables allow (their
+    /// highest PS5 SDK, `fakelib` left out), e.g. `4.50`. `None` without one or a readable
+    /// param.
     pub backport_firmware: Option<String>,
     /// DLC embedded in the dump (in content-id folders, or merged with its metadata left).
     pub dlcs: Vec<Dlc>,
@@ -163,6 +175,14 @@ pub struct Inspection {
     pub details: Vec<String>,
     /// Preflight findings for this source (errors and warnings), one per line.
     pub findings: Vec<String>,
+}
+
+/// An emulator in `fakelib`/`fakelib2`, named by the file it reads from the game root.
+#[derive(Debug, Clone, Serialize)]
+pub struct Emulator {
+    pub path: String,
+    /// `AMPR`, `DLC` or `PlayGo`.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

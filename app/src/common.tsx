@@ -296,6 +296,7 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
           <h3 className={ins ? "title" : "title pending"}>{title}</h3>
           {ins && <FormatPill kind={ins.kind} />}
           {ins && ins.backport.length > 0 && <span className="tag orange">Backport</span>}
+          {ins && ins.emulators.length > 0 && <span className="tag">Emulators</span>}
           {ins && ins.dlcs.length > 0 && <span className="tag violet">DLC</span>}
         </div>
         <PathLine path={props.path} />
@@ -307,13 +308,16 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
 /** The game's facts as inset tiles. */
 function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
   const bp = ins.backport.length > 0;
-  // A backport lowers the firmware the game needs to what its executables allow.
-  const minFw = bp && ins.backport_firmware ? ins.backport_firmware : ins.firmware;
+  const emus = emulatorNames(ins);
+  // With a fakelib/ (backport or emulators) the game runs as low as its executables allow.
+  const fromExe = ins.backport_firmware !== null;
+  const minFw = ins.backport_firmware ?? ins.firmware;
   const fwNote: string[] = [];
-  if (bp && ins.backport_firmware && ins.firmware) fwNote.push(`declares ${ins.firmware}`);
-  if (bp && !ins.backport_firmware)
-    fwNote.push("backport: firmware unknown (no readable SDK in its executables)");
+  if (fromExe && ins.firmware) fwNote.push(`declares ${ins.firmware}`);
+  if ((bp || emus.length > 0) && !fromExe)
+    fwNote.push("firmware unknown from its executables (no readable SDK)");
   if (bp) fwNote.push(backportLib(ins));
+  if (emus.length > 0) fwNote.push(`emulators: ${emus.join(", ")}`);
   if (full && ins.sdk) fwNote.push(`SDK ${ins.sdk} (declared)`);
   return (
     <dl className="tiles">
@@ -330,8 +334,8 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
         <dd>
           <span className="value">{minFw ? `${minFw}+` : "—"}</span>
           {minFw && (
-            <span className={bp && ins.backport_firmware ? "tag orange" : "tag blue"}>
-              {bp && ins.backport_firmware ? "backport" : "declared"}
+            <span className={!fromExe ? "tag blue" : bp ? "tag orange" : "tag"}>
+              {!fromExe ? "declared" : bp ? "backport" : "executables"}
             </span>
           )}
           {fwNote.length > 0 && <span className="note">{fwNote.join(" · ")}</span>}
@@ -356,12 +360,16 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
   );
 }
 
-/** Which fakelib folder a backport ships, and how many files it has. */
+/** Which fakelib folder a backport ships, and how many backport libraries it has. */
 function backportLib(ins: Inspection): string {
   const exclusive = ins.backport.some((p) => /^fakelib2\//i.test(p));
-  const libs = ins.backport.filter((p) => /^fakelib2?\//i.test(p)).length;
-  // Libraries only: "Backport files (N)" also counts ampr_emu.index next to them.
-  return `${exclusive ? "fakelib2/, mounted alone" : "fakelib/"}, ${libs} librar${libs === 1 ? "y" : "ies"}`;
+  const libs = ins.backport.length;
+  return `${exclusive ? "fakelib2/, mounted alone" : "fakelib/"}, ${libs} backport librar${libs === 1 ? "y" : "ies"}`;
+}
+
+/** The emulators in fakelib/, each named once ("AMPR", "DLC", "PlayGo", "Other"). */
+export function emulatorNames(ins: Inspection): string[] {
+  return [...new Set(ins.emulators.map((e) => e.name))];
 }
 
 /** Preflight findings, each with a status icon; one green line when there are none. */
@@ -446,12 +454,14 @@ function dlcNote(d: Inspection["dlcs"][number]): string {
   return "merged into the game's folders";
 }
 
-/** The game's facts, its embedded DLC (and backport files, `full`), then the findings. */
+/** The game's facts, its embedded DLC (and backport and emulator files, `full`), then the
+ * findings. */
 export function InspectSummary({ ins, full = false }: { ins: Inspection; full?: boolean }) {
   return (
     <div className="summary">
       <Facts ins={ins} full={full} />
-      {(ins.dlcs.length > 0 || (full && ins.backport.length > 0)) && (
+      {(ins.dlcs.length > 0 ||
+        (full && (ins.backport.length > 0 || ins.emulators.length > 0))) && (
         <div className="folds">
           <DlcList dlcs={ins.dlcs} />
           {full && ins.backport.length > 0 && (
@@ -461,6 +471,19 @@ export function InspectSummary({ ins, full = false }: { ins: Inspection; full?: 
                 {ins.backport.map((p) => (
                   <li key={p} className="path">
                     {p}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+          {full && ins.emulators.length > 0 && (
+            <details className="fold">
+              <summary>Emulators in fakelib ({ins.emulators.length})</summary>
+              <ul className="rows scroll" tabIndex={0} aria-label="Emulators in fakelib">
+                {ins.emulators.map((e) => (
+                  <li key={e.path}>
+                    <span className="path">{e.path}</span>
+                    <span className="muted">{e.name}</span>
                   </li>
                 ))}
               </ul>

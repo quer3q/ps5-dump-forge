@@ -289,6 +289,30 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     if let Some(id) = &info.title_id {
         ctx.log(format!("title id: {id}"));
     }
+    // Before anything sizes or writes the source, so every target (`.pkg` included) and the
+    // verification see the tree without it.
+    if req.remove_backport {
+        let fakelib = crate::backport::classify(source.as_mut());
+        let kept: Vec<&str> = fakelib.emulators.iter().map(|e| e.name.as_str()).collect();
+        if fakelib.libs.is_empty() {
+            ctx.log("remove backport: nothing to remove, no backport library in fakelib");
+        } else if let Some(why) =
+            crate::backport::blocked(source.as_mut(), info.param_json.as_ref())
+        {
+            findings.push(why);
+        } else {
+            for lib in &fakelib.libs {
+                ctx.log(format!("remove backport: leaving out {lib}"));
+            }
+            source = Box::new(crate::backport::Without::new(source, &fakelib.libs));
+        }
+        if !kept.is_empty() {
+            ctx.log(format!(
+                "remove backport: keeping emulators {}",
+                kept.join(", ")
+            ));
+        }
+    }
     findings.extend(preflight::output(&req.source, &out, req.format));
     if req.format == Format::Pkg {
         return crate::package::run(req, ctx, source.as_mut(), &info, findings, &out, &stamp);

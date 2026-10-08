@@ -228,6 +228,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         output: output.to_path_buf(),
         compression_threads: None,
         inner: None,
+        remove_backport: false,
     }
 }
 

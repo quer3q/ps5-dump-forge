@@ -49,6 +49,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         output: output.to_path_buf(),
         compression_threads: None,
         inner: None,
+        remove_backport: false,
     }
 }
 
@@ -991,4 +992,94 @@ fn too_deep_for_the_image_readers_is_refused() {
         .1
         .unwrap();
     assert!(stale_parts(&root).is_empty());
+}
+
+/// A minimal ELF whose process param carries the PS5 SDK `sdk` (as `sdk.rs` reads it).
+fn eboot(sdk: u32) -> Vec<u8> {
+    let mut f = vec![0u8; 0x300];
+    f[..4].copy_from_slice(b"\x7fELF");
+    f[0x20..0x28].copy_from_slice(&0x40u64.to_le_bytes()); // e_phoff
+    f[0x36..0x38].copy_from_slice(&0x38u16.to_le_bytes()); // e_phentsize
+    f[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    f[0x40..0x44].copy_from_slice(&0x6100_0001u32.to_le_bytes()); // PT_SCE_PROCPARAM
+    f[0x48..0x50].copy_from_slice(&0x200u64.to_le_bytes());
+    f[0x60..0x68].copy_from_slice(&0x40u64.to_le_bytes());
+    f[0x200..0x204].copy_from_slice(&0x4942_524Fu32.to_le_bytes());
+    f[0x20C..0x210].copy_from_slice(&sdk.to_le_bytes());
+    f
+}
+
+#[test]
+fn remove_backport_keeps_emulators_and_refuses_a_lowered_sdk() {
+    let root = dir("remove-backport");
+    let src = root.join("src");
+    write(&src, "eboot.bin", &eboot(0x1200_0038));
+    write(
+        &src,
+        "sce_sys/param.json",
+        br#"{"titleId":"PPSA01234","sdkVersion":"0x1200000000000000"}"#,
+    );
+    write(&src, "fakelib/libSceAgc.sprx", b"\x7fELF a system library");
+    write(
+        &src,
+        "fakelib/libSceAmpr.sprx",
+        b"reads /app0/ampr_emu.index",
+    );
+    write(&src, "fakelib2/libSceGnm.sprx", b"\x7fELF another");
+    write(&src, "ampr_emu.index", b"index");
+
+    let found = inspect(&src).unwrap();
+    assert_eq!(
+        found.backport,
+        ["fakelib/libSceAgc.sprx", "fakelib2/libSceGnm.sprx"]
+    );
+    assert_eq!(found.emulators.len(), 1);
+    assert_eq!(found.emulators[0].name, "AMPR");
+    assert_eq!(found.backport_blocked, None);
+
+    let before = snapshot(&src);
+    let out = root.join("out");
+    let report = run(ConvertRequest {
+        remove_backport: true,
+        ..request(&src, Format::Folder, &out)
+    })
+    .1
+    .unwrap();
+    assert_eq!(snapshot(&src), before, "the source is never touched");
+    let paths: Vec<String> = tree_bytes(&out).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        paths,
+        [
+            "ampr_emu.index",
+            "eboot.bin",
+            "fakelib/libSceAmpr.sprx",
+            "sce_sys/param.json"
+        ]
+    );
+    assert!(
+        !out.join("fakelib2").exists(),
+        "an emptied fakelib2 goes too"
+    );
+    assert!(report.checks.iter().any(|c| c.starts_with("blake3:")));
+
+    // eboot.bin lowered to 9.00 under a 12.00 param: refused, nothing written.
+    write(&src, "eboot.bin", &eboot(0x0900_0040));
+    assert!(
+        inspect(&src)
+            .unwrap()
+            .backport_blocked
+            .unwrap()
+            .contains("lower than param.json's sdkVersion 12.00")
+    );
+    let err = run(ConvertRequest {
+        remove_backport: true,
+        ..request(&src, Format::Folder, &root.join("refused"))
+    })
+    .1
+    .unwrap_err();
+    assert!(
+        err.contains("eboot.bin's SDK 9.00 (0x09000040) is lower"),
+        "{err}"
+    );
+    assert!(!root.join("refused").exists());
 }

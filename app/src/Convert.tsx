@@ -25,6 +25,7 @@ import {
   PathLine,
   SEPARATORS,
   SourceCard,
+  emulatorNames,
 } from "./common";
 import { Icon, type IconName } from "./icons";
 import type { Action, Job } from "./jobs";
@@ -111,6 +112,8 @@ export function Convert(props: {
   /** Name the output `[GAME_NAME]-[TITLE_ID]-[FIRMWARE]`, brackets included; only its
    * folder is chosen. */
   const [generate, setGenerate] = useState(true);
+  /** Leave the backport libraries out; offered only for a source that has some. */
+  const [removeBackport, setRemoveBackport] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
@@ -156,6 +159,7 @@ export function Convert(props: {
     setSourceIsImage(isImage);
     outDir.current = dir;
     setFormat(fmt);
+    setRemoveBackport(false);
     setIns(null);
     setInsError(null);
     setError(null);
@@ -206,6 +210,11 @@ export function Convert(props: {
   const named = !generate && output ? checkName(name, format) : { name };
   const target = !generate && output && !named.error ? joinPath(outDir.current, named.name) : output;
 
+  // Removing the backport is refused when its executables' SDK was lowered (core says why).
+  const removable = ins !== null && ins.backport.length > 0 && !ins.backport_blocked;
+  const libs = ins ? ins.backport.length : 0;
+  const emus = ins ? emulatorNames(ins) : [];
+
   // Build would certainly fail: say why next to it instead.
   const hard = ins ? ins.findings.filter((l) => classify(l).kind === "block") : [];
   const blockReason = insError
@@ -245,6 +254,7 @@ export function Convert(props: {
       output: target,
       compression_threads: null,
       inner: format === "ffpfsc" ? inner : null,
+      remove_backport: removable && removeBackport,
     };
     submittingRef.current = true;
     setSubmitting(true);
@@ -318,6 +328,35 @@ export function Convert(props: {
                 onChange={setInner}
               />
               <p className="muted hint">{INNER_INFO[inner]}</p>
+            </div>
+          )}
+          {ins && ins.backport.length > 0 && (
+            <div className="field backport">
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  className="visually-hidden"
+                  checked={removable && removeBackport}
+                  disabled={!removable}
+                  onChange={(e) => setRemoveBackport(e.target.checked)}
+                />
+                <span className="switch-track" aria-hidden="true" />
+                <span>
+                  Remove backport
+                  {removable && (
+                    <span className="muted hint">
+                      Leaves out {libs} backport librar{libs === 1 ? "y" : "ies"} from fakelib/
+                      {keptNote(emus)}
+                    </span>
+                  )}
+                </span>
+              </label>
+              {ins.backport_blocked && (
+                <p className="note-line warn">
+                  <Icon name="warn" />
+                  <span>Can't remove the backport: {ins.backport_blocked.replace(/^remove backport: /, "")}</span>
+                </p>
+              )}
             </div>
           )}
           <button className="link" onClick={props.onCompare}>
@@ -451,6 +490,14 @@ export function Convert(props: {
       )}
     </div>
   );
+}
+
+/** What "Remove backport" keeps: the emulators by name, and any other homebrew libraries. */
+function keptNote(emus: string[]): string {
+  const named = emus.filter((n) => n !== "Other");
+  const other = emus.includes("Other");
+  if (named.length === 0) return other ? "; other homebrew libraries stay." : ".";
+  return `; the emulators (${named.join(", ")})${other ? " and other homebrew libraries" : ""} stay.`;
 }
 
 /** Where unfinished jobs will publish: taken for a generated name. */

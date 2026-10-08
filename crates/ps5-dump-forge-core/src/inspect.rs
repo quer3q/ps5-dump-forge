@@ -163,17 +163,17 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     let version = text("contentVersion").map(str::to_string);
     let firmware = text("requiredSystemSoftwareVersion").map(bcd_version);
     let sdk = text("sdkVersion").map(bcd_version);
-    // `fakelib/` (or SMP 1.7's exclusive `fakelib2/`) is the backport; `ampr_emu.index`
-    // alone is not (builds generate it for any libSceAmpr title), so it is only listed next
-    // to one.
-    let mut backport: Vec<String> = paths.iter().filter(|p| is_fakelib(p)).cloned().collect();
-    if !backport.is_empty() && paths.iter().any(|p| p == "ampr_emu.index") {
-        backport.push("ampr_emu.index".to_string());
-    }
-    let backport_firmware = if backport.is_empty() {
+    // `fakelib/` (or SMP 1.7's exclusive `fakelib2/`) holds emulators and the backport.
+    let fakelib = crate::backport::classify(tree.as_mut());
+    let backport_blocked = if fakelib.libs.is_empty() {
         None
     } else {
+        crate::backport::blocked(tree.as_mut(), info.param_json.as_ref())
+    };
+    let backport_firmware = if paths.iter().any(|p| is_fakelib(p)) {
         crate::sdk::lowest_firmware(tree.as_mut())
+    } else {
+        None
     };
     let dlcs = crate::dlc::find(tree.as_mut(), info.content_id.as_deref());
     let cover = cover(tree.as_mut());
@@ -194,7 +194,9 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
         version,
         firmware,
         sdk,
-        backport,
+        backport: fakelib.libs,
+        emulators: fakelib.emulators,
+        backport_blocked,
         backport_firmware,
         dlcs,
         cover,
@@ -250,7 +252,7 @@ pub(crate) fn title_name(param: &Value) -> Option<String> {
 
 /// A BCD version word as the console shows it: `0x1160000000000000` is `11.60`,
 /// `0x0700…` is `7.00`; a 32-bit word that lost its leading zero (`0x9000038`) is `9.00`.
-fn bcd(word: &str) -> Option<String> {
+pub(crate) fn bcd(word: &str) -> Option<String> {
     let hex = word
         .strip_prefix("0x")
         .or_else(|| word.strip_prefix("0X"))?;

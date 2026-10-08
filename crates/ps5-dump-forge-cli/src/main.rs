@@ -15,6 +15,7 @@ const USAGE: &str = "\
 usage: ps5-dump-forge inspect <path> [--json]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc|pkg
                          [--inner exfat|ffpkg|ffpfs] [-o <output>] [--threads N]
+                         [--remove-backport]
 
   inspect   describe a game folder or image (.exfat, .ffpkg, .ffpfs, .ffpfsc, .pkg)
   convert   convert a source; progress is printed as JSON lines on stdout
@@ -25,6 +26,9 @@ usage: ps5-dump-forge inspect <path> [--json]
   -o        output path (default: named from the title id, next to the source;
             .ffpfs/.ffpfsc names must stay within 63 bytes)
   --threads compression threads for pkg and ffpfsc (default: all cores)
+  --remove-backport
+            leave out fakelib's backport libraries, keeping its emulators (AMPR, DLC,
+            PlayGo); refused when eboot.bin's SDK was lowered
   -h, --help";
 
 #[derive(Debug)]
@@ -44,13 +48,14 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     }
     let mut positional = Vec::new();
     let (mut json, mut to, mut output) = (false, None, None);
-    let (mut threads, mut inner) = (None, None);
+    let (mut threads, mut inner, mut remove_backport) = (None, None, false);
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         let text = |v: OsString| v.into_string().map_err(|_| "option values must be text");
         match arg.to_str().unwrap_or("") {
             "-h" | "--help" => return Ok(Cli::Help),
             "--json" => json = true,
+            "--remove-backport" => remove_backport = true,
             "--to" => to = Some(parse_format(&text(value("--to")?)?)?),
             "--inner" => inner = Some(parse_format(&text(value("--inner")?)?)?),
             "-o" | "--output" => output = Some(PathBuf::from(value("-o")?)),
@@ -90,6 +95,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                 output,
                 compression_threads: threads,
                 inner,
+                remove_backport,
             }))
         }
         other => Err(format!("unknown command {other:?}")),
@@ -197,16 +203,31 @@ fn inspect(path: &Path, json: bool) -> ExitCode {
         };
     }
     let or_none = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
-    let backport = match found.backport.len() {
-        0 => "no".to_string(),
-        n => format!(
-            "yes, firmware {} or later from its executables, {n} files (fakelib/)",
-            or_none(&found.backport_firmware)
+    let backport = match (found.backport.len(), &found.backport_blocked) {
+        (0, _) => "no".to_string(),
+        (n, blocked) => format!(
+            "yes, firmware {} or later from its executables, {n} {} (fakelib/); {}",
+            or_none(&found.backport_firmware),
+            if n == 1 { "library" } else { "libraries" },
+            blocked
+                .as_deref()
+                .unwrap_or("removable (--remove-backport)")
+        ),
+    };
+    let mut names: Vec<&str> = found.emulators.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let emulators = match names.len() {
+        0 => "none".to_string(),
+        _ => format!(
+            "{} ({} files in fakelib/)",
+            names.join(", "),
+            found.emulators.len()
         ),
     };
     let mut text = format!(
         "{} ({})\ntitle:      {}\ntitle id:   {}\ncontent id: {}\nversion:    {}\n\
-         firmware:   {} (sdk {})\nbackport:   {backport}\n\
+         firmware:   {} (sdk {})\nbackport:   {backport}\nemulators:  {emulators}\n\
          files:      {} ({} bytes), {} empty dirs\n",
         found.describe,
         found.kind,
@@ -340,6 +361,12 @@ mod tests {
             panic!("not a convert");
         };
         assert_eq!((r.format, r.inner), (Format::Ffpfsc, Some(Format::Ffpkg)));
+        assert!(!r.remove_backport);
+        let Ok(Cli::Convert(r)) = parse_args(args("convert /g --to folder --remove-backport -o x"))
+        else {
+            panic!("not a convert");
+        };
+        assert!(r.remove_backport);
     }
 
     #[test]

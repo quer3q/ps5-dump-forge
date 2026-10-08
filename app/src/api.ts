@@ -18,6 +18,9 @@ export interface ConvertRequest {
   compression_threads: number | null;
   /** The image inside a `.ffpfsc`; `null` (or any other target): `.exfat`. */
   inner: InnerFormat | null;
+  /** Leave the backport libraries (not the emulators) out of fakelib/; refused when the
+   * executables' SDK was lowered. */
+  remove_backport: boolean;
 }
 
 export interface JobReport {
@@ -60,6 +63,13 @@ export interface Dlc {
   emulated: string | null;
 }
 
+export interface Emulator {
+  path: string;
+  /** "AMPR", "DLC", "PlayGo", or "Other": unrecognised homebrew that reads files from /app0/,
+   * or a fakelib file that couldn't be read. Always kept, never removed. */
+  name: string;
+}
+
 export interface InspectFile {
   path: string;
   size: number;
@@ -75,9 +85,17 @@ export interface Inspection {
   /** Required firmware, e.g. "7.00". */
   firmware: string | null;
   sdk: string | null;
-  /** Backport files (fakelib/*, plus ampr_emu.index next to them); empty when none. */
+  /** Backport libraries: fakelib/ (or fakelib2/) files that are not a known emulator;
+   * empty when none. */
   backport: string[];
-  /** For a backport: the lowest firmware its executables allow, e.g. "4.50". */
+  /** Emulators in fakelib/ (AMPR, DLC, PlayGo, Other): homebrew the game runs with, not a
+   * backport. */
+  emulators: Emulator[];
+  /** Why removing the backport is refused (eboot.bin's SDK is below param.json's sdkVersion,
+   * or it can't be told); null when it can be removed or there is none. */
+  backport_blocked: string | null;
+  /** With a fakelib/ (backport or emulators): the lowest firmware its executables allow,
+   * e.g. "4.50". */
   backport_firmware: string | null;
   /** DLC embedded in the dump. */
   dlcs: Dlc[];

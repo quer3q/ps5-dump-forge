@@ -9,9 +9,9 @@ use ps5upload_fpkg::source::SourceTree;
 #[cfg(test)]
 const PT_LOAD: u32 = 1;
 pub(crate) const PT_SCE_PROCPARAM: u32 = 0x6100_0001;
-const PT_SCE_MODULE_PARAM: u32 = 0x6100_0002;
+pub(crate) const PT_SCE_MODULE_PARAM: u32 = 0x6100_0002;
 pub(crate) const PROCESS_PARAM_MAGIC: u32 = 0x4942_524F;
-const MODULE_PARAM_MAGIC: u32 = 0x3C13_F4BF;
+pub(crate) const MODULE_PARAM_MAGIC: u32 = 0x3C13_F4BF;
 /// The PS5 SDK word, from the param's magic.
 const PS5_SDK_AT: usize = 0xC;
 const ELF: [u8; 4] = [0x7F, b'E', b'L', b'F'];
@@ -34,6 +34,11 @@ const SELF_COMPRESSED: u64 = 1 << 3;
 /// The backport's own `fakelib`/`fakelib2` libraries are left out: they come from the
 /// newer firmware they stand in for. `None` when no executable carries a readable param.
 pub(crate) fn lowest_firmware(tree: &mut dyn SourceTree) -> Option<String> {
+    firmware(highest_sdk(tree)?)
+}
+
+/// The highest valid PS5 SDK word across the executables, `fakelib`/`fakelib2` left out.
+pub(crate) fn highest_sdk(tree: &mut dyn SourceTree) -> Option<u32> {
     let paths: Vec<String> = tree
         .files()
         .iter()
@@ -56,7 +61,7 @@ pub(crate) fn lowest_firmware(tree: &mut dyn SourceTree) -> Option<String> {
         // Each word on its own: one malformed executable must not hide the others.
         sdks.extend(ps5_sdk(tree, path).filter(|&w| firmware(w).is_some()));
     }
-    firmware(sdks.into_iter().max()?)
+    sdks.into_iter().max()
 }
 
 fn is_executable(path: &str) -> bool {
@@ -78,7 +83,7 @@ fn le<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
 
 /// The PS5 SDK word of one executable, `None` when it is not a readable ELF or fSELF with
 /// a process or module param.
-fn ps5_sdk(tree: &mut dyn SourceTree, path: &str) -> Option<u32> {
+pub(crate) fn ps5_sdk(tree: &mut dyn SourceTree, path: &str) -> Option<u32> {
     let head = tree.read_range(path, 0, HEAD).ok()?;
     let u16_at = |at: usize| le::<2>(&head, at).map(u16::from_le_bytes);
     let u32_at = |at: usize| le::<4>(&head, at).map(u32::from_le_bytes);
@@ -172,7 +177,7 @@ pub(crate) fn test_elf(kind: u32, magic: u32, sdk: u32, sized: bool) -> Vec<u8> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `elf` wrapped as a fSELF: a one-entry segment table placing the PT_LOAD at 0x400.
@@ -189,13 +194,13 @@ mod tests {
         f
     }
 
-    struct Files(
+    pub(crate) struct Files(
         Vec<(String, Vec<u8>)>,
         Vec<ps5upload_fpkg::source::SourceFile>,
     );
 
     impl Files {
-        fn new(list: Vec<(&str, Vec<u8>)>) -> Self {
+        pub(crate) fn new(list: Vec<(&str, Vec<u8>)>) -> Self {
             let meta = list
                 .iter()
                 .map(|(p, b)| ps5upload_fpkg::source::SourceFile {

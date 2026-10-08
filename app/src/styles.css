@@ -222,6 +222,10 @@ input[type="search"] { -webkit-appearance: none; appearance: none; }
 .switch input:checked + .switch-track::after { transform: translateX(14px); }
 .switch input:focus + .switch-track { outline: 2px solid var(--focus); outline-offset: 2px; }
 .switch input:focus:not(:focus-visible) + .switch-track { outline: none; }
+/* A refused switch: the track dims, the label keeps its contrast (the reason sits below it). */
+.switch:has(input:disabled) { cursor: not-allowed; }
+.switch input:disabled + .switch-track { opacity: .4; }
+.field.backport > .note-line { margin-top: 8px; }
 .hint { display: block; margin-top: 2px; font-size: 11.5px; }
 
 .build-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
