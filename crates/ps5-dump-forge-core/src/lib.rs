@@ -55,6 +55,22 @@ pub enum Format {
     Pkg,
 }
 
+/// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same,
+/// but `Fast` by default. The console reads every level the same way; a slower one makes a
+/// slightly smaller package with every core busy for longer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KrakenLevel {
+    /// A lazy parse. On a third-party package's blocks: 331 MB/s on 14 cores, 36.8% of the bytes.
+    #[default]
+    Fast,
+    /// An optimal parse priced twice: ~6x slower than `Fast`, ~2.6% smaller (57 MB/s, 35.8%).
+    Balanced,
+    /// An optimal parse with deeper searches priced three times: ~9x slower than `Fast`
+    /// (38 MB/s, 35.7%).
+    Smallest,
+}
+
 /// One conversion: any readable source to one target format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvertRequest {
@@ -75,9 +91,24 @@ pub struct ConvertRequest {
     #[serde(default)]
     pub remove_backport: bool,
     /// Re-read every byte of the output; unset, verification is fast: every structural check
-    /// and a seeded sample of the content ([`VerifySummary`]). A `.pkg` is always verified in full.
+    /// and a seeded sample of the content ([`VerifySummary`]); a `.pkg`'s builder self-check
+    /// samples its blocks with the same seed.
     #[serde(default)]
     pub full_verify: bool,
+    /// For `.pkg`: the compression level. Ignored for every other target.
+    #[serde(default)]
+    pub kraken_level: KrakenLevel,
+    /// For `.ffpfsc`: the zlib level, 0 (store) through 9 (smallest), 6 when unset. Ignored for
+    /// every other target.
+    #[serde(default = "default_ffpfsc_level")]
+    pub ffpfsc_level: u32,
+}
+
+/// The `.ffpfsc` zlib level a request without one gets.
+pub const DEFAULT_FFPFSC_LEVEL: u32 = ps5_dump_forge_pfs::DEFAULT_LEVEL;
+
+fn default_ffpfsc_level() -> u32 {
+    DEFAULT_FFPFSC_LEVEL
 }
 
 pub type JobId = u64;

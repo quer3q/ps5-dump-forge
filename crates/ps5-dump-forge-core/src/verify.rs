@@ -4,6 +4,8 @@
 //! compare 8 MiB slices, so the source is hashed once.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail};
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
@@ -52,17 +54,29 @@ pub(crate) struct Digest {
 
 /// Builds a [`Digest`] from bytes fed front to back in pieces of any size: slice boundaries
 /// don't depend on how the file is read, and nothing is buffered.
+///
+/// A whole slice is hashed on the [`pool`], so the thread reading the source only copies it:
+/// one core hashes ~2.4 GB/s, which made hashing, not the disk, a write's limit.
 struct Digester {
     len: u64,
-    slice: blake3::Hasher,
-    slices: Vec<blake3::Hash>,
+    /// The current slice's bytes.
+    buf: Vec<u8>,
+    slices: Vec<Slice>,
 }
+
+enum Slice {
+    Ready(blake3::Hash),
+    Hashing(Receiver<blake3::Hash>),
+}
+
+/// A short tail slice up to this size is hashed in place: handing it over costs more.
+const INLINE_MAX: usize = 1 << 20;
 
 impl Digester {
     fn new() -> Self {
         Self {
             len: 0,
-            slice: blake3::Hasher::new(),
+            buf: Vec::new(),
             slices: Vec::new(),
         }
     }
@@ -71,11 +85,14 @@ impl Digester {
         while !bytes.is_empty() {
             let room = (SLICE - self.len % SLICE) as usize;
             let (now, rest) = bytes.split_at(bytes.len().min(room));
-            self.slice.update(now);
+            if self.buf.capacity() == 0 {
+                self.buf = pool().buffer();
+            }
+            self.buf.extend_from_slice(now);
             self.len += now.len() as u64;
             if self.len.is_multiple_of(SLICE) {
-                self.slices.push(self.slice.finalize());
-                self.slice.reset();
+                let full = std::mem::take(&mut self.buf);
+                self.slices.push(Slice::Hashing(pool().hash(full)));
             }
             bytes = rest;
         }
@@ -84,11 +101,104 @@ impl Digester {
     /// A short tail is the last slice.
     fn finish(mut self) -> Digest {
         if !self.len.is_multiple_of(SLICE) {
-            self.slices.push(self.slice.finalize());
+            let tail = std::mem::take(&mut self.buf);
+            self.slices.push(if tail.len() <= INLINE_MAX {
+                let hash = blake3::hash(&tail);
+                pool().give_back(tail);
+                Slice::Ready(hash)
+            } else {
+                Slice::Hashing(pool().hash(tail))
+            });
+        } else if self.buf.capacity() > 0 {
+            pool().give_back(std::mem::take(&mut self.buf));
         }
-        Digest {
-            slices: self.slices,
+        let slices = self
+            .slices
+            .into_iter()
+            .map(|s| match s {
+                Slice::Ready(hash) => hash,
+                // A worker only hashes and replies; it cannot fail.
+                Slice::Hashing(rx) => rx.recv().expect("the hashing pool replies"),
+            })
+            .collect();
+        Digest { slices }
+    }
+}
+
+/// Threads that hash whole slices, one per core up to [`POOL_MAX`], fed through a bounded queue;
+/// their buffers are reused. At most `3 × threads` slices exist at once (queued, being hashed,
+/// spare): 192 MiB at 8 threads, which still hash ~19 GB/s, past any disk.
+struct Pool {
+    jobs: SyncSender<(Vec<u8>, SyncSender<blake3::Hash>)>,
+    spare: Arc<Mutex<Vec<Vec<u8>>>>,
+    keep: usize,
+}
+
+type Job = (Vec<u8>, SyncSender<blake3::Hash>);
+
+/// The most hashing threads (see [`Pool`]): a bound on memory, on the PS5 most of all.
+const POOL_MAX: usize = 8;
+
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(POOL_MAX);
+        let (jobs, queue) = sync_channel::<Job>(threads);
+        let queue = Arc::new(Mutex::new(queue));
+        let spare = Arc::new(Mutex::new(Vec::new()));
+        let keep = threads;
+        for i in 0..threads {
+            let (queue, spare) = (queue.clone(), spare.clone());
+            // ponytail: workers live as long as the process (the pool is static). If none
+            // starts, the queue's receiver is gone and the first `hash` fails loudly.
+            let _ = std::thread::Builder::new()
+                .name(format!("hash-{i}"))
+                .spawn(move || {
+                    loop {
+                        let Ok((buf, reply)) = queue.lock().expect("queue lock").recv() else {
+                            return;
+                        };
+                        let _ = reply.send(blake3::hash(&buf));
+                        let mut spare = spare.lock().expect("spare lock");
+                        if spare.len() < keep {
+                            let mut buf = buf;
+                            buf.clear();
+                            spare.push(buf);
+                        }
+                    }
+                });
         }
+        Pool { jobs, spare, keep }
+    })
+}
+
+impl Pool {
+    /// An empty buffer that holds a whole slice.
+    fn buffer(&self) -> Vec<u8> {
+        self.spare
+            .lock()
+            .expect("spare lock")
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(SLICE as usize))
+    }
+
+    fn give_back(&self, mut buf: Vec<u8>) {
+        let mut spare = self.spare.lock().expect("spare lock");
+        if spare.len() < self.keep && buf.capacity() >= SLICE as usize {
+            buf.clear();
+            spare.push(buf);
+        }
+    }
+
+    /// `buf`'s hash, as soon as a worker gets to it.
+    fn hash(&self, buf: Vec<u8>) -> Receiver<blake3::Hash> {
+        let (reply, rx) = sync_channel(1);
+        self.jobs
+            .send((buf, reply))
+            .expect("the hashing pool is running");
+        rx
     }
 }
 

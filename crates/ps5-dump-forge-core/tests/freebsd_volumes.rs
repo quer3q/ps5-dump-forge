@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 
-use ps5_dump_forge_core::{ConvertRequest, Event, Format, JobReport, Jobs, stale_parts};
+use ps5_dump_forge_core::{
+    ConvertRequest, Event, Format, JobReport, Jobs, KrakenLevel, stale_parts,
+};
 
 fn dir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
@@ -76,6 +78,8 @@ fn request(source: &Path, format: Format, output: &Path, inner: Option<Format>) 
         inner,
         remove_backport: false,
         full_verify: false,
+        kraken_level: KrakenLevel::Fast,
+        ffpfsc_level: 6,
     }
 }
 

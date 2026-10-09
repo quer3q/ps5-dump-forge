@@ -23,7 +23,7 @@ const ROWS: { kind: string; tagline: string; cells: [string, Rating][] }[] = [
     cells: [
       ["Installed like a store game", "good"],
       ["Native, full speed", "good"],
-      // Approximate: a partial Stellar Blade run, not a measured full build.
+      // Approximate: a partial run of an 89 GB game, not a measured full build.
       ["About the game size (Kraken; game data is mostly already compressed)", "ok"],
       ["~20 min", "bad"],
       ["11.60 or lower, with kstuff, fpkg-enable and ppr-patch", "bad"],

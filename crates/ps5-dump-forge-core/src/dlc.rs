@@ -128,7 +128,7 @@ pub(crate) fn find(tree: &mut dyn SourceTree, game: Option<&str>) -> Vec<Dlc> {
 ///
 /// ```text
 /// [PSAC]
-/// content_id=EP9000-PPSA13197_00-STELLARBLADEDLC1
+/// content_id=EP9000-PPSA13197_00-SAMPLEGAMEDLC001
 /// download_status=NO_EXTRA_DATA
 /// ```
 fn emulated(text: &str) -> Vec<(String, String)> {
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn dlc_emulator_list() {
-        let ini = "; unlocked\r\n[PSAC]\r\ncontent_id=EP9000-PPSA13197_00-STELLARBLADEDLC1\r\n\
+        let ini = "; unlocked\r\n[PSAC]\r\ncontent_id=EP9000-PPSA13197_00-SAMPLEGAMEDLC001\r\n\
                    download_status=NO_EXTRA_DATA\r\n\r\n[PSAC]\ncontent_id = EP9000-PPSA13197_00-NIKKEREWARD00000\n\
                    [OTHER]\ncontent_id=EP9000-PPSA13197_00-NOTADLC000000000\n[PSAC]\ncontent_id=garbage\n";
         let mut tree = Files::new(vec![
@@ -308,7 +308,7 @@ mod tests {
             [
                 ("NIKKEREWARD00000".to_string(), Some(String::new())),
                 (
-                    "STELLARBLADEDLC1".to_string(),
+                    "SAMPLEGAMEDLC001".to_string(),
                     Some("NO_EXTRA_DATA".to_string())
                 ),
             ]

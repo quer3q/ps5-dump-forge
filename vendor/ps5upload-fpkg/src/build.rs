@@ -284,6 +284,9 @@ pub struct BuildControl<'a> {
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
     /// Called as each [`Stage`] begins.
     pub stage: Option<&'a mut dyn FnMut(Stage)>,
+    /// `Some(seed)`: the built package's self-check reads a seeded sample of its blocks
+    /// ([`verify::verify_file_sampled`]), for a caller that checks the files itself.
+    pub sample: Option<u64>,
 }
 
 /// Build the package. `progress` receives short phase lines.
@@ -1047,11 +1050,12 @@ fn verify_written(
             f(done, total);
         }
     };
-    match verify::verify_file_controlled(
+    match verify::verify_file_sampled(
         file,
         &prepared.request.passcode,
         &mut verify_bytes,
         cancel,
+        control.sample,
     )? {
         report if report.ok() => Ok(report),
         report => format_err(format!("the built package failed verification:\n{report}")),

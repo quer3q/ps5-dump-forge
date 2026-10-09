@@ -34,7 +34,7 @@ mod read;
 mod wrap;
 
 pub use read::{FfpfscInfo, PfsHeader, PfsSource, open_ffpfsc};
-pub use wrap::{Stream, WrapOptions, WrapReport, container_size_max, wrap};
+pub use wrap::{DEFAULT_LEVEL, Stream, WrapOptions, WrapReport, container_size_max, wrap};
 
 /// The PFS block size this crate writes, and the PFSC block size of every container.
 pub const BLOCK: u64 = 0x10000;

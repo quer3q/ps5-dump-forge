@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use ps5_dump_forge_core::{
-    ConvertRequest, DataDirs, Event, Format, JobReport, Jobs, ScannedFolder, VerifyMode,
-    default_output, extraction_findings, inspect, rename_no_replace, stale_parts,
+    ConvertRequest, DataDirs, Event, Format, JobReport, Jobs, KrakenLevel, ScannedFolder,
+    VerifyMode, default_output, extraction_findings, inspect, rename_no_replace, stale_parts,
 };
 use ps5upload_fpkg::source::SourceTree;
 
@@ -51,6 +51,8 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         inner: None,
         remove_backport: false,
         full_verify: false,
+        kraken_level: KrakenLevel::Fast,
+        ffpfsc_level: 6,
     }
 }
 
@@ -336,6 +338,8 @@ fn folder_round_trip_verifies_with_blake3() {
     let out = root.join("out-full");
     let (events, result) = run(ConvertRequest {
         full_verify: true,
+        kraken_level: KrakenLevel::Fast,
+        ffpfsc_level: 6,
         ..request(&src, Format::Folder, &out)
     });
     let report = result.unwrap();
@@ -420,8 +424,10 @@ fn folder_to_pkg_verifies_and_publishes() {
     // Our own read-back through `FpkgSource`: param.json, eboot, two data files, the
     // generated keystone and the two container-only images.
     assert_eq!(report.files, 7, "{checks}");
+    // Fast by default, the builder's own sweep sampled with the same seed.
     for want in [
-        "blake3: 7 files match",
+        "in 7 files, match the source (fast, seed",
+        "imagedigs entry 0 of 7 failed (a sample of 7, seed",
         "empty dirs: 1 match",
         "(2 as container entries)",
         "sce_sys/keystone (generated)",

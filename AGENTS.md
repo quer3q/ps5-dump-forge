@@ -12,7 +12,7 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
 - `crates/ps5-dump-forge-core`: everything a job does. Own folder scanner (no symlink follow,
   exact names), preflight (names, special files, space, FAT32, depth), jobs (worker thread per job, one at a time, cancel flag,
   `catch_unwind`), `.part` + atomic no-replace rename (macOS exFAT has none: check, then rename), BLAKE3 verification
-  (`verify.rs`: 8 MiB slice hashes, fast sample or full), `inspect` (cover, firmware, backport firmware from
+  (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads, fast sample or full), `inspect` (cover, firmware, backport firmware from
   executables, embedded DLC), `prefetch.rs` (read-ahead thread). FreeBSD/PS5 only: `dest.rs` (destination probe,
   U1), `durable.rs` (`sync_retry`, `SyncEvery`, drive-removal check; U4/U5/U7). Its `lib.rs` is the public API
   the CLI, the app and the server build against.
@@ -64,14 +64,16 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
   compatibility). Format copy and the About formats table (`app/src/Formats.tsx`) follow
   ShadowMountPlus 1.7's README and release notes.
 - No settings and no config file: the UI keeps choices in memory until it closes. Defaults: target
-  `.ffpkg`, exFAT inside a `.ffpfsc`, all cores for compression, no extra free space beyond each
-  format's built-in spare.
+  `.ffpkg`, exFAT inside a `.ffpfsc` at zlib level 6, all cores for compression, `.pkg` Kraken level `fast`
+  (`balanced`/`smallest`: ~2.6% smaller, ~6x/~9x the compress time; tests use `fast` only), no extra
+  free space beyond each format's built-in spare.
 - Progress is one bar per job: `Event::Progress` `done`/`total` span every pass (write, verify,
   ...); `Ctx::expect_rest` renews the estimate as each pass learns its size.
 - The Tauri app has no HTTP sidecar and no `tauri-plugin-fs`; the capability grants only the app's
   commands, dialogs and event listening. The web UI is a separate build served by `serve`.
 - Verification: fast by default everywhere (every structural check + seeded BLAKE3 sample of 8 MiB slices),
-  full is opt-in (`full_verify`, `--full-verify`, the "Full verification" switch). `.pkg` is always full.
+  full is opt-in (`full_verify`, `--full-verify`, the "Full verification" switch). A fast `.pkg` also samples the builder's own block sweep and
+  `playgo-chunk.crc` check (vendor patch 0021, the job's seed).
 - PS5 payload: one plain `.elf`, no PKG, no signing, no updates (replace the file). FreeBSD 11 ABI via
   `--cfg libc_unstable_freebsd_version="11"` (the env var is ignored by libc ≥ 0.2.187) and struct-size
   asserts in the CLI. `panic=abort`.
@@ -105,8 +107,10 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
   Names: ASCII only, no case collisions, every offender listed.
 - `.ffpfsc`: a single-file PFS (MkPFS `pack file` layout) whose one file is a zlib PFSC container of 64 KiB
   blocks around a nested `.exfat`/`.ffpkg`/`.ffpfs` named `<TITLE_ID>.<ext>` (default exFAT, MkPFS's most
-  stable). Always PFSC, level 6, a block is kept compressed only if it saves ≥ 5%; zlib from `flate2`
-  (`miniz_oxide`; console acceptance is a hardware gate in `TODO.md`). Streamed: the inner
+  stable). Always PFSC, zlib level 0–9 as zlib numbers them (the slider, `--level`, `ffpfsc_level`;
+  default 6, the measured knee: 7 took 6% longer for 0.02% smaller; 0 stores every block raw), a block is kept compressed only if it saves
+  ≥ 5%; a block with near-8-bit byte entropy that level 1 shrinks < 2% skips the level's search (stored
+  raw). zlib from `flate2` (`miniz_oxide`; console acceptance is a hardware gate in `TODO.md`). Streamed: the inner
   writer feeds the compressor, which writes the `.part`; no temporary inner image. Free-space preflight asks
   for the worst case (every block raw).
 - Generated `.ffpfs`/`.ffpfsc` names are ≤ 63 bytes (SMP fails longer ones with ENAMETOOLONG); the game-name
@@ -119,7 +123,7 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --release
 (cd app && npm ci && npm run tauri dev)                       # GUI in dev mode
 cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to exfat   # or ffpkg | ffpfs | ffpfsc | pkg | folder
-cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to ffpfsc --inner exfat   # inner: exfat | ffpkg | ffpfs
+cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to ffpfsc --inner exfat   # inner: exfat | ffpkg | ffpfs; --level 0..9
 cargo run --release -p ps5-dump-forge-pfs --example pfs_tool -- ffpfs <dir> <out> <time>   # for MkPFS byte comparisons
 scripts/check-exfat.sh <img.exfat> [src_dir]   # macOS fsck_exfat + mount compare + exfatprogs (Docker)
 scripts/fsck-ufs.sh <img.ffpkg>...             # FreeBSD fsck_ufs -n in qemu (Docker, ~1 min)

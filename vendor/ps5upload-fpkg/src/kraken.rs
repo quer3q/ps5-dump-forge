@@ -2,8 +2,8 @@
 //!
 //! The console's decompressor reads each 256 KiB block of the image as two 128 KiB halves,
 //! stored bare: no Oodle stream or chunk headers, the lengths and modes live in the block's
-//! layout record (see `docs/research/2026-09-23-ps5-kraken-package-blocks.md`). A half is one
-//! Kraken LZ chunk body:
+//! layout record (see `docs/research/2026-09-23-ps5-kraken-package-blocks.md`). A half is raw
+//! bytes, a bare entropy array, or a Kraken LZ chunk body:
 //!
 //! ```text
 //! [8-byte seed]            even half only: the block's first 8 bytes, raw
@@ -26,8 +26,9 @@
 //! half's own symbol statistics (the other levels); on Spider-Man 2's blocks the default level
 //! stores 33.6% of the logical size against Sony's own encoder's 32.8%.
 //! The encoder is written from the format (documented by powzix/ooz, GPL-3, and the PS5 framing
-//! decoded from Sony's packages); the decoder here reads exactly what the encoder writes and is
-//! what proves every block before a package keeps it.
+//! decoded from Sony's packages). The decoder also reads bare entropy-array halves from
+//! third-party packages; it still supports only raw and old-table Huffman arrays and excess-framed
+//! LZ chunks. It proves every encoded block before a package keeps it.
 
 mod huff;
 
@@ -1085,13 +1086,37 @@ pub fn encode_block_at(block: &[u8], level: Level) -> Vec<Half> {
 // ─────────────────────────────── decoder ───────────────────────────────
 
 /// Literals into `out[dst..dst + n]`, delta-coded against the byte `last` back when `delta`.
+/// `last` is at least [`MIN_DISTANCE`], so eight bytes at a time never read one not yet written.
 fn put_literals(out: &mut [u8], dst: usize, lits: &[u8], delta: bool, last: usize) {
     if delta {
-        for (k, &l) in lits.iter().enumerate() {
-            out[dst + k] = l.wrapping_add(out[dst + k - last]);
+        let mut k = 0;
+        while k + 8 <= lits.len() {
+            let base: [u8; 8] = out[dst + k - last..dst + k - last + 8].try_into().unwrap();
+            let chunk = &mut out[dst + k..dst + k + 8];
+            for j in 0..8 {
+                chunk[j] = lits[k + j].wrapping_add(base[j]);
+            }
+            k += 8;
+        }
+        for k in k..lits.len() {
+            out[dst + k] = lits[k].wrapping_add(out[dst + k - last]);
         }
     } else {
         out[dst..dst + lits.len()].copy_from_slice(lits);
+    }
+}
+
+/// `out[dst..dst + len] = out[dst - dist..]`, byte by byte in effect: `dist` is at least
+/// [`MIN_DISTANCE`], so each eight-byte word is read only after it is written.
+fn copy_match(out: &mut [u8], dst: usize, dist: usize, len: usize) {
+    let mut k = 0;
+    while k + 8 <= len {
+        let w: [u8; 8] = out[dst + k - dist..dst + k - dist + 8].try_into().unwrap();
+        out[dst + k..dst + k + 8].copy_from_slice(&w);
+        k += 8;
+    }
+    for k in k..len {
+        out[dst + k] = out[dst + k - dist];
     }
 }
 
@@ -1183,6 +1208,9 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
             eb.get_length()?
         });
     }
+    if ea.seam() != eb.seam() {
+        return format_err("kraken: excess streams do not meet");
+    }
     let mut esc = esc.into_iter();
     let mut lens = lens.iter().map(|&v| -> Result<usize> {
         Ok(3 + if v == 255 {
@@ -1237,9 +1265,7 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
         if dist < MIN_DISTANCE || dist > dst || dst + mlen > end {
             return format_err("kraken: match out of bounds");
         }
-        for k in 0..mlen {
-            out[dst + k] = out[dst + k - dist];
-        }
+        copy_match(out, dst, dist, mlen);
         dst += mlen;
     }
     let tail = end - dst;
@@ -1253,21 +1279,37 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
     Ok(())
 }
 
+/// A non-LZ half can be a bare entropy array rather than a raw copy.
+pub(crate) fn decode_entropy_half(src: &[u8], len: usize) -> Result<Vec<u8>> {
+    let (out, used) = get_array(src, 0, src.len(), len)?;
+    if used != src.len() || out.len() != len {
+        return format_err("kraken: entropy half has the wrong length or trailing bytes");
+    }
+    Ok(out)
+}
+
 /// Decode a block of `len` logical bytes from its halves.
 pub fn decode_block(halves: &[Half], len: usize) -> Result<Vec<u8>> {
+    let parts: Vec<_> = halves
+        .iter()
+        .map(|h| (h.bytes(), h.is_lz(), h.is_delta()))
+        .collect();
+    decode_parts(&parts, len)
+}
+
+/// [`decode_block`] over borrowed halves, each `(bytes, LZ, delta literals)`.
+pub(crate) fn decode_parts(halves: &[(&[u8], bool, bool)], len: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; len];
     let mut at = 0usize;
-    for h in halves {
+    for &(b, lz, delta) in halves {
         let hl = (len - at).min(HALF);
-        match h {
-            Half::Raw(b) => {
-                if b.len() != hl {
-                    return format_err("kraken: raw half has the wrong length");
-                }
-                out[at..at + hl].copy_from_slice(b);
+        if lz {
+            decode_half(b, &mut out, at, hl, delta)?;
+        } else {
+            if b.len() != hl {
+                return format_err("kraken: raw half has the wrong length");
             }
-            Half::Lz(b) => decode_half(b, &mut out, at, hl, false)?,
-            Half::LzDelta(b) => decode_half(b, &mut out, at, hl, true)?,
+            out[at..at + hl].copy_from_slice(b);
         }
         at += hl;
     }

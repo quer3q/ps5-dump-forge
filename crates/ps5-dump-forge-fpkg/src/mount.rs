@@ -22,8 +22,11 @@ use crate::{CORRUPT, UNSUPPORTED_CODEC, err};
 // ponytail: 4-slot ring (1 MiB), no LRU; widen if random access patterns show up
 const DECODED_CACHE: usize = 4;
 /// The largest layout descriptor read: nine bytes per block record, so 32 MiB covers ~3.7 M
-/// blocks, about 900 GiB of mount (Spider-Man 2's 272 GB mount is a 10 MB descriptor).
-// ponytail: 32 MiB descriptor, held whole with ~100 B per block while it is walked
+/// stored blocks, about 900 GiB of mount (Spider-Man 2's 272 GB mount is a 10 MB descriptor).
+/// Sparse blocks (zeros, no record) are not bounded by it: boundary offsets are 40-bit, so a
+/// mount holds at most ~4.2 M of them (1 TiB / 256 KiB), ~7.9 M blocks in all.
+// ponytail: 32 MiB descriptor, held whole with ~100 B per block while it is walked (~0.8 GB at
+// the ~7.9 M-block worst case)
 pub(crate) const MAX_DESCRIPTOR: u64 = 32 << 20;
 /// The compression type every layout this reader decodes declares (Kraken, or no payload).
 const COMP_KRAKEN: u64 = 2;
@@ -205,6 +208,26 @@ impl Kraken {
         let mut i = self
             .blocks
             .partition_point(|b| b.logical + u64::from(b.len) <= off);
+        let end = off + buf.len() as u64;
+        let last = self.blocks.partition_point(|b| b.logical < end);
+        // The batch holds its blocks' stored bytes at once, so it is taken only when they are
+        // no more than the decoded bytes (true of every real block: a half that does not
+        // shrink is stored raw); a forged descriptor claiming more goes one block at a time.
+        let span = &self.blocks[i..last];
+        let stored: u64 = span.iter().map(|b| u64::from(b.stored_len)).sum();
+        let logical: u64 = span.iter().map(|b| u64::from(b.len)).sum();
+        if last - i > 2 && stored <= logical {
+            // A sequential reader's previous read ended in this one's first block.
+            let mut done = 0usize;
+            if let Some((_, data)) = self.cache.iter().find(|(k, _)| *k == i) {
+                let within = (off - self.blocks[i].logical) as usize;
+                done = data.len() - within;
+                buf[..done].copy_from_slice(&data[within..]);
+                i += 1;
+            }
+            let at = off + done as u64;
+            return self.read_many(outer, image, i..last, at, &mut buf[done..]);
+        }
         let mut done = 0usize;
         while done < buf.len() {
             let at = off + done as u64;
@@ -220,13 +243,76 @@ impl Kraken {
         Ok(())
     }
 
+    /// [`Kraken::read`] over blocks `range`, decoded on every core. Their stored bytes are read
+    /// one run of back-to-back blocks at a time, so the outer checks spread across cores too.
+    fn read_many(
+        &mut self,
+        outer: &mut Outer,
+        image: &OuterFile,
+        range: std::ops::Range<usize>,
+        off: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let blocks = &self.blocks[range.clone()];
+        // (run, offset in it) per block; a sparse block stores nothing and joins any run.
+        let mut runs: Vec<Vec<u8>> = Vec::new();
+        let mut at = Vec::with_capacity(blocks.len());
+        let mut k = 0;
+        while k < blocks.len() {
+            let start = blocks[k].stored_at;
+            let mut stored = start;
+            let mut j = k;
+            while j < blocks.len() && (blocks[j].stored_len == 0 || blocks[j].stored_at == stored) {
+                let len = u64::from(blocks[j].stored_len);
+                at.push((runs.len(), if len == 0 { 0 } else { stored - start }));
+                stored += len;
+                j += 1;
+            }
+            let mut run = vec![0u8; (stored - start) as usize];
+            image.read(outer, start, &mut run)?;
+            runs.push(run);
+            k = j;
+        }
+        let work: Vec<_> = range
+            .clone()
+            .zip(&at)
+            .map(|(i, &(run, from))| {
+                let len = self.blocks[i].stored_len as usize;
+                (i, &runs[run][from as usize..from as usize + len])
+            })
+            .collect();
+        let mut decoded = crate::par_map(work, |(i, stored)| self.decode(i, stored))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let mut done = 0usize;
+        for (i, data) in range.clone().zip(&decoded) {
+            let within = (off + done as u64 - self.blocks[i].logical) as usize;
+            let n = (data.len() - within).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&data[within..within + n]);
+            done += n;
+        }
+        // A sequential reader's next read starts in the last block.
+        let tail = decoded.pop().unwrap_or_default();
+        self.remember(range.end - 1, tail);
+        Ok(())
+    }
+
     fn decoded(&mut self, i: usize, outer: &mut Outer, image: &OuterFile) -> Result<&[u8]> {
         if let Some(pos) = self.cache.iter().position(|(k, _)| *k == i) {
             return Ok(&self.cache[pos].1);
         }
         let b = &self.blocks[i];
-        self.scratch.resize(b.stored_len as usize, 0);
-        image.read(outer, b.stored_at, &mut self.scratch)?;
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.resize(b.stored_len as usize, 0);
+        image.read(outer, b.stored_at, &mut scratch)?;
+        let data = self.decode(i, &scratch);
+        self.scratch = scratch;
+        Ok(self.remember(i, data?))
+    }
+
+    /// Block `i` from its stored bytes.
+    fn decode(&self, i: usize, stored: &[u8]) -> Result<Vec<u8>> {
+        let b = &self.blocks[i];
         let described = DescribedBlock {
             logical: b.logical,
             len: u64::from(b.len),
@@ -239,7 +325,7 @@ impl Kraken {
         };
         // The stored bytes passed their outer digest, so a block that does not decode uses a
         // mode this decoder does not handle rather than being damaged.
-        let data = kraken_image::decode_described(&self.scratch, &described).map_err(|e| {
+        let data = kraken_image::decode_described(stored, &described).map_err(|e| {
             err(
                 UNSUPPORTED_CODEC,
                 format!(
@@ -259,6 +345,11 @@ impl Kraken {
                 ),
             ));
         }
+        Ok(data)
+    }
+
+    /// Keep block `i`'s decoded bytes in the ring.
+    fn remember(&mut self, i: usize, data: Vec<u8>) -> &[u8] {
         let slot = if self.cache.len() < DECODED_CACHE {
             self.cache.push((i, data));
             self.cache.len() - 1
@@ -268,6 +359,6 @@ impl Kraken {
             self.next = (slot + 1) % DECODED_CACHE;
             slot
         };
-        Ok(&self.cache[slot].1)
+        &self.cache[slot].1
     }
 }

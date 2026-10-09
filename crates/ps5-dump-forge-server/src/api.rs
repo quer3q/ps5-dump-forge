@@ -552,6 +552,8 @@ mod tests {
             inner: None,
             remove_backport: false,
             full_verify: false,
+            kraken_level: ps5_dump_forge_core::KrakenLevel::Fast,
+            ffpfsc_level: 6,
         });
         let starter = {
             let (server, out) = (server.clone(), tmp.join("out.exfat"));

@@ -326,28 +326,55 @@ impl Outer {
                 ),
             ));
         }
+        let (raw, want) = self.load_raw(index)?;
+        Ok(plaintext(
+            self.xts.as_ref(),
+            self.sb_index,
+            index,
+            raw,
+            &want,
+        ))
+    }
+
+    /// Block `index` as stored, and the digest its plaintext must have.
+    fn load_raw(&mut self, index: u64) -> Result<(Vec<u8>, [u8; 32])> {
         let mut raw = vec![0u8; BLOCK as usize];
         self.pkg
             .read_at(self.pfs_offset + index * BLOCK, &mut raw)?;
         let mut want = [0u8; 32];
         self.pkg.read_at(self.digests_at + index * 32, &mut want)?;
         want.reverse();
-        let Some(xts) = self.xts.as_ref().filter(|_| index != self.sb_index) else {
-            return Ok((sha3(&raw) == want).then_some(raw));
-        };
-        let (first, second) = if index < self.sb_index {
-            (index, SIGNED_SECTOR_FLAG | index)
-        } else {
-            (SIGNED_SECTOR_FLAG | index, index)
-        };
-        for sector in [first, second] {
-            let mut pt = raw.clone();
-            xts.decrypt(sector, &mut pt);
-            if sha3(&pt) == want {
-                return Ok(Some(pt));
+        Ok((raw, want))
+    }
+
+    /// [`Outer::block`] for many blocks at once, uncached: read in order, then checked (and
+    /// decrypted) on every core.
+    pub fn blocks(&mut self, indices: &[u64]) -> Result<Vec<Vec<u8>>> {
+        let mut loaded = Vec::with_capacity(indices.len());
+        for &index in indices {
+            if index >= self.blocks {
+                return Err(err(
+                    CORRUPT,
+                    format!(
+                        "outer block {index} is past the image's {} blocks",
+                        self.blocks
+                    ),
+                ));
             }
+            let (raw, want) = self.load_raw(index)?;
+            loaded.push((index, raw, want));
         }
-        Ok(None)
+        let (xts, sb_index) = (self.xts.as_ref(), self.sb_index);
+        crate::par_map(loaded, |(index, raw, want)| {
+            plaintext(xts, sb_index, index, raw, &want).ok_or_else(|| {
+                err(
+                    CORRUPT,
+                    format!("outer block {index} does not match its imagedigs entry"),
+                )
+            })
+        })
+        .into_iter()
+        .collect()
     }
 
     /// Block `index`'s checked plaintext, from the ring when it is there.
@@ -372,6 +399,33 @@ impl Outer {
         };
         Ok(&self.cache[slot].1)
     }
+}
+
+/// Outer block `index`'s plaintext from its stored bytes, `None` when no reading of it matches
+/// `want` (see [`Outer::try_load`]).
+fn plaintext(
+    xts: Option<&Xts>,
+    sb_index: u64,
+    index: u64,
+    raw: Vec<u8>,
+    want: &[u8; 32],
+) -> Option<Vec<u8>> {
+    let Some(xts) = xts.filter(|_| index != sb_index) else {
+        return (sha3(&raw) == *want).then_some(raw);
+    };
+    let (first, second) = if index < sb_index {
+        (index, SIGNED_SECTOR_FLAG | index)
+    } else {
+        (SIGNED_SECTOR_FLAG | index, index)
+    };
+    for sector in [first, second] {
+        let mut pt = raw.clone();
+        xts.decrypt(sector, &mut pt);
+        if sha3(&pt) == *want {
+            return Some(pt);
+        }
+    }
+    None
 }
 
 /// One file of the outer PFS (`pfs_image.dat`, `naps_pkg_layout.dat`): its size and the outer
@@ -446,6 +500,26 @@ impl OuterFile {
                     self.size
                 ),
             ));
+        }
+        let first = (off / BLOCK) as usize;
+        let last = (off + buf.len() as u64).div_ceil(BLOCK) as usize;
+        // A long read checks its blocks on every core; the ring would only hold its tail.
+        // ponytail: the edge blocks of a long read may be loaded twice (once more by the next read)
+        if last - first > 2 {
+            let indices: Vec<u64> = self.map[first..last]
+                .iter()
+                .map(|&i| u64::from(i))
+                .collect();
+            let blocks = outer.blocks(&indices)?;
+            let within = (off % BLOCK) as usize;
+            let mut done = 0usize;
+            for (k, block) in blocks.iter().enumerate() {
+                let from = if k == 0 { within } else { 0 };
+                let n = (BLOCK as usize - from).min(buf.len() - done);
+                buf[done..done + n].copy_from_slice(&block[from..from + n]);
+                done += n;
+            }
+            return Ok(());
         }
         let mut done = 0usize;
         while done < buf.len() {

@@ -1,0 +1,205 @@
+diff --git a/ps5upload-fpkg/src/kraken.rs b/ps5upload-fpkg/src/kraken.rs
+index 3ed7b96..132263b 100644
+--- a/ps5upload-fpkg/src/kraken.rs
++++ b/ps5upload-fpkg/src/kraken.rs
+@@ -1086,16 +1086,40 @@ pub fn encode_block_at(block: &[u8], level: Level) -> Vec<Half> {
+ // ─────────────────────────────── decoder ───────────────────────────────
+ 
+ /// Literals into `out[dst..dst + n]`, delta-coded against the byte `last` back when `delta`.
++/// `last` is at least [`MIN_DISTANCE`], so eight bytes at a time never read one not yet written.
+ fn put_literals(out: &mut [u8], dst: usize, lits: &[u8], delta: bool, last: usize) {
+     if delta {
+-        for (k, &l) in lits.iter().enumerate() {
+-            out[dst + k] = l.wrapping_add(out[dst + k - last]);
++        let mut k = 0;
++        while k + 8 <= lits.len() {
++            let base: [u8; 8] = out[dst + k - last..dst + k - last + 8].try_into().unwrap();
++            let chunk = &mut out[dst + k..dst + k + 8];
++            for j in 0..8 {
++                chunk[j] = lits[k + j].wrapping_add(base[j]);
++            }
++            k += 8;
++        }
++        for k in k..lits.len() {
++            out[dst + k] = lits[k].wrapping_add(out[dst + k - last]);
+         }
+     } else {
+         out[dst..dst + lits.len()].copy_from_slice(lits);
+     }
+ }
+ 
++/// `out[dst..dst + len] = out[dst - dist..]`, byte by byte in effect: `dist` is at least
++/// [`MIN_DISTANCE`], so each eight-byte word is read only after it is written.
++fn copy_match(out: &mut [u8], dst: usize, dist: usize, len: usize) {
++    let mut k = 0;
++    while k + 8 <= len {
++        let w: [u8; 8] = out[dst + k - dist..dst + k - dist + 8].try_into().unwrap();
++        out[dst + k..dst + k + 8].copy_from_slice(&w);
++        k += 8;
++    }
++    for k in k..len {
++        out[dst + k] = out[dst + k - dist];
++    }
++}
++
+ /// Decode one LZ half into `out[at..at + len]`; `out[..at]` is the block's history. `delta`
+ /// selects literal mode 0.
+ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -> Result<()> {
+@@ -1241,9 +1265,7 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
+         if dist < MIN_DISTANCE || dist > dst || dst + mlen > end {
+             return format_err("kraken: match out of bounds");
+         }
+-        for k in 0..mlen {
+-            out[dst + k] = out[dst + k - dist];
+-        }
++        copy_match(out, dst, dist, mlen);
+         dst += mlen;
+     }
+     let tail = end - dst;
+@@ -1268,19 +1290,26 @@ pub(crate) fn decode_entropy_half(src: &[u8], len: usize) -> Result<Vec<u8>> {
+ 
+ /// Decode a block of `len` logical bytes from its halves.
+ pub fn decode_block(halves: &[Half], len: usize) -> Result<Vec<u8>> {
++    let parts: Vec<_> = halves
++        .iter()
++        .map(|h| (h.bytes(), h.is_lz(), h.is_delta()))
++        .collect();
++    decode_parts(&parts, len)
++}
++
++/// [`decode_block`] over borrowed halves, each `(bytes, LZ, delta literals)`.
++pub(crate) fn decode_parts(halves: &[(&[u8], bool, bool)], len: usize) -> Result<Vec<u8>> {
+     let mut out = vec![0u8; len];
+     let mut at = 0usize;
+-    for h in halves {
++    for &(b, lz, delta) in halves {
+         let hl = (len - at).min(HALF);
+-        match h {
+-            Half::Raw(b) => {
+-                if b.len() != hl {
+-                    return format_err("kraken: raw half has the wrong length");
+-                }
+-                out[at..at + hl].copy_from_slice(b);
++        if lz {
++            decode_half(b, &mut out, at, hl, delta)?;
++        } else {
++            if b.len() != hl {
++                return format_err("kraken: raw half has the wrong length");
+             }
+-            Half::Lz(b) => decode_half(b, &mut out, at, hl, false)?,
+-            Half::LzDelta(b) => decode_half(b, &mut out, at, hl, true)?,
++            out[at..at + hl].copy_from_slice(b);
+         }
+         at += hl;
+     }
+diff --git a/ps5upload-fpkg/src/kraken/huff.rs b/ps5upload-fpkg/src/kraken/huff.rs
+index b39e694..331fb83 100644
+--- a/ps5upload-fpkg/src/kraken/huff.rs
++++ b/ps5upload-fpkg/src/kraken/huff.rs
+@@ -239,6 +239,23 @@ impl<'a> LsbReader<'a> {
+     }
+ 
+     fn peek(&mut self) -> usize {
++        // Whole bytes at once while eight are left in range: the same bits as one at a time.
++        if self.n < MAX_LEN && self.left >= 8 {
++            let word = if self.back {
++                u64::from_be_bytes(self.src[self.next - 8..self.next].try_into().unwrap())
++            } else {
++                u64::from_le_bytes(self.src[self.next..self.next + 8].try_into().unwrap())
++            };
++            let k = ((63 - self.n) / 8) as usize;
++            self.acc |= (word & ((1u64 << (k * 8)) - 1)) << self.n;
++            self.n += k as u32 * 8;
++            self.left -= k;
++            if self.back {
++                self.next -= k;
++            } else {
++                self.next += k;
++            }
++        }
+         while self.n < MAX_LEN {
+             let byte = if self.left == 0 {
+                 0
+@@ -374,12 +391,14 @@ pub(super) fn decode(src: &[u8], n: usize) -> Result<Vec<u8>> {
+         LsbReader::new(src, a0 + split, src.len(), true),
+         LsbReader::new(src, a0 + split, src.len(), false),
+     ];
+-    let mut out = Vec::with_capacity(n);
+-    for i in 0..n {
+-        let s = &mut streams[i % 3];
+-        let (sym, l) = lut[s.peek()];
+-        s.skip(l);
+-        out.push(sym);
++    // Symbol i comes from stream i % 3.
++    let mut out = vec![0u8; n];
++    for chunk in out.chunks_mut(3) {
++        for (s, o) in streams.iter_mut().zip(chunk) {
++            let (sym, l) = lut[s.peek()];
++            s.skip(l);
++            *o = sym;
++        }
+     }
+     let [a, b, c] = &streams;
+     if a.bytes_used() != split || b.bytes_used() + c.bytes_used() != src.len() - a0 - split {
+diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
+index 58c9786..6f4737c 100644
+--- a/ps5upload-fpkg/src/kraken_image.rs
++++ b/ps5upload-fpkg/src/kraken_image.rs
+@@ -12,6 +12,7 @@
+ //! the console could not read back. The compressed image goes to a spool file first, because
+ //! the outer image's geometry depends on its final length.
+ 
++use std::borrow::Cow;
+ use std::fs::File;
+ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+ use std::sync::atomic::{AtomicBool, Ordering};
+@@ -759,7 +760,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+ /// Decode block `b` of a stored image. `b` comes from [`describe`]; one built by hand is
+ /// checked the same way: a block longer than 256 KiB, or one running past the image, is an
+ /// error rather than an allocation or a panic.
+-pub fn decode_described(image: &[u8], b: &DescribedBlock) -> Result<Vec<u8>> {
++pub fn decode_described<'a>(image: &'a [u8], b: &DescribedBlock) -> Result<Vec<u8>> {
+     if b.len == 0 || b.len > UBLOCK {
+         return format_err(format!(
+             "a block of {:#x} bytes is not a Kraken block",
+@@ -790,24 +791,18 @@ pub fn decode_described(image: &[u8], b: &DescribedBlock) -> Result<Vec<u8>> {
+         .and_then(|range| image.get(range))
+         .ok_or_else(|| crate::Error::Format("a block runs past the image".into()))?;
+     let even_logical = b.len.min(kraken::HALF as u64);
+-    let mut halves = Vec::new();
+     let (e, o) = src.split_at((b.even_len as usize).min(src.len()));
+     // An LZ flag selects the chunk decoder. A non-LZ half is either an exact-size raw
+     // copy or a bare entropy array; its literal-mode bit does not apply to that array.
+-    let half = |bytes: &[u8], len: u64, is_lz: bool, delta: bool| -> Result<Half> {
+-        Ok(if is_lz {
+-            if delta {
+-                Half::LzDelta(bytes.to_vec())
+-            } else {
+-                Half::Lz(bytes.to_vec())
+-            }
+-        } else if bytes.len() as u64 == len {
+-            Half::Raw(bytes.to_vec())
++    let half = |bytes: &'a [u8], len: u64, is_lz: bool, delta: bool| -> Result<_> {
++        Ok(if is_lz || bytes.len() as u64 == len {
++            (Cow::Borrowed(bytes), is_lz, delta)
+         } else {
+-            Half::Raw(kraken::decode_entropy_half(bytes, len as usize)?)
++            let array = kraken::decode_entropy_half(bytes, len as usize)?;
++            (Cow::Owned(array), false, false)
+         })
+     };
+-    halves.push(half(e, even_logical, b.even_lz, b.mode_bits & 1 != 0)?);
++    let mut halves = vec![half(e, even_logical, b.even_lz, b.mode_bits & 1 != 0)?];
+     if b.len > kraken::HALF as u64 {
+         halves.push(half(
+             o,
+@@ -818,7 +813,8 @@ pub fn decode_described(image: &[u8], b: &DescribedBlock) -> Result<Vec<u8>> {
+     } else if !o.is_empty() {
+         return format_err("kraken: unexpected odd half");
+     }
+-    kraken::decode_block(&halves, b.len as usize)
++    let parts: Vec<_> = halves.iter().map(|(h, lz, d)| (&h[..], *lz, *d)).collect();
++    kraken::decode_parts(&parts, b.len as usize)
+ }
+ 
+ #[cfg(test)]

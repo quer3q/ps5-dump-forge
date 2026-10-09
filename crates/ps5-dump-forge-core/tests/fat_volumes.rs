@@ -20,8 +20,8 @@ use std::time::Duration;
 use ps5upload_fpkg::source::SourceTree;
 
 use ps5_dump_forge_core::{
-    ConvertRequest, Event, Format, JobId, JobReport, Jobs, ScannedFolder, rename_no_replace,
-    stale_parts,
+    ConvertRequest, Event, Format, JobId, JobReport, Jobs, KrakenLevel, ScannedFolder,
+    rename_no_replace, stale_parts,
 };
 
 /// An `hdiutil` volume attached at `base/mnt`. [`Volume::detach`] is the checked teardown;
@@ -230,6 +230,8 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         inner: None,
         remove_backport: false,
         full_verify: false,
+        kraken_level: KrakenLevel::Fast,
+        ffpfsc_level: 6,
     }
 }
 

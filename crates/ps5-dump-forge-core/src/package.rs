@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{anyhow, bail};
 use ps5_dump_forge_fpkg::FpkgSource;
 use ps5upload_fpkg::build::{self, BuildControl, BuildRequest, Origin, Prepared, Stage};
+use ps5upload_fpkg::kraken::Level;
 use ps5upload_fpkg::source::{self, SourceFile, SourceTree};
 use ps5upload_fpkg::{Error, sdk_rules};
 use unicode_normalization::is_nfc;
@@ -22,7 +23,7 @@ use crate::finalize::{Part, part_path};
 use crate::jobs::Ctx;
 use crate::preflight::{self, GameInfo, listing};
 use crate::verify::{self, HashingTree, Mode};
-use crate::{ConvertRequest, JobReport};
+use crate::{ConvertRequest, JobReport, KrakenLevel};
 
 /// Shown on every package job: a plaintext debug package installs nowhere else.
 pub(crate) const CONSOLE: &str =
@@ -285,6 +286,11 @@ pub(crate) fn run(
     // `source`/`output_dir` are not read by `prepare`/`write_package`; the `.part` is ours.
     let mut request = BuildRequest::production(&req.source, dir);
     request.threads = req.compression_threads;
+    request.level = match req.kraken_level {
+        KrakenLevel::Fast => Level::Fast,
+        KrakenLevel::Balanced => Level::Balanced,
+        KrakenLevel::Smallest => Level::Smallest,
+    };
     let stage = Cell::new(Stage::Check.id());
     let sized = Cell::new(false);
     let mut on_stage = |s: Stage| {
@@ -315,10 +321,23 @@ pub(crate) fn run(
     // What the package write watches instead of the job's cancel (`sync_beside`).
     #[cfg(target_os = "freebsd")]
     let abort = AtomicBool::new(false);
+    // Fast verification samples the builder's own sweep too, with the job's seed.
+    let mode = if req.full_verify {
+        Mode::Full
+    } else {
+        Mode::Fast {
+            seed: verify::fresh_seed()?,
+            seam: false,
+        }
+    };
     let mut control = BuildControl {
         bytes: Some(&mut on_bytes),
         cancel: Some(ctx.cancel),
         stage: Some(&mut on_stage),
+        sample: match mode {
+            Mode::Fast { seed, .. } => Some(seed),
+            Mode::Full => None,
+        },
     };
     let prepared =
         build::prepare(tree, &request, &mut control).map_err(fpkg("preparing the package"))?;
@@ -417,10 +436,6 @@ pub(crate) fn run(
     // Verification: the expected manifest is what the package must carry, each file hashed as the
     // builder serves it; files the build passed through keep the hash of the source read.
     ctx.progress("verify", 0, 1);
-    // ponytail: a `.pkg` is always verified in full, whatever `full_verify` says; the builder's
-    // own verify sweeps every block anyway. Upgrade: a numbered vendor patch with a sampling
-    // policy in vendor verify, then `Mode::Fast` here.
-    let mode = Mode::Full;
     let source_hashes = hashing.into_digests();
     let mut packaged = Packaged::new(&prepared, tree);
     let known: HashMap<String, verify::Digest> = packaged

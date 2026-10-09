@@ -391,11 +391,97 @@ pub fn verify_streaming_controlled(
 
 /// [`verify_streaming_controlled`] over a package already open, e.g. through the handle it was
 /// just written with, so the bytes checked are that file's whatever its path now names.
+/// Outer blocks the sweep reads per batch (8 MiB).
+const SWEEP_BATCH: u64 = 128;
+
+/// How many of `raw`'s blocks (outer blocks `first` on) reach no `digests` entry, checked on
+/// every core: by decryption with either sector number under `xts`, as stored without it. The
+/// superblock is skipped: it is not encrypted and was matched against the game digest.
+fn failing_blocks(
+    raw: &[u8],
+    first: u64,
+    sb_index: u64,
+    xts: Option<&Xts>,
+    digests: &[[u8; 32]],
+) -> u64 {
+    let matches = |block: &[u8], index: u64| match xts {
+        None => sha3(block) == digests[index as usize],
+        Some(xts) => [index, SIGNED_SECTOR_FLAG | index].iter().any(|&sector| {
+            let mut pt = block.to_vec();
+            xts.decrypt(sector, &mut pt);
+            sha3(&pt) == digests[index as usize]
+        }),
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = (raw.len() / BLOCK as usize).div_ceil(threads).max(1) * BLOCK as usize;
+    std::thread::scope(|s| {
+        let workers: Vec<_> = raw
+            .chunks(per)
+            .enumerate()
+            .map(|(c, share)| {
+                let matches = &matches;
+                s.spawn(move || {
+                    share
+                        .chunks(BLOCK as usize)
+                        .enumerate()
+                        .filter(|&(k, block)| {
+                            let index = first + ((c * per) / BLOCK as usize + k) as u64;
+                            index != sb_index && !matches(block, index)
+                        })
+                        .count() as u64
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .sum()
+    })
+}
+
 pub fn verify_file_controlled(
+    file: PkgFile,
+    passcode: &str,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<Report> {
+    verify_file_sampled(file, passcode, progress, cancel, None)
+}
+
+/// Which of `batches` 8 MiB batches a sampled sweep reads, ascending: the first, the last and
+/// a seeded 1% of the rest, at most 128 of them (1 GiB). The same for the same seed.
+fn sampled_batches(batches: u64, seed: u64) -> Vec<u64> {
+    let mut picked = vec![0, batches.saturating_sub(1)];
+    let rest = batches.saturating_sub(2);
+    // Ends included, at most 128 batches (1 GiB).
+    let want = (rest / 100).max(u64::from(rest > 0)).min(126);
+    // SplitMix64: small, and the same on every platform for the same seed.
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for _ in 0..want {
+        picked.push(1 + next() % rest);
+    }
+    picked.sort_unstable();
+    picked.dedup();
+    picked.retain(|&b| b < batches);
+    picked
+}
+
+/// [`verify_file_controlled`], with `sample: Some(seed)` reading only [`sampled_batches`] of
+/// the outer blocks and of the `playgo-chunk.crc` table (every structural check still runs);
+/// for a caller that checks the package's files itself.
+pub fn verify_file_sampled(
     mut file: PkgFile,
     passcode: &str,
     progress: &mut dyn FnMut(u64, u64),
     cancel: Option<&AtomicBool>,
+    sample: Option<u64>,
 ) -> Result<Report> {
     let stop = || -> Result<()> {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -494,37 +580,31 @@ pub fn verify_file_controlled(
 
     // The sweep: every data block must reach the digest `imagedigs` carries — by decryption in
     // the native mode, as stored in the plaintext one.
-    let mut bad = 0u64;
-    let mut done = 0u64;
-    for index in 0..count {
+    // Read a batch at a time and checked on every core.
+    let batches = count.div_ceil(SWEEP_BATCH);
+    let swept: Vec<u64> = match sample {
+        Some(seed) => sampled_batches(batches, seed),
+        None => (0..batches).collect(),
+    };
+    let sweep_blocks: u64 = swept
+        .iter()
+        .map(|b| (count - b * SWEEP_BATCH).min(SWEEP_BATCH))
+        .sum();
+    let (mut bad, mut done) = (0u64, 0u64);
+    for &b in &swept {
         stop()?;
-        // The superblock is not encrypted; it was matched against the game digest above.
-        if index != sb_index {
-            let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
-            let mut matched = false;
-            match &xts {
-                None => matched = sha3(&raw) == digests[index as usize],
-                Some(xts) => {
-                    for sector in [index, SIGNED_SECTOR_FLAG | index] {
-                        let mut pt = raw.clone();
-                        xts.decrypt(sector, &mut pt);
-                        if sha3(&pt) == digests[index as usize] {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !matched {
-                bad += 1;
-            }
-        }
-        done += 1;
-        if done.is_multiple_of(256) {
-            progress(done * BLOCK, count * BLOCK);
-        }
+        let first = b * SWEEP_BATCH;
+        let n = (count - first).min(SWEEP_BATCH);
+        let raw = file.read_at(fih.pfs_offset + first * BLOCK, (n * BLOCK) as usize)?;
+        bad += failing_blocks(&raw, first, sb_index, xts.as_ref(), &digests);
+        done += n;
+        progress(done * BLOCK, sweep_blocks * BLOCK);
     }
-    progress(done * BLOCK, count * BLOCK);
+    progress(done * BLOCK, sweep_blocks * BLOCK);
+    let scope = match sample {
+        Some(seed) => format!(" (a sample of {done}, seed {seed})"),
+        None => String::new(),
+    };
     r.push(
         if plaintext_mode {
             "outer blocks match their imagedigs entry"
@@ -532,7 +612,7 @@ pub fn verify_file_controlled(
             "outer blocks decrypt to their imagedigs entry"
         },
         bad == 0,
-        format!("{} of {count} failed", bad),
+        format!("{bad} of {count} failed{scope}"),
     );
 
     // The uroot dirents and the flat-path table, read on demand like everything else.
@@ -577,12 +657,37 @@ pub fn verify_file_controlled(
             match s.members.iter().find(|m| m.name == crc_name) {
                 Some(m) => {
                     let stored = file.read_at(m.offset, m.size as usize)?;
-                    let expected = si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
-                    r.push(
-                        "si playgo-chunk.crc",
-                        stored == expected,
-                        format!("{} bytes", m.size),
-                    );
+                    let (ok, detail) = match sample {
+                        None => {
+                            let expected =
+                                si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
+                            (stored == expected, format!("{} bytes", m.size))
+                        }
+                        Some(seed) => {
+                            let batches = s.zip_start.div_ceil(si::CRC_BATCH * BLOCK);
+                            let picked = sampled_batches(batches, seed);
+                            let mut ok = stored.len() as u64 == s.zip_start.div_ceil(BLOCK) * 4;
+                            for &b in &picked {
+                                if !ok {
+                                    break;
+                                }
+                                stop()?;
+                                let start = b * si::CRC_BATCH * BLOCK;
+                                let len = (s.zip_start - start).min(si::CRC_BATCH * BLOCK);
+                                let at = (b * si::CRC_BATCH * 4) as usize;
+                                let crcs = si::batch_crcs(&mut file, start, len)?;
+                                ok = crcs.iter().enumerate().all(|(k, c)| {
+                                    stored.get(at + k * 4..at + k * 4 + 4) == Some(&c.to_le_bytes())
+                                });
+                            }
+                            let n = picked.len();
+                            (
+                                ok,
+                                format!("{} bytes, {n} of {batches} batches sampled", m.size),
+                            )
+                        }
+                    };
+                    r.push("si playgo-chunk.crc", ok, detail);
                 }
                 None => r.push("si playgo-chunk.crc", false, format!("{crc_name} missing")),
             }
@@ -590,4 +695,30 @@ pub fn verify_file_controlled(
         None => r.push("si zip present", false, "no trailing STORED ZIP"),
     }
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampled_batches;
+
+    #[test]
+    fn a_sample_holds_the_ends_and_one_percent() {
+        assert_eq!(sampled_batches(1, 7), [0]);
+        assert_eq!(sampled_batches(2, 7), [0, 1]);
+        assert_eq!(sampled_batches(3, 7), [0, 1, 2]);
+        let picked = sampled_batches(10_000, 42);
+        assert_eq!(
+            picked,
+            sampled_batches(10_000, 42),
+            "the same for the same seed"
+        );
+        assert_ne!(picked, sampled_batches(10_000, 43));
+        assert!(picked.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!((picked[0], *picked.last().unwrap()), (0, 9_999));
+        assert!((90..=102).contains(&picked.len()), "{}", picked.len());
+        assert!(
+            (0..64).all(|seed| sampled_batches(1_000_000, seed).len() <= 128),
+            "at most 128 batches, 1 GiB"
+        );
+    }
 }

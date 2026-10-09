@@ -39,10 +39,15 @@ pub(crate) const PFSC_TABLE_AT: u64 = 0x400;
 /// Replies pending per worker before the stream waits on the oldest.
 const DEPTH_PER_WORKER: usize = 4;
 
+/// The app's default zlib level (see [`WrapOptions::level`]), zlib's own. On a 13 GB game
+/// (14 cores) level 6 took 16.3 s for 76.25% stored; 7: 17.3 s, 76.23%; 9: 20.4 s, 76.21%;
+/// 5: 13.7 s, 76.33%; 1: 5.7 s, 78.57%.
+pub const DEFAULT_LEVEL: u32 = 6;
+
 #[derive(Debug, Clone)]
 pub struct WrapOptions {
-    /// zlib level, 1–9. Level 6 lands within 0.2% of level 9 on a real exFAT game image and
-    /// builds 30% faster.
+    /// zlib level, 0–9 as zlib numbers them: 0 stores every block raw, 1 is fastest, 9 the
+    /// smallest. Every level writes the same kind of zlib stream; only the size and time differ.
     pub level: u32,
     /// Percent a block must shrink by to be stored compressed (at most 90).
     pub min_block_gain: u8,
@@ -55,7 +60,7 @@ pub struct WrapOptions {
 impl Default for WrapOptions {
     fn default() -> Self {
         Self {
-            level: 6,
+            level: DEFAULT_LEVEL,
             min_block_gain: 5,
             threads: 0,
             time: None,
@@ -104,15 +109,46 @@ pub fn container_size_max(raw_size: u64) -> Result<u64> {
 fn encode_block(raw: &[u8], level: u32, min_gain: u8) -> io::Result<Vec<u8>> {
     let mut padded = raw.to_vec();
     padded.resize(BLOCK as usize, 0);
-    let mut enc = ZlibEncoder::new(Vec::with_capacity(BLOCK as usize), Compression::new(level));
-    enc.write_all(&padded)?;
-    let z = enc.finish()?;
+    // Level 0 stores: its zlib stream is always longer than the block, so the block stays raw.
+    if level == 0 || (min_gain >= 5 && level > 1 && incompressible(&padded)?) {
+        return Ok(padded);
+    }
+    let z = zlib(&padded, level)?;
     let limit = BLOCK as usize * (100 - usize::from(min_gain)) / 100;
     Ok(if z.len() < BLOCK as usize && z.len() <= limit {
         z
     } else {
         padded
     })
+}
+
+fn zlib(block: &[u8], level: u32) -> io::Result<Vec<u8>> {
+    let mut enc = ZlibEncoder::new(Vec::with_capacity(BLOCK as usize), Compression::new(level));
+    enc.write_all(block)?;
+    enc.finish()
+}
+
+/// Whether a block is not worth the level's full search: its bytes are spread almost evenly
+/// (over 7.9 bits each) and level 1 saves under 2%. Measured on ~24,000 blocks of three games
+/// (compressed game data, a Kraken package, an executable), it changed no keep/raw decision
+/// at levels 7 and 10 and saved 4–66% of the compression time, by how much data was
+/// already compressed. A block it misjudges is only stored raw, still valid.
+// ponytail: thresholds from that sample; widen the corpus if a game ever compresses worse
+fn incompressible(block: &[u8]) -> io::Result<bool> {
+    let mut counts = [0u32; 256];
+    for &b in block {
+        counts[usize::from(b)] += 1;
+    }
+    let n = block.len() as f64;
+    let bits: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = f64::from(c) / n;
+            -p * p.log2()
+        })
+        .sum();
+    Ok(bits > 7.9 && zlib(block, 1)?.len() * 100 > block.len() * 98)
 }
 
 /// Build a `.ffpfsc` holding `inner_name` (whose name tells SMP the filesystem) into `out`, an
@@ -143,9 +179,9 @@ fn wrap_with<T, W: Write + Seek>(
     encode: &Encode,
     fill: impl FnOnce(&mut Stream<'_>) -> Result<T>,
 ) -> Result<(T, WrapReport)> {
-    if !(1..=9).contains(&opts.level) {
+    if opts.level > 9 {
         return Err(err(format!(
-            "zlib level must be 1 through 9, not {}",
+            "zlib level must be 0 through 9, not {}",
             opts.level
         )));
     }
@@ -452,6 +488,7 @@ fn too_big() -> Error {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::io::Read;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -496,6 +533,57 @@ mod tests {
 
     fn plain(raw: &[u8]) -> io::Result<Vec<u8>> {
         encode_block(raw, 6, 5)
+    }
+
+    /// Every level from 1 writes a block zlib reads back exactly; 0 keeps it raw. 10 is
+    /// refused before anything is written.
+    #[test]
+    fn every_level_round_trips() {
+        let raw: Vec<u8> = (0..BLOCK as u32)
+            .map(|i| ((i % 251) ^ (i / 997)) as u8)
+            .collect();
+        let mut sizes = Vec::new();
+        assert_eq!(encode_block(&raw, 0, 5).unwrap(), raw);
+        for level in 1..=9 {
+            let z = encode_block(&raw, level, 5).unwrap();
+            assert!(z.len() < raw.len(), "level {level} kept the block raw");
+            let mut back = Vec::new();
+            flate2::read::ZlibDecoder::new(&z[..])
+                .read_to_end(&mut back)
+                .unwrap();
+            assert_eq!(back, raw, "level {level}");
+            sizes.push(z.len());
+        }
+        assert!(sizes[8] <= sizes[0], "{sizes:?}");
+        let d = temp("level");
+        for level in [10, 11] {
+            let mut out = File::create(d.join(format!("{level}.ffpfsc"))).unwrap();
+            let o = WrapOptions { level, ..opts(1) };
+            let e = wrap("x.exfat", 100, &mut out, &o, &AtomicBool::new(false), |s| {
+                feed(s, 100)
+            })
+            .unwrap_err();
+            assert!(e.to_string().contains("0 through 9"), "{e}");
+        }
+    }
+
+    /// Noise skips the level's search and is stored raw; patterned data still compresses.
+    #[test]
+    fn noise_is_found_without_the_full_search() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let noise: Vec<u8> = (0..BLOCK)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        assert!(incompressible(&noise).unwrap());
+        assert_eq!(encode_block(&noise, 7, 5).unwrap(), noise);
+        let pattern: Vec<u8> = (0..BLOCK as u32).map(|i| (i % 97) as u8).collect();
+        assert!(!incompressible(&pattern).unwrap());
+        assert!(encode_block(&pattern, 7, 5).unwrap().len() < BLOCK as usize / 10);
     }
 
     #[test]

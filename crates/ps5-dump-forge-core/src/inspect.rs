@@ -54,9 +54,17 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     } else if kind == Kind::Ffpfsc {
         let (tree, info) = crate::convert::open_ffpfsc(path)?;
         pfs_facts("outer PFS", &info.outer, &mut details, &mut pfs_findings);
+        // The zlib header's level class, with the levels this app's writer gives it.
+        let class = match info.zlib_level_class {
+            Some(0) => ", zlib class fastest (level 1 here)",
+            Some(1) => ", zlib class fast (levels 2–3 here)",
+            Some(2) => ", zlib class default (levels 4–8 here)",
+            Some(_) => ", zlib class maximum (level 9 here)",
+            None => "",
+        };
         details.push(if info.compressed {
             format!(
-                "container: {}, {} bytes stored in {} ({}%), {} of {} 64 KiB blocks compressed",
+                "container: {}, {} bytes stored in {} ({}%), {} of {} 64 KiB blocks compressed{class}",
                 info.inner_name,
                 info.raw_size,
                 info.stored_size,

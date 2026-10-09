@@ -272,24 +272,47 @@ impl ExFat {
             }
         }
         let mut out = Vec::with_capacity(len);
-        while out.len() < len {
+        loop {
             let at = self.cluster_offset(cluster)? + skip as u64;
-            let want = (len - out.len()).min(cluster_size as usize - skip);
+            // Clusters that follow each other on disk are read as one run (a contiguous
+            // stream always does); each is still checked before it is read.
+            let mut span = cluster_size as usize - skip;
+            let mut last = cluster;
+            let mut jump = None;
+            while out.len() + span < len {
+                let next = self.following(last, no_fat_chain, path)?;
+                if Some(next) != last.checked_add(1) {
+                    jump = Some(next);
+                    break;
+                }
+                last = next;
+                span += cluster_size as usize;
+            }
+            let want = (len - out.len()).min(span);
             out.extend_from_slice(&self.file.read_at(at, want)?);
             skip = 0;
-            if out.len() < len {
-                // A contiguous stream advances by cluster number; only a chained one
-                // consults the FAT, which on these images is not maintained.
-                cluster = if no_fat_chain {
-                    let next = cluster + 1;
-                    self.check_cluster(next)?;
-                    next
-                } else {
-                    self.next_cluster(cluster)?.ok_or_else(|| early_end(path))?
-                };
+            if out.len() >= len {
+                return Ok(out);
             }
+            cluster = match jump {
+                Some(next) => next,
+                None => self.following(last, no_fat_chain, path)?,
+            };
         }
-        Ok(out)
+    }
+
+    /// The cluster after `cluster` in a file: the next number in a contiguous stream; only a
+    /// chained one consults the FAT, which on these images is not maintained.
+    fn following(&mut self, cluster: u32, no_fat_chain: bool, path: &str) -> Result<u32> {
+        if no_fat_chain {
+            let next = cluster
+                .checked_add(1)
+                .ok_or_else(|| crate::Error::Format(format!("{path} runs off the volume")))?;
+            self.check_cluster(next)?;
+            Ok(next)
+        } else {
+            self.next_cluster(cluster)?.ok_or_else(|| early_end(path))
+        }
     }
 
     fn check_cluster(&self, cluster: u32) -> Result<()> {

@@ -12,6 +12,7 @@ import {
   type Format,
   type InnerFormat,
   type Inspection,
+  type KrakenLevel,
   type JobReport,
   type VerifyReport,
 } from "./api";
@@ -61,14 +62,54 @@ const INNER_INFO: Record<InnerFormat, string> = {
     "An uncompressed PFS image inside, also recommended by ShadowMountPlus. File names must be plain ASCII.",
 };
 
-// ponytail: approximate: the compress pass runs ~85–105 MB/s (measured on Apple Silicon), then
-// write and verify run at disk speed, so a whole .pkg job averages ~80 MB/s of source
-// (about 20 min for an 89 GB game). Ceiling: other machines and drives differ.
-const PKG_BYTES_PER_SEC = 80e6;
+/** The `.ffpfsc` zlib level a new window starts on. */
+const DEFAULT_FFPFSC_LEVEL = 6;
 
-/** "about 20 min" for a .fpkg build of `bytes`, to the nearest 5 minutes. */
-function pkgBuildTime(bytes: number): string {
-  const min = Math.max(5, Math.round(bytes / PKG_BYTES_PER_SEC / 60 / 5) * 5);
+/** One line under the `.ffpfsc` level slider: what the chosen level costs, from a 13 GB test
+ * game on 14 cores (0: 3.0 s, 100% stored; 1: 5.7 s, 78.6%; 4: 13.0 s, 76.4%; 6: 16.3 s,
+ * 76.25%; 7: 17.3 s; 9: 20.4 s, 76.21%). */
+function ffpfscLevelNote(level: number): string {
+  if (level === 0) return "No compression: every block stored as it is. The file is as large as the image.";
+  if (level === DEFAULT_FFPFSC_LEVEL)
+    return "Recommended (zlib's default). 1 builds about 3× faster with a file about 3% larger; 9 is barely smaller.";
+  if (level < DEFAULT_FFPFSC_LEVEL)
+    return "Builds faster than 6 (level 1 about 3×); the file comes out larger (level 1 about 3%).";
+  return "Barely smaller than 6 (level 9 by 0.04%), but compressing takes longer (level 9 about 25%), with every core busy throughout.";
+}
+
+/** The `.fpkg` compression levels, in picker order: icon, label, and one line under the picker. */
+const KRAKEN_LEVELS: KrakenLevel[] = ["fast", "balanced", "smallest"];
+const KRAKEN_INFO: Record<KrakenLevel, { icon: IconName; label: string; note: string }> = {
+  fast: {
+    icon: "bolt",
+    label: "Fast",
+    note: "Recommended. The quickest build; the package comes out about 3% larger.",
+  },
+  balanced: {
+    icon: "scale",
+    label: "Balanced",
+    note: "About 2.6% smaller than Fast, but compressing takes about 6× as long, with every core busy the whole time.",
+  },
+  smallest: {
+    icon: "compress",
+    label: "Smallest",
+    note: "About 2.7% smaller than Fast, but compressing takes about 9× as long, with every core busy the whole time.",
+  },
+};
+
+// ponytail: approximate: a whole .pkg job's average speed per level, in bytes of source per
+// second, on Apple Silicon (14 cores) with fast verification: Fast measured on an 89 GB game
+// (296 s), Balanced from an earlier whole-job measurement, Smallest scaled from it by the
+// encoder's speed ratio. Ceiling: other machines, drives and games differ.
+const PKG_BYTES_PER_SEC: Record<KrakenLevel, number> = {
+  fast: 300e6,
+  balanced: 80e6,
+  smallest: 55e6,
+};
+
+/** "about 20 min" for a .fpkg build of `bytes` at `level`, to the nearest 5 minutes. */
+function pkgBuildTime(bytes: number, level: KrakenLevel): string {
+  const min = Math.max(5, Math.round(bytes / PKG_BYTES_PER_SEC[level] / 60 / 5) * 5);
   return min < 120 ? `about ${min} min` : `about ${Math.round(min / 60)} h`;
 }
 
@@ -119,6 +160,10 @@ export function Convert(props: {
   const [removeBackport, setRemoveBackport] = useState(false);
   /** Re-read every byte instead of sampling; kept across sources and targets. */
   const [fullVerify, setFullVerify] = useState(false);
+  /** The `.fpkg` compression level; kept across sources and targets. */
+  const [krakenLevel, setKrakenLevel] = useState<KrakenLevel>("fast");
+  /** The `.ffpfsc` zlib level, 0–9; kept across sources and targets. */
+  const [ffpfscLevel, setFfpfscLevel] = useState(DEFAULT_FFPFSC_LEVEL);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
@@ -260,7 +305,9 @@ export function Convert(props: {
       compression_threads: null,
       inner: format === "ffpfsc" ? inner : null,
       remove_backport: removable && removeBackport,
-      full_verify: format === "pkg" || fullVerify,
+      full_verify: fullVerify,
+      kraken_level: krakenLevel,
+      ffpfsc_level: ffpfscLevel,
     };
     submittingRef.current = true;
     setSubmitting(true);
@@ -334,6 +381,21 @@ export function Convert(props: {
                 onChange={setInner}
               />
               <p className="muted hint">{INNER_INFO[inner]}</p>
+              <label className="label range-label" htmlFor="c-ffpfsc-level">
+                <span>Compression level</span>
+                <span className="range-value">{ffpfscLevel}</span>
+              </label>
+              <input
+                id="c-ffpfsc-level"
+                type="range"
+                className="range"
+                min={0}
+                max={9}
+                step={1}
+                value={ffpfscLevel}
+                onChange={(e) => setFfpfscLevel(Number(e.target.value))}
+              />
+              <p className="muted hint">{ffpfscLevelNote(ffpfscLevel)}</p>
             </div>
           )}
           {ins && ins.backport.length > 0 && (
@@ -365,29 +427,47 @@ export function Convert(props: {
               )}
             </div>
           )}
+          {format === "pkg" && (
+            <div className="field inner">
+              {/* The radio group's own label says the same to a screen reader. */}
+              <span className="label" aria-hidden="true">
+                Compression
+              </span>
+              <div className="seg formats inner" role="radiogroup" aria-label="Compression level">
+                {KRAKEN_LEVELS.map((l) => (
+                  <label key={l} className={`seg-choice fmt-pkg${krakenLevel === l ? " on" : ""}`}>
+                    <input
+                      type="radio"
+                      className="visually-hidden"
+                      name="kraken-level"
+                      value={l}
+                      checked={krakenLevel === l}
+                      onChange={() => setKrakenLevel(l)}
+                    />
+                    <span className="seg-opt">
+                      <Icon name={KRAKEN_INFO[l].icon} />
+                      {KRAKEN_INFO[l].label}
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <p className="muted hint">{KRAKEN_INFO[krakenLevel].note}</p>
+            </div>
+          )}
           <div className="field verify">
             <label className="switch">
               <input
                 type="checkbox"
                 className="visually-hidden"
-                checked={format === "pkg" || fullVerify}
-                disabled={format === "pkg"}
+                checked={fullVerify}
                 onChange={(e) => setFullVerify(e.target.checked)}
               />
               <span className="switch-track" aria-hidden="true" />
               <span>
                 Full verification
-                {format !== "pkg" && (
-                  <span className="muted hint">Re-reads every byte to check the output. Takes longer.</span>
-                )}
+                <span className="muted hint">Re-reads every byte to check the output. Takes longer.</span>
               </span>
             </label>
-            {format === "pkg" && (
-              <p className="note-line muted">
-                <Icon name="info" />
-                <span>Packages are always fully verified.</span>
-              </p>
-            )}
           </div>
           <button className="link" onClick={props.onCompare}>
             <Icon name="table" />
@@ -396,7 +476,7 @@ export function Convert(props: {
           {format === "pkg" && ins && (
             <p className="alert-bar warn">
               <Icon name="warn" />
-              <span>Estimated build time for this game: {pkgBuildTime(ins.total_bytes)}.</span>
+              <span>Estimated build time for this game: {pkgBuildTime(ins.total_bytes, krakenLevel)}.</span>
             </p>
           )}
           <div className="field" role="group" aria-labelledby="c-output-label">

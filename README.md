@@ -23,7 +23,7 @@ macOS, Windows and Linux apps + command-line tool, and a PS5 payload with the sa
   a DLC's own `param.json`/`param.sfo`, and folders named after its content id.
 - **Writes onto USB sticks and SD cards** formatted exFAT or FAT32.
 - **Fast**: an 89 GB game becomes `.exfat`/`.ffpkg` in about 2–2.5 min (write + verify) on an Apple Silicon
-  Mac; `.pkg` takes ≈ 20 min (Kraken compression).
+  Mac; `.pkg` takes ≈ 5 min at the default Fast compression level (an 89 GB game, 14 cores).
 
 > **v0.0.1-pre4 is a test release.** Not every format has been hardware-tested on a console yet; keep the
 > original dump.
@@ -44,7 +44,13 @@ only run like external-drive content. `.ffpfs` and `.ffpfsc` are experimental in
 is the smallest but always mounts read-only and reads slower on the console. A `.ffpfs` holds ASCII file names
 only, and ShadowMountPlus fails to mount a `.ffpfs`/`.ffpfsc` whose file name is over 63 bytes, so generated
 names are cut to fit. Not sure which to pick? See the app's **About formats** tab.
-Installing a `.pkg` needs a console with kstuff + fpkg-enable + drakmor's ppr-patch.
+Installing a `.pkg` needs a console with kstuff + fpkg-enable + drakmor's ppr-patch. Its **Compression** picker
+(`--kraken`) chooses the Kraken level: **Fast** (the default), or **Balanced** / **Smallest**, about 2.6% smaller
+but about 6× / 9× the compression time, with every core busy throughout.
+A `.ffpfsc`'s **Compression level** slider (`--level`) sets zlib from 0 (store) to 9, default 6. On a 13 GB test
+game (14 cores): level 0 built in 3.0 s (100% stored), 1 in 5.7 s (78.57%), 4 in 13.0 s (76.42%), 6 in 16.3 s
+(76.25%), 7 in 17.3 s (76.23%), 9 in 20.4 s (76.21%). The job log names the level and reports blocks compressed and stored, the ratio and the speed;
+`inspect` shows the zlib level class the container's blocks record.
 
 The app has three tabs: **Convert** (pick a source and target, Build, a jobs list with progress and Show in
 Finder / Explorer / folder), **Inspect** (game summary; Files / param.json / Details; leftover `.part`
@@ -63,8 +69,10 @@ Every output is read back through its own reader before it is published. Two mod
 - **Full**: the **Full verification** switch in the app (off by default), `--full-verify` in the CLI.
   Re-reads every byte of the output and compares it with the source; takes longer.
 
-The source is hashed once, while writing, in fixed 8 MiB slices, so both modes compare slices. A `.pkg` is
-always fully verified (the package builder checks every block); the switch shows on and disabled for `.fpkg`.
+The source is hashed once, while writing, in fixed 8 MiB slices, so both modes compare slices. A `.pkg` also
+gets the package builder's own checks: in fast mode every header, container and digest-table check, and the
+outer blocks and `playgo-chunk.crc` of the first, last and a seeded 1% of its 8 MiB batches (at most 1 GiB);
+in full mode every block.
 A finished job says "Fast verification passed" or "Full verification passed".
 
 What fast can miss: a damaged block in a region it didn't sample. It catches structural and layout errors
@@ -108,6 +116,8 @@ The zip also has `ps5-dump-forge`:
 ./ps5-dump-forge inspect PPSA01234.exfat
 ./ps5-dump-forge convert ~/Games/PPSA01234 --to ffpkg      # folder | exfat | ffpkg | ffpfs | ffpfsc | pkg (debug FPKG)
 ./ps5-dump-forge convert ~/Games/PPSA01234 --to ffpfsc --inner exfat   # inner: exfat (default) | ffpkg | ffpfs
+./ps5-dump-forge convert ~/Games/PPSA01234 --to ffpfsc --level 6        # zlib level 0 (store) .. 9 (smallest), default 6
+./ps5-dump-forge convert ~/Games/PPSA01234 --to pkg --kraken fast       # fast (default) | balanced | smallest
 ```
 
 ### Windows (10 or 11 on x86-64, 11 on arm64)

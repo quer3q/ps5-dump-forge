@@ -239,6 +239,23 @@ impl<'a> LsbReader<'a> {
     }
 
     fn peek(&mut self) -> usize {
+        // Whole bytes at once while eight are left in range: the same bits as one at a time.
+        if self.n < MAX_LEN && self.left >= 8 {
+            let word = if self.back {
+                u64::from_be_bytes(self.src[self.next - 8..self.next].try_into().unwrap())
+            } else {
+                u64::from_le_bytes(self.src[self.next..self.next + 8].try_into().unwrap())
+            };
+            let k = ((63 - self.n) / 8) as usize;
+            self.acc |= (word & ((1u64 << (k * 8)) - 1)) << self.n;
+            self.n += k as u32 * 8;
+            self.left -= k;
+            if self.back {
+                self.next -= k;
+            } else {
+                self.next += k;
+            }
+        }
         while self.n < MAX_LEN {
             let byte = if self.left == 0 {
                 0
@@ -321,7 +338,11 @@ pub(super) fn decode(src: &[u8], n: usize) -> Result<Vec<u8>> {
             return format_err("kraken: empty Huffman table");
         }
         if count == 1 {
-            return Ok(vec![r.get(8) as u8; n]);
+            let symbol = r.get(8) as u8;
+            if r.seam() != src.len() as isize {
+                return format_err("kraken: single-symbol Huffman table has the wrong size");
+            }
+            return Ok(vec![symbol; n]);
         }
         let cb = r.get(3);
         if cb > 4 {
@@ -370,12 +391,14 @@ pub(super) fn decode(src: &[u8], n: usize) -> Result<Vec<u8>> {
         LsbReader::new(src, a0 + split, src.len(), true),
         LsbReader::new(src, a0 + split, src.len(), false),
     ];
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let s = &mut streams[i % 3];
-        let (sym, l) = lut[s.peek()];
-        s.skip(l);
-        out.push(sym);
+    // Symbol i comes from stream i % 3.
+    let mut out = vec![0u8; n];
+    for chunk in out.chunks_mut(3) {
+        for (s, o) in streams.iter_mut().zip(chunk) {
+            let (sym, l) = lut[s.peek()];
+            s.skip(l);
+            *o = sym;
+        }
     }
     let [a, b, c] = &streams;
     if a.bytes_used() != split || b.bytes_used() + c.bytes_used() != src.len() - a0 - split {
@@ -407,6 +430,14 @@ mod tests {
             .collect();
         bytes.resize(16, 0);
         assert!(decode(&bytes, 16).is_err());
+    }
+
+    #[test]
+    fn single_symbol_tables_consume_the_whole_body() {
+        assert_eq!(decode(&[0, 0x40, 0], 100).unwrap(), vec![0; 100]);
+        assert_eq!(decode(&[0, 0x6a, 0xc0], 100).unwrap(), vec![0xab; 100]);
+        assert!(decode(&[0, 0x40], 100).is_err());
+        assert!(decode(&[0, 0x40, 0, 0], 100).is_err());
     }
 
     fn roundtrip(data: &[u8]) -> Option<usize> {

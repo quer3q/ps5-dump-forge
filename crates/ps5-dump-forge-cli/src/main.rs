@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ps5_dump_forge_core::{ConvertRequest, Event, Format, Jobs, VerifyMode};
+use ps5_dump_forge_core::{ConvertRequest, Event, Format, Jobs, KrakenLevel, VerifyMode};
 
 const USAGE: &str = "\
 usage: ps5-dump-forge inspect <path> [--json]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc|pkg
                          [--inner exfat|ffpkg|ffpfs] [-o <output>] [--threads N]
-                         [--remove-backport] [--full-verify]
+                         [--remove-backport] [--full-verify] [--kraken fast|balanced|smallest]
+                         [--level 0..9]
        ps5-dump-forge serve [--port N] --root <dir> [--root <dir>]...
 
   inspect   describe a game folder or image (.exfat, .ffpkg, .ffpfs, .ffpfsc, .pkg)
@@ -33,7 +34,10 @@ usage: ps5-dump-forge inspect <path> [--json]
   --full-verify
             re-read every byte of the output to verify it (takes longer); by default
             verification is fast: every structural check, small files whole and a random
-            sample of the rest. A pkg is always verified in full
+            sample of the rest
+  --level   with --to ffpfsc: zlib level, 0 (store) to 9 (smallest), default 6
+  --kraken  with --to pkg: compression level (default fast). balanced and smallest make a
+            package ~2.6% smaller but take ~6x and ~9x longer, every core busy throughout
   serve     the web UI on http://<this computer>:<port> (default 8095); the file browser
             starts at the --root folders (on the PS5: /data, /mnt/usb0..7, /mnt/ext0..1,
             no --root). No protections: anyone on the network can use it
@@ -62,6 +66,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let (mut json, mut to, mut output) = (false, None, None);
     let (mut threads, mut inner, mut remove_backport) = (None, None, false);
     let mut full_verify = false;
+    let mut kraken_level = None;
+    let mut ffpfsc_level = None;
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         let text = |v: OsString| v.into_string().map_err(|_| "option values must be text");
@@ -72,6 +78,23 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             "--full-verify" => full_verify = true,
             "--to" => to = Some(parse_format(&text(value("--to")?)?)?),
             "--inner" => inner = Some(parse_format(&text(value("--inner")?)?)?),
+            "--level" => {
+                ffpfsc_level = Some(
+                    text(value("--level")?)?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|l| *l <= 9)
+                        .ok_or("--level takes 0 through 9")?,
+                )
+            }
+            "--kraken" => {
+                kraken_level = Some(match text(value("--kraken")?)?.as_str() {
+                    "fast" => KrakenLevel::Fast,
+                    "balanced" => KrakenLevel::Balanced,
+                    "smallest" => KrakenLevel::Smallest,
+                    _ => return Err("--kraken takes fast, balanced or smallest".into()),
+                })
+            }
             "-o" | "--output" => output = Some(PathBuf::from(value("-o")?)),
             "--threads" => {
                 threads = Some(
@@ -99,6 +122,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                 Some(Format::Exfat | Format::Ffpkg | Format::Ffpfs) | None => {}
                 Some(_) => return Err("--inner takes exfat, ffpkg or ffpfs".into()),
             }
+            if kraken_level.is_some() && format != Format::Pkg {
+                return Err("--kraken only goes with --to pkg".into());
+            }
+            if ffpfsc_level.is_some() && format != Format::Ffpfsc {
+                return Err("--level only goes with --to ffpfsc".into());
+            }
             let output = match output {
                 Some(o) => o,
                 None => default_output(&path, format)?,
@@ -111,6 +140,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                 inner,
                 remove_backport,
                 full_verify,
+                kraken_level: kraken_level.unwrap_or_default(),
+                ffpfsc_level: ffpfsc_level.unwrap_or(ps5_dump_forge_core::DEFAULT_FFPFSC_LEVEL),
             }))
         }
         other => Err(format!("unknown command {other:?}")),
@@ -479,6 +510,16 @@ mod tests {
             panic!("not a convert");
         };
         assert!(r.full_verify);
+        assert_eq!(r.kraken_level, KrakenLevel::Fast, "fast by default");
+        let Ok(Cli::Convert(r)) = parse_args(args("convert /g --to pkg --kraken smallest -o x"))
+        else {
+            panic!("not a convert");
+        };
+        assert_eq!(r.kraken_level, KrakenLevel::Smallest);
+        let Ok(Cli::Convert(r)) = parse_args(args("convert /g --to ffpfsc --level 0 -o x")) else {
+            panic!("not a convert");
+        };
+        assert_eq!(r.ffpfsc_level, 0);
     }
 
     #[test]
@@ -493,6 +534,11 @@ mod tests {
         assert!(parse_args(args("frob /g")).is_err());
         assert!(parse_args(args("inspect /g --bogus")).is_err());
         assert!(parse_args(args("convert /g --to exfat --full-verify=yes -o x")).is_err());
+        assert!(parse_args(args("convert /g --to pkg --kraken medium -o x")).is_err());
+        assert!(parse_args(args("convert /g --to exfat --kraken fast -o x")).is_err());
+        assert!(parse_args(args("convert /g --to ffpfsc --level 10 -o x")).is_err());
+        assert!(parse_args(args("convert /g --to ffpfsc --level -1 -o x")).is_err());
+        assert!(parse_args(args("convert /g --to exfat --level 5 -o x")).is_err());
         assert!(matches!(
             parse_args(args("inspect /g --json")),
             Ok(Cli::Inspect { path, json: true }) if path == Path::new("/g")

@@ -22,7 +22,7 @@ mod tree;
 use std::path::Path;
 
 use ps5upload_fpkg::cnt::ids;
-use ps5upload_fpkg::cnt_write::PRESENTATION;
+use ps5upload_fpkg::cnt_write::{PRESENTATION, PROTECTED};
 use ps5upload_fpkg::crypto::{
     DEFAULT_PASSCODE, derive_ekpfs, derive_pfs_key, derive_xts_keys, sha3,
 };
@@ -57,17 +57,50 @@ pub(crate) fn err(kind: &str, msg: impl std::fmt::Display) -> Error {
     Error::Format(format!("{kind}: {msg}"))
 }
 
+/// `f` over `items` on every core, results in order: each thread takes one contiguous share.
+// ponytail: threads spawned per call (a few per 4 MiB read); a pool if the spawns ever show up
+pub(crate) fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores < 2 || items.len() < 2 {
+        return items.into_iter().map(f).collect();
+    }
+    let per = items.len().div_ceil(cores);
+    let mut shares: Vec<Vec<T>> = Vec::new();
+    for (k, item) in items.into_iter().enumerate() {
+        if k % per == 0 {
+            shares.push(Vec::with_capacity(per));
+        }
+        shares.last_mut().unwrap().push(item);
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = shares
+            .into_iter()
+            .map(|share| s.spawn(move || share.into_iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        // A worker's panic is re-raised here, as if `f` had panicked on this thread.
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
 /// The container entries that carry a game file: the presentation set the builder copies into
-/// the container (icons, `pic*`, `snd0.at9`, `save_data.png`, trophy and UDS data). Everything
-/// else in a container is the package's own metadata (keys, digests, license, PlayGo tables,
-/// `param.json`'s install copy, the protected NP entries) and is not a file of the game.
+/// the container (icons, `pic*` PNGs and DDSs, `snd0.at9`, `save_data.png`, trophy and UDS data), and
+/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a third-party builder can keep
+/// only in the container (plaintext; ours keeps them in the image too and encrypts the
+/// container's NP copies, which the merge skips). Everything else in a container is the
+/// package's own metadata (keys, digests, license, PlayGo tables) and is not a file of the game.
 fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     [
         (ids::ICON0_PNG, "sce_sys/icon0.png"),
         (ids::ICON0_DDS, "sce_sys/icon0.dds"),
+        (ids::PARAM_JSON, "sce_sys/param.json"),
     ]
     .into_iter()
     .chain(PRESENTATION.iter().map(|(id, path, _)| (*id, *path)))
+    .chain(PROTECTED.iter().map(|(id, path, _, _)| (*id, *path)))
 }
 
 /// Where a file's bytes are.

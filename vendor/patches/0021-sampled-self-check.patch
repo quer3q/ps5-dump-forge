@@ -1,0 +1,223 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index 0d53df4..2fdf002 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -284,6 +284,9 @@ pub struct BuildControl<'a> {
+     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+     /// Called as each [`Stage`] begins.
+     pub stage: Option<&'a mut dyn FnMut(Stage)>,
++    /// `Some(seed)`: the built package's self-check reads a seeded sample of its blocks
++    /// ([`verify::verify_file_sampled`]), for a caller that checks the files itself.
++    pub sample: Option<u64>,
+ }
+ 
+ /// Build the package. `progress` receives short phase lines.
+@@ -1047,11 +1050,12 @@ fn verify_written(
+             f(done, total);
+         }
+     };
+-    match verify::verify_file_controlled(
++    match verify::verify_file_sampled(
+         file,
+         &prepared.request.passcode,
+         &mut verify_bytes,
+         cancel,
++        control.sample,
+     )? {
+         report if report.ok() => Ok(report),
+         report => format_err(format!("the built package failed verification:\n{report}")),
+diff --git a/ps5upload-fpkg/src/verify.rs b/ps5upload-fpkg/src/verify.rs
+index 52dd2e2..45debb0 100644
+--- a/ps5upload-fpkg/src/verify.rs
++++ b/ps5upload-fpkg/src/verify.rs
+@@ -440,10 +440,48 @@ fn failing_blocks(
+ }
+ 
+ pub fn verify_file_controlled(
++    file: PkgFile,
++    passcode: &str,
++    progress: &mut dyn FnMut(u64, u64),
++    cancel: Option<&AtomicBool>,
++) -> Result<Report> {
++    verify_file_sampled(file, passcode, progress, cancel, None)
++}
++
++/// Which of `batches` 8 MiB batches a sampled sweep reads, ascending: the first, the last and
++/// a seeded 1% of the rest, at most 128 of them (1 GiB). The same for the same seed.
++fn sampled_batches(batches: u64, seed: u64) -> Vec<u64> {
++    let mut picked = vec![0, batches.saturating_sub(1)];
++    let rest = batches.saturating_sub(2);
++    // Ends included, at most 128 batches (1 GiB).
++    let want = (rest / 100).max(u64::from(rest > 0)).min(126);
++    // SplitMix64: small, and the same on every platform for the same seed.
++    let mut state = seed;
++    let mut next = || {
++        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = state;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    };
++    for _ in 0..want {
++        picked.push(1 + next() % rest);
++    }
++    picked.sort_unstable();
++    picked.dedup();
++    picked.retain(|&b| b < batches);
++    picked
++}
++
++/// [`verify_file_controlled`], with `sample: Some(seed)` reading only [`sampled_batches`] of
++/// the outer blocks and of the `playgo-chunk.crc` table (every structural check still runs);
++/// for a caller that checks the package's files itself.
++pub fn verify_file_sampled(
+     mut file: PkgFile,
+     passcode: &str,
+     progress: &mut dyn FnMut(u64, u64),
+     cancel: Option<&AtomicBool>,
++    sample: Option<u64>,
+ ) -> Result<Report> {
+     let stop = || -> Result<()> {
+         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+@@ -543,17 +581,30 @@ pub fn verify_file_controlled(
+     // The sweep: every data block must reach the digest `imagedigs` carries — by decryption in
+     // the native mode, as stored in the plaintext one.
+     // Read a batch at a time and checked on every core.
+-    let mut bad = 0u64;
+-    let mut done = 0u64;
+-    while done < count {
++    let batches = count.div_ceil(SWEEP_BATCH);
++    let swept: Vec<u64> = match sample {
++        Some(seed) => sampled_batches(batches, seed),
++        None => (0..batches).collect(),
++    };
++    let sweep_blocks: u64 = swept
++        .iter()
++        .map(|b| (count - b * SWEEP_BATCH).min(SWEEP_BATCH))
++        .sum();
++    let (mut bad, mut done) = (0u64, 0u64);
++    for &b in &swept {
+         stop()?;
+-        let n = (count - done).min(SWEEP_BATCH);
+-        let raw = file.read_at(fih.pfs_offset + done * BLOCK, (n * BLOCK) as usize)?;
+-        bad += failing_blocks(&raw, done, sb_index, xts.as_ref(), &digests);
++        let first = b * SWEEP_BATCH;
++        let n = (count - first).min(SWEEP_BATCH);
++        let raw = file.read_at(fih.pfs_offset + first * BLOCK, (n * BLOCK) as usize)?;
++        bad += failing_blocks(&raw, first, sb_index, xts.as_ref(), &digests);
+         done += n;
+-        progress(done * BLOCK, count * BLOCK);
++        progress(done * BLOCK, sweep_blocks * BLOCK);
+     }
+-    progress(done * BLOCK, count * BLOCK);
++    progress(done * BLOCK, sweep_blocks * BLOCK);
++    let scope = match sample {
++        Some(seed) => format!(" (a sample of {done}, seed {seed})"),
++        None => String::new(),
++    };
+     r.push(
+         if plaintext_mode {
+             "outer blocks match their imagedigs entry"
+@@ -561,7 +612,7 @@ pub fn verify_file_controlled(
+             "outer blocks decrypt to their imagedigs entry"
+         },
+         bad == 0,
+-        format!("{} of {count} failed", bad),
++        format!("{bad} of {count} failed{scope}"),
+     );
+ 
+     // The uroot dirents and the flat-path table, read on demand like everything else.
+@@ -606,12 +657,37 @@ pub fn verify_file_controlled(
+             match s.members.iter().find(|m| m.name == crc_name) {
+                 Some(m) => {
+                     let stored = file.read_at(m.offset, m.size as usize)?;
+-                    let expected = si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
+-                    r.push(
+-                        "si playgo-chunk.crc",
+-                        stored == expected,
+-                        format!("{} bytes", m.size),
+-                    );
++                    let (ok, detail) = match sample {
++                        None => {
++                            let expected =
++                                si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
++                            (stored == expected, format!("{} bytes", m.size))
++                        }
++                        Some(seed) => {
++                            let batches = s.zip_start.div_ceil(si::CRC_BATCH * BLOCK);
++                            let picked = sampled_batches(batches, seed);
++                            let mut ok = stored.len() as u64 == s.zip_start.div_ceil(BLOCK) * 4;
++                            for &b in &picked {
++                                if !ok {
++                                    break;
++                                }
++                                stop()?;
++                                let start = b * si::CRC_BATCH * BLOCK;
++                                let len = (s.zip_start - start).min(si::CRC_BATCH * BLOCK);
++                                let at = (b * si::CRC_BATCH * 4) as usize;
++                                let crcs = si::batch_crcs(&mut file, start, len)?;
++                                ok = crcs.iter().enumerate().all(|(k, c)| {
++                                    stored.get(at + k * 4..at + k * 4 + 4) == Some(&c.to_le_bytes())
++                                });
++                            }
++                            let n = picked.len();
++                            (
++                                ok,
++                                format!("{} bytes, {n} of {batches} batches sampled", m.size),
++                            )
++                        }
++                    };
++                    r.push("si playgo-chunk.crc", ok, detail);
+                 }
+                 None => r.push("si playgo-chunk.crc", false, format!("{crc_name} missing")),
+             }
+@@ -620,3 +696,29 @@ pub fn verify_file_controlled(
+     }
+     Ok(r)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::sampled_batches;
++
++    #[test]
++    fn a_sample_holds_the_ends_and_one_percent() {
++        assert_eq!(sampled_batches(1, 7), [0]);
++        assert_eq!(sampled_batches(2, 7), [0, 1]);
++        assert_eq!(sampled_batches(3, 7), [0, 1, 2]);
++        let picked = sampled_batches(10_000, 42);
++        assert_eq!(
++            picked,
++            sampled_batches(10_000, 42),
++            "the same for the same seed"
++        );
++        assert_ne!(picked, sampled_batches(10_000, 43));
++        assert!(picked.windows(2).all(|w| w[0] < w[1]));
++        assert_eq!((picked[0], *picked.last().unwrap()), (0, 9_999));
++        assert!((90..=102).contains(&picked.len()), "{}", picked.len());
++        assert!(
++            (0..64).all(|seed| sampled_batches(1_000_000, seed).len() <= 128),
++            "at most 128 batches, 1 GiB"
++        );
++    }
++}
+diff --git a/ps5upload-fpkg/tests/scale.rs b/ps5upload-fpkg/tests/scale.rs
+index c62e3c3..8fd9717 100644
+--- a/ps5upload-fpkg/tests/scale.rs
++++ b/ps5upload-fpkg/tests/scale.rs
+@@ -119,6 +119,7 @@ fn the_streaming_writer_reports_progress() {
+         stage: None,
+         bytes: Some(&mut |done, total| samples.push((done, total))),
+         cancel: None,
++        sample: None,
+     };
+     let report = build::build_controlled(
+         &request(source.path(), out.path()),
+@@ -565,6 +566,7 @@ fn a_cancelled_build_leaves_nothing_behind() {
+         stage: None,
+         bytes: None,
+         cancel: Some(&cancel),
++        sample: None,
+     };
+     let error = match build::build_controlled(
+         &request(source.path(), out.path()),

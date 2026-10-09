@@ -19,6 +19,8 @@ const PATHS = {
   file: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5",
   up: "M12 19V5M6 11l6-6 6 6",
   power: "M12 3v8M7.1 6.2a7.5 7.5 0 1 0 9.8 0",
+  scale: "M12 4v16M8 20h8M5 7h14M5 7l-3 6a3 3 0 0 0 6 0zM19 7l-3 6a3 3 0 0 0 6 0z",
+  compress: "M12 3v6M9 6l3 3 3-3M12 21v-6M9 18l3-3 3 3M5 12h14",
 } as const;
 
 export type IconName = keyof typeof PATHS;

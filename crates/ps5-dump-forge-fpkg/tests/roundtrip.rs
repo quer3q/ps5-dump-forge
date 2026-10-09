@@ -21,7 +21,13 @@ fn a_kraken_package_reads_back_as_its_manifest() {
     // The artwork the builder moved into the container is served from there.
     assert_eq!(
         built.container_only,
-        ["sce_sys/icon0.png", "sce_sys/pic0.png", "sce_sys/snd0.at9"]
+        [
+            "sce_sys/icon0.png",
+            "sce_sys/pic0.png",
+            "sce_sys/pic1.png",
+            "sce_sys/pic2.png",
+            "sce_sys/snd0.at9"
+        ]
     );
     assert!(built.empty_dirs.contains(&"data/empty".to_string()));
     let details = source.details().join("\n");
@@ -29,6 +35,29 @@ fn a_kraken_package_reads_back_as_its_manifest() {
     assert!(details.contains("layout: Kraken"), "{details}");
     assert!(details.contains("plaintext"), "{details}");
     assert!(source.describe().contains(common::CONTENT_ID));
+}
+
+#[test]
+fn our_packages_take_param_json_and_np_files_from_the_image() {
+    let built = build("np", 0, |_| {});
+    let mut source = FpkgSource::open(&built.path, None).unwrap();
+    assert_matches(&mut source, &built);
+    let details = source.details().join("\n");
+    assert!(details.contains(" 0 conflicts"), "{details}");
+    assert!(
+        !built
+            .container_only
+            .contains(&"sce_sys/param.json".to_string())
+    );
+    for path in [
+        "sce_sys/param.json",
+        "sce_sys/nptitle.dat",
+        "sce_sys/uds/npbind.dat",
+        "sce_sys/trophy2/npbind.dat",
+    ] {
+        let n = source.files().iter().filter(|f| f.path == path).count();
+        assert_eq!(n, 1, "{path}");
+    }
 }
 
 #[test]
@@ -46,6 +75,12 @@ fn unaligned_ranges_of_a_multi_block_file_match() {
         let end = offset.saturating_add(len).min(BIG_LEN);
         assert!(got == want[start..end], "{offset} + {len}");
     }
+    // Sequential reads of more than two blocks, each starting in the block the last one ended in.
+    let mut got = Vec::new();
+    while got.len() < BIG_LEN {
+        got.extend(source.read_range(BIG, got.len() as u64, 600_001).unwrap());
+    }
+    assert!(got == want, "sequential");
     // Block boundaries of the 256 KiB Kraken blocks, from either side.
     for k in 1..5u64 {
         let at = k * 256 * 1024;

@@ -1,0 +1,112 @@
+diff --git a/ps5upload-fpkg/src/cnt.rs b/ps5upload-fpkg/src/cnt.rs
+index 09c34ae..f19df13 100644
+--- a/ps5upload-fpkg/src/cnt.rs
++++ b/ps5upload-fpkg/src/cnt.rs
+@@ -28,6 +28,7 @@ pub mod ids {
+     pub const PARAM_JSON: u32 = 0x2000;
+     pub const PLAYGO_HASH_TABLE: u32 = 0x2010;
+     pub const PLAYGO_FICM: u32 = 0x2011;
++    pub const PIC1_PNG: u32 = 0x1006;
+     pub const SAVE_DATA_PNG: u32 = 0x100D;
+     pub const PIC0_PNG: u32 = 0x1220;
+     pub const SND0_AT9: u32 = 0x1240;
+@@ -35,14 +36,18 @@ pub mod ids {
+     pub const PIC1_DDS: u32 = 0x12C0;
+     pub const TROPHY: u32 = 0x1480;
+     pub const UDS: u32 = 0x14A0;
++    pub const PIC2_PNG: u32 = 0x2040;
+     pub const PIC2_DDS: u32 = 0x2060;
+     pub const PLAYGO_SCENARIO_JSON: u32 = 0x3000;
+ 
+     /// The presentation entries the "system" general digest covers, in the id order it
+-    /// hashes them. Derived from a Publishing Tools package with all eight: the slot is the
++    /// hashes them. Derived from a Publishing Tools package with eight of them: the slot is the
+     /// `SHA3` of their digests concatenated. Trophy and UDS data are not in it, and a
+     /// package with only the two icons reduces to the icon-only formula the samples show.
+-    pub const SYSTEM_DIGEST_IDS: [u32; 8] = [
++    /// `pic1.png` and `pic2.png` are in it too, in id order: a third-party package that carries
++    /// all ten has a system digest that matches only with both.
++    pub const SYSTEM_DIGEST_IDS: [u32; 10] = [
++        PIC1_PNG,
+         SAVE_DATA_PNG,
+         ICON0_PNG,
+         PIC0_PNG,
+@@ -50,6 +55,7 @@ pub mod ids {
+         ICON0_DDS,
+         PIC0_DDS,
+         PIC1_DDS,
++        PIC2_PNG,
+         PIC2_DDS,
+     ];
+ }
+diff --git a/ps5upload-fpkg/src/cnt_write.rs b/ps5upload-fpkg/src/cnt_write.rs
+index e57c5be..ad985b3 100644
+--- a/ps5upload-fpkg/src/cnt_write.rs
++++ b/ps5upload-fpkg/src/cnt_write.rs
+@@ -48,8 +48,10 @@ const ENTRIES: [(u32, u32, &str); 13] = [
+ 
+ /// Presentation files the container carries beside the icons, when the source has them:
+ /// `(entry id, source path, entry name)`. The ids and names are the ones a Publishing Tools
+-/// package uses for the same files. Each is also left in the image, as that package does.
+-pub const PRESENTATION: [(u32, &str, &str); 8] = [
++/// package uses for the same files (`pic1.png`/`pic2.png`: a third-party package's). Those not in
++/// [`CONTAINER_ONLY`] are also left in the image, as that package does.
++pub const PRESENTATION: [(u32, &str, &str); 10] = [
++    (ids::PIC1_PNG, "sce_sys/pic1.png", "pic1.png"),
+     (ids::SAVE_DATA_PNG, "sce_sys/save_data.png", "save_data.png"),
+     (ids::PIC0_PNG, "sce_sys/pic0.png", "pic0.png"),
+     (ids::SND0_AT9, "sce_sys/snd0.at9", "snd0.at9"),
+@@ -61,6 +63,7 @@ pub const PRESENTATION: [(u32, &str, &str); 8] = [
+         "trophy2/trophy00.ucp",
+     ),
+     (ids::UDS, "sce_sys/uds/uds00.ucp", "uds/uds00.ucp"),
++    (ids::PIC2_PNG, "sce_sys/pic2.png", "pic2.png"),
+     (ids::PIC2_DDS, "sce_sys/pic2.dds", "pic2.dds"),
+ ];
+ 
+@@ -69,12 +72,14 @@ pub const PRESENTATION: [(u32, &str, &str); 8] = [
+ /// reads them, and a Publishing Tools image leaves them out. `param.json`, the trophy and
+ /// UDS data and the NP files stay in the image — our own backport tooling and third-party
+ /// trophy tools read them from the game's folder.
+-pub const CONTAINER_ONLY: [&str; 8] = [
++pub const CONTAINER_ONLY: [&str; 10] = [
+     "sce_sys/icon0.png",
+     "sce_sys/icon0.dds",
+     "sce_sys/pic0.png",
+     "sce_sys/pic0.dds",
++    "sce_sys/pic1.png",
+     "sce_sys/pic1.dds",
++    "sce_sys/pic2.png",
+     "sce_sys/pic2.dds",
+     "sce_sys/snd0.at9",
+     "sce_sys/save_data.png",
+@@ -859,7 +864,7 @@ mod tests {
+ 
+     /// The layout of a Publishing Tools package with every presentation entry: table in id
+     /// order, payloads in its body order and on 16-byte boundaries, the system digest over
+-    /// all eight presentation entries.
++    /// all ten presentation entries.
+     /// The document LibProsperoPkg writes, byte for byte (its Minecraft package: 2,293 bytes).
+     #[test]
+     fn playgo_scenario_matches_the_reference() {
+@@ -930,16 +935,16 @@ mod tests {
+         let mut sorted = table.clone();
+         sorted.sort();
+         assert_eq!(table, sorted, "the entry table is in id order");
+-        assert_eq!(table.len(), 21);
++        assert_eq!(table.len(), 23);
+         let mut by_offset = parsed.entries.clone();
+         by_offset.sort_by_key(|e| e.offset);
+         let body: Vec<u32> = by_offset.iter().map(|e| e.id).collect();
+         assert_eq!(
+             body,
+             [
+-                0x0010, 0x0020, 0x0080, 0x0100, 0x0001, 0x0200, 0x2000, 0x2060, 0x040A, 0x1001,
+-                0x100D, 0x1200, 0x1220, 0x1240, 0x1280, 0x12A0, 0x12C0, 0x1480, 0x14A0, 0x2010,
+-                0x2011,
++                0x0010, 0x0020, 0x0080, 0x0100, 0x0001, 0x0200, 0x2000, 0x2040, 0x2060, 0x040A,
++                0x1001, 0x1006, 0x100D, 0x1200, 0x1220, 0x1240, 0x1280, 0x12A0, 0x12C0, 0x1480,
++                0x14A0, 0x2010, 0x2011,
+             ]
+         );
+         assert!(parsed.entries.iter().all(|e| e.offset % 16 == 0));

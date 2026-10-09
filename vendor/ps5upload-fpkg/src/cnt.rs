@@ -28,6 +28,7 @@ pub mod ids {
     pub const PARAM_JSON: u32 = 0x2000;
     pub const PLAYGO_HASH_TABLE: u32 = 0x2010;
     pub const PLAYGO_FICM: u32 = 0x2011;
+    pub const PIC1_PNG: u32 = 0x1006;
     pub const SAVE_DATA_PNG: u32 = 0x100D;
     pub const PIC0_PNG: u32 = 0x1220;
     pub const SND0_AT9: u32 = 0x1240;
@@ -35,14 +36,18 @@ pub mod ids {
     pub const PIC1_DDS: u32 = 0x12C0;
     pub const TROPHY: u32 = 0x1480;
     pub const UDS: u32 = 0x14A0;
+    pub const PIC2_PNG: u32 = 0x2040;
     pub const PIC2_DDS: u32 = 0x2060;
     pub const PLAYGO_SCENARIO_JSON: u32 = 0x3000;
 
     /// The presentation entries the "system" general digest covers, in the id order it
-    /// hashes them. Derived from a Publishing Tools package with all eight: the slot is the
+    /// hashes them. Derived from a Publishing Tools package with eight of them: the slot is the
     /// `SHA3` of their digests concatenated. Trophy and UDS data are not in it, and a
     /// package with only the two icons reduces to the icon-only formula the samples show.
-    pub const SYSTEM_DIGEST_IDS: [u32; 8] = [
+    /// `pic1.png` and `pic2.png` are in it too, in id order: a third-party package that carries
+    /// all ten has a system digest that matches only with both.
+    pub const SYSTEM_DIGEST_IDS: [u32; 10] = [
+        PIC1_PNG,
         SAVE_DATA_PNG,
         ICON0_PNG,
         PIC0_PNG,
@@ -50,6 +55,7 @@ pub mod ids {
         ICON0_DDS,
         PIC0_DDS,
         PIC1_DDS,
+        PIC2_PNG,
         PIC2_DDS,
     ];
 }

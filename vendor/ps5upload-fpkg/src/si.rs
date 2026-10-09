@@ -90,16 +90,45 @@ pub fn chunk_crc_table_controlled(
 ) -> Result<Vec<u8>> {
     let blocks = zip_start.div_ceil(BLOCK);
     let mut out = Vec::with_capacity(blocks as usize * 4);
-    for i in 0..blocks {
+    let mut start = 0u64;
+    while start < zip_start {
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
             return Err(crate::Error::Cancelled);
         }
-        let start = i * BLOCK;
-        let len = (zip_start - start).min(BLOCK) as usize;
-        out.extend_from_slice(&crc32c(&file.read_at(start, len)?).to_le_bytes());
+        let len = (zip_start - start).min(CRC_BATCH * BLOCK);
+        for crc in batch_crcs(file, start, len)? {
+            out.extend_from_slice(&crc.to_le_bytes());
+        }
+        start += len;
     }
     Ok(out)
 }
+
+/// The CRC32C of each 64 KiB block of `file[start..start + len]` (the last may be short),
+/// read at once and computed on every core: each thread takes a contiguous share.
+pub(crate) fn batch_crcs(file: &mut PkgFile, start: u64, len: u64) -> Result<Vec<u32>> {
+    let batch = file.read_at(start, len as usize)?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = (batch.len().div_ceil(BLOCK as usize))
+        .div_ceil(threads)
+        .max(1)
+        * BLOCK as usize;
+    Ok(std::thread::scope(|s| {
+        let workers: Vec<_> = batch
+            .chunks(per)
+            .map(|share| {
+                s.spawn(move || share.chunks(BLOCK as usize).map(crc32c).collect::<Vec<_>>())
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    }))
+}
+
+/// Blocks [`chunk_crc_table_controlled`] reads per batch (8 MiB).
+pub(crate) const CRC_BATCH: u64 = 128;
 
 #[cfg(test)]
 mod tests {

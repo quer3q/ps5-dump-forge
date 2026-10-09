@@ -8,7 +8,9 @@ Grouped by area; the first section blocks a release.
 ## Before the first release
 - [ ] **Hardware smoke test** per format, on a console: SMP 1.7 mounts `.exfat` and `.ffpkg` and the game
   boots (read-only and `image_rw=`); a `.pkg` installs and boots with kstuff + fpkg-enable + ppr-patch. Only the
-  console proves a format is accepted.
+  console proves a format is accepted. Include a source with `sce_sys/pic1.png`/`pic2.png`: since vendor patch
+  0018 they go into the container only (0x1006/0x2040, in the system digest), as in a third-party package,
+  and no such `.pkg` has been installed yet.
 - [ ] **`.ffpfs` and `.ffpfsc` on a console**: SMP 1.7 mounts and boots a `.ffpfs` (under `/data`, and on USB) and a
   `.ffpfsc` with each inner format (`.exfat`, `.ffpkg`, `.ffpfs`). Both follow MkPFS's layouts, but neither
   has been booted from this builder.
@@ -16,7 +18,8 @@ Grouped by area; the first section blocks a release.
   their checks have run there, no mount). See "PS5 payload" below for the rest.
 - [ ] **zlib on the console**: `.ffpfsc` blocks come from `flate2`'s `miniz_oxide`, not the zlib backends MkPFS uses.
   MkPFS reports that ISA-L output can crash the console's hardware decompressor; a standard zlib stream should be
-  fine, but only a console run of a whole game (every block read) proves miniz's streams are accepted.
+  fine, but only a console run of a whole game (every block read) proves miniz's streams are accepted. Run the
+  default level 6 and the ends of the slider: 0 (every block raw, no zlib stream) and 9.
 - [x] Run CI on GitHub once and fix what breaks: every test leg (macOS, Linux and Windows on x86-64 and
   arm64), the FreeBSD `fsck_ufs` job, the macOS `fat_volumes` step, the fuzz job, and the release workflow
   (the v0.0.1-pre3 tag: all five targets built, verified and drafted).
@@ -38,6 +41,14 @@ Grouped by area; the first section blocks a release.
   `applicationCategoryType`, which a patch may keep).
 - [ ] FPKG extraction from other builders (LibProsperoPKG, scene tools): needs a test corpus; Sony-style
   inner encryption is not handled; the flat-layout reader relies on this builder's placement rule.
+  After 0.0.1-pre4, the reader also handles what a third-party package (a real Oodle Kraken image) needs: sparse
+  extents in the layout descriptor (vendor patch 0016), bare entropy-array halves (0017), and
+  `param.json`/NP files kept only in the container. Every file of that package (521 files, 188 GB) reads
+  back through the reader; every block decoded in a prototype scan of the same fixes (blocks no file covers
+  were not read with the shipped code). Converted to `.exfat` and back to `.pkg`, 520 of its files came out
+  byte-identical (the other two: a generated `ampr_emu.index` and `param.json`'s cleared `versionFileUri`),
+  not yet installed on a console. Nothing checks the decoded bytes against Oodle's own decoder; other Kraken array types (RLE,
+  tANS, multi-array) are still refused.
 - [ ] Optional user-supplied FPKG key file (all key use already sits behind vendored `keys.rs`).
 
 ## Platforms (after v1)

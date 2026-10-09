@@ -10,7 +10,7 @@
 //! digests) — never by the size of the game.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cnt_write::{self, CntParams};
@@ -177,6 +177,48 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
     }
 }
 
+/// Blocks of a compressed image read back per batch (8 MiB).
+const WRITE_BATCH: u64 = 128;
+
+/// Each block of `batch` (image blocks from `first` on): its plaintext digest and, after the
+/// XTS transform when there is one (applied in place), its CRC; one contiguous share per thread.
+fn digest_blocks(
+    batch: &mut [u8],
+    first: u64,
+    xts: Option<&Xts>,
+    threads: usize,
+) -> Vec<([u8; 32], u32)> {
+    let per = (batch.len() / BLOCK as usize)
+        .div_ceil(threads.max(1))
+        .max(1)
+        * BLOCK as usize;
+    std::thread::scope(|s| {
+        let workers: Vec<_> = batch
+            .chunks_mut(per)
+            .enumerate()
+            .map(|(c, share)| {
+                s.spawn(move || {
+                    share
+                        .chunks_mut(BLOCK as usize)
+                        .enumerate()
+                        .map(|(k, block)| {
+                            let digest = sha3(block);
+                            if let Some(xts) = xts {
+                                xts.encrypt(first + ((c * per) / BLOCK as usize + k) as u64, block);
+                            }
+                            (digest, crc32c(block))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    })
+}
+
 fn cancelled() -> crate::Error {
     crate::Error::Cancelled
 }
@@ -292,32 +334,54 @@ pub fn write_package(
     let mut file_digests = FileDigester::new(files.len());
     let mut block = vec![0u8; BLOCK as usize];
     let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(8);
-    for index in 0..inner_blocks {
+    // The compressed image: its files' digests were taken as it was compressed. It is read
+    // back a batch at a time and its blocks digested (and encrypted) on every core.
+    let mut index = 0u64;
+    if let Some(spool) = spool.as_mut() {
+        let threads = compression_threads(request.threads);
+        let mut batch = Vec::new();
+        while index < inner_blocks {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+            let n = (inner_blocks - index).min(WRITE_BATCH);
+            batch.resize((n * BLOCK) as usize, 0);
+            spool.seek(SeekFrom::Start(spool_at + index * BLOCK))?;
+            spool.read_exact(&mut batch)?;
+            for (k, (digest, crc)) in digest_blocks(&mut batch, index, xts.as_ref(), threads)
+                .into_iter()
+                .enumerate()
+            {
+                let at = index as usize + k;
+                digests[at] = digest;
+                crcs[1 + at] = crc;
+                file_digests.blocks.push(digest);
+            }
+            // Written in place, a plaintext image is already where the outer image keeps it.
+            if !(in_place && xts.is_none()) {
+                out.seek(SeekFrom::Start(BLOCK + index * BLOCK))?;
+                out.write_all(&batch)?;
+            }
+            index += n;
+            (progress.bytes)((index * BLOCK).min(outer_size), outer_size);
+        }
+    }
+    for index in index..inner_blocks {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
-        if let Some(spool) = spool.as_mut() {
-            // The compressed image: its files' digests were taken as it was compressed.
-            crate::kraken_image::spool_block(spool, spool_at, index, &mut block)?;
-            file_digests.block(&block, &[]);
-        } else {
-            block_spans(&source, plan, index, &mut spans);
-            let plaintext = source.block(index, read)?;
-            block.copy_from_slice(plaintext);
-            file_digests.block(&block, &spans);
-        }
+        block_spans(&source, plan, index, &mut spans);
+        let plaintext = source.block(index, read)?;
+        block.copy_from_slice(plaintext);
+        file_digests.block(&block, &spans);
 
         digests[index as usize] = crate::crypto::sha3(&block);
         if let Some(xts) = &xts {
             xts.encrypt(index, &mut block);
         }
         crcs[1 + index as usize] = crc32c(&block);
-        // A compressed image written in place is already where the outer image keeps it;
-        // only a transformed block has to go back.
-        if !(in_place && spool.is_some() && xts.is_none()) {
-            out.seek(SeekFrom::Start(BLOCK + index * BLOCK))?;
-            out.write_all(&block)?;
-        }
+        out.seek(SeekFrom::Start(BLOCK + index * BLOCK))?;
+        out.write_all(&block)?;
         if index.is_multiple_of(512) {
             // Bytes of the outer image, the same measure the verifier reports.
             (progress.bytes)(((index + 1) * BLOCK).min(outer_size), outer_size);

@@ -14,6 +14,8 @@ export type Format = "folder" | "exfat" | "ffpkg" | "ffpfs" | "ffpfsc" | "pkg";
 export type Kind = Format;
 /** The image inside a `.ffpfsc` container. */
 export type InnerFormat = "exfat" | "ffpkg" | "ffpfs";
+/** How hard a `.pkg` build compresses (Kraken). */
+export type KrakenLevel = "fast" | "balanced" | "smallest";
 export type JobId = number;
 
 export interface ConvertRequest {
@@ -27,9 +29,12 @@ export interface ConvertRequest {
   /** Leave the backport libraries (not the emulators) out of fakelib/; refused when the
    * executables' SDK was lowered. */
   remove_backport: boolean;
-  /** Re-read every byte of the output; `false`: fast (sampled) verification. A `.pkg` is
-   * always fully verified. */
+  /** Re-read every byte of the output; `false`: fast (sampled) verification. */
   full_verify: boolean;
+  /** For `.pkg`: the compression level; missing or any other target: `"fast"`. */
+  kraken_level?: KrakenLevel;
+  /** For `.ffpfsc`: the zlib level, 0 (store) to 9 (smallest); missing: 6. */
+  ffpfsc_level?: number;
 }
 
 /** How the output was verified. `samples` and `seed` are 0 for full. */

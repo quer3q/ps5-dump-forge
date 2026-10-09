@@ -37,6 +37,8 @@ const MAX_DEPTH: u32 = 32;
 const MAX_PATH_BYTES: u64 = 256 << 20;
 /// Decoded PFSC blocks kept per file: a sequential read needs one, a directory walk a few.
 const CACHE_BLOCKS: usize = 8;
+/// The most blocks one read decodes together (16 MiB).
+const MANY_BLOCKS: u64 = 256;
 
 /// The header's facts, for verification and inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,14 +640,16 @@ impl Pfsc {
         Ok((start, end))
     }
 
-    /// Every span, read in one pass: the count of compressed blocks.
-    fn compressed_blocks(&self, r: &mut dyn ReadSeek) -> Result<u64> {
+    /// Every span, read in one pass: the count of compressed blocks, and the level class the
+    /// first one's zlib header records (`FLEVEL`: 0 fastest, 1 fast, 2 default, 3 maximum).
+    fn compressed_blocks(&self, r: &mut dyn ReadSeek) -> Result<(u64, Option<u8>)> {
         r.seek(SeekFrom::Start(self.at + PFSC_TABLE_AT))?;
         let mut t = BufReader::with_capacity(BLOCK as usize, &mut *r);
         let mut b = [0u8; 8];
         t.read_exact(&mut b)?;
         let mut prev = u64::from_le_bytes(b);
         let mut n = 0;
+        let mut first = None;
         for i in 0..self.blocks {
             t.read_exact(&mut b)?;
             let next = u64::from_le_bytes(b);
@@ -654,10 +658,94 @@ impl Pfsc {
                     "damaged PFSC container: block {i} has a bad span"
                 )));
             }
-            n += u64::from(next - prev < BLOCK);
+            if next - prev < BLOCK {
+                n += 1;
+                first.get_or_insert(prev);
+            }
             prev = next;
         }
-        Ok(n)
+        drop(t);
+        let hint = match first {
+            Some(at) => {
+                let mut h = [0u8; 2];
+                r.seek(SeekFrom::Start(self.at + at))?;
+                r.read_exact(&mut h)?;
+                Some(h[1] >> 6)
+            }
+            None => None,
+        };
+        Ok((n, hint))
+    }
+
+    /// Up to `buf.len()` logical bytes at `pos` across blocks `pos / BLOCK` on: their table
+    /// entries and stored bytes read in one pass each, inflated on every core. The last block
+    /// is cached for the next read, which usually starts in it.
+    fn read_many(&mut self, r: &mut dyn ReadSeek, pos: u64, buf: &mut [u8]) -> Result<usize> {
+        // At most MANY_BLOCKS per call (a short read is a read), so memory stays bounded.
+        let room = MANY_BLOCKS * BLOCK - pos % BLOCK;
+        let want = (buf.len() as u64)
+            .min(self.len.saturating_sub(pos))
+            .min(room) as usize;
+        let (first, end) = (pos / BLOCK, (pos + want as u64).div_ceil(BLOCK));
+        let count = (end - first) as usize;
+        let mut table = vec![0u8; (count + 1) * 8];
+        r.seek(SeekFrom::Start(self.at + PFSC_TABLE_AT + first * 8))?;
+        r.read_exact(&mut table)?;
+        let entry = |i: usize| le64(&table, i * 8);
+        for i in 0..count {
+            let (start, end) = (entry(i), entry(i + 1));
+            if start < self.data_at || end <= start || end - start > BLOCK || end > self.stored {
+                return Err(err(format!(
+                    "damaged PFSC container: block {} has a bad span",
+                    first + i as u64
+                )));
+            }
+        }
+        let base = entry(0);
+        let mut stored = vec![0u8; (entry(count) - base) as usize];
+        r.seek(SeekFrom::Start(self.at + base))?;
+        r.read_exact(&mut stored)?;
+        let mut plain = vec![0u8; count * BLOCK as usize];
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let per = count.div_ceil(threads).max(1);
+        let (table, stored) = (&table, &stored);
+        let bad = std::thread::scope(|s| {
+            let workers: Vec<_> = plain
+                .chunks_mut(per * BLOCK as usize)
+                .enumerate()
+                .map(|(c, share)| {
+                    s.spawn(move || {
+                        for (k, out) in share.chunks_mut(BLOCK as usize).enumerate() {
+                            let i = c * per + k;
+                            let span = (le64(table, i * 8) - base) as usize
+                                ..(le64(table, (i + 1) * 8) - base) as usize;
+                            if !inflate_into(&stored[span], out) {
+                                return Some(i);
+                            }
+                        }
+                        None
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                .min()
+        });
+        if let Some(i) = bad {
+            return Err(err(format!(
+                "damaged PFSC container: block {} does not inflate to 64 KiB",
+                first + i as u64
+            )));
+        }
+        let off = (pos % BLOCK) as usize;
+        buf[..want].copy_from_slice(&plain[off..off + want]);
+        if self.cache.len() >= CACHE_BLOCKS {
+            self.cache.remove(0);
+        }
+        let last = plain.split_off((count - 1) * BLOCK as usize);
+        self.cache.push((end - 1, last));
+        Ok(want)
     }
 
     /// Decoded block `n`: a 64 KiB span is raw, a shorter one inflates to exactly 64 KiB.
@@ -707,6 +795,20 @@ impl Pfsc {
     }
 }
 
+/// A stored block into its 64 KiB: a full-length span is raw, a shorter one must inflate to
+/// exactly 64 KiB (as [`Pfsc::block`] requires; bytes after the zlib stream are ignored there too).
+fn inflate_into(stored: &[u8], out: &mut [u8]) -> bool {
+    if stored.len() == out.len() {
+        out.copy_from_slice(stored);
+        return true;
+    }
+    let mut z = flate2::Decompress::new(true);
+    matches!(
+        z.decompress(stored, out, flate2::FlushDecompress::Finish),
+        Ok(flate2::Status::StreamEnd)
+    ) && z.total_out() == out.len() as u64
+}
+
 /// One file of an image as its own bytes: a window into the image, decoded if compressed.
 struct Window {
     r: Box<dyn ReadSeek>,
@@ -721,7 +823,15 @@ impl Read for Window {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
         }
+        // A read over three blocks or more decodes them together, on every core.
+        let many = |p: &Pfsc, pos: u64| {
+            let end = (pos + buf.len() as u64).min(p.len);
+            end.div_ceil(BLOCK).saturating_sub(pos / BLOCK) >= 3
+        };
         let got = match &mut self.pfsc {
+            Some(p) if many(p, self.pos) => p
+                .read_many(&mut *self.r, self.pos, buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
             Some(p) => p
                 .read_at(&mut *self.r, self.pos, buf)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
@@ -768,6 +878,10 @@ pub struct FfpfscInfo {
     pub blocks: u64,
     /// Of those, the ones stored compressed.
     pub compressed_blocks: u64,
+    /// The level class the first compressed block's zlib header records (`FLEVEL`: 0 fastest,
+    /// 1 fast, 2 default, 3 maximum; this app's writer gives levels 1, 2–3, 4–8 and 9
+    /// those classes; level 0 writes no zlib stream); `None` with none compressed.
+    pub zlib_level_class: Option<u8>,
     /// The outer PFS image.
     pub outer: PfsHeader,
 }
@@ -811,11 +925,11 @@ pub fn open_ffpfsc(
     let e = outer.extent(&name)?;
     let header = outer.header.clone();
     let mut window = outer.into_reader(&name).map_err(|x| prefix(label, x))?;
-    let compressed_blocks = match &window.pfsc {
+    let (compressed_blocks, zlib_level_class) = match &window.pfsc {
         Some(p) => p
             .compressed_blocks(&mut *window.r)
             .map_err(|x| prefix(label, x))?,
-        None => 0,
+        None => (0, None),
     };
     let info = FfpfscInfo {
         inner_name: name.clone(),
@@ -828,6 +942,7 @@ pub fn open_ffpfsc(
             0
         },
         compressed_blocks,
+        zlib_level_class,
         outer: header,
     };
     let inner_label = format!("{label} ({name})");

@@ -9,7 +9,7 @@ const got = [];
 for (const e of ["jobs://restore", "job://progress", "job://log", "job://done"]) await c.listen(e, (p) => got.push([e, p]));
 const take = () => got.splice(0);
 
-const request = { source: "/data/g", format: "exfat", output: "/data/g.exfat", compression_threads: 3, inner: null, remove_backport: false, full_verify: false };
+const request = { source: "/data/g", format: "exfat", output: "/data/g.exfat", compression_threads: 3, inner: null, remove_backport: false, full_verify: false, kraken_level: "fast", ffpfsc_level: 6 };
 const job = (id, over = {}) => ({ id, request, progress: null, done: null, log: [], log_total: 0, ...over });
 const prog = (id, done) => ({ kind: "progress", job: id, stage: "write", done, total: 100 });
 const ok = (id) => ({ kind: "done", job: id, result: { Ok: { output: request.output, bytes: 1, files: 1, checks: [] } } });

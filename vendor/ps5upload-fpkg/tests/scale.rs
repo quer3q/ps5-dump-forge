@@ -119,6 +119,7 @@ fn the_streaming_writer_reports_progress() {
         stage: None,
         bytes: Some(&mut |done, total| samples.push((done, total))),
         cancel: None,
+        sample: None,
     };
     let report = build::build_controlled(
         &request(source.path(), out.path()),
@@ -565,6 +566,7 @@ fn a_cancelled_build_leaves_nothing_behind() {
         stage: None,
         bytes: None,
         cancel: Some(&cancel),
+        sample: None,
     };
     let error = match build::build_controlled(
         &request(source.path(), out.path()),

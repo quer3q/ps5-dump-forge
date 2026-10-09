@@ -1,0 +1,291 @@
+diff --git a/ps5upload-fpkg/src/si.rs b/ps5upload-fpkg/src/si.rs
+index b2debf8..798df5a 100644
+--- a/ps5upload-fpkg/src/si.rs
++++ b/ps5upload-fpkg/src/si.rs
+@@ -90,17 +90,46 @@ pub fn chunk_crc_table_controlled(
+ ) -> Result<Vec<u8>> {
+     let blocks = zip_start.div_ceil(BLOCK);
+     let mut out = Vec::with_capacity(blocks as usize * 4);
+-    for i in 0..blocks {
++    let mut start = 0u64;
++    while start < zip_start {
+         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+             return Err(crate::Error::Cancelled);
+         }
+-        let start = i * BLOCK;
+-        let len = (zip_start - start).min(BLOCK) as usize;
+-        out.extend_from_slice(&crc32c(&file.read_at(start, len)?).to_le_bytes());
++        let len = (zip_start - start).min(CRC_BATCH * BLOCK);
++        for crc in batch_crcs(file, start, len)? {
++            out.extend_from_slice(&crc.to_le_bytes());
++        }
++        start += len;
+     }
+     Ok(out)
+ }
+ 
++/// The CRC32C of each 64 KiB block of `file[start..start + len]` (the last may be short),
++/// read at once and computed on every core: each thread takes a contiguous share.
++pub(crate) fn batch_crcs(file: &mut PkgFile, start: u64, len: u64) -> Result<Vec<u32>> {
++    let batch = file.read_at(start, len as usize)?;
++    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
++    let per = (batch.len().div_ceil(BLOCK as usize))
++        .div_ceil(threads)
++        .max(1)
++        * BLOCK as usize;
++    Ok(std::thread::scope(|s| {
++        let workers: Vec<_> = batch
++            .chunks(per)
++            .map(|share| {
++                s.spawn(move || share.chunks(BLOCK as usize).map(crc32c).collect::<Vec<_>>())
++            })
++            .collect();
++        workers
++            .into_iter()
++            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
++            .collect()
++    }))
++}
++
++/// Blocks [`chunk_crc_table_controlled`] reads per batch (8 MiB).
++pub(crate) const CRC_BATCH: u64 = 128;
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
+index 7946741..3e81c1d 100644
+--- a/ps5upload-fpkg/src/stream.rs
++++ b/ps5upload-fpkg/src/stream.rs
+@@ -10,7 +10,7 @@
+ //! digests) — never by the size of the game.
+ 
+ use std::fs::File;
+-use std::io::{Seek, SeekFrom, Write};
++use std::io::{Read, Seek, SeekFrom, Write};
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use crate::cnt_write::{self, CntParams};
+@@ -177,6 +177,48 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
+     }
+ }
+ 
++/// Blocks of a compressed image read back per batch (8 MiB).
++const WRITE_BATCH: u64 = 128;
++
++/// Each block of `batch` (image blocks from `first` on): its plaintext digest and, after the
++/// XTS transform when there is one (applied in place), its CRC; one contiguous share per thread.
++fn digest_blocks(
++    batch: &mut [u8],
++    first: u64,
++    xts: Option<&Xts>,
++    threads: usize,
++) -> Vec<([u8; 32], u32)> {
++    let per = (batch.len() / BLOCK as usize)
++        .div_ceil(threads.max(1))
++        .max(1)
++        * BLOCK as usize;
++    std::thread::scope(|s| {
++        let workers: Vec<_> = batch
++            .chunks_mut(per)
++            .enumerate()
++            .map(|(c, share)| {
++                s.spawn(move || {
++                    share
++                        .chunks_mut(BLOCK as usize)
++                        .enumerate()
++                        .map(|(k, block)| {
++                            let digest = sha3(block);
++                            if let Some(xts) = xts {
++                                xts.encrypt(first + ((c * per) / BLOCK as usize + k) as u64, block);
++                            }
++                            (digest, crc32c(block))
++                        })
++                        .collect::<Vec<_>>()
++                })
++            })
++            .collect();
++        workers
++            .into_iter()
++            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
++            .collect()
++    })
++}
++
+ fn cancelled() -> crate::Error {
+     crate::Error::Cancelled
+ }
+@@ -292,32 +334,54 @@ pub fn write_package(
+     let mut file_digests = FileDigester::new(files.len());
+     let mut block = vec![0u8; BLOCK as usize];
+     let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(8);
+-    for index in 0..inner_blocks {
++    // The compressed image: its files' digests were taken as it was compressed. It is read
++    // back a batch at a time and its blocks digested (and encrypted) on every core.
++    let mut index = 0u64;
++    if let Some(spool) = spool.as_mut() {
++        let threads = compression_threads(request.threads);
++        let mut batch = Vec::new();
++        while index < inner_blocks {
++            if cancel.load(Ordering::Relaxed) {
++                return Err(cancelled());
++            }
++            let n = (inner_blocks - index).min(WRITE_BATCH);
++            batch.resize((n * BLOCK) as usize, 0);
++            spool.seek(SeekFrom::Start(spool_at + index * BLOCK))?;
++            spool.read_exact(&mut batch)?;
++            for (k, (digest, crc)) in digest_blocks(&mut batch, index, xts.as_ref(), threads)
++                .into_iter()
++                .enumerate()
++            {
++                let at = index as usize + k;
++                digests[at] = digest;
++                crcs[1 + at] = crc;
++                file_digests.blocks.push(digest);
++            }
++            // Written in place, a plaintext image is already where the outer image keeps it.
++            if !(in_place && xts.is_none()) {
++                out.seek(SeekFrom::Start(BLOCK + index * BLOCK))?;
++                out.write_all(&batch)?;
++            }
++            index += n;
++            (progress.bytes)((index * BLOCK).min(outer_size), outer_size);
++        }
++    }
++    for index in index..inner_blocks {
+         if cancel.load(Ordering::Relaxed) {
+             return Err(cancelled());
+         }
+-        if let Some(spool) = spool.as_mut() {
+-            // The compressed image: its files' digests were taken as it was compressed.
+-            crate::kraken_image::spool_block(spool, spool_at, index, &mut block)?;
+-            file_digests.block(&block, &[]);
+-        } else {
+-            block_spans(&source, plan, index, &mut spans);
+-            let plaintext = source.block(index, read)?;
+-            block.copy_from_slice(plaintext);
+-            file_digests.block(&block, &spans);
+-        }
++        block_spans(&source, plan, index, &mut spans);
++        let plaintext = source.block(index, read)?;
++        block.copy_from_slice(plaintext);
++        file_digests.block(&block, &spans);
+ 
+         digests[index as usize] = crate::crypto::sha3(&block);
+         if let Some(xts) = &xts {
+             xts.encrypt(index, &mut block);
+         }
+         crcs[1 + index as usize] = crc32c(&block);
+-        // A compressed image written in place is already where the outer image keeps it;
+-        // only a transformed block has to go back.
+-        if !(in_place && spool.is_some() && xts.is_none()) {
+-            out.seek(SeekFrom::Start(BLOCK + index * BLOCK))?;
+-            out.write_all(&block)?;
+-        }
++        out.seek(SeekFrom::Start(BLOCK + index * BLOCK))?;
++        out.write_all(&block)?;
+         if index.is_multiple_of(512) {
+             // Bytes of the outer image, the same measure the verifier reports.
+             (progress.bytes)(((index + 1) * BLOCK).min(outer_size), outer_size);
+diff --git a/ps5upload-fpkg/src/verify.rs b/ps5upload-fpkg/src/verify.rs
+index 580ca03..52dd2e2 100644
+--- a/ps5upload-fpkg/src/verify.rs
++++ b/ps5upload-fpkg/src/verify.rs
+@@ -391,6 +391,54 @@ pub fn verify_streaming_controlled(
+ 
+ /// [`verify_streaming_controlled`] over a package already open, e.g. through the handle it was
+ /// just written with, so the bytes checked are that file's whatever its path now names.
++/// Outer blocks the sweep reads per batch (8 MiB).
++const SWEEP_BATCH: u64 = 128;
++
++/// How many of `raw`'s blocks (outer blocks `first` on) reach no `digests` entry, checked on
++/// every core: by decryption with either sector number under `xts`, as stored without it. The
++/// superblock is skipped: it is not encrypted and was matched against the game digest.
++fn failing_blocks(
++    raw: &[u8],
++    first: u64,
++    sb_index: u64,
++    xts: Option<&Xts>,
++    digests: &[[u8; 32]],
++) -> u64 {
++    let matches = |block: &[u8], index: u64| match xts {
++        None => sha3(block) == digests[index as usize],
++        Some(xts) => [index, SIGNED_SECTOR_FLAG | index].iter().any(|&sector| {
++            let mut pt = block.to_vec();
++            xts.decrypt(sector, &mut pt);
++            sha3(&pt) == digests[index as usize]
++        }),
++    };
++    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
++    let per = (raw.len() / BLOCK as usize).div_ceil(threads).max(1) * BLOCK as usize;
++    std::thread::scope(|s| {
++        let workers: Vec<_> = raw
++            .chunks(per)
++            .enumerate()
++            .map(|(c, share)| {
++                let matches = &matches;
++                s.spawn(move || {
++                    share
++                        .chunks(BLOCK as usize)
++                        .enumerate()
++                        .filter(|&(k, block)| {
++                            let index = first + ((c * per) / BLOCK as usize + k) as u64;
++                            index != sb_index && !matches(block, index)
++                        })
++                        .count() as u64
++                })
++            })
++            .collect();
++        workers
++            .into_iter()
++            .map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
++            .sum()
++    })
++}
++
+ pub fn verify_file_controlled(
+     mut file: PkgFile,
+     passcode: &str,
+@@ -494,35 +542,16 @@ pub fn verify_file_controlled(
+ 
+     // The sweep: every data block must reach the digest `imagedigs` carries — by decryption in
+     // the native mode, as stored in the plaintext one.
++    // Read a batch at a time and checked on every core.
+     let mut bad = 0u64;
+     let mut done = 0u64;
+-    for index in 0..count {
++    while done < count {
+         stop()?;
+-        // The superblock is not encrypted; it was matched against the game digest above.
+-        if index != sb_index {
+-            let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
+-            let mut matched = false;
+-            match &xts {
+-                None => matched = sha3(&raw) == digests[index as usize],
+-                Some(xts) => {
+-                    for sector in [index, SIGNED_SECTOR_FLAG | index] {
+-                        let mut pt = raw.clone();
+-                        xts.decrypt(sector, &mut pt);
+-                        if sha3(&pt) == digests[index as usize] {
+-                            matched = true;
+-                            break;
+-                        }
+-                    }
+-                }
+-            }
+-            if !matched {
+-                bad += 1;
+-            }
+-        }
+-        done += 1;
+-        if done.is_multiple_of(256) {
+-            progress(done * BLOCK, count * BLOCK);
+-        }
++        let n = (count - done).min(SWEEP_BATCH);
++        let raw = file.read_at(fih.pfs_offset + done * BLOCK, (n * BLOCK) as usize)?;
++        bad += failing_blocks(&raw, done, sb_index, xts.as_ref(), &digests);
++        done += n;
++        progress(done * BLOCK, count * BLOCK);
+     }
+     progress(done * BLOCK, count * BLOCK);
+     r.push(

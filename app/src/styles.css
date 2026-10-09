@@ -103,6 +103,12 @@ img { display: block; }
 .field.inner > .label { margin: 0 0 6px 4px; }
 .seg.formats.inner { display: inline-flex; width: auto; }
 .field.inner > .hint { margin: 6px 0 0 4px; }
+.seg-choice .seg-opt .icon { width: 15px; height: 15px; }
+/* The .ffpfsc compression level: a native range input in the accent colour. */
+.field.inner > .range-label { display: flex; justify-content: space-between; margin: 14px 4px 4px; }
+.range-value { color: var(--fg); font-variant-numeric: tabular-nums; font-weight: 600; }
+.range { width: 100%; accent-color: var(--accent); cursor: pointer; }
+.range:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
 /* `.on` comes from React state (see FormatPicker), not from `:checked`. */
 /* Chosen: filled with the format's tint, ringed, brighter and bolder text (not hue alone).
    Its text on the tint is >= 8.4:1; unchosen labels are plain muted text. */

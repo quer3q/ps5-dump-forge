@@ -197,7 +197,7 @@ assert.equal(await a.c.call("reveal", { id: 1 }), undefined);
 console.log("commands: list_dir (roots, root, folder, above the root), inspect (and a missing path), default_output, generated_output, stale_parts, reveal (local)");
 
 // Jobs: one runs to the end, one is cancelled while queued behind it.
-const request = { source: game, format: "exfat", output: out, compression_threads: null, inner: null, remove_backport: false, full_verify: false };
+const request = { source: game, format: "exfat", output: out, compression_threads: null, inner: null, remove_backport: false, full_verify: false, kraken_level: "fast", ffpfsc_level: 6 };
 const id = await a.c.call("start_job", { request });
 const id2 = await a.c.call("start_job", { request: { ...request, output: out2 } });
 assert.equal(await a.c.call("cancel_job", { id: id2 }), null);

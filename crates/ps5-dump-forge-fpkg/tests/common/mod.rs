@@ -87,8 +87,14 @@ pub fn write_tree(root: &Path, big_random: usize) {
     );
     put("sce_sys/icon0.png", rng.bytes(2048));
     put("sce_sys/pic0.png", rng.bytes(1024));
+    put("sce_sys/pic1.png", rng.bytes(900));
+    put("sce_sys/pic2.png", rng.bytes(800));
     put("sce_sys/snd0.at9", rng.bytes(3000));
     put("sce_sys/trophy2/trophy00.ucp", rng.bytes(500));
+    // NP files: the builder keeps them in the image and encrypts the container's copies.
+    put("sce_sys/nptitle.dat", rng.bytes(64));
+    put("sce_sys/uds/npbind.dat", rng.bytes(48));
+    put("sce_sys/trophy2/npbind.dat", rng.bytes(32));
     let mut big = Vec::with_capacity(BIG_LEN);
     while big.len() < BIG_LEN {
         // Alternate a compressible stretch and a random one, so blocks take both kinds of half.
@@ -148,6 +154,8 @@ pub fn build(name: &str, big_random: usize, tweak: impl FnOnce(&mut BuildRequest
     let mut request = BuildRequest::production(src.path(), out.path());
     request.time = Some((1_700_000_000, 0));
     request.threads = Some(2);
+    // The app's default; tests build at this level only.
+    request.level = ps5upload_fpkg::kraken::Level::Fast;
     tweak(&mut request);
     let mut tree = FolderSource::open(src.path()).unwrap();
     let prepared = build::prepare(&mut tree, &request, &mut BuildControl::default()).unwrap();

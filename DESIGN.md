@@ -97,7 +97,12 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   - Native radios or `role="tab"` sit underneath, so the keyboard works.
   - Segments are sized by their labels, then share the spare width; six formats fit half of a 900px window.
   - The image inside a `.ffpfsc` is a smaller picker of the same kind (`.seg.formats.inner`), shown only
-    for that target.
+    for that target. So is the `.fpkg` "Compression" picker (Fast / Balanced / Smallest, each led by a
+    15px icon: bolt, scale, compress; all in the `.fpkg` tint), with one line under it on what the chosen
+    level costs in time and CPU.
+  - The `.ffpfsc` "Compression level" is a native range input (`.range`, `accent-color`), 0–9, default 6,
+    under "Image inside": its label row shows the value (`.range-value`, tabular figures), one line under
+    it says what the level costs.
 - **Card** (`.card`, `.card-head` = 18px icon + 15px title + actions on the right, `.card.compact`).
   The hero variant is `.card.hero`; its glow fades in once the colours are known (`.lit`).
 - **Buttons.**
@@ -116,8 +121,7 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
 - **Switch** (`.switch`): a native checkbox drawn as a switch, blue when on. A disabled switch dims
   its track only; the reason sits under it as a `.note-line.warn` ("Remove backport", shown under the
   format picker only for a source with backport libraries, is disabled when core refuses removal).
-  "Full verification" (off by default) sits below it; for `.fpkg` it shows on and disabled, with a
-  `.note-line.muted` saying packages are always fully verified.
+  "Full verification" (off by default) sits below it, for every target.
 - **Tags** (`.tag`, `.tag.fmt`, semantic colours): 22px pills, 12px/500.
 - **Stat tiles** (`.tiles`, `.tile`, `.value`, `.note`): two per row (four per row at medium widths);
   `.tile.wide` spans the row.

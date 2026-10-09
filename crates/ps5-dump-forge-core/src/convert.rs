@@ -397,6 +397,13 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
             }
             planned(req.format, &mut findings).map(Plan::Image)
         }
+        Format::Ffpfsc if req.ffpfsc_level > 9 => {
+            findings.push(format!(
+                "the .ffpfsc zlib level is 0 through 9, not {}",
+                req.ffpfsc_level
+            ));
+            None
+        }
         Format::Ffpfsc => match req.inner.unwrap_or(Format::Exfat) {
             inner @ (Format::Exfat | Format::Ffpkg | Format::Ffpfs) => {
                 planned(inner, &mut findings).map(|image| {
@@ -529,8 +536,19 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
             part.set_dest(&dest);
             let opts = WrapOptions {
                 threads: req.compression_threads.unwrap_or(0),
+                level: req.ffpfsc_level,
                 ..WrapOptions::default()
             };
+            let threads = match opts.threads {
+                0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+                n => n,
+            };
+            ctx.log(format!(
+                ".ffpfsc: zlib level {} of 0–9 (miniz_oxide), 64 KiB blocks, a block kept compressed \
+                 when it saves at least {}%, {threads} compression threads",
+                opts.level, opts.min_block_gain
+            ));
+            let started = std::time::Instant::now();
             #[cfg(not(target_os = "freebsd"))]
             let (line, report) = ps5_dump_forge_pfs::wrap(
                 name,
@@ -546,9 +564,18 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
                     Ok(image.write(&mut hashing, stream, ctx)?.1)
                 })
             })?;
+            let secs = started.elapsed().as_secs_f64().max(1e-3);
             ctx.log(format!(
-                "wrote .ffpfsc: {} bytes holding {name} ({line}); {} of {} blocks compressed",
-                report.image_size, report.compressed_blocks, report.blocks
+                "wrote .ffpfsc: {} bytes holding {name} ({line}); {} of {} blocks compressed, \
+                 {} raw; stored {:.1}% of {} bytes; {:.0} MB/s of image at zlib level {}",
+                report.image_size,
+                report.compressed_blocks,
+                report.blocks,
+                report.blocks - report.compressed_blocks,
+                report.stored_size as f64 * 100.0 / report.raw_size.max(1) as f64,
+                report.raw_size,
+                report.raw_size as f64 / 1e6 / secs,
+                opts.level
             ));
             (part, Some(file), report.image_size, Some(report))
         }
