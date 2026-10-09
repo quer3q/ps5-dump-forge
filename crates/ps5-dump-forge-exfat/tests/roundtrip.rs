@@ -5,7 +5,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use ps5_dump_forge_exfat::{Layout, Options, plan, write};
+use ps5_dump_forge_exfat::{Layout, Options, plan, read_maker, write};
 use ps5upload_fpkg::Result;
 use ps5upload_fpkg::exfat::ExFatSource;
 use ps5upload_fpkg::source::{FolderSource, SourceFile, SourceTree};
@@ -395,6 +395,46 @@ fn bad_label_is_rejected() {
 }
 
 #[test]
+fn maker_mark_round_trips_and_is_bounded() {
+    let tmp = TempDir::new("maker");
+    let cancel = AtomicBool::new(false);
+    for (maker, name) in [
+        (Some("PS5-FORGE-v0.0.1-pre4"), "mark.exfat"),
+        (None, "plain.exfat"),
+    ] {
+        let mut tree = MemTree::new(&[("eboot.bin", 1)]);
+        let opts = Options {
+            maker: maker.map(str::to_string),
+            ..Options::default()
+        };
+        let layout = plan(&tree, &opts, &cancel).unwrap();
+        let mut out = File::create(tmp.0.join(name)).unwrap();
+        write(&mut tree, &layout, &mut out, &cancel, &mut |_, _| {}).unwrap();
+        let mut f = File::open(tmp.0.join(name)).unwrap();
+        assert_eq!(read_maker(&mut f).unwrap().as_deref(), maker);
+        // The backup boot region is the same bytes, so its OEM record matches too.
+        let regions = read_at(&mut f, 0, 24 * 512);
+        assert_eq!(regions[..12 * 512], regions[12 * 512..]);
+    }
+    // A bad boot checksum voids the OEM parameters (spec §3.3).
+    let mut boot = read_at(
+        &mut File::open(tmp.0.join("mark.exfat")).unwrap(),
+        0,
+        12 * 512,
+    );
+    boot[100] ^= 1;
+    assert_eq!(read_maker(&mut std::io::Cursor::new(boot)).unwrap(), None);
+    for bad in ["x".repeat(33), "tab\there".into(), "é".into()] {
+        let opts = Options {
+            maker: Some(bad),
+            ..Options::default()
+        };
+        let e = plan(&MemTree::new(&[("eboot.bin", 1)]), &opts, &cancel).unwrap_err();
+        assert!(e.to_string().contains("maker's mark"), "{e}");
+    }
+}
+
+#[test]
 fn cancel_stops_plan_and_write() {
     let mut tree = MemTree::new(&[("big.bin", 40 << 20), ("eboot.bin", 1)]);
     let cancel = AtomicBool::new(true);
@@ -475,6 +515,7 @@ fn write_check_image() {
     let opts = Options {
         free_bytes: 16 << 20,
         label: Some("PPSA01234".into()),
+        maker: Some("PS5-FORGE-v0.0.1-pre4".into()),
     };
     let image = out.join("check.exfat");
     build(&src, &image, &opts);

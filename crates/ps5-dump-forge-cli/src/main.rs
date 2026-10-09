@@ -366,6 +366,9 @@ fn inspect(path: &Path, json: bool) -> ExitCode {
         found.total_bytes,
         found.empty_dirs.len()
     );
+    if let Some(v) = &found.forge_version {
+        text += &format!("forge:      v{v}\n");
+    }
     if !found.dlcs.is_empty() {
         text += &format!("dlc:        {}\n", found.dlcs.len());
         for d in &found.dlcs {

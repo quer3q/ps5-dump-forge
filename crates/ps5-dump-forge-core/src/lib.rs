@@ -232,6 +232,9 @@ pub struct Inspection {
     pub backport_firmware: Option<String>,
     /// DLC embedded in the dump (in content-id folders, or merged with its metadata left).
     pub dlcs: Vec<Dlc>,
+    /// The PS5 Dump Forge version that wrote the image (`0.0.1-pre4`), from the maker's mark
+    /// of an `.exfat`, `.ffpkg` or the image inside a `.ffpfsc`. `None` for anything else.
+    pub forge_version: Option<String>,
     /// `sce_sys/icon0.png` as a `data:image/png;base64,` URL, when present and small.
     pub cover: Option<String>,
     /// `sce_sys/param.json`, parsed, when present.

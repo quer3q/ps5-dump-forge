@@ -113,6 +113,10 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
   raw). zlib from `flate2` (`miniz_oxide`; console acceptance is a hardware gate in `TODO.md`). Streamed: the inner
   writer feeds the compressor, which writes the `.part`; no temporary inner image. Free-space preflight asks
   for the worst case (every block raw).
+- Maker's mark `PS5-FORGE-v<version>` (≤ 31 bytes, a const assert in `convert.rs`): `.exfat` in an OEM
+  Parameters record (sector 9, our GUID `{182B1321-1B2D-441D-BECA-28B704837CA0}` + 32 bytes ASCII, in both
+  boot regions, under the boot checksum), `.ffpkg` as `fs_volname` in every superblock, `.ffpfsc` in its
+  inner `.exfat`/`.ffpkg`. `.ffpfs` and `.pkg` carry none (no field for it). `inspect` reports `forge_version`.
 - Generated `.ffpfs`/`.ffpfsc` names are ≤ 63 bytes (SMP fails longer ones with ENAMETOOLONG); the game-name
   part is cut first.
 - FPKG: outer PFS plaintext with the `PPRPLAIN-NOAUTH!` marker (native AES-XTS fails the console's auth),

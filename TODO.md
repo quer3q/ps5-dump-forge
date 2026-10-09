@@ -10,7 +10,9 @@ Grouped by area; the first section blocks a release.
   boots (read-only and `image_rw=`); a `.pkg` installs and boots with kstuff + fpkg-enable + ppr-patch. Only the
   console proves a format is accepted. Include a source with `sce_sys/pic1.png`/`pic2.png`: since vendor patch
   0018 they go into the container only (0x1006/0x2040, in the system digest), as in a third-party package,
-  and no such `.pkg` has been installed yet.
+  and no such `.pkg` has been installed yet. Images now carry the maker's mark (exFAT OEM Parameters record,
+  UFS2 `fs_volname` `PS5-FORGE-v…`, which a FreeBSD GEOM label would expose as `/dev/ufs/PS5-FORGE-v…`):
+  check those mount too.
 - [ ] **`.ffpfs` and `.ffpfsc` on a console**: SMP 1.7 mounts and boots a `.ffpfs` (under `/data`, and on USB) and a
   `.ffpfsc` with each inner format (`.exfat`, `.ffpkg`, `.ffpfs`). Both follow MkPFS's layouts, but neither
   has been booted from this builder.

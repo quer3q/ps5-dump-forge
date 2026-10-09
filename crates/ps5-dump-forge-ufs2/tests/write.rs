@@ -44,7 +44,11 @@ fn game_folder_round_trip() {
 
     let mut src = FolderSource::open(&root).unwrap();
     assert_eq!(src.empty_dirs(), ["data/shaders"]);
-    let (img, layout, report) = build("game", &mut src, &Options::default());
+    let opts = Options {
+        maker: Some("PS5-FORGE-v0.0.1-pre4".into()),
+        ..Options::default()
+    };
+    let (img, layout, report) = build("game", &mut src, &opts);
     assert_eq!(report.files, files.len() as u64);
     assert_eq!(report.image_size % B, 0);
     assert_eq!(std::fs::metadata(&img).unwrap().len(), layout.image_size);
@@ -58,9 +62,26 @@ fn game_folder_round_trip() {
     assert_eq!(r.files.len(), files.len());
     compare_with_reader(&img, &mut src);
 
-    // Same tree, same bytes.
+    // The maker's mark is fs_volname in the primary and every backup superblock.
     let first = std::fs::read(&img).unwrap();
-    let (img2, _, _) = build("game-again", &mut src, &Options::default());
+    let volname = |at: usize| &first[at + 680..at + 712];
+    let mut want = [0u8; 32];
+    want[..21].copy_from_slice(b"PS5-FORGE-v0.0.1-pre4");
+    assert_eq!(volname(65536), want);
+    let fpg = layout.blocks_per_group as usize * B as usize;
+    for c in 0..layout.cylinder_groups as usize {
+        assert_eq!(
+            volname(c * fpg + 2 * B as usize),
+            want,
+            "backup in group {c}"
+        );
+    }
+    let mut f = std::fs::File::open(&img).unwrap();
+    let got = ps5_dump_forge_ufs2::read_volname(&mut f).unwrap();
+    assert_eq!(got.as_deref(), Some("PS5-FORGE-v0.0.1-pre4"));
+
+    // Same tree, same bytes.
+    let (img2, _, _) = build("game-again", &mut src, &opts);
     assert!(
         first == std::fs::read(&img2).unwrap(),
         "output is not deterministic"
@@ -70,10 +91,35 @@ fn game_folder_round_trip() {
 
 /// Free space for writable mounts: the requested bytes stay free, plus spare inodes.
 #[test]
+fn maker_mark_is_bounded_and_optional() {
+    let mut src = Synth::new(&[("eboot.bin", 100)]);
+    let cancel = AtomicBool::new(false);
+    for bad in ["x".repeat(32), "tab\there".into(), "é".into()] {
+        let opts = Options {
+            maker: Some(bad),
+            ..Options::default()
+        };
+        let e = ps5_dump_forge_ufs2::plan(&src, &opts, &cancel).unwrap_err();
+        assert!(e.to_string().contains("maker's mark"), "{e}");
+    }
+    let (img, _, _) = build("unmarked", &mut src, &Options::default());
+    let mut f = std::fs::File::open(&img).unwrap();
+    assert_eq!(ps5_dump_forge_ufs2::read_volname(&mut f).unwrap(), None);
+    std::fs::remove_file(img).unwrap();
+}
+
+#[test]
 fn free_bytes_reserved() {
     let mut src = Synth::new(&[("eboot.bin", 100), ("sce_sys/param.json", 10)]);
     let want = 300 * 1024 * 1024;
-    let (img, layout, _) = build("free", &mut src, &Options { free_bytes: want });
+    let (img, layout, _) = build(
+        "free",
+        &mut src,
+        &Options {
+            free_bytes: want,
+            ..Options::default()
+        },
+    );
     assert!(layout.free_bytes >= want, "{} < {want}", layout.free_bytes);
     assert!(layout.free_inodes >= 2048);
     assert_clean(&img);
@@ -134,6 +180,7 @@ fn nearly_empty_last_group() {
     for _ in 0..40 {
         let opts = Options {
             free_bytes: free as u64,
+            ..Options::default()
         };
         let l = ps5_dump_forge_ufs2::plan(&src, &opts, &cancel).unwrap();
         let meta = l.metadata_blocks_per_group as i64;

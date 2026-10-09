@@ -357,6 +357,12 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
           <dd className={ins.content_id ? "value mono" : "value"}>{ins.content_id ?? "—"}</dd>
         </div>
       )}
+      {full && ins.forge_version !== null && (
+        <div className="tile wide">
+          <dt>PS5 Dump Forge</dt>
+          <dd className="value mono">v{ins.forge_version}</dd>
+        </div>
+      )}
     </dl>
   );
 }

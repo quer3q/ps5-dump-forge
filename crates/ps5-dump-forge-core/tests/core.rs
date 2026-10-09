@@ -822,6 +822,14 @@ fn image_round_trip(
     }
     let found = inspect(&image).unwrap();
     assert_eq!(found.kind, ext);
+    // The maker's mark: in an `.exfat`/`.ffpkg`, or the one inside a `.ffpfsc`; never PFS.
+    let marked = match format {
+        Format::Exfat | Format::Ffpkg => true,
+        Format::Ffpfsc => inner != Some(Format::Ffpfs),
+        _ => false,
+    };
+    let mark = marked.then_some(env!("CARGO_PKG_VERSION"));
+    assert_eq!(found.forge_version.as_deref(), mark, "{format:?} {inner:?}");
     assert_eq!(found.title_id.as_deref(), Some("PPSA01234"));
     assert_eq!(found.empty_dirs, ["data/empty", "deep/a/b", "only-junk"]);
     // An `.exfat` notes its SMP geometry; nothing else is found in what we wrote.
@@ -998,7 +1006,7 @@ fn junk_inside_an_image_is_dropped_everywhere() {
         file("data/Thumbs.db", 5),
     ]);
     let cancel = AtomicBool::new(false);
-    let opts = ps5_dump_forge_ufs2::Options { free_bytes: 0 };
+    let opts = ps5_dump_forge_ufs2::Options::default();
     let layout = ps5_dump_forge_ufs2::plan(&tree, &opts, &cancel).unwrap();
     let image = root.join("junk.ffpkg");
     let mut out = std::fs::File::create_new(&image).unwrap();
@@ -1006,6 +1014,7 @@ fn junk_inside_an_image_is_dropped_everywhere() {
     drop(out);
 
     let found = inspect(&image).unwrap();
+    assert_eq!(found.forge_version, None, "written without a maker's mark");
     let paths: Vec<&str> = found.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, ["data/keep.bin", "eboot.bin", "sce_sys/param.json"]);
     assert_eq!(found.empty_dirs, ["only-junk"]);
@@ -1018,6 +1027,8 @@ fn junk_inside_an_image_is_dropped_everywhere() {
         assert_eq!(report.files, 3, "{format:?}");
         assert!(report.checks.iter().any(|c| c == "empty dirs: 1 match"));
         let back = inspect(&root.join(name)).unwrap();
+        let mark = (format != Format::Folder).then(|| env!("CARGO_PKG_VERSION").to_string());
+        assert_eq!(back.forge_version, mark, "{format:?}");
         assert!(
             back.files.iter().all(|f| !f.path.contains(".Trashes")),
             "{format:?} carried junk"

@@ -24,6 +24,17 @@ use crate::{ConvertRequest, Format, JobReport};
 
 /// Every SMP image size and cluster is a multiple of this.
 const IMAGE_ALIGN: u64 = 64 * 1024;
+/// The maker's mark, `PS5-FORGE-v<version>`: an `.exfat` holds it in an OEM Parameters
+/// record, an `.ffpkg` as its `fs_volname` (31 bytes at most), a `.ffpfsc` in its inner image.
+pub(crate) const MAKER_PREFIX: &str = "PS5-FORGE-v";
+const _: () = assert!(
+    MAKER_PREFIX.len() + env!("CARGO_PKG_VERSION").len() <= 31,
+    "the maker's mark must fit UFS2 fs_volname (31 bytes)"
+);
+
+fn maker() -> Option<String> {
+    Some(format!("{MAKER_PREFIX}{}", env!("CARGO_PKG_VERSION")))
+}
 
 /// What a source path is, by what it is on disk and then by its extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,13 +217,17 @@ impl Image {
                 let opts = ps5_dump_forge_exfat::Options {
                     free_bytes: 0,
                     label: label.into(),
+                    maker: maker(),
                 };
                 ps5_dump_forge_exfat::plan(tree, &opts, cancel)
                     .map(Self::Exfat)
                     .map_err(|e| format!("exFAT layout: {e}"))
             }
             Format::Ffpkg => {
-                let opts = ps5_dump_forge_ufs2::Options { free_bytes: 0 };
+                let opts = ps5_dump_forge_ufs2::Options {
+                    free_bytes: 0,
+                    maker: maker(),
+                };
                 ps5_dump_forge_ufs2::plan(tree, &opts, cancel)
                     .map(Self::Ffpkg)
                     .map_err(|e| format!("UFS2 layout: {e}"))
@@ -978,7 +993,7 @@ mod tests {
         };
         let mut tree = Mem(vec![file("eboot.bin", 100), file("data/a.bin", 70_000)]);
         let cancel = AtomicBool::new(false);
-        let opts = ps5_dump_forge_ufs2::Options { free_bytes: 0 };
+        let opts = ps5_dump_forge_ufs2::Options::default();
         let layout = ps5_dump_forge_ufs2::plan(&tree, &opts, &cancel).unwrap();
         let path = dir.join("x.ffpkg");
         let mut out = crate::finalize::create_new(&path).unwrap();

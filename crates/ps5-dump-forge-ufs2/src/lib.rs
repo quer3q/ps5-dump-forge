@@ -15,7 +15,7 @@ mod geom;
 mod ondisk;
 mod tree;
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ps5upload_fpkg::source::SourceTree;
@@ -43,6 +43,9 @@ const SPARE_BLOCKS: u64 = 1024;
 pub struct Options {
     /// Extra free space (bytes) beyond what the files need, for `image_rw=` mounts.
     pub free_bytes: u64,
+    /// Maker's mark for `fs_volname`: printable ASCII, at most 31 bytes (the field is 32,
+    /// NUL-terminated); `plan` rejects anything else. `None` leaves it empty, as newfs does.
+    pub maker: Option<String>,
 }
 
 /// Everything `write` needs, fixed before the first file byte is read.
@@ -71,6 +74,7 @@ pub struct Layout {
     dirs: u64,
     file_bytes: u64,
     fs_id: u32,
+    volname: [u8; ondisk::VOLNAME_LEN],
     /// Hash of the tree's file list and empty dirs as planned; `write` refuses another.
     source: u64,
 }
@@ -117,10 +121,37 @@ fn fingerprint(tree: &dyn SourceTree) -> u64 {
     h
 }
 
+/// `fs_volname` of a UFS2 image (where this crate puts the maker's mark), from the primary
+/// superblock: `None` when the image is not UFS2 or the label is empty.
+pub fn read_volname<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<String>> {
+    let mut sb = vec![0u8; 1376];
+    r.seek(SeekFrom::Start(ondisk::SBLOCK_UFS2))?;
+    r.read_exact(&mut sb)?;
+    if sb[1372..1376] != ondisk::FS_UFS2_MAGIC.to_le_bytes() {
+        return Ok(None);
+    }
+    let name = &sb[ondisk::VOLNAME_AT..ondisk::VOLNAME_AT + ondisk::VOLNAME_LEN];
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    Ok(std::str::from_utf8(&name[..end])
+        .ok()
+        .filter(|n| !n.is_empty())
+        .map(str::to_string))
+}
+
 /// Validate names and lay the image out. Fails with every offending path listed.
 /// Checks `cancel` between steps.
 pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Result<Layout> {
     check_cancel(cancel)?;
+    let mut volname = [0u8; ondisk::VOLNAME_LEN];
+    if let Some(m) = &opts.maker {
+        if m.len() >= volname.len() || !m.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+            return Err(Error::Format(format!(
+                "maker's mark {m:?}: printable ASCII, at most {} bytes",
+                volname.len() - 1
+            )));
+        }
+        volname[..m.len()].copy_from_slice(m.as_bytes());
+    }
     let mut nodes = tree::build(tree)?;
     check_cancel(cancel)?;
 
@@ -198,6 +229,7 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
         dirs,
         file_bytes,
         fs_id: h,
+        volname,
         source: fingerprint(tree),
         nodes,
     })
@@ -430,11 +462,11 @@ impl<W: Write + Seek> Writer<'_, W> {
         let base = c * g.fpg * BSIZE;
         if c == 0 {
             self.put(ondisk::SBLOCK_UFS2 - 20, &ondisk::fsrecovery(&g))?;
-            let sb = ondisk::superblock(&g, &total, layout.fs_id, ondisk::SBLOCK_UFS2);
+            let sb = ondisk::superblock(&g, &total, layout, ondisk::SBLOCK_UFS2);
             self.put(ondisk::SBLOCK_UFS2, &sb)?;
         }
         let at = base + SBLKNO * BSIZE;
-        self.put(at, &ondisk::superblock(&g, &total, layout.fs_id, at))?;
+        self.put(at, &ondisk::superblock(&g, &total, layout, at))?;
         let u = &self.cs[c as usize];
         let cg = ondisk::cylinder_group(&g, c, u.inodes, u.blocks, &u.cs);
         let used = u.inodes;

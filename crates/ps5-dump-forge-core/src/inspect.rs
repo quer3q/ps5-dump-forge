@@ -1,6 +1,6 @@
 //! `inspect` and `default_output`: what a source holds, and what to call its conversion.
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -36,11 +36,28 @@ pub(crate) fn already_smp(path: &Path) -> Option<String> {
         .then(|| format!("{}: {ALREADY_SMP}", path.display()))
 }
 
+/// The version in the maker's mark of an `.exfat` (`exfat`) or `.ffpkg` image; `None` when
+/// it has none or can't be read (inspect goes on without it).
+fn maker_version<R: Read + Seek>(r: &mut R, exfat: bool) -> Option<String> {
+    let mark = if exfat {
+        ps5_dump_forge_exfat::read_maker(r)
+    } else {
+        ps5_dump_forge_ufs2::read_volname(r)
+    };
+    let version = mark
+        .ok()??
+        .strip_prefix(crate::convert::MAKER_PREFIX)?
+        .to_string();
+    let printable = version.bytes().all(|b| b.is_ascii_graphic());
+    (!version.is_empty() && printable).then_some(version)
+}
+
 pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     let kind = Kind::of(path)?;
     let mut details = Vec::new();
     let mut pfs_findings = Vec::new();
     let mut cnt_id = None;
+    let mut forge_version = None;
     let mut tree = if kind == Kind::Pkg {
         let pkg =
             FpkgSource::open(path, None).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -78,6 +95,19 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
                 info.inner_name, info.raw_size
             )
         });
+        // The maker's mark is in the inner image.
+        let inner = info.inner_name.to_ascii_lowercase();
+        if [".exfat", ".ffpkg", ".ufs2"]
+            .iter()
+            .any(|e| inner.ends_with(e))
+        {
+            forge_version = (|| {
+                let file = std::fs::File::open(path).ok()?;
+                let outer = PfsSource::from_reader(Box::new(file), String::new()).ok()?;
+                let mut nested = Nested::new(outer, &info.inner_name).ok()?;
+                maker_version(&mut nested, inner.ends_with(".exfat"))
+            })();
+        }
         // A nested `.ffpfs` has a block size of its own.
         if info.inner_name.to_ascii_lowercase().ends_with(".ffpfs") {
             let file = std::fs::File::open(path)?;
@@ -141,6 +171,11 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
         if len % (64 * 1024) != 0 {
             findings.push("the image size is not a multiple of 64 KiB".to_string());
         }
+    }
+    if matches!(kind, Kind::Exfat | Kind::Ffpkg) {
+        forge_version = std::fs::File::open(path)
+            .ok()
+            .and_then(|mut f| maker_version(&mut f, kind == Kind::Exfat));
     }
     let paths: Vec<String> = tree.files().iter().map(|f| f.path.clone()).collect();
     if kind != Kind::Folder {
@@ -207,6 +242,7 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
         backport_blocked,
         backport_firmware,
         dlcs,
+        forge_version,
         cover,
         param_json: info.param_json,
         total_bytes: files.iter().fold(0u64, |s, f| s.saturating_add(f.size)),

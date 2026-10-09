@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ps5upload_fpkg::source::SourceTree;
@@ -55,6 +55,15 @@ const MAX_CLUSTERS: u64 = (1 << 32) - 11;
 /// A directory's DataLength may not exceed 256 MiB.
 const MAX_DIR_BYTES: u64 = 256 << 20;
 const ENTRY: usize = 32;
+/// The OEM Parameters record (spec §3.3) a maker's mark goes in: GUID
+/// {182B1321-1B2D-441D-BECA-28B704837CA0}, ours, in the on-disk order (first three fields
+/// little-endian), then 32 bytes of ASCII.
+pub const MAKER_GUID: [u8; 16] = [
+    0x21, 0x13, 0x2B, 0x18, 0x2D, 0x1B, 0x1D, 0x44, 0xBE, 0xCA, 0x28, 0xB7, 0x04, 0x83, 0x7C, 0xA0,
+];
+const MAKER_LEN: usize = 32;
+/// Sector 9 of the boot region: OEM Parameters.
+const OEM_SECTOR: usize = 9;
 const NAME_UNITS_PER_ENTRY: usize = 15;
 /// Read size per `read_range`: bounded memory however large the file.
 const CHUNK: u64 = 8 << 20;
@@ -75,6 +84,9 @@ pub struct Options {
     /// Volume label (ps5-dump-forge-core passes the title ID), at most 11 UTF-16 units; a longer
     /// one is rejected by `plan`. `None` writes an empty label entry, as mkfs.exfat does.
     pub label: Option<String>,
+    /// Maker's mark: printable ASCII, at most 32 bytes, written to the first OEM Parameters
+    /// record under [`MAKER_GUID`]; `plan` rejects anything else. `None` leaves sector 9 zero.
+    pub maker: Option<String>,
 }
 
 /// Everything `write` needs, fixed before the first file byte is read.
@@ -93,6 +105,7 @@ pub struct Layout {
     /// Nodes that own clusters, in heap order (root first, then pre-order).
     order: Vec<usize>,
     label: Vec<u16>,
+    maker: Option<String>,
 }
 
 /// The boot-sector numbers, all in the units the boot sector stores.
@@ -164,6 +177,13 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
     let label = opts.label.as_deref().unwrap_or("");
     if let Some(why) = names::label_problem(label) {
         problems.push(format!("volume label {label:?}: {why}"));
+    }
+    if let Some(m) = &opts.maker
+        && (m.len() > MAKER_LEN || !m.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+    {
+        problems.push(format!(
+            "maker's mark {m:?}: printable ASCII, at most {MAKER_LEN} bytes"
+        ));
     }
     let mut nodes = vec![Node::new("", "", true, 0)];
     let mut index = HashMap::new();
@@ -271,6 +291,7 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
         nodes,
         order,
         label: label.encode_utf16().collect(),
+        maker: opts.maker.clone(),
         skipped,
     })
 }
@@ -636,7 +657,13 @@ fn boot_region(layout: &Layout) -> Vec<u8> {
             0xAA55_0000,
         );
     }
-    // Sectors 9 (OEM parameters) and 10 (reserved) stay zero.
+    // Sector 9 (OEM parameters): the maker's record, the other nine null (zero GUID); sector
+    // 10 (reserved) stays zero.
+    if let Some(m) = &layout.maker {
+        let at = OEM_SECTOR * SECTOR as usize;
+        r[at..at + 16].copy_from_slice(&MAKER_GUID);
+        r[at + 16..at + 16 + m.len()].copy_from_slice(m.as_bytes());
+    }
     let sum = boot_checksum(&r[..11 * SECTOR as usize]);
     for at in (11 * SECTOR as usize..BOOT_REGION).step_by(4) {
         put32(&mut r, at, sum);
@@ -892,6 +919,30 @@ fn add(a: u64, b: u64) -> Result<u64> {
 
 fn too_big() -> Error {
     err("the tree is too large for an exFAT volume with 64 KiB clusters")
+}
+
+/// The maker's mark of an image this crate wrote, from its main boot region: `None` for
+/// any other exFAT (not 512-byte sectors at byte 0, a bad boot checksum, which the spec
+/// says voids the OEM parameters, or no record under [`MAKER_GUID`]).
+pub fn read_maker<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<String>> {
+    let mut b = vec![0u8; BOOT_REGION];
+    r.seek(SeekFrom::Start(0))?;
+    r.read_exact(&mut b)?;
+    let checksum = 11 * SECTOR as usize;
+    let sum = boot_checksum(&b[..checksum]).to_le_bytes();
+    if &b[3..11] != b"EXFAT   "
+        || b[108] != SECTOR_SHIFT
+        || !b[checksum..].chunks(4).all(|c| c == sum)
+    {
+        return Ok(None);
+    }
+    let oem = &b[OEM_SECTOR * SECTOR as usize..][..10 * (16 + MAKER_LEN)];
+    let Some(rec) = oem.chunks(16 + MAKER_LEN).find(|r| r[..16] == MAKER_GUID) else {
+        return Ok(None);
+    };
+    let text = &rec[16..];
+    let end = text.iter().position(|&c| c == 0).unwrap_or(MAKER_LEN);
+    Ok(std::str::from_utf8(&text[..end]).ok().map(str::to_string))
 }
 
 fn err(msg: impl Into<String>) -> Error {

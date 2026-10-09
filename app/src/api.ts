@@ -122,6 +122,9 @@ export interface Inspection {
   /** With a fakelib/ (backport or emulators): the lowest firmware its executables allow,
    * e.g. "4.50". */
   backport_firmware: string | null;
+  /** The PS5 Dump Forge version that wrote the image (its maker's mark), e.g. "0.0.1-pre4";
+   * null for folders, .pkg, .ffpfs and images made by other tools. */
+  forge_version: string | null;
   /** DLC embedded in the dump. */
   dlcs: Dlc[];
   /** icon0.png as a data: URL. */
