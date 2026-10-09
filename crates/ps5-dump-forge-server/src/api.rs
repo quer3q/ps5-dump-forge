@@ -500,6 +500,22 @@ mod tests {
             .unwrap_or_else(|r| r)
     }
 
+    /// Until a `start_job` on another thread holds admission (in its test pause). A fixed sleep
+    /// raced it on a loaded CI runner: the thread could still be on its way in, or past it.
+    fn wait_admitting(server: &Server) {
+        let start = Instant::now();
+        while !matches!(
+            server.admission.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "start_job never got in"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     // Only the Unix-only admission test needs a folder.
     #[cfg(unix)]
     fn dir(name: &str) -> PathBuf {
@@ -564,7 +580,7 @@ mod tests {
                 post(&server, "start_job", request).status
             })
         };
-        std::thread::sleep(Duration::from_millis(100)); // job 2 is inside the pause
+        wait_admitting(&server); // job 2 is inside the pause
         let pid = std::process::id();
         let live = tmp.join(format!("out.exfat.2-{pid}.part"));
         let old = tmp.join("old.exfat.1-1.part");
@@ -572,7 +588,7 @@ mod tests {
         std::fs::write(&old, b"").unwrap();
         let start = Instant::now();
         let r = post(&server, "stale_parts", json!({ "dirs": [tmp] }));
-        assert!(start.elapsed() >= Duration::from_millis(200)); // waited for admission
+        // Job 2's `.part` isn't stale: `stale_parts` waited for its admission.
         assert_eq!(r.status, 200);
         assert_eq!(r.text(), json!([old]).to_string());
         assert!(server.stop());
@@ -618,7 +634,7 @@ mod tests {
                 server.start_job(body.to_string().as_bytes()).is_ok()
             })
         };
-        std::thread::sleep(Duration::from_millis(100)); // inside the pause, `Done` recorded
+        wait_admitting(&server); // inside the pause
         assert!(server.stop());
         assert!(lock(&server.table).all_admitted());
         assert_eq!(lock(&server.table).snapshot().len(), 1);
