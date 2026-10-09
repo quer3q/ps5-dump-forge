@@ -787,9 +787,13 @@ mod tests {
             next_to.join("PPSA01234.exfat")
         );
         // A trailing `..` is the folder it climbs to (`convert ..`), not its lexical parent.
+        // Compared as folders: Windows' `absolute` resolves `..` itself (keeping 8.3 names
+        // like RUNNER~1), Unix's goes through `canonicalize` (`\\?\` on Windows).
+        let up = default_output(&game.join("sce_sys/.."), Format::Exfat, Path::new("")).unwrap();
+        assert_eq!(up.file_name(), Some("PPSA01234.exfat".as_ref()));
         assert_eq!(
-            default_output(&game.join("sce_sys/.."), Format::Exfat, Path::new("")).unwrap(),
-            next_to.canonicalize().unwrap().join("PPSA01234.exfat")
+            up.parent().unwrap().canonicalize().unwrap(),
+            next_to.canonicalize().unwrap()
         );
         let _ = std::fs::remove_dir_all(&root);
     }
