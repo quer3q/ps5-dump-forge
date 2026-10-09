@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PS5 Dump Forge",
   "mainBinaryName": "PS5 Dump Forge",
-  "version": "0.0.1-pre4",
+  "version": "0.0.1-pre5",
   "identifier": "io.github.quer3q.ps5-dump-forge",
   "build": {
     "beforeDevCommand": "npm run dev",

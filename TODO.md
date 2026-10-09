@@ -1,6 +1,6 @@
 # TODO
 
-What is left (current release: v0.0.1-pre4, a test release). Grouped by area; the first section blocks a
+What is left (current release: v0.0.1-pre5, a test release). Grouped by area; the first section blocks a
 release.
 
 ## Before the first release
