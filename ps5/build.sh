@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds target/ps5/ps5-dump-forge.elf, the CLI as a PS5 payload, in Docker. See README.md, "PS5 payload internals".
+# Builds target/ps5/ps5-dump-forge.elf, the CLI as a PS5 payload, in Docker. See ps5/README.md.
 # The web UI it serves is built on the host first (node isn't in the image) and embedded;
 # FORGE_SKIP_WEB=1 skips that (app/dist-http as it is, or a placeholder page).
 # Two stages, since a running payload can't read its own file: stage 1 (target/ps5/stage1.elf)

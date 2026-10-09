@@ -13,8 +13,8 @@ export default defineConfig(({ mode }) => {
   const http = mode === "http";
   return {
     // The page title carries the version: the PS5 browser shows it in its title bar (the
-    // desktop window keeps tauri.conf.json's title). scripts/check-versions.sh keeps
-    // package.json at Cargo.toml's version.
+    // desktop window sets the same title from Cargo's version in main.rs).
+    // scripts/check-versions.sh keeps package.json at Cargo.toml's version.
     plugins: [
       react(),
       {

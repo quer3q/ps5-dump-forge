@@ -20,5 +20,5 @@ ps5-dump-forge-pfs.workspace = true
 ps5-dump-forge-fpkg.workspace = true
 
 [lints.rust]
-# `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` for the PS5-only bits (README.md, "PS5 payload internals").
+# `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` for the PS5-only bits (ps5/README.md).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_env, values("ps5"))'] }

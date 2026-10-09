@@ -170,7 +170,7 @@ export const api = {
   defaultOutput: (source: string, format: Format, dir: string) =>
     invoke<string>("default_output", { source, format, dir }),
   /**
-   * `[GAME_NAME]-[TITLE_ID]-[FIRMWARE].<ext>` (brackets included) in `dir`, from the
+   * `[GAME_NAME]-[TITLE_ID].<ext>` (brackets included) in `dir`, from the
    * source's param.json; never
    * an existing path nor one in `taken` (outputs of running jobs): `-2`, `-3`, ... instead.
    */

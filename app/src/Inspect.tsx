@@ -158,73 +158,52 @@ function panel(id: View, view: View) {
 /**
  * Leftover `.part` files where outputs land (the source's folder, this session's output
  * folders). Listed only, never deleted. Re-checked whenever the tab shows (jobs may have
- * ended meanwhile).
+ * ended meanwhile). The card shows only when some were found: nothing while checking, when
+ * there are none or nothing to check, or when the check fails.
  */
 function Leftovers(props: { dirs: (string | null)[]; visible: boolean }) {
   const dirs = [...new Set(props.dirs.filter((d): d is string => !!d))];
   const key = JSON.stringify(dirs);
-  const [parts, setParts] = useState<string[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [parts, setParts] = useState<string[]>([]);
 
   useEffect(() => {
     if (!props.visible) return;
-    setParts(null);
-    setError(null);
+    setParts([]);
     const list: string[] = JSON.parse(key);
     if (list.length === 0) return;
     let live = true;
     api.staleParts(list).then(
       (p) => live && setParts(p),
-      (e) => live && setError(errorText(e)),
+      () => {},
     );
     return () => {
       live = false;
     };
   }, [key, props.visible]);
 
-  let state = null;
-  if (error) state = <span className="tag red">Check failed</span>;
-  else if (dirs.length > 0 && parts === null) state = <span className="tag">Checking…</span>;
-  else if (parts && parts.length === 0)
-    state = (
-      <span className="tag green">
-        None in {dirs.length === 1 ? "this folder" : "these folders"}
-      </span>
-    );
-  else if (parts) state = <span className="tag orange">{parts.length} found</span>;
-
+  if (parts.length === 0) return null;
   return (
     <section className="card compact" aria-labelledby="i-leftovers">
       <CardHead icon="file" title="Leftover .part files" id="i-leftovers">
-        {state}
+        <span className="tag orange">{parts.length} found</span>
       </CardHead>
-      {dirs.length === 0 && (
-        <p className="muted">Choose a source to check its folder for leftovers.</p>
-      )}
-      {error && <p className="bad">{error}</p>}
-      {parts && parts.length > 0 && (
-        <>
-          <ul className="rows path">
-            {parts.map((p) => (
-              <li key={p}>{p}</li>
-            ))}
-          </ul>
-          <p className="muted">
-            Unfinished outputs, usually from interrupted jobs. Remove only the ones you recognize,
-            and only when no job is running; PS5 Dump Forge never deletes them itself.
-          </p>
-        </>
-      )}
-      {dirs.length > 0 && (
-        <details className="fold">
-          <summary>Folders checked ({dirs.length})</summary>
-          <ul className="rows path">
-            {dirs.map((d) => (
-              <li key={d}>{d}</li>
-            ))}
-          </ul>
-        </details>
-      )}
+      <ul className="rows path">
+        {parts.map((p) => (
+          <li key={p}>{p}</li>
+        ))}
+      </ul>
+      <p className="muted">
+        Unfinished outputs, usually from interrupted jobs. Remove only the ones you recognize,
+        and only when no job is running; PS5 Dump Forge never deletes them itself.
+      </p>
+      <details className="fold">
+        <summary>Folders checked ({dirs.length})</summary>
+        <ul className="rows path">
+          {dirs.map((d) => (
+            <li key={d}>{d}</li>
+          ))}
+        </ul>
+      </details>
     </section>
   );
 }

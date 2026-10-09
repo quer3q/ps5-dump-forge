@@ -1,4 +1,4 @@
-// The http build's client for `ps5-dump-forge serve` (contract: README.md, "Web server"): plain
+// The http build's client for `ps5-dump-forge serve` (contract: ps5/README.md, "Web server"): plain
 // JSON over HTTP, and one poller over `GET /api/jobs` that turns snapshots into the app's job
 // events. Type imports only, so a plain `node` can drive it (scripts/check-poller.mjs,
 // scripts/smoke.mjs).

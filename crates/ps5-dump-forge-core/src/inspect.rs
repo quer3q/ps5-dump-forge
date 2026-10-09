@@ -316,7 +316,7 @@ fn bcd_version(word: &str) -> String {
 }
 
 /// The longest game name kept in a generated file name, in UTF-8 bytes. With the title id,
-/// firmware, extension, a `-N` and the job's `.part` suffix the name stays well inside 255
+/// extension, a `-N` and the job's `.part` suffix the name stays well inside 255
 /// bytes (APFS) and 255 UTF-16 units after decomposition (HFS+, exFAT, NTFS).
 const MAX_NAME_BYTES: usize = 100;
 
@@ -417,10 +417,9 @@ fn pkg_header(path: &Path) -> anyhow::Result<(Vec<String>, Option<String>)> {
     Ok((details, id))
 }
 
-/// `[GAME_NAME]-[TITLE_ID]-[FIRMWARE]` from the source, brackets included, e.g.
-/// `[Astro Bot]-[PPSA01234]-[7.00].exfat`; parts it lacks are left out, and with none of
-/// them it is [`default_output`]'s name. The firmware is the lowest the game runs on: for a
-/// backport, what its executables allow; else what `param.json` declares.
+/// `[GAME_NAME]-[TITLE_ID]` from the source, brackets included, e.g.
+/// `[Astro Bot]-[PPSA01234].ffpkg`; parts it lacks are left out, and with neither it is
+/// [`default_output`]'s name. An empty `dir` is the folder holding the source.
 /// ponytail: the source is opened again (a folder scanned, a package's image walked) for
 /// every generated name, each format or folder change; metadata only, cache it per source
 /// if a big game makes that slow.
@@ -430,37 +429,23 @@ pub(crate) fn generated_output(
     dir: &Path,
     taken: &[PathBuf],
 ) -> anyhow::Result<PathBuf> {
+    let dir = &output_dir(source, dir)?;
     let mut tree = open_source(source, Kind::of(source)?, &AtomicBool::new(false))?;
     let info = preflight::input(tree.as_mut()).0;
-    let param = info.param_json.as_ref();
-    let name = param
+    let name = info
+        .param_json
+        .as_ref()
         .and_then(title_name)
         .map(|n| file_safe(&n))
         .filter(|n| !n.is_empty());
-    // A backport runs lower than `param.json` may say: its executables tell.
-    let backported = tree.files().iter().any(|f| is_fakelib(&f.path));
-    let firmware = backported
-        .then(|| crate::sdk::lowest_firmware(tree.as_mut()))
-        .flatten()
-        .or_else(|| {
-            param
-                .and_then(|p| p.get("requiredSystemSoftwareVersion"))
-                .and_then(Value::as_str)
-                .and_then(bcd)
-        });
-    let rest: Vec<String> = [info.title_id.clone(), firmware]
-        .into_iter()
-        .flatten()
-        .map(|p| format!("[{p}]"))
-        .collect();
-    let mut stem = match (&name, rest.is_empty()) {
-        (None, true) => default_stem(source, info.title_id)?,
-        _ => stem_with(name.as_deref(), &rest, usize::MAX),
+    let id = info.title_id.as_ref().map(|id| format!("[{id}]"));
+    let mut stem = match (&name, &id) {
+        (None, None) => default_stem(source, info.title_id)?,
+        _ => stem_with(name.as_deref(), id.as_deref().unwrap_or(""), usize::MAX),
     };
     if is_reserved_on_windows(&stem) {
         stem.insert(0, '_');
     }
-    let ext = preflight::extension(format).map_or(0, |e| e.len() + 1);
     // The name can't be edited while it is generated, so it never names something that
     // exists or that a running job (`taken`) will publish: a rebuild becomes `-2`, `-3`, ...
     // (publishing still never replaces, should something take the name meanwhile).
@@ -470,17 +455,17 @@ pub(crate) fn generated_output(
         } else {
             format!("-{n}")
         };
-        // Within the format's name limit: the game name is cut first, the title id and
-        // firmware are kept.
-        let stem = match preflight::name_limit(format) {
-            Some(max) if stem.len() + suffix.len() + ext > max => {
-                let room = max.saturating_sub(suffix.len() + ext);
-                match &name {
-                    Some(_) => stem_with(name.as_deref(), &rest, room),
-                    None => cut(&stem, room).to_string(),
-                }
+        // Within the name limit (what ShadowMountPlus can mount): the game name is cut first,
+        // the title id kept, then the suffix.
+        let max = preflight::stem_limit(format);
+        let stem = if stem.len() + suffix.len() > max {
+            let room = max.saturating_sub(suffix.len());
+            match &name {
+                Some(_) => stem_with(name.as_deref(), id.as_deref().unwrap_or(""), room),
+                None => cut(&stem, room).to_string(),
             }
-            _ => stem.clone(),
+        } else {
+            stem.clone()
         };
         let path = with_extension(dir, &format!("{stem}{suffix}"), format);
         if !taken.contains(&path) && std::fs::symlink_metadata(&path).is_err() {
@@ -493,19 +478,39 @@ pub(crate) fn generated_output(
     )
 }
 
-/// `[name]-` before `rest` (bracketed parts), the name cut to keep the whole within `max`
+/// `[name]-` before `id` (bracketed, or empty), the name cut to keep the whole within `max`
 /// bytes and left out if nothing of it fits.
-fn stem_with(name: Option<&str>, rest: &[String], max: usize) -> String {
-    let rest = rest.join("-");
-    let sep = usize::from(!rest.is_empty());
-    let room = max.saturating_sub(rest.len() + sep + 2);
+fn stem_with(name: Option<&str>, id: &str, max: usize) -> String {
+    let sep = usize::from(!id.is_empty());
+    let room = max.saturating_sub(id.len() + sep + 2);
     let name = name
         .map(|n| cut(n, room).trim_end_matches(['.', ' ']))
         .filter(|n| !n.is_empty());
     match name {
-        Some(n) if rest.is_empty() => format!("[{n}]"),
-        Some(n) => format!("[{n}]-{rest}"),
-        None => cut(&rest, max).to_string(),
+        Some(n) if id.is_empty() => format!("[{n}]"),
+        Some(n) => format!("[{n}]-{id}"),
+        None => cut(id, max).to_string(),
+    }
+}
+
+/// Where a default or generated output goes: `dir`, or, when it is empty, the folder holding
+/// `source`, made absolute from the source's path. Never a bare relative name, which would
+/// land in the process's working directory (the PS5 payload's is wherever its loader left it).
+fn output_dir(source: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
+    if !dir.as_os_str().is_empty() {
+        return Ok(dir.to_path_buf());
+    }
+    let mut source =
+        std::path::absolute(source).with_context(|| format!("{}", source.display()))?;
+    // `absolute` keeps a trailing `..` (`convert ..`), whose lexical parent is the wrong folder.
+    if source.file_name().is_none() {
+        source = source
+            .canonicalize()
+            .with_context(|| format!("{}", source.display()))?;
+    }
+    match source.parent() {
+        Some(parent) => Ok(parent.to_path_buf()),
+        None => bail!("{} has no folder to put the output in", source.display()),
     }
 }
 
@@ -525,9 +530,12 @@ fn with_extension(dir: &Path, name: &str, format: Format) -> PathBuf {
     }
 }
 
+/// `<TITLE_ID>.<ext>` (else the source's own name) in `dir`; an empty `dir` is the folder
+/// holding the source.
 pub(crate) fn default_output(source: &Path, format: Format, dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = output_dir(source, dir)?;
     let title = game_info(source).ok().and_then(|i| i.title_id);
-    Ok(with_extension(dir, &default_stem(source, title)?, format))
+    Ok(with_extension(&dir, &default_stem(source, title)?, format))
 }
 
 /// The title id, else the source's own name.
@@ -646,43 +654,29 @@ mod tests {
                 "localizedParameters":{"defaultLanguage":"en-US","en-US":{"titleName":"Astro: Bot"}}}"#,
         )
         .unwrap();
+        // No firmware in the name, whatever param.json says.
         assert_eq!(
             generated_output(&game, Format::Exfat, &root, &[]).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-[7.00].exfat")
+            root.join("[Astro Bot]-[PPSA01234].exfat")
         );
         assert_eq!(
             generated_output(&game, Format::Folder, &root, &[]).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-[7.00]")
+            root.join("[Astro Bot]-[PPSA01234]")
         );
         // Taken names are skipped, never offered.
-        std::fs::write(root.join("[Astro Bot]-[PPSA01234]-[7.00].exfat"), b"").unwrap();
-        std::fs::write(root.join("[Astro Bot]-[PPSA01234]-[7.00]-2.exfat"), b"").unwrap();
+        std::fs::write(root.join("[Astro Bot]-[PPSA01234].exfat"), b"").unwrap();
+        std::fs::write(root.join("[Astro Bot]-[PPSA01234]-2.exfat"), b"").unwrap();
         assert_eq!(
             generated_output(&game, Format::Exfat, &root, &[]).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-[7.00]-3.exfat")
+            root.join("[Astro Bot]-[PPSA01234]-3.exfat")
         );
         // A running job's output counts as taken too.
-        let running = [root.join("[Astro Bot]-[PPSA01234]-[7.00]-3.exfat")];
+        let running = [root.join("[Astro Bot]-[PPSA01234]-3.exfat")];
         assert_eq!(
             generated_output(&game, Format::Exfat, &root, &running).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-[7.00]-4.exfat")
+            root.join("[Astro Bot]-[PPSA01234]-4.exfat")
         );
-        // A backport: the firmware comes from its executables, not param.json.
-        std::fs::create_dir_all(game.join("fakelib")).unwrap();
-        std::fs::write(game.join("fakelib/libSceAgc.sprx"), b"lib").unwrap();
-        let eboot = crate::sdk::test_elf(
-            crate::sdk::PT_SCE_PROCPARAM,
-            crate::sdk::PROCESS_PARAM_MAGIC,
-            0x0450_0031,
-            false,
-        );
-        std::fs::write(game.join("eboot.bin"), eboot).unwrap();
-        assert_eq!(
-            generated_output(&game, Format::Ffpkg, &root, &[]).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-[4.50].ffpkg")
-        );
-        std::fs::remove_dir_all(game.join("fakelib")).unwrap();
-        // No name and no firmware: only the title id.
+        // No name: only the title id.
         std::fs::write(
             game.join("sce_sys/param.json"),
             r#"{"titleId":"PPSA01234"}"#,
@@ -702,48 +696,100 @@ mod tests {
     }
 
     #[test]
-    fn generated_pfs_names_fit_63_bytes() {
-        let root = crate::test_dir("generated-pfs-name");
+    fn generated_names_fit_smp_mount_points() {
+        for format in [
+            Format::Exfat,
+            Format::Ffpkg,
+            Format::Ffpfs,
+            Format::Folder,
+            Format::Pkg,
+        ] {
+            assert_eq!(preflight::stem_limit(format), 63);
+        }
+        assert_eq!(preflight::stem_limit(Format::Ffpfsc), 58);
+
+        let root = crate::test_dir("generated-smp-name");
         let game = root.join("game");
         std::fs::create_dir_all(game.join("sce_sys")).unwrap();
         std::fs::write(game.join("eboot.bin"), b"x").unwrap();
         let param = |name: &str| {
-            let json = format!(
-                r#"{{"titleId":"PPSA01234","requiredSystemSoftwareVersion":"0x0700000000000000",
-                    "titleName":"{name}"}}"#
-            );
+            let json = format!(r#"{{"titleId":"PPSA01234","titleName":"{name}"}}"#);
             std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
         };
-        let name = |p: &Path| p.file_name().unwrap().to_str().unwrap().to_string();
+        let stem = |p: &Path| p.file_stem().unwrap().to_str().unwrap().to_string();
         param(&"Long Game Name ".repeat(6));
-        // `.exfat` keeps the whole (100-byte capped) name; the PFS formats cut it.
-        let exfat = name(&generated_output(&game, Format::Exfat, &root, &[]).unwrap());
-        assert!(exfat.len() > 63, "{exfat}");
-        let pfs = name(&generated_output(&game, Format::Ffpfs, &root, &[]).unwrap());
-        assert_eq!(pfs.len(), 63, "{pfs}");
-        assert!(pfs.starts_with("[Long Game Name Long"), "{pfs}");
-        assert!(pfs.ends_with("]-[PPSA01234]-[7.00].ffpfs"), "{pfs}");
-        // With a `-N` suffix the name gives up more room.
-        std::fs::write(root.join(&pfs), b"").unwrap();
-        let next = name(&generated_output(&game, Format::Ffpfs, &root, &[]).unwrap());
-        assert!(
-            next.len() <= 63 && next.ends_with("]-[PPSA01234]-[7.00]-2.ffpfs"),
-            "{next}"
-        );
+        // Every output cuts it, a folder and a .pkg too.
+        for (format, max) in [
+            (Format::Exfat, 63),
+            (Format::Ffpkg, 63),
+            (Format::Ffpfs, 63),
+            (Format::Ffpfsc, 58),
+            (Format::Pkg, 63),
+            (Format::Folder, 63),
+        ] {
+            let path = generated_output(&game, format, &root, &[]).unwrap();
+            let s = match format {
+                Format::Folder => path.file_name().unwrap().to_str().unwrap().to_string(),
+                _ => stem(&path),
+            };
+            assert_eq!(s.len(), max, "{s}");
+            assert!(s.starts_with("[Long Game Name Long"), "{s}");
+            assert!(s.ends_with("]-[PPSA01234]"), "{s}");
+            // With a `-N` suffix the name gives up more room.
+            std::fs::write(&path, b"").unwrap();
+            let next = stem(&generated_output(&game, format, &root, &[]).unwrap());
+            assert!(
+                next.len() <= max && next.ends_with("]-[PPSA01234]-2"),
+                "{next}"
+            );
+        }
         // Cut at a character boundary, never inside one, and no trailing space.
         param(&"ゼルダ ".repeat(12));
-        let pfsc = name(&generated_output(&game, Format::Ffpfsc, &root, &[]).unwrap());
-        assert!(pfsc.len() <= 63, "{pfsc}");
-        assert!(
-            pfsc.starts_with("[ゼルダ ゼルダ") && !pfsc.contains(" ]"),
-            "{pfsc}"
-        );
-        assert!(pfsc.ends_with("]-[PPSA01234]-[7.00].ffpfsc"), "{pfsc}");
+        let pfsc = generated_output(&game, Format::Ffpfsc, &root, &[]).unwrap();
+        let s = stem(&pfsc);
+        assert!(s.len() <= 58, "{s}");
+        assert!(s.starts_with("[ゼルダ ゼルダ") && !s.contains(" ]"), "{s}");
+        assert!(s.ends_with("]-[PPSA01234]"), "{s}");
         // A short name is left whole.
         param("Astro Bot");
         assert_eq!(
             generated_output(&game, Format::Ffpfsc, &root, &[]).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234]-[7.00].ffpfsc")
+            root.join("[Astro Bot]-[PPSA01234].ffpfsc")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_dir_is_next_to_the_source() {
+        let root = crate::test_dir("output-dir");
+        let game = root.join("homebrew/game");
+        std::fs::create_dir_all(game.join("sce_sys")).unwrap();
+        std::fs::write(game.join("eboot.bin"), b"x").unwrap();
+        std::fs::write(
+            game.join("sce_sys/param.json"),
+            r#"{"titleId":"PPSA01234","titleName":"Astro Bot"}"#,
+        )
+        .unwrap();
+        // Never a bare name the process's working directory would resolve.
+        let next_to = root.join("homebrew");
+        assert_eq!(
+            generated_output(&game, Format::Ffpkg, Path::new(""), &[]).unwrap(),
+            next_to.join("[Astro Bot]-[PPSA01234].ffpkg")
+        );
+        assert_eq!(
+            default_output(&game, Format::Exfat, Path::new("")).unwrap(),
+            next_to.join("PPSA01234.exfat")
+        );
+        // A trailing separator names the same folder.
+        let slash = PathBuf::from(format!("{}/", game.display()));
+        assert_eq!(
+            default_output(&slash, Format::Exfat, Path::new("")).unwrap(),
+            next_to.join("PPSA01234.exfat")
+        );
+        // A trailing `..` is the folder it climbs to (`convert ..`), not its lexical parent.
+        assert_eq!(
+            default_output(&game.join("sce_sys/.."), Format::Exfat, Path::new("")).unwrap(),
+            next_to.canonicalize().unwrap().join("PPSA01234.exfat")
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -89,7 +89,8 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
 
 - **Header** (`.topbar`): the 30px logo on the left, the screen tabs centred as a segmented control.
   No wordmark, because the window title already says "PS5 Dump Forge".
-  The version is in the page title ("PS5 Dump Forge v…", shown by the PS5 browser's title bar), not in the header.
+  The version is in the title ("PS5 Dump Forge v…": the desktop window's title, and the page title the
+  PS5 browser shows in its title bar), not in the header.
 - **Segmented control** (`.seg`, `.seg-opt`, `.on`): used for the screen tabs, the Inspect sub-tabs and
   the format picker (`.seg.formats`).
   - In the format picker the selected segment fills with its format tint.
@@ -111,24 +112,33 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   |---|---|---|
   | Primary | `.primary` | White. One per card (Build). |
   | Secondary | default | Dark. Choose folder…, Change…, Show in Finder (Explorer, folder). |
-  | Danger | `.danger` | Red tint. "Stop job?", "Cancel jobs and quit". |
+  | Danger | `.danger` | Red tint. "Stop job?", "Stop jobs and quit". |
   | Small | `.small` | Job rows. |
   | Link | `.link` | Quiet text action ("Compare formats"). |
 
   Every button is a pill and may lead with an icon.
 - **Inputs**: pill, `--inset` fill, mono font for paths. A generated output name shows whole in
-  `.out-box`, with its folder on the `.out-dir` line below it. Never clip a file name.
+  `.out-box`, with its folder on the `.out-dir` line below it. Never clip a file name. A typed
+  name that can't work (another image extension, or longer than core's name limit: 63 bytes
+  before the extension, 58 for `.ffpfsc`, what ShadowMountPlus mounts) is refused in `.field-error` under the box,
+  and Build stays off.
 - **Switch** (`.switch`): a native checkbox drawn as a switch, blue when on. A disabled switch dims
   its track only; the reason sits under it as a `.note-line.warn` ("Remove backport", shown under the
   format picker only for a source with backport libraries, is disabled when core refuses removal).
-  "Full verification" (off by default) sits below it, for every target.
+  "Full verification" (off by default) sits below it, for every target. Both sit in their own inset
+  box (`.field.backport`, `.field.verify`: `--inset`, `--line` border, 12px radius), apart from the
+  one-liners around them; "Generate name" in the build row does not.
+- **Lead word** (`Lead` in `Convert.tsx`, `.lead-good` / `.lead-warn`): a Convert note that starts with
+  "Recommended" shows that word in `--good`, one that starts with "Experimental" in `--warn`. Text
+  colour only (≥ 9:1 on `--card` and `--inset`), no tint; the word itself carries the meaning.
 - **Tags** (`.tag`, `.tag.fmt`, semantic colours): 22px pills, 12px/500.
 - **Stat tiles** (`.tiles`, `.tile`, `.value`, `.note`): two per row (four per row at medium widths);
   `.tile.wide` spans the row.
 - **Alert bar** (`.alert-bar`, `.alert-bar.warn`): one line of notice.
   - The blue-to-orange gradient is kept dark under the text.
   - Orange is only a glow at the right edge.
-  - The warn variant is amber and is used for the `.fpkg` requirements and build time.
+  - The warn variant is amber and is used for the `.fpkg` firmware limit (11.60 or lower), under
+    the format's one-liner.
 - **Findings** (`ul.findings`): `li` warns (amber), `li.block` fails every target (red), `li.info` is
   good news (blue).
 - **Folds** (`details.fold`): the DLC list, backport files, emulators in fakelib, job logs, verified
@@ -137,7 +147,8 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   tag, meta line (`%` · speed · time left). Once finished, the row shows Show in Finder (Show in Explorer
   on Windows, Show in folder on Linux), the error box or "Fast (Full) verification passed: N checks"; a
   fast one lists its coverage first among the checks.
-- **Rating chip** (`.chip.good` / `.ok` / `.bad`): used in the About formats table. Tint, icon and text
+- **Rating chip** (`.chip.good` / `.ok` / `.bad`): used in the About formats table (Console speed and
+  Size on disk per format, the folder last; the tab holds only that table). Tint, icon and text
   together, every text ≥ 8.9:1.
 - **Empty state** (`.empty`): an inset well with a round blue icon, a title, one line of help, the
   accepted kinds as tags, and two buttons.

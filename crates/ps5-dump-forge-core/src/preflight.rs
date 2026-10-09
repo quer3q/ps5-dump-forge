@@ -138,14 +138,23 @@ pub(crate) fn extension(format: Format) -> Option<&'static str> {
     }
 }
 
-/// The longest `.ffpfs`/`.ffpfsc` file name SMP mounts, in UTF-8 bytes, extension included.
-// ponytail: empirical: PS5 UltraPack saw SMP's mount fail with ENAMETOOLONG above about 63
-// bytes; no limit is known for `.exfat`/`.ffpkg`. Widen after a console test.
-pub(crate) const MAX_PFS_NAME: usize = 63;
-
-/// The name limit for `format`'s output file, when it has one.
-pub(crate) fn name_limit(format: Format) -> Option<usize> {
-    matches!(format, Format::Ffpfs | Format::Ffpfsc).then_some(MAX_PFS_NAME)
+/// The longest output name for `format` (UTF-8 bytes, the extension and its dot excluded, a
+/// `-N` included): what ShadowMountPlus mounts an image from, and the same 63 bytes for a folder
+/// and a `.pkg` (not image-mounted), so every output follows one rule.
+// SMP (drakmor/ShadowMountPlus src/sm_image.c, build_image_mount_point_for_fs) nmounts every
+// image at `<base>/<stem>_<8 hex: fnv1a32 of the full path>`, the stem cut at the name's last
+// dot, base `/mnt/shadowmnt` (`/mnt/shadowmnt/pfsc` for a `.ffpfsc` container). The PS5
+// kernel is FreeBSD 11: nmount's fspath, NUL included, must fit MNAMELEN (88) or it fails with
+// ENAMETOOLONG, so at most 87 bytes: 87 - 15 ("/mnt/shadowmnt/") - 9 ("_xxxxxxxx") = 63, and
+// 87 - 20 ("/mnt/shadowmnt/pfsc/") - 9 = 58. A `.ffpfsc`'s inner image, `<TITLE_ID>.<ext>`,
+// is mounted under `/mnt/shadowmnt` too and is always short.
+pub(crate) fn stem_limit(format: Format) -> usize {
+    const FSPATH_MAX: usize = 88 - 1; // MNAMELEN, without its NUL
+    const HASH: usize = "_xxxxxxxx".len();
+    match format {
+        Format::Ffpfsc => FSPATH_MAX - "/mnt/shadowmnt/pfsc/".len() - HASH,
+        _ => FSPATH_MAX - "/mnt/shadowmnt/".len() - HASH,
+    }
 }
 
 /// `output` is absolute (from [`output_path`]).
@@ -164,15 +173,30 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
         }
     }
     let name = output.file_name().unwrap_or_default().to_string_lossy();
-    if let Some(max) = name_limit(format)
-        && name.len() > max
-    {
-        findings.push(format!(
-            "{name} is {} bytes long: ShadowMountPlus fails to mount a .{} whose name is over \
-             {max} bytes (UTF-8, extension included)",
-            name.len(),
-            extension(format).unwrap_or_default()
-        ));
+    // A file's stem as SMP takes it: up to the last dot; a folder's whole name.
+    let stem = match format {
+        Format::Folder => &*name,
+        _ => name.rsplit_once('.').map_or(&*name, |(stem, _)| stem),
+    };
+    let max = stem_limit(format);
+    if stem.len() > max {
+        findings.push(match extension(format) {
+            Some(ext @ ("exfat" | "ffpkg" | "ffpfs" | "ffpfsc")) => format!(
+                "{name} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
+                 .{ext} whose name is over {max} bytes (UTF-8, extension excluded), as its mount \
+                 point would pass the PS5's 87-byte limit",
+                stem.len()
+            ),
+            Some(ext) => format!(
+                "{name} is {} bytes long without its .{ext}: output names are at most {max} \
+                 bytes (UTF-8, extension excluded)",
+                stem.len()
+            ),
+            None => format!(
+                "{name} is {} bytes long: output names are at most {max} bytes (UTF-8)",
+                stem.len()
+            ),
+        });
     }
     if let Ok(source) = source.canonicalize()
         && source.is_dir()
@@ -282,7 +306,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -
     Destination { findings, notes }
 }
 
-/// The same checks on what the destination probe saw (U1 in README.md). A USB drive is
+/// The same checks on what the destination probe saw (U1 in ps5/README.md). A USB drive is
 /// never tested on hardware, so this fails closed: a probe that fails refuses the job.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBool) -> Destination {

@@ -186,7 +186,7 @@ assert.ok(above.entries.some((e) => e.path === root && e.dir), "the folder above
 await assert.rejects(a.c.call("inspect", { path: `${root}/missing` }), (e) => typeof e === "string" && e.length > 0);
 const ins = await a.c.call("inspect", { path: game });
 assert.equal(ins.title_id, "PPSA01234");
-const name = "[Smoke Game]-[PPSA01234]-[7.00].exfat";
+const name = "[Smoke Game]-[PPSA01234].exfat";
 assert.equal(await a.c.call("default_output", { source: game, format: "exfat", dir: images }), `${images}/PPSA01234.exfat`);
 const out = await a.c.call("generated_output", { source: game, format: "exfat", dir: images, taken: [] });
 assert.equal(out, `${images}/${name}`);

@@ -13,6 +13,7 @@ import {
   type InnerFormat,
   type Inspection,
   type KrakenLevel,
+  type JobId,
   type JobReport,
   type VerifyReport,
 } from "./api";
@@ -42,24 +43,21 @@ const FORMAT_INFO: Record<Format, string> = {
   folder: "Unpack an image or package back into a plain game folder.",
   exfat:
     "For games that misbehave as .ffpkg and only run like external-drive content. Also opens on a Mac or PC.",
-  ffpkg:
-    "Recommended. The PS5's own file system (UFS2), mounted by ShadowMountPlus. Writable mounts possible.",
-  ffpfs:
-    "Experimental. The PS5's PFS file system, uncompressed, mounted by ShadowMountPlus. File names must be plain ASCII.",
-  ffpfsc:
-    "Experimental. Smallest: a compressed container around one image, always mounted read-only. Reads at 150–250 MB/s on the console; busy games may stutter.",
-  pkg: "Installs like a store game. Needs kstuff, fpkg-enable and ppr-patch, firmware 11.60 or lower. Slow to build.",
+  ffpkg: "Recommended. The PS5's own file system (UFS2). Writable mounts possible.",
+  ffpfs: "Experimental. The PS5's PFS file system, uncompressed. File names must be plain ASCII.",
+  ffpfsc: "Experimental. Smallest: a compressed container around one image, always mounted read-only.",
+  pkg: "Installs like a store game and runs at native speed. Needs kstuff, fpkg-enable and ppr-patch.",
 };
 
 /** The image a `.ffpfsc` holds, in picker order. */
 const INNER_FORMATS: InnerFormat[] = ["exfat", "ffpkg", "ffpfs"];
 
-/** One line under the inner-image picker. */
+/** One line under the inner-image picker: the format's own line, less what a `.ffpfsc` (always
+ * mounted read-only) doesn't give. */
 const INNER_INFO: Record<InnerFormat, string> = {
-  exfat: "Recommended by ShadowMountPlus; MkPFS calls it the most stable layout.",
-  ffpkg: "A UFS2 image (.ffpkg) inside.",
-  ffpfs:
-    "An uncompressed PFS image inside, also recommended by ShadowMountPlus. File names must be plain ASCII.",
+  exfat: FORMAT_INFO.exfat,
+  ffpkg: "Recommended. The PS5's own file system (UFS2).",
+  ffpfs: FORMAT_INFO.ffpfs,
 };
 
 /** The `.ffpfsc` zlib level a new window starts on. */
@@ -83,7 +81,7 @@ const KRAKEN_INFO: Record<KrakenLevel, { icon: IconName; label: string; note: st
   fast: {
     icon: "bolt",
     label: "Fast",
-    note: "Recommended. The quickest build; the package comes out about 3% larger.",
+    note: "Recommended. The quickest build.",
   },
   balanced: {
     icon: "scale",
@@ -97,37 +95,54 @@ const KRAKEN_INFO: Record<KrakenLevel, { icon: IconName; label: string; note: st
   },
 };
 
-// ponytail: approximate: a whole .pkg job's average speed per level, in bytes of source per
-// second, on Apple Silicon (14 cores) with fast verification: Fast measured on an 89 GB game
-// (296 s), Balanced from an earlier whole-job measurement, Smallest scaled from it by the
-// encoder's speed ratio. Ceiling: other machines, drives and games differ.
-const PKG_BYTES_PER_SEC: Record<KrakenLevel, number> = {
-  fast: 300e6,
-  balanced: 80e6,
-  smallest: 55e6,
-};
-
-/** "about 20 min" for a .fpkg build of `bytes` at `level`, to the nearest 5 minutes. */
-function pkgBuildTime(bytes: number, level: KrakenLevel): string {
-  const min = Math.max(5, Math.round(bytes / PKG_BYTES_PER_SEC[level] / 60 / 5) * 5);
-  return min < 120 ? `about ${min} min` : `about ${Math.round(min / 60)} h`;
+/** A note with its leading "Recommended" in green or "Experimental" in amber (text colour
+ * only; the word itself says it). */
+function Lead({ text }: { text: string }) {
+  const word = /^(Recommended|Experimental)\b/.exec(text)?.[1];
+  if (!word) return <>{text}</>;
+  return (
+    <>
+      <span className={word === "Recommended" ? "lead-good" : "lead-warn"}>{word}</span>
+      {text.slice(word.length)}
+    </>
+  );
 }
 
 /** Extensions a typed name can end in: the real ones, plus "fpkg", the debug package's label. */
 const TYPED_EXTENSIONS = [...IMAGE_EXTENSIONS, "fpkg"];
 
+/** The longest output name without its extension (UTF-8 bytes): what ShadowMountPlus mounts an
+ * image from, the same for a folder and a .pkg; core's `preflight::stem_limit`, which refuses
+ * longer ones when the job starts. */
+const STEM_LIMIT: Record<Format, number> = {
+  folder: 63,
+  exfat: 63,
+  ffpkg: 63,
+  ffpfs: 63,
+  ffpfsc: 58,
+  pkg: 63,
+};
+
 /** A typed output name, with the target's extension appended when it has none. A different
- * image extension is an error: the extension picks the mount driver. */
+ * image extension is an error: the extension picks the mount driver. So is a name over
+ * `STEM_LIMIT`. */
 function checkName(name: string, format: Format): { name: string; error?: string } {
   if (SEPARATORS.test(name))
     return { name, error: "A name can't contain a folder separator; use Change… for the folder." };
-  if (format === "folder") return { name };
+  const tooLong = (stem: string) => {
+    const bytes = new TextEncoder().encode(stem).length;
+    const max = STEM_LIMIT[format];
+    const what = format === "folder" ? "" : " before the extension";
+    return bytes > max ? `Too long: ${bytes} bytes${what}, at most ${max} (UTF-8).` : undefined;
+  };
+  if (format === "folder") return { name, error: tooLong(name) };
   const dot = name.lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
-  if (ext === format) return { name };
+  let saved: string;
+  if (ext === format) saved = name;
   // The UI calls the debug package ".fpkg"; a typed "Game.fpkg" is saved as "Game.pkg".
-  if (format === "pkg" && ext === "fpkg") return { name: `${name.slice(0, dot)}.pkg` };
-  if (TYPED_EXTENSIONS.includes(ext))
+  else if (format === "pkg" && ext === "fpkg") saved = `${name.slice(0, dot)}.pkg`;
+  else if (TYPED_EXTENSIONS.includes(ext))
     return {
       name,
       error:
@@ -135,7 +150,9 @@ function checkName(name: string, format: Format): { name: string; error?: string
           ? `Ends in .${ext}, but .fpkg is saved as .pkg: the extension picks the driver.`
           : `Ends in .${ext}, but the target is .${format}: the extension picks the driver.`,
     };
-  return { name: `${name}.${format}` };
+  else saved = `${name}.${format}`;
+  const error = tooLong(saved.slice(0, saved.lastIndexOf(".")));
+  return error ? { name, error } : { name: saved };
 }
 
 export function Convert(props: {
@@ -153,8 +170,8 @@ export function Convert(props: {
   /** The image inside a `.ffpfsc`; kept while other targets are picked. */
   const [inner, setInner] = useState<InnerFormat>("exfat");
   const [output, setOutput] = useState("");
-  /** Name the output `[GAME_NAME]-[TITLE_ID]-[FIRMWARE]`, brackets included; only its
-   * folder is chosen. */
+  /** Name the output `[GAME_NAME]-[TITLE_ID]`, brackets included; only its folder is
+   * chosen. */
   const [generate, setGenerate] = useState(true);
   /** Leave the backport libraries out; offered only for a source that has some. */
   const [removeBackport, setRemoveBackport] = useState(false);
@@ -167,6 +184,8 @@ export function Convert(props: {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
+  /** Jobs this page started: only those scroll into view (not the ones a reload restores). */
+  const started = useRef(new Set<JobId>());
 
   // Only the latest pick / output request may land (an older inspect can finish last).
   const sourceSeq = useRef(0);
@@ -314,6 +333,7 @@ export function Convert(props: {
     const choice = choiceSeq.current;
     try {
       const id = await api.startJob(request);
+      started.current.add(id);
       props.dispatch({ type: "started", id, request });
       // A generated name moves on to the next free one, so Build again starts another job
       // (unless the choices changed meanwhile: their own refresh is the newer one).
@@ -365,7 +385,15 @@ export function Convert(props: {
             onChange={pickFormat}
             disabled={(f) => f === "folder" && source !== null && !sourceIsImage}
           />
-          <p className="muted desc">{FORMAT_INFO[format]}</p>
+          <p className="muted desc">
+            <Lead text={FORMAT_INFO[format]} />
+          </p>
+          {format === "pkg" && (
+            <p className="alert-bar warn">
+              <Icon name="warn" />
+              <span>Works only on firmware 11.60 or lower.</span>
+            </p>
+          )}
           {format === "ffpfsc" && (
             <div className="field inner">
               {/* The radio group's own label says the same to a screen reader. */}
@@ -380,7 +408,9 @@ export function Convert(props: {
                 value={inner}
                 onChange={setInner}
               />
-              <p className="muted hint">{INNER_INFO[inner]}</p>
+              <p className="muted hint">
+                <Lead text={INNER_INFO[inner]} />
+              </p>
               <label className="label range-label" htmlFor="c-ffpfsc-level">
                 <span>Compression level</span>
                 <span className="range-value">{ffpfscLevel}</span>
@@ -395,7 +425,9 @@ export function Convert(props: {
                 value={ffpfscLevel}
                 onChange={(e) => setFfpfscLevel(Number(e.target.value))}
               />
-              <p className="muted hint">{ffpfscLevelNote(ffpfscLevel)}</p>
+              <p className="muted hint">
+                <Lead text={ffpfscLevelNote(ffpfscLevel)} />
+              </p>
             </div>
           )}
           {ins && ins.backport.length > 0 && (
@@ -451,7 +483,9 @@ export function Convert(props: {
                   </label>
                 ))}
               </div>
-              <p className="muted hint">{KRAKEN_INFO[krakenLevel].note}</p>
+              <p className="muted hint">
+                <Lead text={KRAKEN_INFO[krakenLevel].note} />
+              </p>
             </div>
           )}
           <div className="field verify">
@@ -473,12 +507,6 @@ export function Convert(props: {
             <Icon name="table" />
             Compare formats
           </button>
-          {format === "pkg" && ins && (
-            <p className="alert-bar warn">
-              <Icon name="warn" />
-              <span>Estimated build time for this game: {pkgBuildTime(ins.total_bytes, krakenLevel)}.</span>
-            </p>
-          )}
           <div className="field" role="group" aria-labelledby="c-output-label">
             <div className="label-row">
               <span className="label" id="c-output-label">
@@ -537,7 +565,7 @@ export function Convert(props: {
                 Generate name based on content
                 {/* When on, the Output box shows the generated name itself. */}
                 {!generate && (
-                  <span className="muted mono hint">[game name]-[title ID]-[firmware]</span>
+                  <span className="muted mono hint">[game name]-[title ID]</span>
                 )}
               </span>
             </label>
@@ -593,7 +621,12 @@ export function Convert(props: {
           </CardHead>
           <div className="job-list">
             {[...props.jobs].reverse().map((j) => (
-              <JobCard key={j.id} job={j} dispatch={props.dispatch} />
+              <JobCard
+                key={j.id}
+                job={j}
+                fresh={started.current.has(j.id)}
+                dispatch={props.dispatch}
+              />
             ))}
           </div>
         </section>
@@ -652,7 +685,8 @@ function revealLabel(): string {
   return navigator.userAgent.includes("Windows") ? "Show in Explorer" : "Show in folder";
 }
 
-function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void }) {
+function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => void }) {
+  const { job, fresh, dispatch } = props;
   const [cancelling, setCancelling] = useState(false);
   // A running job's Cancel asks once ("Stop job?") for a few seconds; a second click stops it.
   const [confirming, setConfirming] = useState(false);
@@ -714,11 +748,12 @@ function JobCard({ job, dispatch }: { job: Job; dispatch: (a: Action) => void })
   else [status, tone] = [STAGES[job.stage] ?? job.stage, "blue"];
   const running = !result && job.stage !== undefined;
 
-  // A new job scrolls into view inside the job list, which may already be scrolled.
+  // A job just started here scrolls into view inside the job list, which may already be
+  // scrolled; restored ones (a reload) leave the list at its top, the newest job.
   const ref = useRef<HTMLElement>(null);
   useEffect(() => {
-    ref.current?.scrollIntoView({ block: "nearest" });
-  }, []);
+    if (fresh) ref.current?.scrollIntoView({ block: "nearest" });
+  }, [fresh]);
 
   return (
     <article className="job" aria-label={name} ref={ref}>

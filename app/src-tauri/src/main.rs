@@ -609,7 +609,8 @@ fn main() {
             });
 
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                .title("PS5 Dump Forge")
+                // The web build's page title says the same (vite.config.ts).
+                .title(concat!("PS5 Dump Forge v", env!("CARGO_PKG_VERSION")))
                 .inner_size(1200.0, 820.0)
                 .min_inner_size(900.0, 620.0);
             // WebView data goes to `<app dir>/data/webview`, except on macOS where

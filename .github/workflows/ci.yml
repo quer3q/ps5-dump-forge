@@ -118,6 +118,7 @@ jobs:
           name: fsck-images
           path: fsck-images.tar.gz
           if-no-files-found: error
+          retention-days: 3
 
   fsck-macos:
     # macOS's own fsck_exfat, plus a read-only mount compared file by file with the source.
@@ -234,3 +235,4 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts
           if-no-files-found: ignore
+          retention-days: 3

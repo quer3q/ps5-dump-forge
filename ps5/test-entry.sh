@@ -115,4 +115,19 @@ set +e; NOTES="$tmp/notes" "$tmp/entry" serve > /dev/null; code=$?; set -e
 launch inspect x
 [[ $code == 0 && "$out" == 'argc=3 [inspect][x]' && -z "$log" && -z "$notes" ]] ||
   { echo "FAIL: plain CLI: exit $code out: $out log: $log"; exit 1; }
+# Earlier runs' logs: gone processes' logs deleted except the newest; a live process's log, other
+# names and our own new log stay.
+dead() { sh -c 'echo $$'; }  # the pid of a process that has exited
+rm -rf "$tmp/forge"; mkdir "$tmp/forge"
+d1=$(dead); d2=$(dead); d3=$(dead)
+touch -t 202601010000 "$tmp/forge/serve-$d1.txt"
+touch -t 202601020000 "$tmp/forge/log-$d2.txt"
+touch -t 202601030000 "$tmp/forge/serve-$d3.txt"
+touch "$tmp/forge/serve-$$.txt" "$tmp/forge/serve-abc.txt" "$tmp/forge/serve-$d1.txt.bak"
+set +e; NOTES="$tmp/notes" "$tmp/entry" serve > /dev/null; code=$?; set -e
+left="$(cd "$tmp/forge" && ls | sort | tr '\n' ' ')"
+[[ $code == 0 && ! -e "$tmp/forge/serve-$d1.txt" && ! -e "$tmp/forge/log-$d2.txt" &&
+   -e "$tmp/forge/serve-$d3.txt" && -e "$tmp/forge/serve-$$.txt" && -e "$tmp/forge/serve-abc.txt" &&
+   -e "$tmp/forge/serve-$d1.txt.bak" && $(ls "$tmp"/forge/serve-*.txt | wc -l) -eq 4 ]] ||
+  { echo "FAIL: log pruning: exit $code, left: $left"; exit 1; }
 echo "entry.c launch modes and args parsing: ok"

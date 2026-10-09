@@ -46,6 +46,7 @@ jobs:
           name: release-macos
           path: dist/*
           if-no-files-found: error
+          retention-days: 3
 
   windows:
     # PS5 Dump Forge.exe + the CLI (MSVC, built natively on each runner), unsigned. x86-64: one zip
@@ -90,6 +91,7 @@ jobs:
           name: release-windows-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 3
 
   linux:
     # The extracted AppImage (an AppDir) + forge.sh + the CLI, unsigned, as one tarball per arch,
@@ -134,6 +136,7 @@ jobs:
           name: release-linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 3
 
   ps5:
     # The CLI as a PS5 payload with the web UI embedded, one plain .elf, unsigned. Cross-built in
@@ -157,6 +160,7 @@ jobs:
           name: release-ps5
           path: dist/*.elf
           if-no-files-found: error
+          retention-days: 3
 
   publish:
     # One array entry per platform job (the windows and linux matrix legs all upload release-* artifacts).
@@ -201,7 +205,7 @@ jobs:
         run: |
           ver=${GITHUB_REF_NAME#v}
           {
-            echo "macOS 11 or later (Intel and Apple Silicon): unzip the universal zip, then see \"First launch\" in README.md."
+            echo "macOS 11 or later (Intel and Apple Silicon): unzip the universal zip, then see \"macOS\" in README.md."
             echo "The app is ad-hoc signed only (no Developer ID, not notarized), so macOS asks you to allow it once."
             echo
             echo "Windows 10 or 11 (x86-64): the windows-x86-64 zip uses the Microsoft Edge WebView2 Runtime, which Windows 11 and most Windows 10 PCs already have."

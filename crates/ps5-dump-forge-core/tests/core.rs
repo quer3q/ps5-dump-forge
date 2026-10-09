@@ -944,20 +944,33 @@ fn pfs_targets_refuse_what_smp_cannot_mount() {
         let want = format!("a .ffpfsc holds an .exfat, .ffpkg or .ffpfs image, not {what}");
         assert!(err.contains(&want), "{want:?} not in:\n{err}");
     }
-    // An explicit name over 63 bytes is refused for the PFS formats only.
-    let long = format!("{}.ffpfs", "n".repeat(58));
-    let err = run(request(&src, Format::Ffpfs, &root.join(&long)))
+    // An explicit name over ShadowMountPlus's limit (extension excluded) is refused: 63
+    // bytes for an image, 58 for a .ffpfsc.
+    for (format, ext, max) in [
+        (Format::Exfat, "exfat", 63),
+        (Format::Ffpkg, "ffpkg", 63),
+        (Format::Ffpfs, "ffpfs", 63),
+        (Format::Ffpfsc, "ffpfsc", 58),
+    ] {
+        let long = format!("{}.{ext}", "n".repeat(max + 1));
+        let err = run(request(&src, format, &root.join(&long))).1.unwrap_err();
+        let want = format!(
+            "{long} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
+             .{ext} whose name is over {max} bytes",
+            max + 1
+        );
+        assert!(err.contains(&want), "{want:?} not in:\n{err}");
+    }
+    // A .pkg (not image-mounted) keeps to the same 63 bytes.
+    let long = format!("{}.pkg", "n".repeat(64));
+    let err = run(request(&src, Format::Pkg, &root.join(&long)))
         .1
         .unwrap_err();
-    assert!(
-        err.contains(&format!(
-            "{long} is 64 bytes long: ShadowMountPlus fails to mount a .ffpfs"
-        )),
-        "{err}"
-    );
+    let want = format!("{long} is 64 bytes long without its .pkg: output names are at most 63");
+    assert!(err.contains(&want), "{want:?} not in:\n{err}");
     std::fs::remove_file(src.join("data/café.bin")).unwrap();
     std::fs::remove_dir_all(src.join("data/naïve")).unwrap();
-    let fits = format!("{}.ffpfs", "n".repeat(57));
+    let fits = format!("{}.ffpfs", "n".repeat(63));
     run(request(&src, Format::Ffpfs, &root.join(&fits)))
         .1
         .unwrap();

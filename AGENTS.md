@@ -5,17 +5,20 @@ mounts (`.exfat`, `.ffpkg` UFS2, `.ffpfs` PFS, `.ffpfsc` compressed PFS containe
 debug FPKG `.pkg` (create and extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`), a
 CLI (`ps5-dump-forge`), and a PS5 ELF payload (the CLI's `serve`: the same UI as a web page on port 8095).
 v1 ships macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, and the PS5 `.elf`;
-hardware tests and real arm64 machine tests are still open. `TODO.md` lists what's left. README.md's "PS5
-payload internals" holds the payload's details (harness, HTTP contract, U1–U8 write safety).
+hardware tests and real arm64 machine tests are still open. `TODO.md` lists what's left. `ps5/README.md`
+holds the payload's details (harness, HTTP contract and routes, tile/self copy/launch on open, U1–U10
+write safety, console speeds).
 
 ## Layout
 - `crates/ps5-dump-forge-core`: everything a job does. Own folder scanner (no symlink follow,
-  exact names), preflight (names, special files, space, FAT32, depth), jobs (worker thread per job, one at a time, cancel flag,
-  `catch_unwind`), `.part` + atomic no-replace rename (macOS exFAT has none: check, then rename), BLAKE3 verification
-  (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads, fast sample or full), `inspect` (cover, firmware, backport firmware from
-  executables, embedded DLC), `prefetch.rs` (read-ahead thread). FreeBSD/PS5 only: `dest.rs` (destination probe,
-  U1), `durable.rs` (`sync_retry`, `SyncEvery`, drive-removal check; U4/U5/U7). Its `lib.rs` is the public API
-  the CLI, the app and the server build against.
+  exact names), preflight (names, special files, space, FAT32, depth, name limits), jobs (a worker thread
+  per job, one heavy job at a time in FIFO order, cancel flag, `catch_unwind`), `.part` + atomic no-replace
+  rename (`finalize.rs`; macOS exFAT has none: check, then rename; FreeBSD: hard link where the folder has
+  them, U3), BLAKE3 verification (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads, fast sample
+  or full), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
+  generated output names), `prefetch.rs` (read-ahead thread). FreeBSD/PS5 only: `dest.rs` (destination
+  probe, U1), `durable.rs` (`sync_retry`, `SyncEvery`, drive-removal check; U4/U5/U7). Its `lib.rs` is the
+  public API the CLI, the app and the server build against.
 - `crates/ps5-dump-forge-exfat`: forward-only exFAT writer (512 B sectors, 64 KiB clusters), ported
   from MkPFS. `crates/ps5-dump-forge-ufs2`: write-once UFS2 writer for the one SMP geometry
   (`newfs -O 2 -b 65536 -f 65536 -m 0 -S 4096`). Both: `plan` (validates names, sizes the image)
@@ -28,7 +31,8 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
 - `crates/ps5-dump-forge-cli`: binary `ps5-dump-forge` (`inspect`, `convert`, `serve`), JSON-lines events.
 - `crates/ps5-dump-forge-server`: `serve`, std-only HTTP/1.1 (`http.rs`), routes mirroring the Tauri commands
   (`api.rs`), job table for polling (`table.rs`), roots (`paths.rs`), PS5 tile (`tile.rs`), self copy
-  (`self_copy.rs`), `debug.rs` (only with `FORGE_DEBUG_API`). `build.rs` embeds `app/dist-http` and the self copy.
+  (`self_copy.rs`), `debug.rs` (PS5 only, with `FORGE_DEBUG_API`). `build.rs` embeds `app/dist-http` and the
+  self copy.
 - `ps5/`: the payload's Docker harness: `Dockerfile`, `build.sh`, `linker.sh`, `entry.c` (launch modes,
   logs, `ps5_notify`), `compat.c` (statfs symvers), `launcher.c` (tile registration), `icon0.png`,
   `test-entry.sh`; `shim/` + `x86_64-ps5-freebsd.json` + `prepare-rust-std.py` are ps5-ai-cli's, byte-identical.
@@ -53,7 +57,6 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
 ## Key decisions
 - Every reader/writer meets at `ps5upload_fpkg::source::SourceTree` (sizes up front, `read_range`,
   `empty_dirs`, `Send`). Any source converts to any target with no staging.
-- Outputs are raw filesystems at byte 0; the extension picks the SMP driver, so it must match.
 - Never touch the source: junk (`.DS_Store`, `._*`, `.fseventsd`, ...) is filtered, not deleted.
 - Names are never renamed: bad names (non-NFC, exFAT/PFS case collisions, forbidden chars, non-ASCII
   in PFS) fail preflight with every offender listed.
@@ -61,35 +64,38 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
   installing needs kstuff + fpkg-enable + ppr-patch. Debug keys are embedded.
 - The UI calls the debug FPKG `.fpkg` (a label only): its files, the `Format`/`Kind` id and the CLI
   flag stay `pkg`. The default target is `.ffpkg` (SMP 1.7's recommendation; `.exfat` is for
-  compatibility). Format copy and the About formats table (`app/src/Formats.tsx`) follow
-  ShadowMountPlus 1.7's README and release notes.
+  compatibility). Format copy and the About formats table (`app/src/Formats.tsx`: one table, Console
+  speed and Size on disk for every target plus the plain folder) follow ShadowMountPlus 1.7's README and
+  release notes.
 - No settings and no config file: the UI keeps choices in memory until it closes. Defaults: target
-  `.ffpkg`, exFAT inside a `.ffpfsc` at zlib level 6, all cores for compression, `.pkg` Kraken level `fast`
-  (`balanced`/`smallest`: ~2.6% smaller, ~6x/~9x the compress time; tests use `fast` only), no extra
-  free space beyond each format's built-in spare.
+  `.ffpkg`, exFAT inside a `.ffpfsc` at zlib level 6, all cores for compression (`serve`: cores − 1),
+  `.pkg` Kraken level `fast` (`balanced`/`smallest`: ~2.6% smaller, ~6x/~9x the compress time; tests use
+  `fast` only), no extra free space beyond each format's built-in spare, output next to the source (an
+  empty output `dir` is the source's folder, never the process's working directory).
 - Progress is one bar per job: `Event::Progress` `done`/`total` span every pass (write, verify,
   ...); `Ctx::expect_rest` renews the estimate as each pass learns its size.
 - The Tauri app has no HTTP sidecar and no `tauri-plugin-fs`; the capability grants only the app's
   commands, dialogs and event listening. The web UI is a separate build served by `serve`.
-- Verification: fast by default everywhere (every structural check + seeded BLAKE3 sample of 8 MiB slices),
-  full is opt-in (`full_verify`, `--full-verify`, the "Full verification" switch). A fast `.pkg` also samples the builder's own block sweep and
-  `playgo-chunk.crc` check (vendor patch 0021, the job's seed).
+- Verification: fast by default everywhere (every structural check + seeded BLAKE3 sample of 8 MiB
+  slices), full is opt-in (`full_verify`, `--full-verify`, the "Full verification" switch). A fast `.pkg`
+  also samples the builder's own block sweep and `playgo-chunk.crc` check (vendor patch 0021, the job's seed).
 - PS5 payload: one plain `.elf`, no PKG, no signing, no updates (replace the file). FreeBSD 11 ABI via
   `--cfg libc_unstable_freebsd_version="11"` (the env var is ignored by libc ≥ 0.2.187) and struct-size
   asserts in the CLI. `panic=abort`.
 - The server has **no protections** by user decision: no pairing, token, Host/Origin/CSRF checks or path
   confinement, and no delete route. Don't re-add them.
-- Tile `PDFG00001` "PS5 Dump Forge" (deeplink to `http://127.0.0.1:<port>/`), never written without our owner
-  file. Self copy: `ps5/build.sh` builds twice; the release ELF embeds stage 1 and saves it to
-  `/data/ps5-dump-forge/ps5-dump-forge.elf`. Launch on open: the AppCache'd page asks elfldr (`GET :9021/<elf>?args=serve`)
-  only from the console's own browser at load.
+- Tile `PDFG00001` "PS5 Dump Forge" (deeplink to `http://127.0.0.1:<port>/`), never written without our
+  owner file. Self copy: `ps5/build.sh` builds twice; the release ELF embeds stage 1 and saves it to
+  `/data/ps5-dump-forge/ps5-dump-forge.elf`. Launch on open: the AppCache'd page asks elfldr
+  (`GET :9021/<elf>?args=serve`) only from the console's own browser at load.
 - PS5 writes: a retried fsync fails the job; USB is never hardware-tested, so the destination probe decides
   (never the path or fs name) and fails closed. Debug routes (`FORGE_DEBUG_API`) never ship; `release-ps5.sh`
   refuses them.
 
 ## Format rules (ShadowMountPlus 1.7)
-- Raw filesystem at byte 0, no MBR/GPT; SMP attaches the whole file. The extension picks the driver
-  (`.ffpkg` UFS, `.exfat` exFAT, `.ffpfs` PFS, `.ffpfsc` PFSC); an inner image in `.ffpfsc` keeps its extension.
+- Raw filesystem at byte 0, no MBR/GPT; SMP attaches the whole file. The extension picks the driver, so it
+  must match (`.ffpkg` UFS, `.exfat` exFAT, `.ffpfs` PFS, `.ffpfsc` PFSC); an inner image in `.ffpfsc` keeps
+  its extension.
 - `sce_sys/param.json` + `eboot.bin` at the image root. Image sizes are multiples of 64 KiB.
 - exFAT: 512-byte sectors, 64 KiB clusters (boot-sector shifts 9/7); size as upstream `mkexfat_macos.sh`
   (0.5% spare, 64..512 MiB). The fast path also needs the file directly under `/data` or `/user`.
@@ -108,17 +114,20 @@ payload internals" holds the payload's details (harness, HTTP contract, U1–U8 
 - `.ffpfsc`: a single-file PFS (MkPFS `pack file` layout) whose one file is a zlib PFSC container of 64 KiB
   blocks around a nested `.exfat`/`.ffpkg`/`.ffpfs` named `<TITLE_ID>.<ext>` (default exFAT, MkPFS's most
   stable). Always PFSC, zlib level 0–9 as zlib numbers them (the slider, `--level`, `ffpfsc_level`;
-  default 6, the measured knee: 7 took 6% longer for 0.02% smaller; 0 stores every block raw), a block is kept compressed only if it saves
-  ≥ 5%; a block with near-8-bit byte entropy that level 1 shrinks < 2% skips the level's search (stored
-  raw). zlib from `flate2` (`miniz_oxide`; console acceptance is a hardware gate in `TODO.md`). Streamed: the inner
-  writer feeds the compressor, which writes the `.part`; no temporary inner image. Free-space preflight asks
-  for the worst case (every block raw).
+  default 6, the measured knee: 7 took 6% longer for 0.02% smaller; 0 stores every block raw); a block is
+  kept compressed only if it saves ≥ 5%; a block with near-8-bit byte entropy that level 1 shrinks < 2%
+  skips the level's search (stored raw). zlib from `flate2` (`miniz_oxide`; console acceptance is a
+  hardware gate in `TODO.md`). Streamed: the inner writer feeds the compressor, which writes the `.part`;
+  no temporary inner image. Free-space preflight asks for the worst case (every block raw).
 - Maker's mark `PS5-FORGE-v<version>` (≤ 31 bytes, a const assert in `convert.rs`): `.exfat` in an OEM
   Parameters record (sector 9, our GUID `{182B1321-1B2D-441D-BECA-28B704837CA0}` + 32 bytes ASCII, in both
   boot regions, under the boot checksum), `.ffpkg` as `fs_volname` in every superblock, `.ffpfsc` in its
   inner `.exfat`/`.ffpkg`. `.ffpfs` and `.pkg` carry none (no field for it). `inspect` reports `forge_version`.
-- Generated `.ffpfs`/`.ffpfsc` names are ≤ 63 bytes (SMP fails longer ones with ENAMETOOLONG); the game-name
-  part is cut first.
+- Image names: SMP mounts at `/mnt/shadowmnt[/pfsc]/<stem>_<8 hex>` and FreeBSD 11's MNAMELEN is 88
+  (longer fails with ENAMETOOLONG), so the stem (the name without its extension) is ≤ 63 bytes for
+  `.exfat`/`.ffpkg`/`.ffpfs` and ≤ 58 for `.ffpfsc` (`preflight::stem_limit`); preflight refuses a longer
+  typed name. Folders and `.pkg` keep to the same 63 bytes, so every output follows one rule. Generated names
+  are `[GAME_TITLE]-[TITLE_ID]` (`-2`, `-3`, ... when taken); the game title is cut first.
 - FPKG: outer PFS plaintext with the `PPRPLAIN-NOAUTH!` marker (native AES-XTS fails the console's auth),
   inner image Kraken-compressed (zlib metadata is rejected by the console, never offer it).
 

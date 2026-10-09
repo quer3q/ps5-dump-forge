@@ -1,4 +1,4 @@
-//! The destination probe (U1 in README.md, "Writing safely on the PS5"): what the output
+//! The destination probe (U1 in ps5/README.md, "Writing safely on the PS5"): what the output
 //! folder's filesystem can do, asked of the folder itself once per job, before anything is
 //! written, and never guessed from its path. A PS5 USB drive is never tested on hardware, so whatever the probe is not
 //! sure of counts as the stricter answer (fail closed).

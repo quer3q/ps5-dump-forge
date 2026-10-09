@@ -49,9 +49,9 @@ Code ported from MkPFS is under the GNU General Public License, version 3 (text 
 
 No PS5 UltraPack code is included. Two of its documented console findings are followed: PFS
 images use 64 KiB blocks (its README reports a 4 KiB build of the same game crashing on launch
-on firmware 11.60, where 64 KiB boots), and generated `.ffpfs`/`.ffpfsc` file names stay within
-63 bytes (its `check_ffpfsc_name_lengths.sh` notes ShadowMountPlus failing longer names with
-ENAMETOOLONG).
+on firmware 11.60, where 64 KiB boots), and image names stay short enough to mount (its
+`check_ffpfsc_name_lengths.sh` notes ShadowMountPlus failing longer names with ENAMETOOLONG; the exact
+per-format limits come from ShadowMountPlus's mount point, see README.md, "Formats").
 
 - Upstream: https://github.com/knutwurst/ps5-ultrapack
 - License: MIT, Copyright (c) 2024–2026 Knutwurst

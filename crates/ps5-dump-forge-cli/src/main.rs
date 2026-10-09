@@ -25,8 +25,9 @@ usage: ps5-dump-forge inspect <path> [--json]
             ffpfsc (compressed PFS container, mounted read-only), or pkg = debug FPKG
             (shown as .fpkg in the app; the file still ends in .pkg)
   --inner   with --to ffpfsc: the image inside (default exfat)
-  -o        output path (default: named from the title id, next to the source;
-            .ffpfs/.ffpfsc names must stay within 63 bytes)
+  -o        output path (default: named from the title id, next to the source); an
+            output's name without its extension must stay within 63 bytes (58 for
+            .ffpfsc), or ShadowMountPlus can't mount it
   --threads compression threads for pkg and ffpfsc (default: all cores)
   --remove-backport
             leave out fakelib's backport libraries, keeping its emulators (AMPR, DLC,
@@ -180,13 +181,9 @@ fn parse_format(s: &str) -> Result<Format, String> {
         .map_err(|_| format!("unknown format {s:?} (folder, exfat, ffpkg, ffpfs, ffpfsc, pkg)"))
 }
 
-/// Next to the source, named from its title id.
+/// Next to the source (core's empty `dir`), named from its title id.
 fn default_output(source: &Path, format: Format) -> Result<PathBuf, String> {
-    let dir = source
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    ps5_dump_forge_core::default_output(source, format, dir).map_err(|e| format!("{e:#}"))
+    ps5_dump_forge_core::default_output(source, format, Path::new("")).map_err(|e| format!("{e:#}"))
 }
 
 // scripts/release-ps5.sh looks for the server's marker in the PS5 ELF to check that it is this

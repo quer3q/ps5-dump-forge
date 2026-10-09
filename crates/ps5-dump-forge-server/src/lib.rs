@@ -1,7 +1,7 @@
 //! `ps5-dump-forge serve`: the app's web UI over plain HTTP/1.1, for the PS5 payload (Tauri
 //! can't run on the console) and for trying that UI on a computer. Std only, one request
 //! per connection, and the page polls `GET /api/jobs` (no server push). The rules (limits,
-//! routes) are in README.md, "PS5 payload internals".
+//! routes) are in ps5/README.md, "Web server".
 //!
 //! No protections, by decision: no pairing, no Host/Origin checks, no path confinement. It
 //! behaves like the Tauri commands over HTTP, for anyone (and any web page in a browser) that

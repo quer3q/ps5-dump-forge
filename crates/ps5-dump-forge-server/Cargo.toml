@@ -26,5 +26,5 @@ flate2 = "1"
 sha2 = "0.11"
 
 [lints.rust]
-# `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` (README.md, "PS5 payload internals").
+# `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` (ps5/README.md).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_env, values("ps5"))'] }

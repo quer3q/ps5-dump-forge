@@ -266,16 +266,19 @@ pub fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     inspect::inspect(path)
 }
 
-/// The default output path for `source` in `format`, next to `dir` and named from the title id.
+/// The default output path for `source` in `format`: in `dir`, named from the title id. An
+/// empty `dir` is the folder holding the source (absolute, never the working directory).
 pub fn default_output(source: &Path, format: Format, dir: &Path) -> anyhow::Result<PathBuf> {
     inspect::default_output(source, format, dir)
 }
 
-/// The output path for `source` in `format` in `dir`, named from the game:
-/// `[GAME_NAME]-[TITLE_ID]-[FIRMWARE]`, brackets included (the firmware `param.json`
-/// declares), e.g. `[Astro Bot]-[PPSA01234]-[7.00].exfat`. Parts the source lacks are left out. Never a path
-/// that exists or is in `taken` (outputs of jobs still running): `-2`, `-3`, ... instead.
-/// `.ffpfs`/`.ffpfsc` names stay within the 63 bytes SMP mounts: the game name is cut first.
+/// The output path for `source` in `format` in `dir` (empty: the folder holding the source),
+/// named from the game: `[GAME_NAME]-[TITLE_ID]`, brackets included, e.g.
+/// `[Astro Bot]-[PPSA01234].ffpkg`. Parts the source lacks are left out. Never a path that
+/// exists or is in `taken` (outputs of jobs still running): `-2`, `-3`, ... instead. The name
+/// without its extension stays within what ShadowMountPlus mounts (63 bytes, 58 for a
+/// `.ffpfsc`, and 63 for a folder or `.pkg` too; see `preflight::stem_limit`): the game name is
+/// cut first.
 pub fn generated_output(
     source: &Path,
     format: Format,

@@ -4,13 +4,16 @@
  * elfldr's args=serve: "serve" as the first argument is that same launch (never the args file).
  * A developer hook: an args file there (one argument per line, the command first: "convert",
  * "/mnt/usb0/GAME", "--to", "ffpkg") runs once instead of a no-argument serve, renamed to
- * args.done before it runs, its output in log-<pid>.txt. Run with other arguments, it is the
- * plain CLI.
+ * args.done before it runs, its output in log-<pid>.txt. Each launch that logs first deletes
+ * the logs of earlier runs, keeping the newest one. Run with other arguments, it is the plain CLI.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -36,8 +39,49 @@ int ps5_notify(const char *message) {
     return sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
 }
 
-// stdout and stderr to FORGE_DIR/<name>-<pid>.txt.
+// The pid in a "serve-<pid>.txt" or "log-<pid>.txt" whose process is gone, else 0.
+static long dead_log(const char *name) {
+    const char *digits = strncmp(name, "serve-", 6) == 0 ? name + 6
+                         : strncmp(name, "log-", 4) == 0 ? name + 4
+                                                         : NULL;
+    if (!digits || *digits < '1' || *digits > '9') return 0;
+    char *end;
+    long pid = strtol(digits, &end, 10);
+    if (strcmp(end, ".txt") != 0 || pid == (long)getpid()) return 0;
+    // EPERM: alive, only not ours to signal.
+    return kill((pid_t)pid, 0) != 0 && errno == ESRCH ? pid : 0;
+}
+
+// Logs of earlier runs: those whose process is gone are deleted, except the newest (the run
+// before this one, for a crash's last lines). A running Forge's log is kept (a second launch
+// only answers "already running"). Best effort: a log that can't go stays.
+static void prune_logs(void) {
+    DIR *dir = opendir(FORGE_DIR);
+    if (!dir) return;
+    char path[512], newest[256] = "";
+    time_t newest_time = 0;
+    struct dirent *e;
+    struct stat st;
+    while ((e = readdir(dir)))
+        if (dead_log(e->d_name)) {
+            snprintf(path, sizeof(path), FORGE_DIR "/%s", e->d_name);
+            if (lstat(path, &st) == 0 && (!*newest || st.st_mtime > newest_time)) {
+                newest_time = st.st_mtime;
+                snprintf(newest, sizeof(newest), "%s", e->d_name);
+            }
+        }
+    rewinddir(dir);
+    while ((e = readdir(dir)))
+        if (dead_log(e->d_name) && strcmp(e->d_name, newest) != 0) {
+            snprintf(path, sizeof(path), FORGE_DIR "/%s", e->d_name);
+            unlink(path);
+        }
+    closedir(dir);
+}
+
+// stdout and stderr to FORGE_DIR/<name>-<pid>.txt, after pruning earlier runs' logs.
 static int redirect(const char *name) {
+    prune_logs();
     char log[128];
     snprintf(log, sizeof(log), FORGE_DIR "/%s-%ld.txt", name, (long)getpid());
     int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0666);

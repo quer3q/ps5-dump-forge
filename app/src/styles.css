@@ -237,12 +237,22 @@ input[type="search"] { -webkit-appearance: none; appearance: none; }
 /* A refused switch: the track dims, the label keeps its contrast (the reason sits below it). */
 .switch:has(input:disabled) { cursor: not-allowed; }
 .switch input:disabled + .switch-track { opacity: .4; }
+/* "Remove backport" and "Full verification": each switch in its own inset box, apart from the
+   one-liners around it. */
+.field.backport, .field.verify {
+  padding: 10px 12px; border-radius: 12px; background: var(--inset); border: 1px solid var(--line);
+}
 .field.backport > .note-line, .field.verify > .note-line { margin-top: 8px; }
+.field.verify + button.link { margin-top: 8px; }
 .hint { display: block; margin-top: 2px; font-size: 11.5px; }
 
 .build-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
 .build-row .primary { height: 38px; padding: 0 22px; }
 .desc { margin-top: 9px; font-size: 13px; }
+/* A note's leading "Recommended" / "Experimental" (Lead in Convert.tsx): text colour only,
+   >= 9:1 on --card and --inset. */
+.lead-good { color: var(--good); }
+.lead-warn { color: var(--warn); }
 /* A quiet text button (e.g. "Compare formats" under the format's one-liner). */
 button.link {
   height: auto; padding: 2px 4px; margin: 2px 0 0 -4px; gap: 6px; background: none;
@@ -276,7 +286,7 @@ button.link .icon { width: 15px; height: 15px; }
     linear-gradient(90deg, rgba(61, 90, 255, 0.55), rgba(90, 60, 190, 0.3) 45%, rgba(21, 22, 58, 0) 80%);
 }
 .alert-bar .icon { flex: none; }
-/* The warning kind (.pkg requirements): amber, dark under the text (white >= 10:1). */
+/* The warning kind (the .fpkg firmware limit): amber, dark under the text (white >= 10:1). */
 .alert-bar.warn {
   color: #fff6e6; background-color: #1d1810; border-color: rgba(255, 181, 71, 0.22);
   background-image:
@@ -324,7 +334,8 @@ button.link .icon { width: 15px; height: 15px; }
 
 .summary { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; }
 .tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
-@media (min-width: 600px) and (max-width: 879px) {
+/* Four in a row only once a tile holds "01.000.000" at 18px whole (below 680px it broke mid-number). */
+@media (min-width: 680px) and (max-width: 879px) {
   .hero:not(.full) .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 .tile {
@@ -459,8 +470,9 @@ pre.log {
   border-radius: 12px; background: var(--inset); border: 1px solid rgba(255, 255, 255, 0.04);
 }
 @media (min-width: 880px) {
-  /* Fits the window beside the summary; its body scrolls inside the card. */
-  .contents { position: sticky; top: calc(var(--top) + 16px); height: calc(100vh - var(--top) - 36px); min-height: 360px; }
+  /* Fits the window beside the summary (48px: the screen's 16px top and 32px bottom padding,
+     so the page itself doesn't scroll); its body scrolls inside the card. */
+  .contents { position: sticky; top: calc(var(--top) + 16px); height: calc(100vh - var(--top) - 48px); min-height: 360px; }
   .panel-body { max-height: none; }
 }
 .filter { margin-bottom: 10px; }
@@ -525,13 +537,7 @@ table.compare .tagline { display: block; margin-top: 6px; color: var(--fg-2); fo
 .chip.good { background: rgba(47, 210, 122, 0.12); color: #86e8b0; }
 .chip.ok { background: rgba(255, 181, 71, 0.12); color: #ffd28f; }
 .chip.bad { background: rgba(255, 93, 93, 0.13); color: #ffaaaa; }
-.footnote { margin-top: 10px; font-size: 12px; }
-.notes { margin: 12px 0 0; padding-left: 18px; font-size: 13px; color: var(--fg-2); }
-.notes li + li { margin-top: 4px; }
-.notes code { font: 12px var(--mono); color: var(--fg); }
-.folder-line { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; color: var(--fg-2); }
-table.compare td:nth-child(5) .chip { white-space: nowrap; } /* "~20 min" stays on one line */
-/* Narrow windows (900 px minimum): all six columns still fit, no hidden sideways scroll. */
+/* Narrow windows (900 px minimum): all three columns fit, no hidden sideways scroll. */
 @media (max-width: 1000px) {
   table.compare { font-size: 12px; }
   table.compare th, table.compare td { padding: 8px 5px; }
