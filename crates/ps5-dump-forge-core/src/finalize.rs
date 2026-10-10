@@ -69,6 +69,11 @@ impl Part {
 
     pub(crate) fn create_dir(path: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir(path).with_context(|| format!("creating {}", path.display()))?;
+        if let Err(e) = make_dir_open(path) {
+            // Ours, just created and still empty.
+            let _ = std::fs::remove_dir(path);
+            return Err(e).with_context(|| format!("setting the mode of {}", path.display()));
+        }
         // ponytail: mkdir and this lstat are two steps; a swap in between (by a process
         // that can write the output folder) would be adopted. Every later step checks it.
         let (id, kind) = path_id(path)?;
@@ -153,6 +158,101 @@ impl Part {
         }
     }
 
+    /// Puts the (already verified and fsynced) file part in place of `target`, the source image
+    /// it replaces ([`crate::ConvertRequest::lz4_in_place`]), keeping the original recoverable
+    /// until the new one is durable: the original gets a second name beside it (`*.orig.part`,
+    /// a hard link, or a rename where the volume has no hard links: macOS exFAT/FAT), the folder
+    /// is synced, the part renamed to `target`, the folder synced again, and only then the
+    /// backup removed (folder synced once more). A failure before that last step puts the original back under `target`
+    /// and leaves neither the part nor the backup; where even that fails, the error names the
+    /// backup to rename back. Returns the backup's path when only its removal at the end
+    /// failed. The caller has checked the source unchanged and closed its handles.
+    // ponytail: the source's stamp is checked, then the original moves; a rewrite of the source
+    // inside that window is lost. Without hard links `target` is briefly absent; a crash right
+    // then leaves the original as `*.orig.part` (which `stale_parts` lists) for the user.
+    pub(crate) fn replace(mut self, target: &Path) -> anyhow::Result<Option<PathBuf>> {
+        if self.dir || !self.still_ours() {
+            anyhow::bail!(
+                "{} was replaced after it was verified; not putting it in place",
+                self.path.display()
+            );
+        }
+        #[cfg(target_os = "freebsd")]
+        imp::same_device(&self.path, target, self.dev)
+            .with_context(|| format!("replacing {}", target.display()))?;
+        let parent = target.parent().unwrap_or(Path::new("."));
+        // `<output>.<job>-<pid>.orig.part`: still a `.part`, so `stale_parts` lists a leftover.
+        let part_name = self.path.file_name().unwrap_or_default().to_string_lossy();
+        let stem = part_name.strip_suffix(".part").unwrap_or(&part_name);
+        let backup = self.path.with_file_name(format!("{stem}.orig.part"));
+        let (t, b) = (target.display(), backup.display());
+        // Exclusive either way: the backup name is this attempt's and must not exist.
+        let linked = match inject(Step::Link).and_then(|()| std::fs::hard_link(target, &backup)) {
+            Ok(()) => true,
+            Err(_) => {
+                rename_no_replace(target, &backup)
+                    .with_context(|| format!("moving {t} aside to {b}"))?;
+                false
+            }
+        };
+        // From here a failure puts the original back. The part's handle stays until its rename
+        // lands, so `Drop` can still recognize (and delete) it before then.
+        let restore = |e: anyhow::Error| -> anyhow::Error {
+            let back = std::fs::rename(&backup, target).and_then(|()| fsync_dir(parent));
+            match back {
+                Ok(()) => e,
+                Err(b2) => e.context(format!(
+                    "putting the original back failed ({b2}): the original image is {b}; \
+                     rename it to {t}"
+                )),
+            }
+        };
+        // Before the original can be replaced, its backup name is made durable: a crash after
+        // the rename below then leaves the original reachable under it.
+        let undo = |e: anyhow::Error| -> anyhow::Error {
+            if linked {
+                let _ = std::fs::remove_file(&backup);
+                let _ = fsync_dir(parent);
+                e
+            } else {
+                restore(e)
+            }
+        };
+        let kept = inject(Step::BackupSync)
+            .and_then(|()| fsync_dir(parent))
+            .with_context(|| {
+                format!(
+                    "syncing {} after keeping the original as {b}",
+                    parent.display()
+                )
+            });
+        if let Err(e) = kept {
+            return Err(undo(e));
+        }
+        let renamed = inject(Step::Rename)
+            .and_then(|()| std::fs::rename(&self.path, target))
+            .with_context(|| format!("renaming {} over {t}", self.path.display()));
+        if let Err(e) = renamed {
+            return Err(undo(e));
+        }
+        // The part's name is gone: nothing for `Drop` to delete.
+        self.published = true;
+        let synced = inject(Step::Sync)
+            .and_then(|()| fsync_dir(parent))
+            .with_context(|| format!("syncing {}", parent.display()));
+        if let Err(e) = synced {
+            // Renaming the backup over `target` also drops the new image.
+            return Err(restore(e));
+        }
+        // The new image is in place and durable; a backup that can't be removed is left for the
+        // caller to report (and `stale_parts` lists it).
+        if std::fs::remove_file(&backup).is_err() {
+            return Ok(Some(backup));
+        }
+        let _ = fsync_dir(parent);
+        Ok(None)
+    }
+
     /// U3: the device guard, then a hard link (a file, where the probe saw hard links) or a
     /// checked rename. Once the output name exists the job has succeeded: removing the
     /// part's own name and syncing the folder are best effort.
@@ -205,6 +305,38 @@ impl Drop for Part {
             let _ = fsync_dir(parent);
         }
     }
+}
+
+/// The steps of [`Part::replace`] a test can make fail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Step {
+    /// The hard link to the original (as on a volume without them).
+    Link,
+    /// The folder sync that makes the backup name durable.
+    BackupSync,
+    Rename,
+    Sync,
+    /// `open_up` in [`create_new`].
+    OpenUp,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The step that fails on this thread, in tests.
+    pub(crate) static FAIL: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
+    /// [`Step::Link`] fails too.
+    pub(crate) static NO_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An injected failure of `step` (tests only; always `Ok` otherwise).
+fn inject(step: Step) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL.with(|f| f.get()) == Some(step) || (step == Step::Link && NO_LINKS.with(|n| n.get())) {
+        return Err(io::Error::other("injected failure"));
+    }
+    let _ = step;
+    Ok(())
 }
 
 /// What a path names, independent of its spelling: (device, inode) on Unix, (volume
@@ -307,7 +439,55 @@ pub(crate) fn create_new(path: &Path) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    opts.open(path)
+    let file = opts.open(path)?;
+    if let Err(e) = inject(Step::OpenUp).and_then(|()| open_up(&file)) {
+        // Ours, just created: nothing else knows it yet.
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(file)
+}
+
+/// CE-107750-0: the game cannot read files made with the process default mode on the PS5, so
+/// everything Forge creates in a game folder is 0777 (like the UFS2 writer's inodes), set
+/// explicitly because the create mode is masked by the umask. A no-op off FreeBSD.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn open_up(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `file` is an open descriptor.
+    match unsafe { libc::fchmod(file.as_raw_fd(), 0o777) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn open_up(_: &File) -> io::Result<()> {
+    Ok(())
+}
+
+/// `open_up` for a directory just made at `dir/name` (`dir` is a descriptor, or `AT_FDCWD`).
+#[cfg(target_os = "freebsd")]
+pub(crate) fn open_up_at(dir: libc::c_int, name: &std::ffi::CStr) -> io::Result<()> {
+    // SAFETY: valid C string; `dir` is an open directory descriptor or AT_FDCWD.
+    match unsafe { libc::fchmodat(dir, name.as_ptr(), 0o777, libc::AT_SYMLINK_NOFOLLOW) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// `open_up` for a directory made by path.
+pub(crate) fn make_dir_open(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+        open_up_at(libc::AT_FDCWD, &c)?;
+    }
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "freebsd")))]
@@ -531,6 +711,30 @@ pub(crate) fn stale_parts(dir: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn created_entries_are_0777_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: umask only changes this process's mask.
+        let old = unsafe { libc::umask(0o077) };
+        let dir = std::env::temp_dir().join(format!("forge-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        let d = dir.join("d");
+        super::create_new(&f).unwrap();
+        let part = super::Part::create_dir(&d).unwrap();
+        // SAFETY: restoring the previous mask.
+        unsafe { libc::umask(old) };
+        for p in [&f, &d] {
+            assert_eq!(
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o777,
+                0o777
+            );
+        }
+        drop(part);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
@@ -820,5 +1024,64 @@ mod tests {
             !dir.join("a.part").exists(),
             "the failed publish drops its part"
         );
+    }
+
+    /// Only `keep` is left in `dir`.
+    fn only(dir: &Path, keep: &[&str]) {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, keep);
+    }
+
+    /// With a hard link to the original, and without (the original renamed aside).
+    #[test]
+    fn replace_puts_the_part_in_place_and_drops_the_backup() {
+        for no_links in [false, true] {
+            let dir = crate::test_dir("part-replace");
+            let target = dir.join("game.exfat");
+            std::fs::write(&target, b"original").unwrap();
+            let part = written(&dir, "game.exfat.7-1.part", b"patched");
+            NO_LINKS.with(|n| n.set(no_links));
+            assert_eq!(part.replace(&target).unwrap(), None);
+            NO_LINKS.with(|n| n.set(false));
+            assert_eq!(std::fs::read(&target).unwrap(), b"patched");
+            only(&dir, &["game.exfat"]);
+        }
+    }
+
+    /// A failed rename of the part, or a failed folder sync after it, puts the original back
+    /// byte for byte and leaves neither the part nor the backup, with or without hard links.
+    #[test]
+    fn a_failed_replace_puts_the_original_back() {
+        for no_links in [false, true] {
+            for step in [Step::BackupSync, Step::Rename, Step::Sync] {
+                let dir = crate::test_dir("part-replace-fail");
+                let target = dir.join("game.ffpkg");
+                std::fs::write(&target, b"original").unwrap();
+                let part = written(&dir, "game.ffpkg.7-1.part", b"patched");
+                FAIL.with(|f| f.set(Some(step)));
+                NO_LINKS.with(|n| n.set(no_links));
+                let err = part.replace(&target).unwrap_err();
+                FAIL.with(|f| f.set(None));
+                NO_LINKS.with(|n| n.set(false));
+                assert!(format!("{err:#}").contains("injected failure"), "{err:#}");
+                assert_eq!(std::fs::read(&target).unwrap(), b"original");
+                only(&dir, &["game.ffpkg"]);
+            }
+        }
+    }
+
+    /// A file whose mode can't be set (fchmod on the PS5) is removed again, as is a folder.
+    #[test]
+    fn create_new_removes_what_it_could_not_open_up() {
+        let dir = crate::test_dir("create-open-up");
+        FAIL.with(|f| f.set(Some(Step::OpenUp)));
+        let err = create_new(&dir.join("f")).unwrap_err();
+        FAIL.with(|f| f.set(None));
+        assert!(err.to_string().contains("injected failure"), "{err}");
+        only(&dir, &[]);
     }
 }

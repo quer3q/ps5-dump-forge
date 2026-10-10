@@ -80,6 +80,11 @@ fn request(source: &Path, format: Format, output: &Path, inner: Option<Format>) 
         full_verify: false,
         kraken_level: KrakenLevel::Fast,
         ffpfsc_level: 6,
+        lz4: None,
+        lz4_profile: None,
+        lz4_traces: None,
+        lz4_trace_space_mib: 256,
+        lz4_in_place: false,
     }
 }
 

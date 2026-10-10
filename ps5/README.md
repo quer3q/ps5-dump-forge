@@ -61,12 +61,14 @@ FORGE_DEBUG_API=1 ps5/build.sh   # bring-up only: adds POST /api/debug; never sh
 
 - Std only: hand-rolled HTTP/1.1, one request per connection, no server push; the page polls `GET
   /api/jobs` (every 1 s while a job is unfinished, else 5 s). Binds `0.0.0.0:8095` (`--port`). Roots for the
-  file browser: on the PS5 `/data`, `/mnt/usb0..7`, `/mnt/ext0..1` (a drive counts only while `statfs` names
-  it as its own mount point with blocks: those folders exist with nothing plugged in; re-checked on each
-  use), canonicalized and logged; on a computer the `--root` folders.
+  file browser: on the PS5 `/data`, `/mnt/shadowmnt` (while it exists: ShadowMountPlus's mount points, so a
+  mounted image can be picked as a folder), `/mnt/usb0..7`, `/mnt/ext0..1` (a drive counts only while
+  `statfs` names it as its own mount point with blocks: those folders exist with nothing plugged in;
+  re-checked on each use), canonicalized and logged; on a computer the `--root` folders.
 - **No protections, by decision**: no pairing, token, `Host`/`Origin`/CSRF checks, security headers or
   path confinement; paths go to core as given, as in the Tauri app. No delete route, and none may be added.
-- Limits: head 16 KiB, body 1 MiB (`Content-Length` only), 10 s per request, 30 s per write, 16 handler
+- Limits: head 16 KiB, body 1 MiB (`Content-Length` only), 10 s per request, 30 s per write (a download:
+  per 1 MiB chunk), 16 handler
   threads (then 503), 8 unfinished jobs (then 429), 2 inspections or naming requests at once (429,
   `Retry-After: 1`), 32 finished jobs and 200 log lines each kept, `list_dir` 10,000 entries (`truncated`),
   `stale_parts` 1,000. `compression_threads: null` is `max(1, cores − 1)`.
@@ -80,12 +82,31 @@ FORGE_DEBUG_API=1 ps5/build.sh   # bring-up only: adds POST /api/debug; never sh
 | `POST /api/inspect` | `{path}` | `Inspection` |
 | `POST /api/default_output` | `{source, format, dir}` | path |
 | `POST /api/generated_output` | `{source, format, dir, taken}` | path |
-| `POST /api/start_job` | `{request: ConvertRequest}` | job id |
+| `POST /api/start_job` | `{request: ConvertRequest}` | job id (`lz4_in_place: true` replaces an `.exfat`/`.ffpkg` source; `output` ignored) |
 | `POST /api/cancel_job` | `{id}` | `null` (idempotent) |
-| `POST /api/stale_parts` | `{dirs}` | `string[]`, without running jobs' parts |
+| `POST /api/stale_parts` | `{dirs}` | `string[]`, without running jobs' parts (an in-place job's beside its source) |
+| `POST /api/lz4_patch` | `{source}` | `Lz4Patch`; 409 while a job is queued or running |
+| `POST /api/lz4_unpatch` | `{source}` | `Lz4Patch` (release runtime); 409 while a job is queued or running |
+| `POST /api/lz4_plan_profile` | `{request}` (a Pack `start_job` body) | `Lz4PlanProfile` `{file_name, toml, packed, loose, log}`: Save as profile; reads only (counts as an inspection, 429 past 2); the page downloads `toml` as `file_name` |
+| `GET /api/lz4_traces?source=` | | both trace files as one zip download (below) |
 | `POST /api/list_dir` | `{path: string\|null}` | `{path, parent, entries: [{name, path, dir, size}], truncated}` |
 | `GET /api/jobs` | | `{instance, jobs: [{id, request, progress, done, log, log_total}]}` |
 | `POST /api/quit` | `{}` | `{}`, then cancels every job, waits for cleanup and exits |
+
+`lz4_traces` (LZ4 → Trace → Download traces): `source` (a folder or any image Forge reads; percent-encoded, else
+400); streams `ampr_commands.bin` and `ampr_emu.index` from the source's root (core's `lz4_traces`: a
+folder's files opened directly, an image through its reader) as one zip at the archive root: STORED
+entries, flag bit 3 (CRC-32 computed while streaming, then a data descriptor), central directory, end
+record; ZIP64 fields only where a size or offset reaches 0xFFFFFFFF (core's `zip.rs`, whose reader Pack
+uses). `200`, `application/zip`, `Content-Disposition: attachment; filename="<ASCII stand-in>"` plus
+`filename*=UTF-8''<percent-encoded>` for a non-ASCII name, the name `[GAME_TITLE]-[TITLE_ID]-amprtrace.zip`
+(`amprtrace.zip` without either), the exact `Content-Length` (planned up front), `no-store`, read and
+written 1 MiB at a time (never whole in memory). Either file missing: 404 naming it; a source core can't
+open: 500 with its error. Each chunk is read only while the source is unchanged
+since opening (the image file, or a folder's trace file: length, mtime, identity); a change (a game
+relaunched on a writable mount truncates its journal) ends the transfer short and is logged. Opening
+counts as an inspection (the 2-at-once cap), the transfer doesn't; jobs may run meanwhile. A read failing
+mid-transfer closes the connection short of `Content-Length`.
 
 `instance` is random per start, so the page notices a restart and rebuilds its job list. `list_dir` with
 `null` lists the roots; directories first, then by name; non-UTF-8 names left out; symlinks resolved.

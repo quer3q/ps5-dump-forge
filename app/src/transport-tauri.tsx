@@ -2,7 +2,9 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
+
+import { joinPath } from "./paths";
 
 import type { PickOptions, Transport, Unlisten } from "./transport";
 
@@ -24,4 +26,14 @@ export const transport: Transport = {
     event === "jobs://restore" ? Promise.resolve(() => {}) : listen<T>(event, (e) => f(e.payload)),
   pick,
   useOffline: () => false,
+  lz4Patch: (path) => invoke("lz4_patch", { path }),
+  lz4Unpatch: (path) => invoke("lz4_unpatch", { path }),
+  savePlanProfile: async (request, name, dir) => {
+    const dest = await save({
+      title: "Save as profile",
+      defaultPath: dir ? joinPath(dir, name) : name,
+      filters: [{ name: "LZ4 profile (TOML)", extensions: ["toml"] }],
+    });
+    return dest ? invoke("lz4_save_plan_profile", { request, dest }) : null;
+  },
 };

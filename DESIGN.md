@@ -39,6 +39,8 @@ gradient notice bar) and the app icon (near-black navy with a blue edge and an o
 | `--good` / `--bad` / `--warn` | `#2fd27a` / `#ff6b6b` / `#ffb547` | Status icons and text |
 | `--focus` | `#9db6ff` | 2px focus ring on every control (`:focus-visible`) |
 | `--mono` | `ui-monospace, SFMono-Regular, Menlo` | Paths, file names, IDs, param.json, logs |
+| `--tab-lz4` / `--strap` / `--strap-hi` | `#1c1c26` / white 8% / 13% | The LZ4 screen tab's ground and straps (unselected `--fg-2` ≥ 8.9:1, selected `--fg` ≥ 7.9:1 on a strap) |
+| `--neon-*` | lime, magenta, cyan at 12%; ring lime 38%; ink `#d6e875` | A traced source's `LZ4 (AMPR)` tile (`.tile.neon`) |
 | count badge | `#2f5bff` + white | Running-jobs count on the Convert tab (5.2:1) |
 | primary button | `#fff` + `#0e0e15` | The one main action per card (Build) |
 
@@ -52,6 +54,7 @@ gradient notice bar) and the app icon (near-black navy with a blue edge and an o
 | `.ffpfs` | teal `#7ee0e0` | |
 | `.ffpfsc` | amber `#ffc580` | |
 | `.fpkg` | green `#8fe0ab` | class `fmt-pkg`; the id and file extension stay `pkg` |
+| LZ4 packed folder | lime `#d6e875` | class `fmt-lz4`; not a Convert target segment (only the LZ4 tab's Pack target picker shows it); also tints the LZ4 tab's scenario and Trace action pickers; text on tint 9.7:1 over `--card`, 10.6:1 over `--inset` |
 
 **Semantic tags.** `.tag.blue`, `.tag.green`, `.tag.red`, `.tag.orange` and `.tag.violet` are tinted
 pills for states: Writing (blue), Done (green), Failed (red), Backport (orange), DLC (violet).
@@ -91,8 +94,11 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   No wordmark, because the window title already says "PS5 Dump Forge".
   The version is in the title ("PS5 Dump Forge v…": the desktop window's title, and the page title the
   PS5 browser shows in its title bar), not in the header.
-- **Segmented control** (`.seg`, `.seg-opt`, `.on`): used for the screen tabs, the Inspect sub-tabs and
-  the format picker (`.seg.formats`).
+- **Segmented control** (`.seg`, `.seg-opt`, `.on`): used for the screen tabs (Convert, LZ4, Inspect,
+  About formats), the Inspect sub-tabs, the format picker (`.seg.formats`) and the LZ4 tab's scenario and Trace action pickers.
+  The LZ4 screen tab (`.seg-opt.tab-lz4`) is a grey pill (`--tab-lz4`) with four evenly spaced
+  `--strap` straps running from the top-right to the bottom-left (static); selected, it takes
+  `--raise-hi`, brighter straps (`--strap-hi`), `--fg` and a ring. The focus ring is the usual one.
   - In the format picker the selected segment fills with its format tint.
   - Unselected segments are plain muted text, without dots.
   - Native radios or `role="tab"` sit underneath, so the keyboard works.
@@ -125,15 +131,82 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
 - **Switch** (`.switch`): a native checkbox drawn as a switch, blue when on. A disabled switch dims
   its track only; the reason sits under it as a `.note-line.warn` ("Remove backport", shown under the
   format picker only for a source with backport libraries, is disabled when core refuses removal).
-  "Full verification" (off by default) sits below it, for every target. Both sit in their own inset
-  box (`.field.backport`, `.field.verify`: `--inset`, `--line` border, 12px radius), apart from the
-  one-liners around them; "Generate name" in the build row does not.
-- **Lead word** (`Lead` in `Convert.tsx`, `.lead-good` / `.lead-warn`): a Convert note that starts with
+  "Full verification" (off by default) sits below it, for every target.
+  Both sit in their own inset box (`.field.backport`, `.field.verify`: `--inset`, `--line` border,
+  12px radius), apart from the one-liners around them; "Generate name" in the build row does not.
+  Convert has no LZ4 controls: a packed source is copied as it is, and a combination core would
+  refuse (Remove backport on a packed dump, or a packed dump carrying the trace runtime) disables
+  Build with the reason in a `.note-line.block` beside it, pointing at the LZ4 tab.
+- **LZ4 tab** (`Lz4.tsx`; Convert, LZ4, Inspect, About formats): its own Source card, then an
+  "LZ4 asset packs" card. First the scenario picker, a full-width `.seg.formats` in the LZ4 tint
+  without icons: **Trace** and **Pack**. A scenario that doesn't apply is disabled with the reason
+  in its tooltip and read out, and one muted line under the picker lists it ("Not for this source:
+  Trace (the source is LZ4 packed: unpack it first (Pack))"); a title that neither uses AMPR nor is
+  packed gets one `.note-line.warn` instead. A new source starts on Pack when it is packed, is a
+  read-only image, or (desktop app only) carries a journal; otherwise on Trace. Under the picker
+  the scenario's one-liner, then:
+  - **Trace** (an AMPR title, not packed): a read-only image (`.ffpfs`, `.ffpfsc`, `.fpkg`) gets one
+    `.note-line.warn` (read-only on the console; convert it to `.ffpkg` or `.exfat` first) and
+    nothing else. Otherwise, in the web build and only when the source has a journal, a
+    `.field.lz4.recorded` box "Recorded traces": what to do first (close the game, wait a minute,
+    use a computer's browser, pick the zip in Pack → Traces), one download link drawn as a
+    secondary button (`a.button` with the download icon, `.downloads` row; its label wraps, as it
+    carries the zip's whole name): "Download traces (<size>) as [GAME_NAME]-[TITLE_ID]-amprtrace.zip" (a
+    `.note-line.warn` instead when the source has no index), and a muted line that a journal cut
+    off at the end still packs. Then an "Action" label and a smaller picker of the same kind
+    (`.seg.formats.inner`, LZ4 tint): **Patch** / **Unpatch** (default Unpatch when the runtime is
+    Forge's trace build, else Patch), its one-liner, and one `.field.lz4` box: what it changes
+    (Patch: play, then pick the source again; the trace runtime replaces fakelib/libSceAmpr.sprx.
+    Unpatch: Forge's release runtime (0.4.2.1) does, the journal and logs are deleted); for an image
+    Patch the "Room for the trace" range (64 MiB to 1 GiB, step 64 MiB, default 256 MiB) and the `image_rw=` mount note; for an image
+    a muted `.note-line` with the info icon ("Needs free space about the image's size next to it;
+    the image is replaced only after the copy verifies."); with a journal a `.note-line.warn` that
+    both actions delete it. A folder is changed in place by one request (no verification, output or
+    "Generate name"; the button is off while a job runs or waits, with the reason beside it); its
+    result: a `.note-line.good` (what was installed, files indexed), a muted line for the old trace
+    files removed, and the runtime's known issue as a `.note-line.warn`. An `.exfat` /
+    `.ffpkg` is a job that rebuilds it in its own format and replaces it once verified
+    (`lz4_in_place`): Full verification shows, no output or "Generate name"; a second one on the
+    same image is refused beside the button until the first finishes, and the source is read again
+    when it is done. The button reads **Patch** or **Unpatch**.
+  - **Pack** (any AMPR source, not packed): in one `.field.lz4` box: **Traces**, one control for a zip or a folder. The web build's
+    Choose… opens the browser's zip-or-folder mode; the desktop app's Choose… (with a chevron) opens
+    a two-item menu (`.menu`, Zip… / Folder…: the native dialog can't offer both at once). The
+    chosen path shows whole with Clear. When the source's own traces load by themselves (journal
+    and index, runtime Forge's trace build) the control is locked: a greyed `.lock-box` (dashed
+    `--line-hi` border) with a round lock button and "Traces are already loaded from this source",
+    and a muted line on what they are. The lock unlocks it (focus moves to Choose…); unlocked, a
+    `button.link` with the lock icon, "Use the source's traces", locks it again and drops the
+    choice (traces and profile). Under it a collapsed fold (`details.fold.rules`) "Use a rules profile instead" with the
+    Profile choice (Choose… / Clear); a profile and traces exclude each other. A muted line says
+    where the rules come from (profile, chosen traces, this source's traces, else a built-in guess).
+    Under the box a "Target" label and the format picker (`FormatPicker`, `.seg.formats`) with
+    **LZ4 packed folder** (default) | **.ffpkg** | **.exfat** | **.ffpfs** | **.ffpfsc** (no `.fpkg`),
+    the chosen format's one-liner (`FORMAT_INFO`), the `.ffpfsc` settings (`FfpfscField`) when picked,
+    and for an image a muted line: "Packs into the image directly: no temporary folder; the packed
+    files are read twice." The request is `lz4: "pack"` with that `format` (the folder as `folder`).
+  - **Unpack** (Pack on a packed source): the target picker with every format (default Folder),
+    with the same `.fpkg` warning and `.ffpfsc` / `.fpkg` settings as Convert, and a line on how
+    many packed files come back.
+  Pack and Unpack then show Full verification, Output and "Generate name" as Convert does (shared
+  in `target.tsx`); the button reads Pack or Unpack. Beside Pack (not Unpack) a secondary button
+  **Save as profile** (download icon; "Saving…" while it runs; disabled while any job runs or Pack is
+  blocked) saves the plan Pack would use with the current settings as a TOML (the app: the save dialog,
+  `.toml` filter, `[GAME_NAME]-[TITLE_ID]-lz4profile.toml` offered next to the source; the web UI: a
+  download), then a muted note: "Saved <name>: N files packed, M loose. Edit it and load it with Use a
+  rules profile." Jobs join the one job list
+  (`JobList.tsx`), shown under the cards on both Convert and LZ4.
+- **Lead word** (`Lead` in `target.tsx`, `.lead-good` / `.lead-warn`): a Convert or LZ4 note that starts with
   "Recommended" shows that word in `--good`, one that starts with "Experimental" in `--warn`. Text
   colour only (≥ 9:1 on `--card` and `--inset`), no tint; the word itself carries the meaning.
 - **Tags** (`.tag`, `.tag.fmt`, semantic colours): 22px pills, 12px/500.
 - **Stat tiles** (`.tiles`, `.tile`, `.value`, `.note`): two per row (four per row at medium widths);
-  `.tile.wide` spans the row.
+  `.tile.wide` spans the row (the `LZ4 (AMPR)` facts tile: Packed, Damaged packs, Traced or Plain,
+  with the volume count, journal size or runtime in its note). A traced source (Forge's trace
+  runtime, or a journal) makes that tile `.tile.neon` everywhere it shows (Convert, LZ4, Inspect):
+  muted neon straps (`--neon-lime`, `--neon-magenta`, `--neon-cyan`, 12% over `--inset`) across
+  the whole tile, a `--neon-line` ring with a faint `--neon-glow`, the state in `--neon-ink`.
+  Static. On the brightest strap `--fg` is 12.8:1, `--muted` 5.2:1, `--neon-ink` 10.7:1.
 - **Alert bar** (`.alert-bar`, `.alert-bar.warn`): one line of notice.
   - The blue-to-orange gradient is kept dark under the text.
   - Orange is only a glow at the right edge.
@@ -148,8 +221,9 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
   on Windows, Show in folder on Linux), the error box or "Fast (Full) verification passed: N checks"; a
   fast one lists its coverage first among the checks.
 - **Rating chip** (`.chip.good` / `.ok` / `.bad`): used in the About formats table (Console speed and
-  Size on disk per format, the folder last; the tab holds only that table). Tint, icon and text
-  together, every text ≥ 8.9:1.
+  Size on disk per format, the LZ4 row before the folder). The tab holds that table and, under it, a credits block
+  (`.credits`: plain selectable text, no links, for ampr_emu and Lazy_AMPR and the note that LZ4 numbers
+  are upstream's). Tint, icon and text together, every text ≥ 8.9:1.
 - **Empty state** (`.empty`): an inset well with a round blue icon, a title, one line of help, the
   accepted kinds as tags, and two buttons.
 - **Modal** (`.modal-backdrop`, `.modal`): 440px card on a blurred dark backdrop; the screens behind it
@@ -172,8 +246,10 @@ Two columns start at 880px wide. Inspect splits 5:7 from 1100px.
     plain (`aria-current`). Long paths wrap; they are never clipped.
   - The list (`ul.rows.pick-list`) is an inset well that scrolls inside itself (max 420px): "Parent
     folder" (or "All drives") first, then folders, then files with their size (tabular, muted).
-    The file mode lists only the accepted extensions.
-  - Footer: Cancel and, in folder mode, "Choose this folder" (`.primary`). Esc cancels, focus
+    The file mode lists only the accepted extensions. The zip-or-folder mode (`folderToo`,
+    LZ4 → Pack → Traces) lists folders and `.zip` files: a zip click picks it, "Choose this
+    folder" the folder shown.
+  - Footer: Cancel and, in folder and zip-or-folder mode, "Choose this folder" (`.primary`). Esc cancels, focus
     stays inside, and the next browse opens where the last one ended.
 - **Show path** (replaces Show in Finder on a finished job): the output path in an `.out-box`
   (`.path-shown`) under the job's status, focused and selected, to copy by hand (plain HTTP has

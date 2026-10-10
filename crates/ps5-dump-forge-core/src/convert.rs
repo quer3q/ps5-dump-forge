@@ -20,7 +20,7 @@ use crate::prefetch::Prefetch;
 use crate::preflight::{self, GameInfo};
 use crate::scan::{JunkFiltered, ScannedFolder};
 use crate::verify::{self, HashingTree, Mode};
-use crate::{ConvertRequest, Format, JobReport};
+use crate::{ConvertRequest, Format, JobReport, Lz4Mode};
 
 /// Every SMP image size and cluster is a multiple of this.
 const IMAGE_ALIGN: u64 = 64 * 1024;
@@ -150,6 +150,44 @@ impl SourceStamp {
         })
     }
 
+    /// One file's stamp, whatever it holds (an LZ4 trace file in a folder).
+    pub(crate) fn of_file(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            seen: Some(Self::seen(path)?),
+        })
+    }
+
+    /// The stamp of the file `file` (opened from `path`) is, from the handle, so it describes
+    /// exactly what is read; [`SourceStamp::unchanged`] then also says that `path` still names
+    /// that file (identity, length, modification time).
+    pub(crate) fn of_handle(path: &Path, file: &File) -> anyhow::Result<Self> {
+        let shown = || format!("{}", path.display());
+        let meta = file.metadata().with_context(shown)?;
+        #[cfg(unix)]
+        let id = crate::finalize::meta_id(&meta);
+        #[cfg(windows)]
+        let id = crate::win::raw_file_id(file).with_context(shown)?;
+        #[cfg(not(any(unix, windows)))]
+        let id = crate::finalize::handle_id(file).with_context(shown)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            seen: Some((meta.len(), meta.modified().ok(), id)),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The file still has the length, modification time and identity it had when stamped
+    /// (always true for a folder's stamp, which holds none).
+    pub(crate) fn unchanged(&self) -> bool {
+        self.seen
+            .as_ref()
+            .is_none_or(|seen| Self::seen(&self.path).ok().as_ref() == Some(seen))
+    }
+
     fn seen(path: &Path) -> anyhow::Result<Seen> {
         let shown = || format!("{}", path.display());
         #[cfg(unix)]
@@ -176,9 +214,7 @@ impl SourceStamp {
     }
 
     pub(crate) fn check(&self) -> anyhow::Result<()> {
-        if let Some(seen) = &self.seen
-            && Self::seen(&self.path).ok().as_ref() != Some(seen)
-        {
+        if !self.unchanged() {
             bail!(
                 "{} changed while it was being converted; not publishing the output",
                 self.path.display()
@@ -196,11 +232,13 @@ enum Image {
 }
 
 impl Image {
-    /// Lays `format`'s image out for `tree`; a refusal is a preflight finding.
+    /// Lays `format`'s image out for `tree`, with `free_bytes` of free space beyond its own
+    /// (an LZ4 trace's room); a refusal is a preflight finding.
     fn plan(
         format: Format,
         tree: &dyn SourceTree,
         info: &GameInfo,
+        free_bytes: u64,
         cancel: &AtomicBool,
     ) -> Result<Self, String> {
         match format {
@@ -215,7 +253,7 @@ impl Image {
                 // `.into()` accepts both `label: String` and the coming `label: Option<String>`.
                 #[allow(clippy::useless_conversion)]
                 let opts = ps5_dump_forge_exfat::Options {
-                    free_bytes: 0,
+                    free_bytes,
                     label: label.into(),
                     maker: maker(),
                 };
@@ -225,7 +263,7 @@ impl Image {
             }
             Format::Ffpkg => {
                 let opts = ps5_dump_forge_ufs2::Options {
-                    free_bytes: 0,
+                    free_bytes,
                     maker: maker(),
                 };
                 ps5_dump_forge_ufs2::plan(tree, &opts, cancel)
@@ -288,6 +326,8 @@ impl Image {
 /// The writer's layout, fixed in preflight.
 enum Plan {
     Folder,
+    /// A folder of loose files and LZ4 packs.
+    Lz4(crate::lz4::PackPlan),
     Image(Image),
     /// The image inside, and its name in the container.
     Ffpfsc(Image, String),
@@ -303,6 +343,77 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     });
     #[cfg(not(target_os = "freebsd"))]
     convert(req, ctx)
+}
+
+/// `--remove-backport`: `source` without fakelib's backport libraries, when they can go (else a
+/// finding, or a log line when there are none).
+fn leave_out_backport(
+    req: &ConvertRequest,
+    mut source: Box<dyn SourceTree>,
+    info: &GameInfo,
+    packs: &crate::lz4::Packs,
+    ctx: &Ctx,
+    findings: &mut Vec<String>,
+) -> Box<dyn SourceTree> {
+    if req.remove_backport {
+        let fakelib = crate::backport::classify(source.as_mut());
+        let kept: Vec<&str> = fakelib.emulators.iter().map(|e| e.name.as_str()).collect();
+        if fakelib.libs.is_empty() {
+            ctx.log("remove backport: nothing to remove, no backport library in fakelib");
+        } else if packs.packed && !packs.unpacked {
+            findings.push(
+                "a packed dump lists its backport in its LZ4 manifest: unpack it (Unpack LZ4) to \
+                 leave the backport out"
+                    .into(),
+            );
+        } else if let Some(why) =
+            crate::backport::blocked(source.as_mut(), info.param_json.as_ref())
+        {
+            findings.push(why);
+        } else {
+            for lib in &fakelib.libs {
+                ctx.log(format!("remove backport: leaving out {lib}"));
+            }
+            source = Box::new(crate::backport::Without::new(source, &fakelib.libs));
+        }
+        if !kept.is_empty() {
+            ctx.log(format!(
+                "remove backport: keeping emulators {}",
+                kept.join(", ")
+            ));
+        }
+    }
+    source
+}
+
+/// The pack list a Pack job of `req` would resolve, up to its LZ4 preparation, writing
+/// nothing: the source opened, packs decoded, the backport left out on request, then the rules,
+/// the keep-loose list and auto-loose. LZ4 findings are the error.
+pub(crate) fn lz4_plan(
+    req: &ConvertRequest,
+    ctx: &Ctx,
+) -> anyhow::Result<(crate::lz4::PackPlan, GameInfo)> {
+    anyhow::ensure!(
+        crate::lz4::packing(req),
+        "a pack plan needs an LZ4 Pack request"
+    );
+    let kind = Kind::of(&req.source)?;
+    let source = open_source(&req.source, kind, ctx.cancel)?;
+    ctx.log(format!("source: {}", source.describe()));
+    let (mut source, packs) = crate::lz4::open(req, source, ctx)?;
+    let (info, _) = preflight::input(source.as_mut());
+    let mut findings = Vec::new();
+    let source = leave_out_backport(req, source, &info, &packs, ctx, &mut findings);
+    let mtime = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let prepared = crate::lz4::prepare(req, source, packs, mtime, ctx)?;
+    findings.extend(prepared.findings);
+    if !findings.is_empty() {
+        bail!("{}", findings.join("\n"));
+    }
+    let pack = prepared.pack.context("no pack plan")?;
+    Ok((pack, info))
 }
 
 /// U5 on FreeBSD: `write` puts every byte of the image through `SyncEvery`, sharing the
@@ -339,57 +450,94 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     let kind = Kind::of(&req.source)?;
     // Before the open: a change after this point, however early, fails the publish.
     let stamp = SourceStamp::take(&req.source, kind)?;
-    let mut source = open_source(&req.source, kind, ctx.cancel)?;
+    let source = open_source(&req.source, kind, ctx.cancel)?;
     ctx.log(format!("source: {}", source.describe()));
+    // The job's one timestamp, in whole seconds, for what it generates (an LZ4 manifest and
+    // path index).
+    let mtime = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    // LZ4 packs decoded first, when the job asks: the backport's files are manifest records.
+    let (mut source, packs) = crate::lz4::open(req, source, ctx)?;
     ctx.progress("scan", 1, 1);
     ctx.check()?;
 
     ctx.progress("preflight", 0, 1);
-    let out = preflight::output_path(&req.output)?;
+    // In place the output is the source itself; its `.part` goes beside it.
+    let in_place = req.lz4_in_place;
+    let out = preflight::output_path(if in_place { &req.source } else { &req.output })?;
     let (info, mut findings) = preflight::input(source.as_mut());
     if let Some(id) = &info.title_id {
         ctx.log(format!("title id: {id}"));
     }
     // Before anything sizes or writes the source, so every target (`.pkg` included) and the
     // verification see the tree without it.
-    if req.remove_backport {
-        let fakelib = crate::backport::classify(source.as_mut());
-        let kept: Vec<&str> = fakelib.emulators.iter().map(|e| e.name.as_str()).collect();
-        if fakelib.libs.is_empty() {
-            ctx.log("remove backport: nothing to remove, no backport library in fakelib");
-        } else if let Some(why) =
-            crate::backport::blocked(source.as_mut(), info.param_json.as_ref())
-        {
-            findings.push(why);
-        } else {
-            for lib in &fakelib.libs {
-                ctx.log(format!("remove backport: leaving out {lib}"));
-            }
-            source = Box::new(crate::backport::Without::new(source, &fakelib.libs));
-        }
-        if !kept.is_empty() {
-            ctx.log(format!(
-                "remove backport: keeping emulators {}",
-                kept.join(", ")
-            ));
-        }
+    let source = leave_out_backport(req, source, &info, &packs, ctx, &mut findings);
+    findings.extend(crate::lz4::in_place_findings(req, kind, packs.packed));
+    // The LZ4 options, before anything sizes or writes the tree (`.pkg` included).
+    let prepared = crate::lz4::prepare(req, source, packs, mtime, ctx)?;
+    findings.extend(prepared.findings);
+    let mut source = prepared.tree;
+    let mut pack = prepared.pack;
+    if in_place {
+        ctx.log(format!(
+            "in place: writing {} copy beside {} (about the image's size of free space); it \
+             replaces the source only once it verifies",
+            if req.lz4 == Some(Lz4Mode::Unpatch) {
+                "an unpatched"
+            } else {
+                "a patched"
+            },
+            out.display()
+        ));
+    } else {
+        findings.extend(preflight::output(&req.source, &out, req.format));
     }
-    findings.extend(preflight::output(&req.source, &out, req.format));
     if req.format == Format::Pkg {
         return crate::package::run(req, ctx, source.as_mut(), &info, findings, &out, &stamp);
     }
-    if req.format != Format::Folder {
+    if !matches!(req.format, Format::Folder | Format::Lz4) {
         findings.extend(preflight::too_deep(source.as_ref()));
     }
     let mut need = preflight::estimate(source.as_ref());
     let mut largest = need;
-    let planned = |format: Format, findings: &mut Vec<String>| {
-        Image::plan(format, source.as_ref(), &info, ctx.cancel)
-            .map_err(|e| findings.push(e))
-            .ok()
+    let trace_space = match req.lz4 {
+        Some(Lz4Mode::Trace) => u64::from(req.lz4_trace_space_mib) << 20,
+        _ => 0,
+    };
+    if trace_space > 0 && matches!(req.format, Format::Exfat | Format::Ffpkg) {
+        ctx.log(format!(
+            "LZ4 trace: {} MiB of free space in the image for the game's trace",
+            req.lz4_trace_space_mib
+        ));
+    }
+    // LZ4 packs straight into an image: the measure pass gives every pack file's exact size
+    // before anything lays the image out. Skipped when preflight has already failed.
+    let image_target = matches!(
+        req.format,
+        Format::Exfat | Format::Ffpkg | Format::Ffpfs | Format::Ffpfsc
+    );
+    let measured = match &pack {
+        Some(p) if image_target && findings.is_empty() => {
+            Some(measure_packs(source.as_mut(), p, req, mtime, ctx)?)
+        }
+        _ => None,
+    };
+    let packed = measured.as_ref().zip(pack.as_ref());
+    let mut planned = |format: Format, findings: &mut Vec<String>| {
+        plan_image(
+            format,
+            source.as_mut(),
+            packed,
+            &info,
+            trace_space,
+            ctx.cancel,
+        )
+        .map_err(|e| findings.push(e))
+        .ok()
     };
     let plan = match req.format {
-        Format::Folder => {
+        Format::Folder | Format::Lz4 => {
             // On FreeBSD the names are checked once the probe has seen the destination.
             #[cfg(not(target_os = "freebsd"))]
             {
@@ -401,7 +549,29 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
                 ));
             }
             largest = source.files().iter().map(|f| f.size).max().unwrap_or(0);
-            Some(Plan::Folder)
+            match pack.take() {
+                // Every byte the packer may write, loose files and the path index included
+                // (all chunks stored raw), with the estimate's margin; no volume passes the cap.
+                Some(pack) => {
+                    let bound = ps5_dump_forge_lz4::writer::worst_case_bytes(
+                        &pack.files,
+                        pack.runtime.is_some(),
+                    );
+                    need = bound
+                        .saturating_add(bound / 50)
+                        .saturating_add(64 * 1024 * 1024);
+                    let index = source
+                        .files()
+                        .iter()
+                        .find(|f| f.path == ps5_dump_forge_lz4::INDEX)
+                        .map_or(0, |f| f.size);
+                    largest = crate::lz4::largest_file(&pack.files, pack.runtime.is_some(), index);
+                    Some(Plan::Lz4(pack))
+                }
+                // `prepare` said why.
+                None if crate::lz4::packing(req) => None,
+                None => Some(Plan::Folder),
+            }
         }
         Format::Exfat | Format::Ffpkg | Format::Ffpfs => {
             if req.format == Format::Exfat
@@ -471,7 +641,7 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     }
     // U2: folder names as the destination folds them; with no probe, as if it folds.
     #[cfg(target_os = "freebsd")]
-    if let Some(Plan::Folder) = &plan {
+    if let Some(Plan::Folder | Plan::Lz4(_)) = &plan {
         let paths: Vec<String> = source.files().iter().map(|f| f.path.clone()).collect();
         let (folds, ascii_only) = checked
             .dest
@@ -503,12 +673,30 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
         }
     };
     let summary = verify::summary(source.files(), mode);
+    // Packed into an image, the image holds the pack files: they are written and compared as
+    // written, then the logical files are compared through the packs.
+    let physical_files = match (&measured, &pack) {
+        (Some(m), Some(p)) => Some(
+            ps5_dump_forge_lz4::tree::PackedTree::new(source.as_mut(), m, &p.files, 1, ctx.cancel)?
+                .files()
+                .to_vec(),
+        ),
+        _ => None,
+    };
+    let physical_check = physical_files
+        .as_deref()
+        .map_or(0, |f| verify::summary(f, mode).checked_bytes);
     // Write reads every source byte once, verify reads back what `mode` samples.
-    let file_bytes = source
-        .files()
+    let file_bytes = physical_files
+        .as_deref()
+        .unwrap_or(source.files())
         .iter()
         .fold(0u64, |sum, f| sum.saturating_add(f.size));
-    ctx.expect_rest(file_bytes.saturating_add(summary.checked_bytes));
+    ctx.expect_rest(
+        file_bytes
+            .saturating_add(summary.checked_bytes)
+            .saturating_add(physical_check),
+    );
 
     let part_path = part_path(&out, ctx.job);
     // Reads run one range ahead on their own thread; hashing stays here, and `HashingTree`
@@ -517,6 +705,8 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     let mut hashing = HashingTree::new(&mut ahead);
     #[cfg(target_os = "freebsd")]
     let mut cadence = crate::durable::Cadence::new();
+    // Packed into an image: what the image must hold, as written.
+    let mut physical: Option<verify::Expected> = None;
     // The image `.part` stays open from creation to verification, so what is verified is
     // the file this job wrote, whatever happens to its name meanwhile.
     let (part, image, bytes, wrapped) = match &plan {
@@ -528,71 +718,75 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
             let bytes = crate::extract::write(&mut hashing, &part, ctx)?;
             (part, None, bytes, None)
         }
-        Plan::Image(image) => {
-            // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
+        Plan::Lz4(pack) => {
             #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
-            let (mut part, mut file) = Part::create_file(&part_path)?;
+            let mut part = Part::create_dir(&part_path)?;
             #[cfg(target_os = "freebsd")]
             part.set_dest(&dest);
-            #[cfg(not(target_os = "freebsd"))]
-            let (size, line) = image.write(&mut hashing, &mut file, ctx)?;
-            #[cfg(target_os = "freebsd")]
-            let (size, line) = synced(&mut file, &mut cadence, ctx, |out| {
-                image.write(&mut hashing, out, ctx)
-            })?;
-            ctx.log(format!("wrote {line}"));
-            (part, Some(file), size, None)
-        }
-        Plan::Ffpfsc(image, name) => {
-            // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
-            #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
-            let (mut part, mut file) = Part::create_file(&part_path)?;
-            #[cfg(target_os = "freebsd")]
-            part.set_dest(&dest);
-            let opts = WrapOptions {
-                threads: req.compression_threads.unwrap_or(0),
-                level: req.ffpfsc_level,
-                ..WrapOptions::default()
-            };
-            let threads = match opts.threads {
-                0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
-                n => n,
-            };
-            ctx.log(format!(
-                ".ffpfsc: zlib level {} of 0–9 (miniz_oxide), 64 KiB blocks, a block kept compressed \
-                 when it saves at least {}%, {threads} compression threads",
-                opts.level, opts.min_block_gain
-            ));
-            let started = std::time::Instant::now();
-            #[cfg(not(target_os = "freebsd"))]
-            let (line, report) = ps5_dump_forge_pfs::wrap(
-                name,
-                image.size(),
-                &mut file,
-                &opts,
-                ctx.cancel,
-                |stream| Ok(image.write(&mut hashing, stream, ctx)?.1),
+            // The loose files through a view of the one hashing tree, then the packed ones:
+            // each file is read once, front to back, and keeps its digest.
+            let packed: std::collections::HashSet<&str> = pack
+                .files
+                .iter()
+                .filter(|f| f.spec.is_some())
+                .map(|f| f.path.as_str())
+                .collect();
+            let mut loose = crate::lz4::Only::new(&mut hashing, |p| !packed.contains(p));
+            let loose = crate::extract::write(&mut loose, &part, ctx)?;
+            let stored = write_packs(
+                &mut hashing,
+                pack,
+                &part,
+                req,
+                mtime,
+                ctx,
+                #[cfg(target_os = "freebsd")]
+                &mut cadence,
             )?;
-            #[cfg(target_os = "freebsd")]
-            let (line, report) = synced(&mut file, &mut cadence, ctx, |out| {
-                ps5_dump_forge_pfs::wrap(name, image.size(), out, &opts, ctx.cancel, |stream| {
-                    Ok(image.write(&mut hashing, stream, ctx)?.1)
-                })
-            })?;
-            let secs = started.elapsed().as_secs_f64().max(1e-3);
-            ctx.log(format!(
-                "wrote .ffpfsc: {} bytes holding {name} ({line}); {} of {} blocks compressed, \
-                 {} raw; stored {:.1}% of {} bytes; {:.0} MB/s of image at zlib level {}",
-                report.image_size,
-                report.compressed_blocks,
-                report.blocks,
-                report.blocks - report.compressed_blocks,
-                report.stored_size as f64 * 100.0 / report.raw_size.max(1) as f64,
-                report.raw_size,
-                report.raw_size as f64 / 1e6 / secs,
-                opts.level
-            ));
-            (part, Some(file), report.image_size, Some(report))
+            (part, None, loose.saturating_add(stored), None)
+        }
+        Plan::Image(_) | Plan::Ffpfsc(..) => {
+            let (part, file, size, wrapped) = match (&measured, &pack) {
+                // The image writer reads the packs as a tree made from the source; the files it
+                // sees are hashed as written, the source's as the packs read them.
+                (Some(m), Some(p)) => {
+                    let threads = compression_threads(req);
+                    let mut packs = ps5_dump_forge_lz4::tree::PackedTree::new(
+                        &mut hashing,
+                        m,
+                        &p.files,
+                        threads,
+                        ctx.cancel,
+                    )?;
+                    let mut written = HashingTree::new(&mut packs);
+                    let (part, file, size, wrapped) = write_image(
+                        &plan,
+                        &mut written,
+                        &part_path,
+                        req,
+                        ctx,
+                        #[cfg(target_os = "freebsd")]
+                        &dest,
+                        #[cfg(target_os = "freebsd")]
+                        &mut cadence,
+                    )?;
+                    ctx.progress("verify", 0, 1);
+                    physical = Some(written.expected(ctx, mode)?);
+                    (part, file, size, wrapped)
+                }
+                _ => write_image(
+                    &plan,
+                    &mut hashing,
+                    &part_path,
+                    req,
+                    ctx,
+                    #[cfg(target_os = "freebsd")]
+                    &dest,
+                    #[cfg(target_os = "freebsd")]
+                    &mut cadence,
+                )?,
+            };
+            (part, Some(file), size, wrapped)
         }
     };
     // On FreeBSD `synced` has synced it.
@@ -604,9 +798,23 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
 
     ctx.progress("verify", 0, 1);
     let expected = hashing.expected(ctx, mode)?;
+    // The source is read no more: its handles close before the output may replace it
+    // (Windows refuses to rename over an open file).
+    drop(ahead);
+    // Nor are the packs regenerated: their metadata goes before the reader builds its own.
+    drop(measured);
     ctx.check()?;
+    let runtime = pack.as_ref().and_then(|p| p.runtime);
     let label = part.path().display().to_string();
     let mut checks = match (&plan, image) {
+        (Plan::Lz4(pack), _) => {
+            let tree = ScannedFolder::scan(part.path(), ctx.cancel)?;
+            // As for a folder, below.
+            if tree.root() != part.path() {
+                bail!("{} was replaced while verifying", part.path().display());
+            }
+            pack_checks(&expected, Box::new(tree), pack.runtime, ctx, mode)?
+        }
         (Plan::Folder, _) => {
             let mut tree = ScannedFolder::scan(part.path(), ctx.cancel)?;
             // `scan` resolves its root; a `.part` swapped for a link resolves elsewhere.
@@ -625,26 +833,47 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
                 .map_err(reopen)?;
             checks.push(exfat_geometry(&volume)?);
             ctx.check()?;
-            let mut tree =
+            let tree =
                 ExFatSource::from_volume(volume, format!("exfat {label}")).map_err(reopen)?;
-            checks.extend(verify::compare(&expected, &mut tree, ctx, mode)?);
+            checks.extend(content(
+                &expected,
+                physical.as_ref(),
+                runtime,
+                Box::new(tree),
+                ctx,
+                mode,
+            )?);
             checks
         }
         (Plan::Image(Image::Ffpkg(layout)), Some(file)) => {
             let mut checks = image_checks(&file, bytes)?;
             checks.extend(ufs2_geometry(&mut &file, layout)?);
-            let mut tree = Ufs2Source::from_reader(Box::new(file), format!("ffpkg {label}"))
+            let tree = Ufs2Source::from_reader(Box::new(file), format!("ffpkg {label}"))
                 .map_err(reopen)?;
             checks.push(format!("reader: {}", tree.describe()));
-            checks.extend(verify::compare(&expected, &mut tree, ctx, mode)?);
+            checks.extend(content(
+                &expected,
+                physical.as_ref(),
+                runtime,
+                Box::new(tree),
+                ctx,
+                mode,
+            )?);
             checks
         }
         (Plan::Image(Image::Ffpfs(_)), Some(file)) => {
             let mut checks = image_checks(&file, bytes)?;
-            let mut tree =
+            let tree =
                 PfsSource::from_reader(Box::new(file), format!("ffpfs {label}")).map_err(reopen)?;
             checks.push(pfs_geometry(tree.header())?);
-            checks.extend(verify::compare(&expected, &mut tree, ctx, mode)?);
+            checks.extend(content(
+                &expected,
+                physical.as_ref(),
+                runtime,
+                Box::new(tree),
+                ctx,
+                mode,
+            )?);
             checks
         }
         (Plan::Ffpfsc(inner, name), Some(file)) => {
@@ -653,7 +882,7 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
                 .expect("a .ffpfsc job keeps its wrap report");
             let mut checks = image_checks(&file, bytes)?;
             let copy = file.try_clone().context("reading the output back")?;
-            let (mut tree, info) =
+            let (tree, info) =
                 ps5_dump_forge_pfs::open_ffpfsc(Box::new(copy), &label).map_err(reopen)?;
             checks.push(pfs_geometry(&info.outer)?);
             checks.push(container_check(&info, name, inner.size(), report)?);
@@ -663,7 +892,14 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
             let geometry = image_geometry(inner, Box::new(nested), &format!("{label} ({name})"))?;
             checks.extend(geometry.into_iter().map(|c| format!("inner image {c}")));
             ctx.check()?;
-            checks.extend(verify::compare(&expected, tree.as_mut(), ctx, mode)?);
+            checks.extend(content(
+                &expected,
+                physical.as_ref(),
+                runtime,
+                tree,
+                ctx,
+                mode,
+            )?);
             checks
         }
         _ => unreachable!("image plans keep their file"),
@@ -677,9 +913,19 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     // Checked after the progress event, so a cancel sent in reaction to it still lands.
     ctx.check()?;
     stamp.check()?;
-    part.publish(&out)?;
+    if in_place {
+        if let Some(backup) = part.replace(&out)? {
+            ctx.log(format!(
+                "in place: the original image is still at {}; delete it once the new one works",
+                backup.display()
+            ));
+        }
+        checks.push(format!("replaced {} with the verified copy", out.display()));
+    } else {
+        part.publish(&out)?;
+        checks.push(format!("published {}", out.display()));
+    }
     ctx.progress("finalize", 1, 1);
-    checks.push(format!("published {}", out.display()));
     Ok(JobReport {
         output: out,
         bytes,
@@ -687,6 +933,274 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
         checks,
         verify: summary,
     })
+}
+
+/// Compression threads: the request's cap, else every core.
+fn compression_threads(req: &ConvertRequest) -> usize {
+    match req.compression_threads.unwrap_or(0) {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+}
+
+/// The measure pass of LZ4 packs into an image: `pack`'s compression over the packed files,
+/// keeping only the metadata (no compressed data), so the image can be laid out from exact
+/// sizes. The write pass reads the packed files a second time.
+fn measure_packs(
+    tree: &mut dyn SourceTree,
+    pack: &crate::lz4::PackPlan,
+    req: &ConvertRequest,
+    mtime: i64,
+    ctx: &Ctx,
+) -> anyhow::Result<ps5_dump_forge_lz4::writer::Measured> {
+    let total = pack
+        .files
+        .iter()
+        .filter(|f| f.spec.is_some())
+        .fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let threads = compression_threads(req);
+    ctx.log(
+        "LZ4 into an image: packing straight into it, no temporary folder; the packed files are \
+         read twice (measure, then write)",
+    );
+    ctx.expect_rest(total);
+    ctx.progress("measure", 0, total);
+    let started = std::time::Instant::now();
+    let m = ps5_dump_forge_lz4::writer::measure(
+        tree,
+        &pack.files,
+        mtime,
+        pack.runtime.as_ref(),
+        threads,
+        &mut |n| ctx.progress("measure", n, total),
+        ctx.cancel,
+    )?;
+    ctx.progress("measure", total, total);
+    let r = m.report;
+    let secs = started.elapsed().as_secs_f64().max(1e-3);
+    let chunks = (m.crc.len() - ps5_dump_forge_lz4::format::CRC_HEADER) / 4;
+    ctx.log(format!(
+        "measured LZ4 packs: {} files packed into {} volumes, {} loose; stored {}% of {} bytes; \
+         {:.0} MB/s on {threads} threads; {chunks} chunks, {} bytes of metadata in memory; \
+         rules: {}",
+        r.packed,
+        r.volumes,
+        r.loose,
+        percent(r.stored_bytes, r.raw_bytes),
+        r.raw_bytes,
+        r.raw_bytes as f64 / 1e6 / secs,
+        m.metadata_bytes(),
+        pack.rules
+    ));
+    Ok(m)
+}
+
+/// [`Image::plan`] for the source, or, packing, for the packed tree made from it.
+fn plan_image(
+    format: Format,
+    source: &mut dyn SourceTree,
+    packed: Option<(&ps5_dump_forge_lz4::writer::Measured, &crate::lz4::PackPlan)>,
+    info: &GameInfo,
+    free_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<Image, String> {
+    let Some((m, pack)) = packed else {
+        return Image::plan(format, source, info, free_bytes, cancel);
+    };
+    let tree = ps5_dump_forge_lz4::tree::PackedTree::new(source, m, &pack.files, 1, cancel)
+        .map_err(|e| format!("LZ4 packs: {e}"))?;
+    Image::plan(format, &tree, info, free_bytes, cancel)
+}
+
+/// Writes `plan`'s image (alone or in a `.ffpfsc`) from `tree` into a new `.part`; returns the
+/// `.part`, its open file, the image's size and, for a `.ffpfsc`, the container report.
+#[allow(clippy::too_many_arguments)]
+fn write_image(
+    plan: &Plan,
+    tree: &mut dyn SourceTree,
+    part_path: &Path,
+    req: &ConvertRequest,
+    ctx: &Ctx,
+    #[cfg(target_os = "freebsd")] dest: &crate::dest::Dest,
+    #[cfg(target_os = "freebsd")] cadence: &mut crate::durable::Cadence,
+) -> anyhow::Result<(Part, File, u64, Option<WrapReport>)> {
+    // No shadowing: `file` must drop before `part`, which deletes the `.part` (U6).
+    #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+    let (mut part, mut file) = Part::create_file(part_path)?;
+    #[cfg(target_os = "freebsd")]
+    part.set_dest(dest);
+    match plan {
+        Plan::Image(image) => {
+            #[cfg(not(target_os = "freebsd"))]
+            let (size, line) = image.write(tree, &mut file, ctx)?;
+            #[cfg(target_os = "freebsd")]
+            let (size, line) = synced(&mut file, cadence, ctx, |out| image.write(tree, out, ctx))?;
+            ctx.log(format!("wrote {line}"));
+            Ok((part, file, size, None))
+        }
+        Plan::Ffpfsc(image, name) => {
+            let opts = WrapOptions {
+                threads: req.compression_threads.unwrap_or(0),
+                level: req.ffpfsc_level,
+                ..WrapOptions::default()
+            };
+            ctx.log(format!(
+                ".ffpfsc: zlib level {} of 0–9 (miniz_oxide), 64 KiB blocks, a block kept compressed \
+                 when it saves at least {}%, {} compression threads",
+                opts.level,
+                opts.min_block_gain,
+                compression_threads(req)
+            ));
+            let started = std::time::Instant::now();
+            #[cfg(not(target_os = "freebsd"))]
+            let (line, report) = ps5_dump_forge_pfs::wrap(
+                name,
+                image.size(),
+                &mut file,
+                &opts,
+                ctx.cancel,
+                |stream| Ok(image.write(tree, stream, ctx)?.1),
+            )?;
+            #[cfg(target_os = "freebsd")]
+            let (line, report) = synced(&mut file, cadence, ctx, |out| {
+                ps5_dump_forge_pfs::wrap(name, image.size(), out, &opts, ctx.cancel, |stream| {
+                    Ok(image.write(tree, stream, ctx)?.1)
+                })
+            })?;
+            let secs = started.elapsed().as_secs_f64().max(1e-3);
+            ctx.log(format!(
+                "wrote .ffpfsc: {} bytes holding {name} ({line}); {} of {} blocks compressed, \
+                 {} raw; stored {:.1}% of {} bytes; {:.0} MB/s of image at zlib level {}",
+                report.image_size,
+                report.compressed_blocks,
+                report.blocks,
+                report.blocks - report.compressed_blocks,
+                report.stored_size as f64 * 100.0 / report.raw_size.max(1) as f64,
+                report.raw_size,
+                report.raw_size as f64 / 1e6 / secs,
+                opts.level
+            ));
+            Ok((part, file, report.image_size, Some(report)))
+        }
+        _ => unreachable!("only image plans are written as one file"),
+    }
+}
+
+/// Every runtime check on the packs `tree` holds (the manifest, its sidecars and every volume
+/// header), then the logical files read back through the packs against `expected`.
+fn pack_checks(
+    expected: &verify::Expected,
+    tree: Box<dyn SourceTree>,
+    runtime: Option<ps5_dump_forge_lz4::RuntimeProfile>,
+    ctx: &Ctx,
+    mode: Mode,
+) -> anyhow::Result<Vec<String>> {
+    let mut tree = ps5_dump_forge_lz4::reader::unpack(tree).map_err(reopen)?;
+    // The reader takes packs without the optional sidecars; this job wrote them.
+    if !tree.has_crc() {
+        bail!(
+            "verification failed: {} is missing",
+            ps5_dump_forge_lz4::CRC_SIDECAR
+        );
+    }
+    if tree.profile() != runtime {
+        bail!(
+            "verification failed: {} is {}, the job's profile asked for {:?}",
+            ps5_dump_forge_lz4::PROFILE,
+            tree.profile()
+                .map_or("missing".into(), |p| format!("{p:?}")),
+            runtime
+        );
+    }
+    let mut checks = vec![format!(
+        "packs: the manifest, its CRC sidecar{} and {} volume headers pass the runtime's checks",
+        if runtime.is_some() {
+            ", its runtime profile"
+        } else {
+            ""
+        },
+        tree.manifest().packs.len()
+    )];
+    checks.extend(verify::compare(expected, &mut tree, ctx, mode)?);
+    Ok(checks)
+}
+
+/// An image's content: compared with `expected`, or, packed (`physical` given), compared as
+/// written with `physical` and then through its packs with `expected`.
+fn content(
+    expected: &verify::Expected,
+    physical: Option<&verify::Expected>,
+    runtime: Option<ps5_dump_forge_lz4::RuntimeProfile>,
+    mut tree: Box<dyn SourceTree>,
+    ctx: &Ctx,
+    mode: Mode,
+) -> anyhow::Result<Vec<String>> {
+    let Some(physical) = physical else {
+        return verify::compare(expected, tree.as_mut(), ctx, mode);
+    };
+    let mut checks: Vec<String> = verify::compare(physical, tree.as_mut(), ctx, mode)?
+        .into_iter()
+        .map(|c| format!("as written, {c}"))
+        .collect();
+    checks.extend(pack_checks(expected, tree, runtime, ctx, mode)?);
+    Ok(checks)
+}
+
+/// Packs `pack`'s packed files from `tree` (the hashing tree) into the `.part` folder: the
+/// volumes, then the manifest and its sidecars. Returns the bytes the chunks take.
+fn write_packs(
+    tree: &mut dyn SourceTree,
+    pack: &crate::lz4::PackPlan,
+    part: &Part,
+    req: &ConvertRequest,
+    mtime: i64,
+    ctx: &Ctx,
+    #[cfg(target_os = "freebsd")] cadence: &mut crate::durable::Cadence,
+) -> anyhow::Result<u64> {
+    let total = pack
+        .files
+        .iter()
+        .filter(|f| f.spec.is_some())
+        .fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let threads = compression_threads(req);
+    ctx.progress("pack", 0, total);
+    let mut dest = crate::extract::Dest::open(part)?;
+    let started = std::time::Instant::now();
+    let report = {
+        let mut out = crate::lz4::PartOutput::new(
+            &mut dest,
+            ctx.cancel,
+            #[cfg(target_os = "freebsd")]
+            &mut *cadence,
+        );
+        ps5_dump_forge_lz4::writer::pack(
+            tree,
+            &pack.files,
+            mtime,
+            pack.runtime.as_ref(),
+            threads,
+            &mut out,
+            &mut |n| ctx.progress("pack", n, total),
+            ctx.cancel,
+        )?
+    };
+    #[cfg(target_os = "freebsd")]
+    log_cadence(cadence, ctx);
+    dest.sync(ctx)?;
+    ctx.progress("pack", total, total);
+    let secs = started.elapsed().as_secs_f64().max(1e-3);
+    ctx.log(format!(
+        "wrote LZ4 packs: {} files packed into {} volumes, {} loose; stored {}% of {} bytes; \
+         {:.0} MB/s on {threads} threads; rules: {}",
+        report.packed,
+        report.volumes,
+        report.loose,
+        percent(report.stored_bytes, report.raw_bytes),
+        report.raw_bytes,
+        report.raw_bytes as f64 / 1e6 / secs,
+        pack.rules
+    ));
+    Ok(report.stored_bytes)
 }
 
 /// The SMP exFAT layout, read from the volume's boot sector.

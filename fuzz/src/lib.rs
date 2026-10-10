@@ -7,3 +7,4 @@ pub mod sparse;
 /// input spend seconds copying.
 pub const MAX_FILES: usize = 16;
 pub const READ_CAP: usize = 256 * 1024;
+pub mod lz4_tree;

@@ -110,6 +110,11 @@ struct StartArg {
 }
 
 #[derive(Deserialize)]
+struct SourceArg {
+    source: PathBuf,
+}
+
+#[derive(Deserialize)]
 struct IdArg {
     id: JobId,
 }
@@ -171,11 +176,7 @@ impl Server {
                 Err(_) => Response::error(500, "internal error"),
             };
         let after = response.after.take();
-        http::send(
-            &mut stream,
-            &response,
-            Instant::now() + self.opts.write_timeout,
-        );
+        http::send(&mut stream, &mut response, self.opts.write_timeout);
         if let Some(after) = after {
             after();
         }
@@ -231,6 +232,16 @@ impl Server {
                 Ok(Response::json(&()))
             }
             (true, "stale_parts") => self.stale_parts(body),
+            (true, "lz4_plan_profile") => {
+                // A Pack `start_job` body; reads only (sampling a few MiB per large file).
+                let request = parse::<StartArg>(body)?.request;
+                readable(&request.source)?;
+                let saved = self.capped(|| ps5_dump_forge_core::lz4_plan_profile(&request))?;
+                Ok(Response::json(&saved))
+            }
+            (true, "lz4_patch") => self.lz4_patch(body, false),
+            (true, "lz4_unpatch") => self.lz4_patch(body, true),
+            (false, "lz4_traces") => self.lz4_traces(&head.query),
             (true, "list_dir") => self.list_dir(body),
             #[cfg(target_env = "ps5")]
             (true, "debug_bench") if crate::debug::ENABLED => {
@@ -348,6 +359,54 @@ impl Server {
         std::thread::sleep(self.admit_pause);
         lock(&self.table).admit(id, request);
         Ok(Response::json(&id))
+    }
+
+    /// Patches a game folder in place for LZ4 traces (`unpatch`: undoes it, core's
+    /// `lz4_unpatch`). Refused while a job is queued or running (it could be reading the
+    /// folder); admission is held throughout, so no job starts and no quit lands mid-patch.
+    fn lz4_patch(&self, body: &[u8], unpatch: bool) -> Reply {
+        let arg: SourceArg = parse(body)?;
+        let _admission = lock(&self.admission);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Response::error(409, "PS5 Dump Forge is stopping"));
+        }
+        if self.running.load(Ordering::SeqCst) > 0 {
+            return Err(Response::error(
+                409,
+                format!(
+                    "a conversion is queued or running; {} once it has finished",
+                    if unpatch { "unpatch" } else { "patch" }
+                ),
+            ));
+        }
+        let done = if unpatch {
+            ps5_dump_forge_core::lz4_unpatch(&arg.source)
+        } else {
+            ps5_dump_forge_core::lz4_patch(&arg.source)
+        }
+        .map_err(core)?;
+        Ok(Response::json(&done))
+    }
+
+    /// `GET ?source=<path>` (percent-encoded): both LZ4 trace files at the root of a folder or
+    /// image as one STORED zip, streamed (core's `Lz4Traces::write_zip`). Opening reads the
+    /// source's metadata, so it counts as an inspection; the transfer doesn't. Jobs may run
+    /// meanwhile: this only reads. A source that changes part way ends the body short.
+    fn lz4_traces(&self, query: &str) -> Reply {
+        let Some(source) = http::query_value(query, "source").filter(|v| !v.is_empty()) else {
+            return Err(Response::error(
+                400,
+                "bad request: needs source=, percent-encoded",
+            ));
+        };
+        let source = PathBuf::from(source);
+        readable(&source)?;
+        let mut traces = self
+            .capped(|| ps5_dump_forge_core::lz4_traces(&source))?
+            .map_err(|missing| Response::error(404, missing))?;
+        let (name, len) = (traces.zip_name().to_string(), traces.zip_len());
+        let body = Box::new(move |out: &mut dyn std::io::Write| traces.write_zip(out));
+        Ok(Response::download("application/zip", &name, len, body))
     }
 
     /// Leftover `.part` files in `dirs` (missing ones skip), each folder listed once,
@@ -545,6 +604,29 @@ mod tests {
         assert_eq!(post(&server, "start_job", request).status, 429);
     }
 
+    /// No patch or unpatch while a job is queued or running, or once stopping.
+    #[test]
+    fn lz4_patch_waits_for_jobs() {
+        for (route, verb) in [("lz4_patch", "patch"), ("lz4_unpatch", "unpatch")] {
+            let server = Arc::new(server());
+            let body = json!({ "source": "/nonexistent/game" });
+            server.running.store(1, Ordering::SeqCst);
+            let r = post(&server, route, body.clone());
+            assert_eq!(r.status, 409);
+            assert!(
+                r.text()
+                    .contains(&format!("a conversion is queued or running; {verb} once")),
+                "{}",
+                r.text()
+            );
+            server.running.store(0, Ordering::SeqCst);
+            // Through to core, which finds no folder.
+            assert_eq!(post(&server, route, body.clone()).status, 500);
+            assert!(server.stop());
+            assert_eq!(post(&server, route, body).status, 409);
+        }
+    }
+
     /// Admission is held until a job is in the table, and both `stop` and `stale_parts`
     /// wait for it, though core's events can come first. A job queued behind one blocked on
     /// a FIFO stays unfinished; its `.part` (made here, as a worker would) is not stale.
@@ -570,6 +652,11 @@ mod tests {
             full_verify: false,
             kraken_level: ps5_dump_forge_core::KrakenLevel::Fast,
             ffpfsc_level: 6,
+            lz4: None,
+            lz4_profile: None,
+            lz4_traces: None,
+            lz4_trace_space_mib: 256,
+            lz4_in_place: false,
         });
         let starter = {
             let (server, out) = (server.clone(), tmp.join("out.exfat"));

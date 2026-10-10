@@ -19,4 +19,19 @@ export const transport: Transport = {
   listen,
   pick,
   useOffline: () => useSyncExternalStore(watchStatus, getStatus).offline,
+  lz4Patch: (source) => call("lz4_patch", { source }),
+  lz4Unpatch: (source) => call("lz4_unpatch", { source }),
+  // The server resolves the plan; the browser saves the TOML as a download.
+  savePlanProfile: async <T,>(request: unknown): Promise<T | null> => {
+    const saved = await call<{ file_name: string; toml: string }>("lz4_plan_profile", { request });
+    const url = URL.createObjectURL(new Blob([saved.toml], { type: "application/toml" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = saved.file_name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    return saved as T;
+  },
 };

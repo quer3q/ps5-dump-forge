@@ -1,5 +1,6 @@
 //! A strict HTTP/1.1 subset: one request per connection, origin-form targets, `GET` and
 //! `POST`, bodies by `Content-Length` only. Anything else is refused rather than guessed at.
+//! A reply is a body in memory, or a download its own writer streams after the head.
 
 use std::borrow::Cow;
 use std::io::{ErrorKind, Read, Write};
@@ -14,6 +15,8 @@ pub(crate) struct Head {
     pub method: String,
     /// The target without its query.
     pub path: String,
+    /// The query, still percent-encoded (`""` without one).
+    pub query: String,
     headers: Vec<(String, String)>,
     pub length: usize,
     rest: Vec<u8>,
@@ -37,6 +40,18 @@ pub(crate) struct Response {
     cache: Option<&'static str>,
     /// Runs once the response is sent (quit).
     pub after: Option<Box<dyn FnOnce() + Send>>,
+    /// A download's file name and bytes, streamed after the head instead of `body`.
+    /// Boxed: most replies carry none, and every `Err(Response)` stays small.
+    download: Option<Box<Download>>,
+}
+
+/// Writes a download's body: exactly its `len` bytes into the writer it is given.
+pub(crate) type Body = Box<dyn FnOnce(&mut dyn Write) -> std::io::Result<()> + Send>;
+
+struct Download {
+    name: String,
+    len: u64,
+    body: Option<Body>,
 }
 
 impl Response {
@@ -67,6 +82,18 @@ impl Response {
         r
     }
 
+    /// `len` bytes, written by `body` after the head, as an attachment named `name` (any
+    /// text: [`disposition`] makes the header safe).
+    pub fn download(kind: &'static str, name: &str, len: u64, body: Body) -> Self {
+        let mut r = Self::new(200, kind, Cow::Borrowed(b""));
+        r.download = Some(Box::new(Download {
+            name: name.to_string(),
+            len,
+            body: Some(body),
+        }));
+        r
+    }
+
     pub fn limited(text: &str, retry_after: u64) -> Self {
         let mut r = Self::error(429, text);
         r.retry_after = Some(retry_after);
@@ -86,6 +113,7 @@ impl Response {
             retry_after: None,
             cache: None,
             after: None,
+            download: None,
         }
     }
 
@@ -100,15 +128,20 @@ impl Response {
             503 => "Service Unavailable",
             _ => "Internal Server Error",
         };
+        let len = match &self.download {
+            Some(d) => d.len,
+            None => self.body.len() as u64,
+        };
         let mut head = format!(
-            "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+            "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {len}\r\n\
              Connection: close\r\n",
-            self.status,
-            self.kind,
-            self.body.len()
+            self.status, self.kind,
         );
+        if let Some(d) = &self.download {
+            head += &format!("Content-Disposition: {}\r\n", disposition(&d.name));
+        }
         // API replies: the page must never see a stale one.
-        if self.kind == JSON {
+        if self.kind == JSON || self.download.is_some() {
             head += "Cache-Control: no-store\r\n";
         } else if let Some(cache) = self.cache {
             head += &format!("Cache-Control: {cache}\r\n");
@@ -214,7 +247,7 @@ pub(crate) fn parse_head(bytes: &[u8]) -> Result<Head, Response> {
     if !target.starts_with('/') || !target.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(bad("malformed request target"));
     }
-    let path = target.split('?').next().unwrap_or_default();
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
     let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
     let mut headers = Vec::new();
@@ -249,6 +282,7 @@ pub(crate) fn parse_head(bytes: &[u8]) -> Result<Head, Response> {
     let mut head = Head {
         method: method.to_string(),
         path: path.to_string(),
+        query: query.to_string(),
         headers,
         length: 0,
         rest: Vec::new(),
@@ -281,11 +315,19 @@ pub(crate) fn read_body(
     Ok(body)
 }
 
-/// Writes the response by `deadline`, however slowly the client reads, and closes. Unread
-/// request bytes are drained for a moment first, so the close doesn't reset the connection
-/// before the client has read the response.
-pub(crate) fn send(stream: &mut TcpStream, response: &Response, deadline: Instant) {
-    let _ = write_by(stream, &response.bytes(), deadline);
+/// Writes the response within `timeout`, however slowly the client reads, and closes; a
+/// download gets `timeout` for each write of its body instead (a GiB journal takes minutes, a
+/// client that stops reading still loses its thread). A download whose body fails part way is
+/// cut short: the client sees fewer bytes than `Content-Length` says, and marks it failed. Unread request bytes are
+/// drained for a moment first, so the close doesn't reset the connection before the client
+/// has read the response.
+pub(crate) fn send(stream: &mut TcpStream, response: &mut Response, timeout: Duration) {
+    if write_by(stream, &response.bytes(), Instant::now() + timeout).is_ok()
+        && let Some(d) = response.download.as_mut()
+        && let Err(e) = stream_body(stream, d, timeout)
+    {
+        eprintln!("ps5-dump-forge serve: sending {}: {e}", d.name);
+    }
     let _ = stream.shutdown(Shutdown::Write);
     let until = Instant::now() + Duration::from_secs(1);
     let mut sink = [0u8; 8192];
@@ -297,6 +339,95 @@ pub(crate) fn send(stream: &mut TcpStream, response: &Response, deadline: Instan
             Ok(n) => drained += n,
         }
     }
+}
+
+/// A download's body: its writer, held to exactly `len` bytes.
+fn stream_body(stream: &mut TcpStream, d: &mut Download, timeout: Duration) -> std::io::Result<()> {
+    let body = d.body.take().ok_or(ErrorKind::Other)?;
+    let mut sink = Sink {
+        stream,
+        timeout,
+        left: d.len,
+    };
+    body(&mut sink)?;
+    match sink.left {
+        0 => Ok(()),
+        left => Err(std::io::Error::other(format!("{left} bytes short"))),
+    }
+}
+
+/// The socket under a download: each write by its own deadline, never past `Content-Length`.
+struct Sink<'a> {
+    stream: &'a mut TcpStream,
+    timeout: Duration,
+    left: u64,
+}
+
+impl Write for Sink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() as u64 > self.left {
+            return Err(std::io::Error::other("more bytes than Content-Length"));
+        }
+        write_by(self.stream, buf, Instant::now() + self.timeout)?;
+        self.left -= buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `attachment; filename="..."` with an ASCII stand-in (`_` for anything else, a quote, a
+/// backslash or a control character), plus `filename*=UTF-8''...` percent-encoded when the
+/// name isn't plain ASCII (RFC 6266): no header injection whatever the name holds.
+fn disposition(name: &str) -> String {
+    let plain = |c: char| c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ';
+    let ascii: String = name
+        .chars()
+        .map(|c| if plain(c) { c } else { '_' })
+        .collect();
+    let mut header = format!("attachment; filename=\"{ascii}\"");
+    if ascii != name {
+        let attr = |b: u8| b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b);
+        let encoded: String = name
+            .bytes()
+            .map(|b| match attr(b) {
+                true => (b as char).to_string(),
+                false => format!("%{b:02X}"),
+            })
+            .collect();
+        header += &format!("; filename*=UTF-8''{encoded}");
+    }
+    header
+}
+
+/// Decodes `%XX` escapes (`+` stays `+`, as `encodeURIComponent` writes a space `%20`);
+/// `None` for a bad escape or text that isn't UTF-8.
+pub(crate) fn percent_decode(text: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        let hex = [bytes.next()?, bytes.next()?];
+        if !hex.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The decoded value of `key` in a query (`a=1&b=2`); the first one wins.
+pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| percent_decode(v))
 }
 
 /// `write_all` with one absolute deadline: the timeout is what is left of it before each
@@ -406,6 +537,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fast, b"done");
+    }
+
+    #[test]
+    fn queries_and_downloads() {
+        assert_eq!(
+            percent_decode("a%2Fb%20c+d%C3%A9").as_deref(),
+            Some("a/b c+dé")
+        );
+        for bad in ["%", "%2", "%zz", "%+1", "%FF"] {
+            assert_eq!(percent_decode(bad), None, "{bad}");
+        }
+        let q = "source=%2Fdata%2Fg&name=ampr_emu.index&name=x&flag";
+        assert_eq!(query_value(q, "source").as_deref(), Some("/data/g"));
+        assert_eq!(query_value(q, "name").as_deref(), Some("ampr_emu.index"));
+        assert_eq!(query_value(q, "flag"), None);
+        let head = parse("GET /api/x?a=1 HTTP/1.1").unwrap();
+        assert_eq!((head.path.as_str(), head.query.as_str()), ("/api/x", "a=1"));
+
+        let r = Response::download(
+            "application/octet-stream",
+            "t.bin",
+            5,
+            Box::new(|w| w.write_all(b"hello")),
+        );
+        let head = String::from_utf8(r.bytes()).unwrap();
+        for line in [
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Length: 5\r\n",
+            "Content-Disposition: attachment; filename=\"t.bin\"\r\n",
+            "Cache-Control: no-store\r\n",
+        ] {
+            assert!(head.contains(line), "{head}");
+        }
+        assert!(
+            head.ends_with("\r\n\r\n"),
+            "the body is streamed after the head"
+        );
+        assert_eq!(
+            disposition("[Stellar Blade]-[PPSA13197]-amprtrace.zip"),
+            "attachment; filename=\"[Stellar Blade]-[PPSA13197]-amprtrace.zip\""
+        );
+        assert_eq!(
+            disposition("[ドラゴン é]-[PPSA1]-amprtrace.zip"),
+            "attachment; filename=\"[____ _]-[PPSA1]-amprtrace.zip\"; \
+             filename*=UTF-8''%5B%E3%83%89%E3%83%A9%E3%82%B4%E3%83%B3%20%C3%A9%5D-%5BPPSA1%5D-amprtrace.zip"
+        );
+        let hostile = disposition("a\"b\\c\r\nSet-Cookie: x=1.zip");
+        assert!(!hostile.contains(['\r', '\n']), "{hostile}");
+        assert!(hostile.starts_with("attachment; filename=\"a_b_c__Set-Cookie: x=1.zip\";"));
+        assert!(
+            hostile.ends_with("a%22b%5Cc%0D%0ASet-Cookie%3A%20x%3D1.zip"),
+            "{hostile}"
+        );
     }
 
     fn parse(text: &str) -> Result<Head, u16> {

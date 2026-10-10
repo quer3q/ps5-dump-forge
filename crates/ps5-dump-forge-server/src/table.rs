@@ -60,12 +60,17 @@ impl Table {
         self.jobs.entry(job).or_default().request = Some(request);
     }
 
-    /// The unfinished jobs' ids and outputs.
+    /// The unfinished jobs' ids and outputs (an in-place job's is its source, whose `.part`
+    /// it writes beside it).
     pub fn unfinished(&self) -> Vec<(JobId, PathBuf)> {
         self.jobs
             .iter()
             .filter(|(_, e)| e.done.is_none())
-            .filter_map(|(id, e)| Some((*id, e.request.as_ref()?.output.clone())))
+            .filter_map(|(id, e)| {
+                let r = e.request.as_ref()?;
+                let out = if r.lz4_in_place { &r.source } else { &r.output };
+                Some((*id, out.clone()))
+            })
             .collect()
     }
 
@@ -125,6 +130,11 @@ mod tests {
             full_verify: false,
             kraken_level: ps5_dump_forge_core::KrakenLevel::Fast,
             ffpfsc_level: 6,
+            lz4: None,
+            lz4_profile: None,
+            lz4_traces: None,
+            lz4_trace_space_mib: 256,
+            lz4_in_place: false,
         }
     }
 
@@ -145,6 +155,20 @@ mod tests {
         assert_eq!(snap["log"].as_array().unwrap().len(), 200);
         assert_eq!(snap["log"][0], "l50");
         assert_eq!(t.unfinished(), [(1, PathBuf::from("/o/a.exfat"))]);
+        // In place, the `.part` goes beside the source.
+        t.admit(
+            2,
+            ConvertRequest {
+                source: "/i/game.ffpkg".into(),
+                lz4_in_place: true,
+                ..request("")
+            },
+        );
+        assert_eq!(t.unfinished()[1], (2, PathBuf::from("/i/game.ffpkg")));
+        t.record(&Event::Done {
+            job: 2,
+            result: Err("cancelled".into()),
+        });
         for job in 1..=40 {
             t.admit(job, request("/o/x"));
             t.record(&Event::Done {

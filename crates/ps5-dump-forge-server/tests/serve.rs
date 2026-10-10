@@ -420,6 +420,11 @@ fn job_end_to_end() {
     assert_eq!(job["done"]["result"]["Ok"]["output"], s(&output), "{job}");
     assert_eq!(job["request"]["source"], s(&game));
     assert!(job["request"]["compression_threads"].as_u64().unwrap() >= 1);
+    // A request without the LZ4 fields (an older page) gets core's defaults.
+    assert_eq!(job["request"]["lz4"], Value::Null);
+    assert_eq!(job["request"]["lz4_profile"], Value::Null);
+    assert_eq!(job["request"]["lz4_trace_space_mib"], 256);
+    assert_eq!(job["request"]["lz4_in_place"], false);
     assert_eq!(job["progress"]["kind"], "progress");
     let total = job["log_total"].as_u64().unwrap();
     assert!(total >= 1);
@@ -428,6 +433,400 @@ fn job_end_to_end() {
     assert_eq!(
         srv.post("/api/cancel_job", json!({ "id": id })),
         (200, Value::Null)
+    );
+}
+
+/// The LZ4 fields reach core as sent (no route of their own): an LZ4 target is named like a
+/// folder, and a trace on a title without `libSceAmpr` fails core's preflight.
+#[test]
+fn lz4_fields_pass_through() {
+    let srv = start("lz4");
+    let game = srv.root.join("game");
+    self::game(&game);
+    let out = json!({ "source": s(&game), "format": "lz4", "dir": s(&srv.root) });
+    let (status, v) = srv.post("/api/default_output", out);
+    assert_eq!((status, v), (200, json!(s(&srv.root.join("PPSA01234")))));
+    let output = srv.root.join("traced");
+    let mut req = request(&game, &output);
+    req["request"]["format"] = json!("folder");
+    req["request"]["lz4"] = json!("trace");
+    req["request"]["lz4_trace_space_mib"] = json!(192);
+    let (status, id) = srv.post("/api/start_job", req);
+    assert_eq!(status, 200, "{id}");
+    let mut job = Value::Null;
+    wait(|| {
+        job = srv.jobs()["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == id)
+            .cloned()
+            .unwrap_or_default();
+        !job["done"].is_null()
+    });
+    assert_eq!(job["request"]["lz4"], "trace");
+    assert_eq!(job["request"]["lz4_trace_space_mib"], 192);
+    let err = job["done"]["result"]["Err"].as_str().unwrap_or_default();
+    assert!(err.contains("does not import libSceAmpr"), "{job}");
+    assert!(!output.exists());
+
+    // In place, on a folder: core refuses (folders are patched by their own route).
+    let mut req = request(&game, &output);
+    req["request"]["lz4"] = json!("unpatch");
+    req["request"]["lz4_in_place"] = json!(true);
+    let (status, id) = srv.post("/api/start_job", req);
+    assert_eq!(status, 200, "{id}");
+    wait(|| {
+        job = srv.jobs()["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == id)
+            .cloned()
+            .unwrap_or_default();
+        !job["done"].is_null()
+    });
+    assert_eq!(job["request"]["lz4"], "unpatch");
+    assert_eq!(job["request"]["lz4_in_place"], true);
+    let err = job["done"]["result"]["Err"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("a game folder is patched in place directly"),
+        "{job}"
+    );
+}
+
+/// `lz4_patch` changes the folder in place and answers with core's `Lz4Patch`; core's
+/// refusals come back as its error text.
+#[test]
+fn lz4_patch_route() {
+    let srv = start("lz4patch");
+    let game = srv.root.join("game");
+    self::game(&game);
+    write(
+        &game,
+        "eboot.bin",
+        b"\x7fELF fake eboot importing libSceAmpr.sprx",
+    );
+    write(&game, "ampr_commands.bin", b"last session");
+    write(&game, "ampr_emu.log", b"last log");
+    let (status, v) = srv.post("/api/lz4_patch", json!({ "source": s(&game) }));
+    assert_eq!(status, 200, "{v}");
+    // eboot.bin, param.json, data/a.bin and the runtime.
+    assert_eq!(v["indexed"], 4);
+    assert_eq!(v["removed"], json!(["ampr_commands.bin", "ampr_emu.log"]));
+    assert!(v["warning"].as_str().unwrap().contains("ampr_emu"), "{v}");
+    let runtime = std::fs::metadata(game.join("fakelib/libSceAmpr.sprx")).unwrap();
+    assert_eq!(runtime.len(), 633_094, "the trace build");
+    assert!(game.join("ampr_emu.index").is_file());
+    assert!(!game.join("ampr_commands.bin").exists() && !game.join("ampr_emu.log").exists());
+
+    // `lz4_unpatch` undoes it, with the same answer.
+    write(&game, "ampr_commands.bin", b"this session");
+    let (status, v) = srv.post("/api/lz4_unpatch", json!({ "source": s(&game) }));
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["indexed"], 4);
+    assert_eq!(v["removed"], json!(["ampr_commands.bin"]));
+    let runtime = std::fs::metadata(game.join("fakelib/libSceAmpr.sprx")).unwrap();
+    assert_eq!(runtime.len(), 423_350, "the release build");
+    assert!(!game.join("ampr_commands.bin").exists());
+
+    let plain = srv.root.join("plain");
+    self::game(&plain);
+    let (status, v) = srv.post("/api/lz4_patch", json!({ "source": s(&plain) }));
+    assert_eq!(status, 500);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not import libSceAmpr"),
+        "{v}"
+    );
+    assert!(!plain.join("fakelib").exists());
+    assert_eq!(srv.post("/api/lz4_patch", json!({})).0, 400);
+    let (status, v) = srv.post("/api/lz4_unpatch", json!({ "source": s(&plain) }));
+    assert_eq!(status, 500);
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not import libSceAmpr")
+    );
+    assert_eq!(srv.post("/api/lz4_unpatch", json!({})).0, 400);
+}
+
+#[test]
+fn lz4_plan_profile_route() {
+    let srv = start("lz4planprofile");
+    let game = srv.root.join("game");
+    self::game(&game);
+    write(
+        &game,
+        "eboot.bin",
+        b"\x7fELF fake eboot importing libSceAmpr.sprx",
+    );
+    let body = |source: &Path, format: &str| {
+        json!({ "request": {
+            "source": s(source), "format": format, "output": "",
+            "compression_threads": null, "inner": null, "remove_backport": false,
+        }})
+    };
+    let (status, v) = srv.post("/api/lz4_plan_profile", body(&game, "lz4"));
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["file_name"], "[PPSA01234]-lz4profile.toml");
+    assert_eq!(
+        (v["packed"].as_u64(), v["loose"].as_u64()),
+        (Some(1), Some(3)),
+        "{v}"
+    );
+    let toml = v["toml"].as_str().unwrap();
+    assert!(toml.contains("\"data/a.bin\","), "{toml}");
+    assert!(
+        v["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().starts_with("LZ4 rules"))
+    );
+    assert!(!game.join("fakelib").exists() && !game.join("ampr_emu.index").exists());
+    let (status, v) = srv.post("/api/lz4_plan_profile", body(&game, "exfat"));
+    assert_eq!(status, 500);
+    assert!(v["error"].as_str().unwrap().contains("LZ4 Pack"), "{v}");
+    assert_eq!(srv.post("/api/lz4_plan_profile", json!({})).0, 400);
+}
+
+/// `encodeURIComponent`: every byte but the unreserved ones as `%XX`.
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn traces_request(source: &Path) -> String {
+    format!(
+        "GET /api/lz4_traces?source={} HTTP/1.1\r\nHost: x\r\n\r\n",
+        encode(s(source))
+    )
+}
+
+/// Status, head and raw body of `GET /api/lz4_traces` for `source`.
+fn traces_zip(addr: SocketAddr, source: &Path) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(traces_request(source).as_bytes()).unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    let end = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8(reply[..end].to_vec()).unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, head, reply.split_off(end + 4))
+}
+
+/// The zip's two entries: STORED, so each one's bytes follow its 30-byte local header and
+/// name, and its 16-byte descriptor follows them. Python's zipfile (when installed) and, on
+/// macOS, `unzip -t` and `ditto` check the whole archive too.
+fn check_zip(zip: &[u8], files: &[(&str, &[u8])], tag: &str) {
+    let mut at = 0;
+    for (name, bytes) in files {
+        assert_eq!(&zip[at..at + 4], b"PK\x03\x04", "{name}'s local header");
+        let data = at + 30 + name.len();
+        assert_eq!(&zip[at + 30..data], name.as_bytes());
+        assert!(&zip[data..data + bytes.len()] == *bytes, "{name}'s bytes");
+        at = data + bytes.len() + 16;
+    }
+    let dir = dir(&format!("zip-{tag}"));
+    let path = dir.join("t.zip");
+    std::fs::write(&path, zip).unwrap();
+    let script = "import zipfile,sys\nz=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None\n\
+                  for i in z.infolist(): print(i.filename, i.file_size, i.compress_type)";
+    match std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(&path)
+        .output()
+    {
+        Ok(out) => {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let want: String = files
+                .iter()
+                .map(|(n, b)| format!("{n} {} 0\n", b.len()))
+                .collect();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+        }
+        Err(e) => eprintln!("python3 not run: {e}"),
+    }
+    if cfg!(target_os = "macos") {
+        let run = |cmd: &mut std::process::Command| cmd.output().unwrap().status.success();
+        assert!(run(std::process::Command::new("unzip")
+            .arg("-tq")
+            .arg(&path)));
+        let x = dir.join("x");
+        assert!(run(std::process::Command::new("ditto")
+            .args(["-x", "-k"])
+            .arg(&path)
+            .arg(&x)));
+        for (name, bytes) in files {
+            assert!(
+                std::fs::read(x.join(name)).unwrap() == *bytes,
+                "ditto {name}"
+            );
+        }
+    }
+}
+
+/// `GET /api/lz4_traces` streams both trace files of a folder or an image as one zip (a
+/// journal over several 1 MiB chunks) named after the game; a source without them is a 404
+/// naming what is missing, a source that can't be read core's error.
+#[test]
+fn lz4_traces_route() {
+    let srv = start("traces");
+    let game = srv.root.join("Traced Game");
+    self::game(&game);
+    write(
+        &game,
+        "sce_sys/param.json",
+        r#"{"titleId":"PPSA01234","titleName":"Stellar: Blade/ドラ"}"#.as_bytes(),
+    );
+    let journal: Vec<u8> = (0..5 * 1024 * 1024 + 12_345u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let index = b"fake ampr_emu.index: the journal's file ids".to_vec();
+    write(&game, "ampr_commands.bin", &journal);
+    write(&game, "ampr_emu.index", &index);
+
+    // The same game as a .ffpkg, the traces at its root as a traced image keeps them.
+    let image = srv.root.join("traced.ffpkg");
+    let mut req = request(&game, &image);
+    req["request"]["format"] = json!("ffpkg");
+    let (status, id) = srv.post("/api/start_job", req);
+    assert_eq!(status, 200, "{id}");
+    let mut job = Value::Null;
+    wait(|| {
+        job = srv.jobs()["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == id)
+            .cloned()
+            .unwrap_or_default();
+        !job["done"].is_null()
+    });
+    assert!(job["done"]["result"]["Ok"].is_object(), "{job}");
+    // What the page enables Download traces by.
+    let (status, ins) = srv.post("/api/inspect", json!({ "path": s(&image) }));
+    assert_eq!(status, 200, "{ins}");
+    assert_eq!(ins["lz4"]["journal_bytes"], journal.len());
+
+    let files: [(&str, &[u8]); 2] = [("ampr_commands.bin", &journal), ("ampr_emu.index", &index)];
+    for (tag, source) in [("folder", &game), ("image", &image)] {
+        let (status, head, body) = traces_zip(srv.addr, source);
+        assert_eq!(status, 200, "{head}");
+        for line in [
+            "Content-Type: application/zip".to_string(),
+            "Content-Disposition: attachment; filename=\"[Stellar Blade__]-[PPSA01234]-amprtrace.zip\"; \
+             filename*=UTF-8''%5BStellar%20Blade%E3%83%89%E3%83%A9%5D-%5BPPSA01234%5D-amprtrace.zip"
+                .to_string(),
+            format!("Content-Length: {}", body.len()),
+            "Cache-Control: no-store".to_string(),
+        ] {
+            assert!(head.contains(&line), "{line} in {head}");
+        }
+        check_zip(&body, &files, tag);
+    }
+
+    let plain = srv.root.join("plain");
+    self::game(&plain);
+    let (status, _, body) = traces_zip(srv.addr, &plain);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 404, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("no ampr_commands.bin"),
+        "{v}"
+    );
+    write(&plain, "ampr_commands.bin", b"journal");
+    let (status, _, body) = traces_zip(srv.addr, &plain);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 404, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("no ampr_emu.index beside"),
+        "{v}"
+    );
+    assert_eq!(traces_zip(srv.addr, &srv.root.join("gone.ffpkg")).0, 500);
+    assert_eq!(srv.get("/api/lz4_traces").0, 400);
+    assert_eq!(
+        srv.get("/api/lz4_trace_file?source=x&name=ampr_emu.index")
+            .0,
+        404
+    );
+
+    // The image written to meanwhile (a game relaunched on a writable mount): the next read
+    // fails rather than hand out the old blocks.
+    let mut t = ps5_dump_forge_core::lz4_traces(&image).unwrap().unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    assert_eq!(t.read(0, &mut buf).unwrap(), 1 << 20);
+    let file = std::fs::File::options().write(true).open(&image).unwrap();
+    let later = file.metadata().unwrap().modified().unwrap() + Duration::from_secs(2);
+    file.set_modified(later).unwrap();
+    let err = t.read(0, &mut buf).unwrap_err();
+    assert!(
+        err.to_string().contains("changed during the download"),
+        "{err}"
+    );
+}
+
+/// A journal rewritten mid-download (the game relaunched) ends the transfer short of its
+/// `Content-Length`, so the browser marks the download failed instead of keeping a mix.
+#[test]
+fn lz4_traces_stop_when_the_source_changes() {
+    let srv = start("traces-changed");
+    let game = srv.root.join("game");
+    self::game(&game);
+    // Far more than the socket buffers hold, so most of it is still unread when it changes.
+    let journal = vec![0x5au8; 40 << 20];
+    write(&game, "ampr_commands.bin", &journal);
+    write(&game, "ampr_emu.index", b"idx");
+    let mut stream = TcpStream::connect(srv.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(traces_request(&game).as_bytes()).unwrap();
+    let mut reply = vec![0u8; 64 * 1024];
+    let n = stream.read(&mut reply).unwrap();
+    reply.truncate(n);
+    assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    let head = String::from_utf8_lossy(&reply).into_owned();
+    let length: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300)); // the server fills the buffers and blocks
+    // The same length, other bytes: only the source check tells (an early end would not).
+    write(&game, "ampr_commands.bin", &vec![0xa5u8; journal.len()]);
+    stream.read_to_end(&mut reply).unwrap();
+    let end = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let body = &reply[end..];
+    assert!(body.len() < length, "{} of {length} bytes", body.len());
+    assert!(
+        body[30 + 17..].iter().all(|&b| b == 0x5a),
+        "only the old session's bytes"
     );
 }
 

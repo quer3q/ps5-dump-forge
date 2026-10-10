@@ -2,25 +2,27 @@
 
 import { useEffect, useRef, type KeyboardEvent, type ReactNode } from "react";
 
-import { pick, prettyBytes, type Format, type Inspection, type Kind } from "./api";
+import { pick, prettyBytes, type Format, type Inspection, type Kind, type Lz4Facts } from "./api";
 import { basename, trimSep } from "./paths";
 import { useCoverGlow } from "./glow";
 import { Icon, type IconName } from "./icons";
 
-const KIND_LABEL: Record<Kind, string> = {
+const KIND_LABEL: Record<Format, string> = {
   folder: "Folder",
   exfat: ".exfat",
   ffpkg: ".ffpkg",
   ffpfs: ".ffpfs",
   ffpfsc: ".ffpfsc",
   pkg: ".fpkg", // the debug FPKG's display name; its file still ends in .pkg
+  lz4: "LZ4 packed folder",
 };
 
-/** The target formats, in picker order; every one is also a source kind. */
-export const FORMATS: Format[] = ["folder", "exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
+/** What a source can be, in picker order; also the target picker's formats. The LZ4 packed
+ * folder is not among them: the LZ4 tab's Pack picks it. */
+export const KINDS: Kind[] = ["folder", "exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
 
 export function kindLabel(kind: string): string {
-  return KIND_LABEL[kind as Kind] ?? kind;
+  return KIND_LABEL[kind as Format] ?? kind;
 }
 
 /** A format as a small tinted tag (hues: `.fmt-*` in styles.css). */
@@ -68,7 +70,8 @@ export function panelId(prefix: string, id: string): string {
 export function TabList<T extends string>(props: {
   label: string;
   prefix: string;
-  tabs: { id: T; label: ReactNode }[];
+  /** `className`: extra classes on that tab's button (the LZ4 tab's straps). */
+  tabs: { id: T; label: ReactNode; className?: string }[];
   value: T;
   onChange: (id: T) => void;
   className?: string;
@@ -105,7 +108,7 @@ export function TabList<T extends string>(props: {
             aria-selected={on}
             aria-controls={panelId(props.prefix, t.id)}
             tabIndex={on ? 0 : -1}
-            className={on ? "seg-opt on" : "seg-opt"}
+            className={`seg-opt${on ? " on" : ""}${t.className ? ` ${t.className}` : ""}`}
             onClick={() => props.onChange(t.id)}
           >
             {t.label}
@@ -127,33 +130,46 @@ export function FormatPicker<F extends Format>(props: {
   value: F;
   onChange: (f: F) => void;
   disabled?: (f: F) => boolean;
-  /** Default: every target format. */
+  /** Why a disabled format is refused: read out with its label, and its tooltip. */
+  reason?: (f: F) => string | undefined;
+  /** Default: every source kind (the LZ4 packed folder is chosen elsewhere). */
   formats?: F[];
   className?: string;
 }) {
-  const formats = props.formats ?? (FORMATS as F[]);
+  const formats = props.formats ?? (KINDS as F[]);
   return (
     <div
       className={`seg formats ${props.className ?? ""}`}
       role="radiogroup"
       aria-label={props.label}
     >
-      {formats.map((f) => (
-        // `on` from state, not `input:checked + …`: WebKit misses that restyle when React
-        // sets `checked` by code (a new source switching the format).
-        <label key={f} className={`seg-choice fmt-${f}${props.value === f ? " on" : ""}`}>
-          <input
-            type="radio"
-            className="visually-hidden"
-            name={props.name}
-            value={f}
-            checked={props.value === f}
-            disabled={props.disabled?.(f) ?? false}
-            onChange={() => props.onChange(f)}
-          />
-          <span className="seg-opt">{KIND_LABEL[f]}</span>
-        </label>
-      ))}
+      {formats.map((f) => {
+        const disabled = props.disabled?.(f) ?? false;
+        const why = disabled ? props.reason?.(f) : undefined;
+        return (
+          // `on` from state, not `input:checked + …`: WebKit misses that restyle when React
+          // sets `checked` by code (a new source switching the format).
+          <label
+            key={f}
+            className={`seg-choice fmt-${f}${props.value === f ? " on" : ""}`}
+            title={why}
+          >
+            <input
+              type="radio"
+              className="visually-hidden"
+              name={props.name}
+              value={f}
+              checked={props.value === f}
+              disabled={disabled}
+              onChange={() => props.onChange(f)}
+            />
+            <span className="seg-opt">
+              {KIND_LABEL[f]}
+              {why && <span className="visually-hidden">, {why}</span>}
+            </span>
+          </label>
+        );
+      })}
     </div>
   );
 }
@@ -220,9 +236,11 @@ export function SourceCard(props: {
   error: string | null;
   ins: Inspection | null;
   full?: boolean;
+  /** Keeps element ids apart per screen; default "i" with `full`, else "c". */
+  prefix?: string;
 }) {
   const { path, ins } = props;
-  const headId = `${props.full ? "i" : "c"}-source`;
+  const headId = `${props.prefix ?? (props.full ? "i" : "c")}-source`;
   const glow = useCoverGlow(!path ? null : ins ? ins.cover : props.busy ? undefined : null);
 
   // The first pick unmounts the empty state's buttons, which had focus: hand it to the
@@ -256,7 +274,7 @@ export function SourceCard(props: {
             or package of one.
           </p>
           <div className="kinds" aria-label="Accepted sources">
-            {FORMATS.map((k) => (
+            {KINDS.map((k) => (
               <FormatPill key={k} kind={k} />
             ))}
           </div>
@@ -351,6 +369,7 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
           </span>
         </dd>
       </div>
+      {ins.lz4 && <Lz4Tile facts={ins.lz4} />}
       {full && (
         <div className="tile wide">
           <dt>Content ID</dt>
@@ -365,6 +384,53 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
       )}
     </dl>
   );
+}
+
+/** The source records (or recorded) LZ4 traces: Forge's trace runtime, or a journal. */
+export function lz4Traced(f: Lz4Facts | null | undefined): boolean {
+  return !!f && (f.runtime === "forge_trace" || f.journal_bytes !== null);
+}
+
+/** LZ4 asset packs, as the CLI's `inspect` line says it ("LZ4 (AMPR): packed, …"): the state
+ * as the value, the details under it. A traced source's tile gets the neon straps. */
+function Lz4Tile({ facts }: { facts: Lz4Facts }) {
+  const { state, detail } = lz4State(facts);
+  const notes = [detail];
+  if (!facts.imports_ampr) notes.push("eboot.bin does not import libSceAmpr");
+  return (
+    <div className={lz4Traced(facts) ? "tile wide neon" : "tile wide"}>
+      <dt>LZ4 (AMPR)</dt>
+      <dd>
+        <span className="value">{state}</span>
+        <span className="note">{notes.join(" · ")}</span>
+      </dd>
+    </div>
+  );
+}
+
+const RUNTIME_LABEL: Record<Lz4Facts["runtime"], string> = {
+  forge_release: "Forge release",
+  forge_trace: "Forge trace",
+  other: "other",
+  none: "none",
+};
+
+/** "Packed" / "Damaged packs" / "Traced" / "Plain", and what backs it. */
+export function lz4State(f: Lz4Facts): { state: string; detail: string } {
+  if (f.packed) {
+    const p = f.packed;
+    return {
+      state: "Packed",
+      detail:
+        `${p.files.toLocaleString()} files in ${p.volumes.toLocaleString()} volume${p.volumes === 1 ? "" : "s"}` +
+        (p.stored_percent === null ? "" : `, ${p.stored_percent}% of size`),
+    };
+  }
+  if (f.manifest_error !== null) return { state: "Damaged packs", detail: f.manifest_error };
+  if (f.journal_bytes !== null)
+    return { state: "Traced", detail: `journal ${prettyBytes(f.journal_bytes)}` };
+  if (f.runtime === "forge_trace") return { state: "Traced", detail: "no journal yet" };
+  return { state: "Plain", detail: `runtime ${RUNTIME_LABEL[f.runtime]}` };
 }
 
 /** Which fakelib folder a backport ships, and how many backport libraries it has. */
@@ -417,7 +483,7 @@ export function classify(line: string): { kind: "block" | "warn" | "info"; forma
     return { kind: "warn", formats: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"] };
   // PFS holds ASCII names only; a .ffpfsc defaults to exFAT inside, which takes them.
   if (/^name not ASCII/.test(line)) return { kind: "warn", formats: ["ffpfs"] };
-  if (/^extraction:/.test(line)) return { kind: "warn", formats: ["folder"] };
+  if (/^extraction:/.test(line)) return { kind: "warn", formats: ["folder", "lz4"] };
   if (/^(already 512-byte sectors|geometry differs from the SMP fast path)/.test(line))
     return { kind: "info" };
   return { kind: "warn" };

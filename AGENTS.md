@@ -28,6 +28,12 @@ write safety, console speeds).
   workers → `.part`), and the PFS/PFSC readers (`PfsSource`, `open_ffpfsc`).
 - `crates/ps5-dump-forge-fpkg`: streaming `.pkg` reader (`FpkgSource`), CNT entries merged with the
   inner filesystem.
+- `crates/ps5-dump-forge-lz4`: ampr_emu asset packs: AMPRPAK4 manifest + AMPRDAT3 volume writer and
+  reader (unpack view as a `SourceTree`), AMPRIDX3 and AMPRCMD1 (journal) readers, pack rules (`rules.rs`),
+  the embedded runtimes (`runtime.rs`). Glue in `core/src/lz4.rs` (open/unpack, trace, index, runtime swap);
+  `core/src/lz4_patch.rs` is the in-place folder patch and unpatch; `core/src/lz4_profile.rs` is Save as profile.
+  `tree.rs` is `PackedTree`, the packs served as a `SourceTree` from a `writer::measure` pass.
+  `vendor/ampr_emu/`: the two upstream 0.4.2.1 `.sprx` runtimes + the source archive (see its README).
 - `crates/ps5-dump-forge-cli`: binary `ps5-dump-forge` (`inspect`, `convert`, `serve`), JSON-lines events.
 - `crates/ps5-dump-forge-server`: `serve`, std-only HTTP/1.1 (`http.rs`), routes mirroring the Tauri commands
   (`api.rs`), job table for polling (`table.rs`), roots (`paths.rs`), PS5 tile (`tile.rs`), self copy
@@ -57,7 +63,107 @@ write safety, console speeds).
 ## Key decisions
 - Every reader/writer meets at `ps5upload_fpkg::source::SourceTree` (sizes up front, `read_range`,
   `empty_dirs`, `Send`). Any source converts to any target with no staging.
+- LZ4 packs are an asset-pack transform of a game folder (ampr_emu), not an SMP image format: `--to lz4`
+  writes a folder (no extension) with `ampr_assets.index`, `.crc`, `ampr_assets-NNN.pak` volumes, loose
+  leftovers and the runtime; converting that folder to an image is an ordinary second convert (packs are
+  carried). Pack can also target an image directly (`Lz4Mode::Pack`, `lz4: "pack"`, CLI `--lz4-pack`, `format`
+  folder/exfat/ffpkg/ffpfs/ffpfsc; `.pkg` refused "not supported yet"; `Format::Lz4` stays the alias of pack
+  into a folder): **two passes, no staging folder**. `writer::measure` runs `pack`'s compression without
+  writing and keeps only the metadata (`Measured`: manifest with its 12-byte chunk records, CRC sidecar,
+  profile, volume sizes, build ID; 16 B per chunk). Per-chunk memory over the job, at 1.4 M chunks: measure
+  peaks at 32 B (~45 MB: manifest built plus its self-check decode), write holds 16 B (~22 MB), verify drops
+  `Measured` first, then the reader holds 20 B (~28 MB) and ~36 B (~50 MB) while parsing the manifest; ~50 MB is
+  the job's peak, plus per-file records and the blocks in flight.
+  `tree::PackedTree` lists the loose files plus the pack files at those sizes; reading a volume re-reads
+  each chunk's source block, recompresses it with the one `writer::encode`, and fails unless stored length,
+  codec, CRC and the LZ4 chunk's decoded CRC match the measurement (a changed source or a nondeterministic
+  compressor); one cached chunk, `threads * 4` blocks in flight per volume. `pack` and `measure` share one
+  `Sink` (placement, thresholds, rollover; `Volumes` = files or nowhere) and one `metadata`; folder output
+  is pinned byte for byte by a hash test. The image job: measure (before the plan, stage `measure`), plan →
+  write from `HashingTree(PackedTree(HashingTree(logical)))`, verify as written, then `reader::unpack` of
+  the image (every runtime check) and the logical files against the source, same fast/full policy.
+  Pack and trace need a title whose `eboot.bin` imports `libSceAmpr`. Compression is `lz4_flex`.
+  In the UI every LZ4 action lives in the LZ4 tab (`app/src/Lz4.tsx`), two scenarios: **Trace** (a folder,
+  `.exfat` or `.ffpkg`: Patch / Unpatch; a folder through `lz4_patch`/`lz4_unpatch`, an image through a
+  conversion with `lz4: "trace"|"unpatch"`, `format` = the source's, `lz4_in_place: true`; Download traces
+  in the web build once a journal is there) and **Pack** (traces as a zip or folder, locked to the source's
+  own when it is traced; a profile instead; Unpack when the source is packed). Convert has no LZ4 controls
+  and sends `lz4: null`.
+- The recommended trace path is a traced `.ffpkg` mounted `image_rw=`, then **Download traces** (http build
+  only; the desktop app points at Pack): `GET /api/lz4_traces?source=` streams one STORED zip
+  (`[GAME_TITLE]-[TITLE_ID]-amprtrace.zip`: the generated output stem, one implementation, + `-amprtrace.zip`) of
+  `ampr_commands.bin` + `ampr_emu.index` out of a folder or any image via core's `lz4_traces`
+  (`Lz4Traces`: a folder's files opened directly, an image through `open_source`; `write_zip`/`zip_len`)
+  in 1 MiB chunks (`Response::download` takes a body writer), never whole in memory. `core/src/zip.rs`
+  is the one zip layout, writer and reader (flag bit 3 + data descriptors, ZIP64 only past 0xFFFFFFFF), so
+  they can't drift. Every read re-checks a `SourceStamp` (the image file, or a folder's trace files:
+  length, mtime, identity) and fails on any change, so the body ends short of `Content-Length` (a
+  relaunched game truncates its journal; an image reader would serve stale blocks). `/mnt/shadowmnt` is a
+  PS5 root so the mounted image's folder can be picked too. Patching a folder stays offered: on hardware a
+  folder patched in place didn't launch (CE-107750-0, cause unknown, even after restoring stock files),
+  while a plain Forge `.ffpkg` of the same game did.
+  Both upstream runtimes (release, trace) are embedded with `include_bytes!`, pinned by SHA-256; the trace
+  runtime is swapped for the release one on every pack or plain conversion of a traced dump. Unpatch
+  (`Lz4Mode::Unpatch`, `--lz4-unpatch`) does that explicitly: the release runtime over any runtime
+  (Forge's trace build or another; no backup exists), journal and logs left out, a fresh index; refused
+  for a packed source ("unpack first") and with `--to lz4` (redundant).
+- LZ4 rule sources, first match: `--lz4-profile x.toml`, else the journal of the last trace session
+  (`ampr_commands.bin`, mapped to paths through the source's `ampr_emu.index`; only the last session counts),
+  else the built-in guess. `--lz4-unpack` (also automatic when the target is lz4) restores the logical
+  assets but keeps the runtime and `ampr_emu.index`. A trace (`--lz4-trace`) writes the journal on the
+  title's `/app0`, so the output must be writable there: a folder, or an `image_rw` exfat/ffpkg with
+  `--lz4-trace-space` MiB (default 256, 64..1024 step 64; measured ≈ 25 MB/hour of heavy loading on Stellar Blade, so ≈ 10 hours) of free room; `.ffpfs`/`.ffpfsc`/`.pkg` are refused.
+  `--lz4-traces <zip|folder|ampr_commands.bin>` (the downloaded traces zip: STORED entries only, each CRC-checked,
+  the journal streamed from its byte range; a folder holding both files; or the journal with its index
+  beside it; `--to lz4` or `--lz4-pack` only, exclusive with a profile) uses traces copied from elsewhere ahead of the dump's own: rule sources are profile, copied
+  traces, own journal, built-in guess. The membership check: every path the index lists must be in the
+  dump (else refused: another dump or version), leaving out on both sides the journal, index, logs,
+  `fakelib/libSceAmpr.sprx` and patch temp names; files only in the dump (a scene `.nfo`) are allowed,
+  unobserved and loose, and logged in one line (first 10 + a count). Observed ids resolve through the
+  traced index's own record order. Traces only narrow the built-in guess: an observed file is packed only if the fallback rules would pack it too (container indexes `.pak/.utoc`, configs, media, root files stay loose).
+  Packed files exist for the game only after it starts AMPR (the runtime publishes its index then), so
+  anything the engine opens, stats or lists before that (Unreal mounts `.pak`/`.utoc`, reads `.ini`,
+  `.uproject`) must stay loose. The keep-loose list (`rules::keep_loose`: `FALLBACK_SUFFIXES` + the protected
+  directory families; not the fallback's root-files rule) applies to every rule source, a profile included
+  (`profile_spec` is the profile alone; one log line counts what it wanted packed, first 10).
+  Then auto-loose (upstream `ampr_pack.py`, `rules::AutoLoose`, `[pack] auto_loose_*` honored with upstream's
+  bounds, defaults otherwise): a compress-spec file (not store; hot only with `auto_loose_hot_files`) of
+  ≥ 64 MiB is sampled in core's `plan` during preflight (32 blocks / ≤ 16 MiB at fixed, evenly spread block
+  indices, `writer::sample` = the writer's `encode`) and kept loose when it saves < 5% or ≥ 90% of the
+  blocks stay RAW; one log line `auto-loose: N large files kept loose (incompressible samples): …`.
+- Save as profile (`lz4_plan_profile(&ConvertRequest)` → `Lz4PlanProfile {file_name, toml, packed, loose,
+  log}`, `core/src/lz4_profile.rs`; `convert::lz4_plan` runs a Pack job's front half: open, unpack view,
+  backport, `lz4::prepare` with the rules, keep-loose and auto-loose; writes nothing, LZ4 findings are the
+  error). The TOML: `#` header (Forge version, game stem, rule source, UTC date), `[pack]` loose default,
+  64 KiB, `auto_loose_large_files = false` (already applied), one `[[rule]]` per distinct `PackSpec`
+  (store → `action = "store"`, hot, random → `layout = "random"`, hot sequential → `"mixed"`) with exact
+  paths fnmatch-escaped (`[`→`[[]`, `*`→`[*]`, `?`→`[?]`) and TOML-escaped; the job profile's `[runtime]`.
+  Loaded back it selects the same specs (round-trip test). Name: the generated stem + `-lz4profile.toml`.
+  CLI `lz4-profile <source> [--lz4-traces|--lz4-profile] [-o out.toml]` (default next to the source,
+  never overwrites); server `POST /api/lz4_plan_profile` `{request}` (Blob download in the page); Tauri
+  `lz4_save_plan_profile {request, dest}` (dest from the save dialog, `dialog:allow-save`). UI: a secondary
+  **Save as profile** beside Pack.
 - Never touch the source: junk (`.DS_Store`, `._*`, `.fseventsd`, ...) is filtered, not deleted.
+  Two exceptions, by user decision, both explicit requests:
+  1. The LZ4 folder patch and unpatch (`lz4_patch`/`lz4_unpatch`, CLI `lz4-patch`/`lz4-unpatch`, server
+     `POST /api/lz4_patch`/`POST /api/lz4_unpatch` `{source}`, Tauri `lz4_patch`/`lz4_unpatch` `{path}`)
+     change a plain game folder of an AMPR title: the trace (unpatch: release) runtime replaces any
+     `fakelib/libSceAmpr.sprx` (no backup), the journal and logs are deleted (root synced) and a fresh
+     `ampr_emu.index` is written, each file via an exclusive per-attempt temporary name
+     (`.<name>.forge-<pid>-<n>.tmp`, never indexed, ignored by the traces' membership check), sync and
+     rename, then the folder synced; 0777 on the PS5. Everything is checked first: images, packed
+     folders, non-AMPR titles, a non-file at any target path and (PS5) the destination probe refuse with
+     nothing changed; so does a job queued or running.
+  2. An image patched or unpatched in place (`ConvertRequest.lz4_in_place`, CLI `convert <img>
+     --lz4-trace|--lz4-unpatch --lz4-in-place`): rebuild + replace. Only an `.exfat`/`.ffpkg` source,
+     `format` its own, `lz4` `trace` or `unpatch`, not packed (else preflight findings; `.ffpfs`/`.ffpfsc`/
+     `.pkg` are read-only on the console). `output` is ignored: the job writes `<source>.<job>-<pid>.part`
+     beside the source (the destination check counts the whole new image), verifies it as usual, re-checks
+     the source's `SourceStamp`, closes the source and renames the part over it (`Part::replace`, one
+     atomic rename, folder synced). Any failure leaves the source byte-identical and the `.part` deleted.
+     The server's stale-part filter takes an in-place job's `.part` from its source.
+  The user takes the journal and index off the console (Download traces) and packs on a computer
+  (`--lz4-traces`).
 - Names are never renamed: bad names (non-NFC, exFAT/PFS case collisions, forbidden chars, non-ASCII
   in PFS) fail preflight with every offender listed.
 - `.pkg` is built with `BuildRequest::production` only (plaintext `PPRPLAIN-NOAUTH!`, Kraken);
@@ -131,11 +237,27 @@ write safety, console speeds).
 - FPKG: outer PFS plaintext with the `PPRPLAIN-NOAUTH!` marker (native AES-XTS fails the console's auth),
   inner image Kraken-compressed (zlib metadata is rejected by the console, never offer it).
 
+- LZ4 packs (ampr_emu 0.4.2.1): index at `ampr_assets.index` (AMPRPAK4, little-endian, CRC32, FNV-1a path hashes)
+  with `.crc` sidecar and `ampr_assets-NNN.pak` volumes (AMPRDAT3, volume cap 4 GiB - 64 KiB for FAT32); chunks LZ4 or RAW
+  (a RAW chunk is exactly one I/O page); files the runtime cannot serve stay loose. CRCs detect
+  corruption, they do not authenticate. The manifest's runtime-contract checks run on every open.
+  Not an SMP image: ShadowMountPlus mounts none (no `.lz4` extension, no mount name limit beyond a folder's).
+
 ## Commands
 ```sh
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --release
 (cd app && npm ci && npm run tauri dev)                       # GUI in dev mode
 cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to exfat   # or ffpkg | ffpfs | ffpfsc | pkg | folder
+cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to lz4 [--lz4-profile x.toml]   # asset packs (folder out)
+cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to folder --lz4-trace [--lz4-trace-space MiB]   # install the trace runtime (also --to exfat|ffpkg)
+cargo run -p ps5-dump-forge-cli -- convert <packed_dir> --to folder --lz4-unpack   # back to the loose assets
+cargo run -p ps5-dump-forge-cli -- lz4-patch <game_dir>   # IN PLACE: trace runtime, fresh index, stale journal/logs removed
+cargo run -p ps5-dump-forge-cli -- lz4-unpatch <game_dir>   # IN PLACE: release runtime, fresh index, journal/logs removed
+cargo run -p ps5-dump-forge-cli -- convert <img.ffpkg> --lz4-trace --lz4-in-place   # REPLACES the image (also .exfat; --lz4-unpatch)
+cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to lz4 --lz4-traces <x-amprtrace.zip|folder>   # pack with traces from the console
+cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to ffpkg --lz4-pack [--lz4-traces <zip>]   # pack straight into an image (also exfat|ffpfs|ffpfsc)
+cargo run -p ps5-dump-forge-cli -- lz4-profile <game_dir> [--lz4-traces <zip>] [-o x.toml]   # Save as profile: the pack plan as TOML
+scripts/check-lz4.sh <lz4_out_dir> <orig_dir> | --reverse   # upstream Python tools (Docker) inspect/verify our packs, unpack theirs
 cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to ffpfsc --inner exfat   # inner: exfat | ffpkg | ffpfs; --level 0..9
 cargo run --release -p ps5-dump-forge-pfs --example pfs_tool -- ffpfs <dir> <out> <time>   # for MkPFS byte comparisons
 scripts/check-exfat.sh <img.exfat> [src_dir]   # macOS fsck_exfat + mount compare + exfatprogs (Docker)

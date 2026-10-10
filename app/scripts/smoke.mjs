@@ -2,8 +2,8 @@
 // `ps5-dump-forge serve` (built here with cargo, so it embeds the current dist-http) with
 // plain node (no browser), on a temp root holding a small game: the bundle's files, a few
 // parser checks, every route with JSON bodies (no auth: the contract has none), a real job
-// (folder -> .exfat) and a cancelled one through the poller, a reload's restore, a server
-// restart (the list rebuilt) and quit.
+// (folder -> .exfat) and a cancelled one through the poller, the LZ4 trace download, a
+// reload's restore, a server restart (the list rebuilt) and quit.
 //
 //   npm run build:http && node scripts/smoke.mjs      (FORGE_BIN=<serve binary> skips cargo)
 
@@ -194,10 +194,17 @@ const out2 = await a.c.call("generated_output", { source: game, format: "exfat",
 assert.equal(out2, `${images}/${name.replace(".exfat", "-2.exfat")}`);
 assert.deepEqual(await a.c.call("stale_parts", { dirs: [images, `${root}/gone`] }), [`${images}/Old.exfat.part`]);
 assert.equal(await a.c.call("reveal", { id: 1 }), undefined);
-console.log("commands: list_dir (roots, root, folder, above the root), inspect (and a missing path), default_output, generated_output, stale_parts, reveal (local)");
+// The LZ4 patch refuses a title that doesn't use AMPR (the fake eboot.bin imports nothing).
+await assert.rejects(a.c.call("lz4_patch", { source: game }), (e) => typeof e === "string" && e.length > 0);
+await assert.rejects(a.c.call("lz4_unpatch", { source: game }), (e) => typeof e === "string" && e.includes("libSceAmpr"));
+// Save as profile (a Pack request) refuses it the same way, writing nothing.
+const packReq = { source: game, format: "lz4", output: "", compression_threads: null, inner: null, remove_backport: false, full_verify: false, kraken_level: "fast", ffpfsc_level: 6, lz4: null };
+await assert.rejects(a.c.call("lz4_plan_profile", { request: packReq }), (e) => typeof e === "string" && e.includes("libSceAmpr"));
+assert.deepEqual((await a.c.call("list_dir", { path: game })).entries.map((e) => e.name).sort(), ["data", "eboot.bin", "sce_sys"], "folder untouched");
+console.log("commands: list_dir (roots, root, folder, above the root), inspect (and a missing path), default_output, generated_output, stale_parts, reveal (local), lz4_patch, lz4_unpatch and lz4_plan_profile (refused)");
 
 // Jobs: one runs to the end, one is cancelled while queued behind it.
-const request = { source: game, format: "exfat", output: out, compression_threads: null, inner: null, remove_backport: false, full_verify: false, kraken_level: "fast", ffpfsc_level: 6 };
+const request = { source: game, format: "exfat", output: out, compression_threads: null, inner: null, remove_backport: false, full_verify: false, kraken_level: "fast", ffpfsc_level: 6, lz4: null };
 const id = await a.c.call("start_job", { request });
 const id2 = await a.c.call("start_job", { request: { ...request, output: out2 } });
 assert.equal(await a.c.call("cancel_job", { id: id2 }), null);
@@ -227,6 +234,48 @@ const listed = await a.c.call("list_dir", { path: images });
 assert.ok(listed.entries.some((e) => e.name === name && e.size > 64 << 20), "the image");
 console.log(`jobs: ${mine.length} progress events, ${lines.length}/${total} log lines once each, done once, cancel -> {"Err":"cancelled"}, ${name} written`);
 
+// LZ4 Pack into an image passes through to core, which refuses a game that doesn't use AMPR.
+const packId = await a.c.call("start_job", { request: { ...request, output: `${images}/Packed.ffpkg`, format: "ffpkg", lz4: "pack" } });
+await waitFor("pack refused", () => results(a.ev, packId).length, 60000);
+const packErr = results(a.ev, packId)[0].Err;
+assert.ok(typeof packErr === "string" && packErr.includes("libSceAmpr"), packErr);
+console.log('lz4: "pack" into .ffpkg reaches core (refused: not an AMPR title)');
+
+// Download traces: the page links one zip (a download, not fetch) of both files, STORED, so each
+// entry's bytes follow its 30-byte local header and name; Python's zipfile checks it whole.
+const traced = `${root}/traced game`;
+mkdirSync(`${traced}/sce_sys`, { recursive: true });
+writeFileSync(`${traced}/sce_sys/param.json`, JSON.stringify({ titleId: "PPSA05678", titleName: "Smoke: Traced" }));
+const journal = Buffer.alloc(3 << 20, 0x5a);
+journal.write("AMPR journal head");
+writeFileSync(`${traced}/ampr_commands.bin`, journal);
+writeFileSync(`${traced}/ampr_emu.index`, "fake index");
+const traceUrl = (source) => `${ORIGIN}/api/lz4_traces?source=${encodeURIComponent(source)}`;
+const dl = await realFetch(traceUrl(traced));
+assert.equal(dl.status, 200);
+assert.equal(dl.headers.get("content-type"), "application/zip");
+assert.equal(dl.headers.get("content-disposition"), 'attachment; filename="[Smoke Traced]-[PPSA05678]-amprtrace.zip"');
+const zip = Buffer.from(await dl.arrayBuffer());
+assert.equal(dl.headers.get("content-length"), String(zip.length));
+let at = 0;
+for (const [name, bytes] of [["ampr_commands.bin", journal], ["ampr_emu.index", Buffer.from("fake index")]]) {
+  assert.equal(zip.readUInt32LE(at), 0x04034b50, `${name}'s local header`);
+  assert.equal(zip.subarray(at + 30, at + 30 + name.length).toString(), name);
+  const data = at + 30 + name.length;
+  assert.ok(zip.subarray(data, data + bytes.length).equals(bytes), `${name}, byte for byte`);
+  at = data + bytes.length + 16;
+}
+const zipPath = `${root}/traces.zip`;
+writeFileSync(zipPath, zip);
+const py = spawnSync("python3", ["-c", "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; print(*z.namelist())", zipPath]);
+if (py.error) console.log(`python3 not run (${py.error.code})`);
+else assert.equal(py.stdout.toString().trim(), "ampr_commands.bin ampr_emu.index", py.stderr.toString());
+mkdirSync(`${root}/no index`);
+writeFileSync(`${root}/no index/ampr_commands.bin`, "x");
+assert.equal((await realFetch(traceUrl(`${root}/no index`))).status, 404);
+assert.equal((await realFetch(traceUrl(game))).status, 404);
+console.log(`lz4_traces: a ${zip.length}-byte zip of a 3 MiB journal and its index, entries byte for byte; no index or no traces 404`);
+
 // Every request: POSTs carry JSON; nothing else (no token, no custom header).
 for (const s of sent) {
   if (s.method === "POST") assert.deepEqual(s.headers, { "Content-Type": "application/json" }, s.path);
@@ -240,12 +289,21 @@ assert.ok(!routes.some((x) => x.includes("reveal") || x.includes("quit_app")));
 const b = await page_("b");
 await waitFor("restore", () => b.ev.restore.some((e) => e.replace));
 const back = b.ev.restore.find((e) => e.replace).jobs;
-assert.deepEqual(back.map((j) => j.id), [id, id2]);
+assert.deepEqual(back.map((j) => j.id), [id, id2, packId]);
 assert.equal(back[0].done.result.Ok.output, out);
 // The server resolves `compression_threads: null` to max(1, cores - 1).
 assert.ok(back[0].request.compression_threads >= 1);
-assert.deepEqual(back[0].request, { ...request, compression_threads: back[0].request.compression_threads });
-console.log("reload: both jobs restored with request, log and result");
+// The LZ4 fields Convert leaves out come back as core's defaults.
+assert.deepEqual(back[0].request, {
+  ...request,
+  compression_threads: back[0].request.compression_threads,
+  lz4: null,
+  lz4_profile: null,
+  lz4_traces: null,
+  lz4_trace_space_mib: 256,
+  lz4_in_place: false,
+});
+console.log("reload: every job restored with request, log and result");
 
 // The server restarts: offline, then a new instance's (empty) list replaces the old one; the
 // old jobs don't end with "no longer reported" (that's for one instance's dropped history).

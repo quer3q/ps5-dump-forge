@@ -9,6 +9,10 @@
 #[allow(dead_code)]
 mod sparse;
 
+#[path = "../../src/lz4_tree.rs"]
+#[allow(dead_code)]
+mod lz4_tree;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -105,6 +109,8 @@ fn run(out: &Path, mini: &Path, work: &Path) -> Res<()> {
     };
     ffpfsc::wrap(mini, &ffpfsc, &options, &mut ffpfsc::Control::default())?;
     seed(out, "pfsc", "mini", &sparse::encode(&fs::read(&ffpfsc)?))?;
+
+    lz4_seeds(out)?;
 
     // A debug FPKG built from the exFAT fixture, as the app builds them (Kraken, plaintext).
     let pkg_dir = work.join("pkg");
@@ -249,4 +255,127 @@ fn kraken_sample() -> Res<KrakenSample> {
         }
     }
     Ok((blob, image, want))
+}
+
+/// Output of `lz4::writer::pack`, kept in memory.
+#[derive(Default)]
+struct MemOut(std::collections::BTreeMap<String, Vec<u8>>);
+
+impl ps5_dump_forge_lz4::writer::PackOutput for MemOut {
+    type W = std::io::Cursor<Vec<u8>>;
+    fn create(&mut self, _: &str) -> ps5upload_fpkg::Result<Self::W> {
+        Ok(Default::default())
+    }
+    fn reopen(&mut self, name: &str) -> ps5upload_fpkg::Result<Self::W> {
+        Ok(std::io::Cursor::new(
+            self.0.remove(name).unwrap_or_default(),
+        ))
+    }
+    fn finish(&mut self, name: &str, w: Self::W) -> ps5upload_fpkg::Result<()> {
+        self.0.insert(name.to_string(), w.into_inner());
+        Ok(())
+    }
+}
+
+/// LZ4 packs: a tiny pack (one compressible file, one noise file, one loose record) for the
+/// manifest and unpack targets, the path index, and a two-record journal.
+fn lz4_seeds(out: &Path) -> Res<()> {
+    use ps5_dump_forge_lz4::format::{CMD_HEADER, CMD_MAGIC, cmd_hash, put_u16, put_u32, put_u64};
+    use ps5_dump_forge_lz4::writer::{PackFile, pack};
+    use ps5_dump_forge_lz4::{CRC_SIDECAR, MANIFEST, PackSpec, volume_name};
+
+    let text: Vec<u8> = (0..100_000)
+        .map(|i| b"forge packs assets "[i % 19])
+        .collect();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let noise: Vec<u8> = (0..70_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let spec = |block_shift| {
+        Some(PackSpec {
+            block_shift,
+            store: false,
+            hot: false,
+            random: false,
+        })
+    };
+    let entries = [
+        ("data/a.bin", text, spec(16)),
+        ("data/b.bin", noise, spec(14)),
+        ("eboot.bin", vec![7u8; 100], None),
+    ];
+    let mut src = lz4_tree::Mem::new(entries.iter().map(|(p, d, _)| (p.to_string(), d.clone())));
+    let files: Vec<PackFile> = entries
+        .iter()
+        .map(|(p, d, s)| PackFile {
+            path: p.to_string(),
+            size: d.len() as u64,
+            spec: *s,
+        })
+        .collect();
+    let mut packed = MemOut::default();
+    pack(
+        &mut src,
+        &files,
+        1_700_000_000,
+        None,
+        1,
+        &mut packed,
+        &mut |_| {},
+        &AtomicBool::new(false),
+    )?;
+    let get = |n: &str| packed.0.get(n).cloned().unwrap_or_default();
+    let manifest = get(MANIFEST);
+    seed(out, "lz4_manifest", "pack", &manifest)?;
+    let crc = get(CRC_SIDECAR);
+    seed(
+        out,
+        "lz4_unpack",
+        "pack",
+        &lz4_tree::join(&manifest, &crc, &get(&volume_name(0))),
+    )?;
+    seed(
+        out,
+        "lz4_unpack",
+        "pack-nocrc",
+        &lz4_tree::join(&manifest, &[], &get(&volume_name(0))),
+    )?;
+
+    let index = ps5upload_fpkg::ampr_index::build(
+        &[
+            ("data/a.bin".to_string(), 100_000),
+            ("data/b.bin".to_string(), 70_000),
+            ("eboot.bin".to_string(), 100),
+        ],
+        1_700_000_000,
+    )
+    .ok_or("index")?;
+    seed(out, "lz4_index", "three", &index)?;
+
+    // Journal: a ReadFile of id 2 (len 100 at 0), then of id 3; the file count leads.
+    let record = |seq: u64, words: [u32; 5]| {
+        let payload: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut b = vec![0u8; CMD_HEADER];
+        b[..8].copy_from_slice(CMD_MAGIC);
+        put_u16(&mut b, 8, 1).unwrap();
+        put_u16(&mut b, 10, CMD_HEADER as u16).unwrap();
+        put_u32(&mut b, 12, (CMD_HEADER + payload.len()) as u32).unwrap();
+        put_u64(&mut b, 16, seq).unwrap();
+        put_u64(&mut b, 56, cmd_hash(&payload)).unwrap();
+        put_u32(&mut b, 64, payload.len() as u32).unwrap();
+        put_u32(&mut b, 72, 1).unwrap();
+        put_u32(&mut b, 80, 1).unwrap();
+        b.extend_from_slice(&payload);
+        b
+    };
+    let mut journal = 3u32.to_le_bytes().to_vec();
+    journal.extend(record(1, [40 | 4 << 8, 99, 2, 0, 0]));
+    journal.extend(record(2, [40 | 4 << 8, 49, 3, 0, 0]));
+    seed(out, "lz4_journal", "two-reads", &journal)?;
+    Ok(())
 }

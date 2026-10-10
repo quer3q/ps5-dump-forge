@@ -129,7 +129,8 @@ pub(crate) fn output_path(output: &Path) -> anyhow::Result<PathBuf> {
 /// The extension that makes ShadowMountPlus pick the right driver.
 pub(crate) fn extension(format: Format) -> Option<&'static str> {
     match format {
-        Format::Folder => None,
+        // An LZ4 packed folder is a folder: SMP mounts nothing, so no extension.
+        Format::Folder | Format::Lz4 => None,
         Format::Exfat => Some("exfat"),
         Format::Ffpkg => Some("ffpkg"),
         Format::Ffpfs => Some("ffpfs"),
@@ -175,7 +176,7 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
     let name = output.file_name().unwrap_or_default().to_string_lossy();
     // A file's stem as SMP takes it: up to the last dot; a folder's whole name.
     let stem = match format {
-        Format::Folder => &*name,
+        Format::Folder | Format::Lz4 => &*name,
         _ => name.rsplit_once('.').map_or(&*name, |(stem, _)| stem),
     };
     let max = stem_limit(format);

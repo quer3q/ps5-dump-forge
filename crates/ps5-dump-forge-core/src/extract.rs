@@ -155,13 +155,13 @@ pub fn extraction_findings(
 }
 
 /// Where extracted entries are created, and which directories this job made there.
-struct Dest {
+pub(crate) struct Dest {
     root: at::Dir,
     created: HashSet<String>,
 }
 
 impl Dest {
-    fn open(part: &Part) -> anyhow::Result<Self> {
+    pub(crate) fn open(part: &Part) -> anyhow::Result<Self> {
         let root = at::open_root(part.path())
             .with_context(|| format!("opening {}", part.path().display()))?;
         if !part.is(at::id(&root)?) {
@@ -207,8 +207,18 @@ impl Dest {
         at::create(&dir, name).with_context(|| format!("creating {rel}"))
     }
 
+    /// A new file at the root (the LZ4 pack files), exclusive and not through a link.
+    pub(crate) fn create_root(&self, name: &str) -> std::io::Result<File> {
+        at::create(&self.root, name)
+    }
+
+    /// A root file this job created, opened again for writing (an LZ4 volume's header).
+    pub(crate) fn reopen_root(&self, name: &str) -> std::io::Result<File> {
+        at::reopen(&self.root, name)
+    }
+
     /// fsyncs every directory this job created, and the root.
-    fn sync(&mut self, ctx: &Ctx) -> anyhow::Result<()> {
+    pub(crate) fn sync(&mut self, ctx: &Ctx) -> anyhow::Result<()> {
         let dirs: Vec<String> = self.created.iter().cloned().collect();
         for rel in dirs {
             ctx.check()?;
@@ -265,6 +275,8 @@ mod at {
         if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        #[cfg(target_os = "freebsd")]
+        crate::finalize::open_up_at(dir.as_raw_fd(), &name)?; // CE-107750-0
         Ok(())
     }
 
@@ -275,6 +287,16 @@ mod at {
         // SAFETY: as in `child`; the mode is the variadic third argument of openat.
         let rc =
             unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o666 as libc::c_uint) };
+        let file = File::from(fd(rc)?);
+        crate::finalize::open_up(&file)?; // CE-107750-0
+        Ok(file)
+    }
+
+    pub(super) fn reopen(dir: &Dir, name: &str) -> io::Result<File> {
+        let name = c(name.as_bytes())?;
+        let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: as in `child`.
+        let rc = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
         Ok(File::from(fd(rc)?))
     }
 
@@ -324,6 +346,17 @@ mod at {
 
     pub(super) fn create(dir: &Dir, name: &str) -> io::Result<File> {
         crate::finalize::create_new(&dir.join(name))
+    }
+
+    pub(super) fn reopen(dir: &Dir, name: &str) -> io::Result<File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.custom_flags(crate::finalize::FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        opts.open(dir.join(name))
     }
 
     pub(super) fn clone(dir: &Dir) -> io::Result<Dir> {

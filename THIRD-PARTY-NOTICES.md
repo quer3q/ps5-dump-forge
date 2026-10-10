@@ -155,6 +155,119 @@ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 SUCH DAMAGE.
 ```
 
+## ampr_emu (GPL-3.0-or-later)
+
+`vendor/ampr_emu/` holds the unmodified upstream 0.4.2.1 binaries `libSceAmpr.sprx` (release) and
+`libSceAmpr-trace.sprx` (trace), which Forge embeds and installs into LZ4-packed or traced games, and the
+tagged source archive `ampr_emu-0.4.2.1-src.tar.gz`, kept there as their corresponding source (the exact
+compile-time options of the release binaries are not recorded; this is no claim of reproducibility).
+Forge's pack format code is written from the documented format and checked against upstream's Python
+tools (`scripts/check-lz4.sh`); no ampr_emu code is compiled into Forge.
+
+- Upstream: https://github.com/drakmor/ampr_emu, tag `0.4.2.1`, by drakmor
+- License: GNU General Public License, version 3 or (at your option) any later version.
+
+The runtimes contain these third-party parts (their sources are in the archive):
+
+- LZ4 1.10.0 (`third_party/lz4`), BSD 2-Clause. The license text, from the header of its `lz4.c`/`lz4.h`:
+
+```
+LZ4 - Fast LZ compression algorithm
+Copyright (C) 2011-2023, Yann Collet.
+
+BSD 2-Clause License (http://www.opensource.org/licenses/bsd-license.php)
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+You can contact the author at :
+ - LZ4 homepage : http://www.lz4.org
+ - LZ4 source repository : https://github.com/lz4/lz4
+```
+
+- HDE64 (Hacker Disassembler Engine 64 C), Copyright (c) 2008-2009 Vyacheslav Patkov, all rights reserved.
+  The archive's sources carry only the copyright line; the BSD terms are those published with MinHook
+  (https://github.com/TsudaKageyu/minhook/blob/master/LICENSE.txt), reproduced here:
+
+```
+Hacker Disassembler Engine 64 C
+Copyright (c) 2008-2009, Vyacheslav Patkov.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+[Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR) is the reference workflow (trace, then pack). No code or
+profile of it is included.
+
+## lz4_flex (MIT)
+
+`crates/ps5-dump-forge-lz4` compresses and decompresses LZ4 blocks with
+[lz4_flex](https://github.com/PSeitz/lz4_flex) 0.14.
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2020 Pascal Seitz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
 ## Tauri and other dependencies
 
 The app is built with [Tauri](https://tauri.app) 2 (`tauri`, `tauri-build`,

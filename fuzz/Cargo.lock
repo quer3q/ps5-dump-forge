@@ -257,6 +257,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -311,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-exfat"
-version = "0.0.1-pre"
+version = "0.0.1-pre6"
 dependencies = [
  "ps5upload-fpkg",
  "unicode-normalization",
@@ -319,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-fpkg"
-version = "0.0.1-pre"
+version = "0.0.1-pre6"
 dependencies = [
  "ps5upload-fpkg",
 ]
@@ -330,6 +336,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "ps5-dump-forge-fpkg",
+ "ps5-dump-forge-lz4",
  "ps5-dump-forge-pfs",
  "ps5upload-fpkg",
 ]
@@ -339,14 +346,27 @@ name = "ps5-dump-forge-fuzz-seedgen"
 version = "0.0.0"
 dependencies = [
  "ps5-dump-forge-exfat",
+ "ps5-dump-forge-lz4",
  "ps5-dump-forge-pfs",
  "ps5-dump-forge-ufs2",
  "ps5upload-fpkg",
 ]
 
 [[package]]
+name = "ps5-dump-forge-lz4"
+version = "0.0.1-pre6"
+dependencies = [
+ "blake3",
+ "crc32fast",
+ "lz4_flex",
+ "ps5upload-fpkg",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "ps5-dump-forge-pfs"
-version = "0.0.1-pre"
+version = "0.0.1-pre6"
 dependencies = [
  "flate2",
  "ps5upload-fpkg",
@@ -354,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-ufs2"
-version = "0.0.1-pre"
+version = "0.0.1-pre6"
 dependencies = [
  "ps5upload-fpkg",
  "unicode-normalization",
@@ -448,6 +468,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -525,6 +554,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "winnow",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -544,6 +604,12 @@ checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "zlib-rs"

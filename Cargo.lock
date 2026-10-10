@@ -1781,6 +1781,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2423,10 +2429,12 @@ version = "0.0.1-pre6"
 dependencies = [
  "anyhow",
  "blake3",
+ "crc32fast",
  "getrandom 0.4.3",
  "libc",
  "ps5-dump-forge-exfat",
  "ps5-dump-forge-fpkg",
+ "ps5-dump-forge-lz4",
  "ps5-dump-forge-pfs",
  "ps5-dump-forge-ufs2",
  "ps5upload-fpkg",
@@ -2460,6 +2468,18 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "webview2-com",
+]
+
+[[package]]
+name = "ps5-dump-forge-lz4"
+version = "0.0.1-pre6"
+dependencies = [
+ "blake3",
+ "crc32fast",
+ "lz4_flex",
+ "ps5upload-fpkg",
+ "sha2 0.11.0",
+ "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]

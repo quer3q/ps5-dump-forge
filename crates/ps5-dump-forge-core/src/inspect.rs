@@ -14,7 +14,8 @@ use unicode_normalization::{UnicodeNormalization, is_nfc};
 use crate::convert::{Kind, Nested, open_source, percent};
 use crate::preflight::{self, GameInfo, listing};
 use crate::scan::JunkFiltered;
-use crate::{Format, InspectFile, Inspection};
+use crate::{Format, InspectFile, Inspection, Lz4Facts, Lz4Packed};
+use ps5_dump_forge_lz4::reader;
 use ps5upload_fpkg::source::SourceTree;
 use serde_json::Value;
 
@@ -220,6 +221,7 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     };
     let dlcs = crate::dlc::find(tree.as_mut(), info.content_id.as_deref());
     let cover = cover(tree.as_mut());
+    let lz4 = lz4_facts(tree.as_mut(), &mut findings);
     let files: Vec<InspectFile> = tree
         .files()
         .iter()
@@ -250,7 +252,154 @@ pub(crate) fn inspect(path: &Path) -> anyhow::Result<Inspection> {
         empty_dirs: tree.empty_dirs().to_vec(),
         details,
         findings,
+        lz4,
     })
+}
+
+/// The LZ4 facts of a source; a damaged manifest becomes a finding. `None` without libSceAmpr
+/// or any LZ4 artifact.
+fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz4Facts> {
+    use ps5_dump_forge_lz4::runtime::RuntimeKind;
+    use ps5_dump_forge_lz4::{INDEX, JOURNAL, MANIFEST, reader};
+    let size = |tree: &dyn SourceTree, path: &str| {
+        tree.files().iter().find(|f| f.path == path).map(|f| f.size)
+    };
+    let imports_ampr = size(tree, "eboot.bin").is_some()
+        && ps5upload_fpkg::source::imports_ampr(tree, "eboot.bin");
+    let journal_bytes = size(tree, JOURNAL);
+    let kind = crate::lz4::runtime_kind(tree);
+    let mut packed = None;
+    let mut manifest_error = None;
+    let holds_packs = reader::detect(tree).unwrap_or(false);
+    if holds_packs {
+        match read_manifest(tree, FULL_PARSE_BYTES) {
+            Ok((p, large)) => {
+                if large {
+                    findings.push(format!(
+                        "LZ4 packs: {MANIFEST} manifest too large to inspect fully; \
+                         only its header counts are shown"
+                    ));
+                }
+                packed = Some(p);
+            }
+            Err(e) => {
+                findings.push(format!("LZ4 packs: {MANIFEST} is damaged: {e}"));
+                manifest_error = Some(e);
+            }
+        }
+    }
+    let artifact = holds_packs
+        || journal_bytes.is_some()
+        || size(tree, INDEX).is_some()
+        || matches!(kind, RuntimeKind::ForgeRelease | RuntimeKind::ForgeTrace);
+    if !imports_ampr && !artifact {
+        return None;
+    }
+    let runtime = match kind {
+        RuntimeKind::ForgeRelease => "forge_release",
+        RuntimeKind::ForgeTrace => "forge_trace",
+        RuntimeKind::Other => "other",
+        RuntimeKind::None => "none",
+    };
+    Some(Lz4Facts {
+        imports_ampr,
+        packed,
+        manifest_error,
+        runtime: runtime.to_string(),
+        journal_bytes,
+        traces_zip: (journal_bytes.is_some() && size(tree, INDEX).is_some()).then(|| {
+            let param = size(tree, "sce_sys/param.json")
+                .filter(|&s| s <= preflight::MAX_PARAM_JSON)
+                .and_then(|_| tree.read("sce_sys/param.json").ok());
+            traces_zip_name(param.as_deref())
+        }),
+    })
+}
+
+/// Manifests up to this size are parsed whole; a bigger (valid-looking) one is summed up from
+/// its header, so inspecting a hostile file never allocates its declared size.
+const FULL_PARSE_BYTES: u64 = 64 << 20;
+
+/// The manifest's counts, reading the 128-byte header first. The bool is true when the
+/// manifest was too big to parse and only the header counts are known.
+fn read_manifest(tree: &mut dyn SourceTree, limit: u64) -> Result<(Lz4Packed, bool), String> {
+    use ps5_dump_forge_lz4::MANIFEST;
+    use ps5_dump_forge_lz4::format::{self as f, u32_at, u64_at};
+    let actual = tree
+        .files()
+        .iter()
+        .find(|x| x.path == MANIFEST)
+        .map_or(0, |x| x.size);
+    let h = tree
+        .read_range(MANIFEST, 0, f::PAK_HEADER)
+        .map_err(|e| e.to_string())?;
+    if h.len() < f::PAK_HEADER {
+        return Err("manifest is shorter than its header".into());
+    }
+    let e = |r: ps5upload_fpkg::Result<u32>| r.map_err(|e| e.to_string());
+    for (at, want, what) in [
+        (8, f::PAK_VERSION, "version"),
+        (12, f::PAK_HEADER as u32, "header size"),
+        (16, 0, "flags"),
+        (20, f::ENDIAN_MARKER, "endian marker"),
+        (60, f::FILE_RECORD as u32, "file record size"),
+        (64, f::CHUNK_RECORD as u32, "chunk record size"),
+        (68, f::PACK_RECORD as u32, "pack record size"),
+    ] {
+        let got = e(u32_at(&h, at))?;
+        if got != want {
+            return Err(format!("manifest {what} is {got:#x}, not {want:#x}"));
+        }
+    }
+    if f::pak_header_crc(&h).map_err(|e| e.to_string())? != e(u32_at(&h, f::PAK_HEADER_CRC_AT))? {
+        return Err("manifest header CRC mismatch".into());
+    }
+    let at = u64_at(&h, 96).map_err(|e| e.to_string())?;
+    let len = u64_at(&h, 104).map_err(|e| e.to_string())?;
+    if at.checked_add(len) != Some(actual) {
+        return Err(format!(
+            "manifest is {actual} bytes, its header declares {at} + {len}"
+        ));
+    }
+    if actual > limit {
+        let files = u64_at(&h, 40).map_err(|e| e.to_string())?;
+        let volumes = u64::from(e(u32_at(&h, 56))?);
+        let counts = Lz4Packed {
+            files,
+            packed_files: None,
+            volumes,
+            stored_percent: None,
+        };
+        return Ok((counts, true));
+    }
+    let b = tree
+        .read_range(MANIFEST, 0, actual as usize)
+        .map_err(|e| e.to_string())?;
+    let m = reader::open_manifest(&b).map_err(|e| e.to_string())?;
+    Ok((packed_counts(&m), false))
+}
+
+/// Counts from a sound manifest; the percentage is stored bytes of the packed files over
+/// their logical bytes (loose files and metadata are not in either).
+fn packed_counts(m: &reader::Manifest) -> Lz4Packed {
+    let (mut packed_files, mut stored, mut logical) = (0u64, 0u64, 0u64);
+    for f in m.files.iter().filter(|f| f.packed()) {
+        packed_files += 1;
+        logical = logical.saturating_add(f.size);
+        let first = f.first_chunk as usize;
+        let end = first
+            .saturating_add(f.chunk_count as usize)
+            .min(m.chunks.len());
+        for c in m.chunks.get(first..end).unwrap_or_default() {
+            stored = stored.saturating_add(u64::from(c.stored));
+        }
+    }
+    Lz4Packed {
+        files: m.files.len() as u64,
+        packed_files: Some(packed_files),
+        volumes: m.packs.len() as u64,
+        stored_percent: Some(percent(stored, logical)),
+    }
 }
 
 /// A PFS header as one details line; a block size the console misreads is a finding.
@@ -432,16 +581,10 @@ pub(crate) fn generated_output(
     let dir = &output_dir(source, dir)?;
     let mut tree = open_source(source, Kind::of(source)?, &AtomicBool::new(false))?;
     let info = preflight::input(tree.as_mut()).0;
-    let name = info
-        .param_json
-        .as_ref()
-        .and_then(title_name)
-        .map(|n| file_safe(&n))
-        .filter(|n| !n.is_empty());
-    let id = info.title_id.as_ref().map(|id| format!("[{id}]"));
-    let mut stem = match (&name, &id) {
-        (None, None) => default_stem(source, info.title_id)?,
-        _ => stem_with(name.as_deref(), id.as_deref().unwrap_or(""), usize::MAX),
+    let parts = NameParts::of(&info);
+    let mut stem = match parts.stem(usize::MAX) {
+        Some(stem) => stem,
+        None => default_stem(source, info.title_id)?,
     };
     if is_reserved_on_windows(&stem) {
         stem.insert(0, '_');
@@ -460,8 +603,8 @@ pub(crate) fn generated_output(
         let max = preflight::stem_limit(format);
         let stem = if stem.len() + suffix.len() > max {
             let room = max.saturating_sub(suffix.len());
-            match &name {
-                Some(_) => stem_with(name.as_deref(), id.as_deref().unwrap_or(""), room),
+            match &parts.name {
+                Some(_) => parts.stem(room).unwrap_or_default(),
                 None => cut(&stem, room).to_string(),
             }
         } else {
@@ -476,6 +619,57 @@ pub(crate) fn generated_output(
         "{stem} and its -2 to -{MAX_SUFFIX} variants are all taken in {}",
         dir.display()
     )
+}
+
+/// The download name of a source's LZ4 traces, from its `param.json` bytes: the generated
+/// output stem ([`NameParts::stem`], `[GAME_TITLE]-[TITLE_ID]`, the title cut first to keep the
+/// stem within 63 bytes) and `-amprtrace.zip`; either part alone without the other,
+/// `amprtrace.zip` with neither.
+pub(crate) fn traces_zip_name(param_json: Option<&[u8]>) -> String {
+    let info = param_json.map(preflight::parse_param).unwrap_or_default();
+    download_name(&info, "amprtrace.zip")
+}
+
+/// `[GAME_TITLE]-[TITLE_ID]-<suffix>` as [`traces_zip_name`] builds it, `<suffix>` alone
+/// without either part.
+pub(crate) fn download_name(info: &GameInfo, suffix: &str) -> String {
+    match name_stem(info) {
+        Some(stem) => format!("{stem}-{suffix}"),
+        None => suffix.to_string(),
+    }
+}
+
+/// The generated stem, `[GAME_TITLE]-[TITLE_ID]` within 63 bytes; `None` with neither part.
+pub(crate) fn name_stem(info: &GameInfo) -> Option<String> {
+    NameParts::of(info).stem(63)
+}
+
+/// The parts of a generated name: the game's title made file-safe (`None` when nothing of it
+/// is left) and the title id in brackets.
+struct NameParts {
+    name: Option<String>,
+    id: Option<String>,
+}
+
+impl NameParts {
+    fn of(info: &GameInfo) -> Self {
+        Self {
+            name: info
+                .param_json
+                .as_ref()
+                .and_then(title_name)
+                .map(|n| file_safe(&n))
+                .filter(|n| !n.is_empty()),
+            id: info.title_id.as_ref().map(|id| format!("[{id}]")),
+        }
+    }
+
+    /// `[GAME_NAME]-[TITLE_ID]` within `max` bytes, the name cut first ([`stem_with`]); `None`
+    /// with neither part.
+    fn stem(&self, max: usize) -> Option<String> {
+        (self.name.is_some() || self.id.is_some())
+            .then(|| stem_with(self.name.as_deref(), self.id.as_deref().unwrap_or(""), max))
+    }
 }
 
 /// `[name]-` before `id` (bracketed, or empty), the name cut to keep the whole within `max`
@@ -599,6 +793,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traces_zip_names() {
+        let name = |json: &str| traces_zip_name(Some(json.as_bytes()));
+        assert_eq!(
+            name(r#"{"titleId":"PPSA13197","titleName":"Stellar Blade"}"#),
+            "[Stellar Blade]-[PPSA13197]-amprtrace.zip"
+        );
+        // Separators and other unsafe characters go, non-ASCII stays, NFC.
+        assert_eq!(
+            name(r#"{"titleId":"PPSA00001","titleName":"Ys X: Nordics / \"Re\" \u0001"}"#),
+            "[Ys X Nordics Re]-[PPSA00001]-amprtrace.zip"
+        );
+        assert_eq!(
+            name(r#"{"titleId":"PPSA00002","titleName":"ドラゴンクエスト"}"#),
+            "[ドラゴンクエスト]-[PPSA00002]-amprtrace.zip"
+        );
+        // The title is cut first: the stem within 63 bytes, as for a generated output.
+        let long = name(&format!(
+            r#"{{"titleId":"PPSA00003","titleName":"{}"}}"#,
+            "é".repeat(60)
+        ));
+        assert_eq!(
+            long,
+            format!("[{}]-[PPSA00003]-amprtrace.zip", "é".repeat(24))
+        );
+        assert_eq!(long.len() - "-amprtrace.zip".len(), 62);
+        // The id from the content id; no title; nothing usable.
+        assert_eq!(
+            name(r#"{"contentId":"UP0000-PPSA00004_00-TESTTESTTESTTEST"}"#),
+            "[PPSA00004]-amprtrace.zip"
+        );
+        assert_eq!(
+            name(r#"{"titleName":"Only a name"}"#),
+            "[Only a name]-amprtrace.zip"
+        );
+        assert_eq!(
+            name(r#"{"titleId":"../x","titleName":"::"}"#),
+            "amprtrace.zip"
+        );
+        assert_eq!(name("not json"), "amprtrace.zip");
+        assert_eq!(traces_zip_name(None), "amprtrace.zip");
+    }
+
+    #[test]
     fn base64_matches_rfc4648() {
         for (raw, want) in [
             ("", ""),
@@ -702,6 +939,7 @@ mod tests {
             Format::Ffpkg,
             Format::Ffpfs,
             Format::Folder,
+            Format::Lz4,
             Format::Pkg,
         ] {
             assert_eq!(preflight::stem_limit(format), 63);
@@ -718,6 +956,11 @@ mod tests {
         };
         let stem = |p: &Path| p.file_stem().unwrap().to_str().unwrap().to_string();
         param(&"Long Game Name ".repeat(6));
+        // An LZ4 packed folder is named as a folder: no extension.
+        assert_eq!(
+            generated_output(&game, Format::Lz4, &root, &[]).unwrap(),
+            generated_output(&game, Format::Folder, &root, &[]).unwrap()
+        );
         // Every output cuts it, a folder and a .pkg too.
         for (format, max) in [
             (Format::Exfat, 63),
@@ -836,5 +1079,77 @@ mod tests {
         assert_eq!(title_name(&param).as_deref(), Some("Jeu"));
         let bare: Value = serde_json::from_str(r#"{"titleName":"bare"}"#).unwrap();
         assert_eq!(title_name(&bare).as_deref(), Some("bare"));
+    }
+
+    /// A manifest tree that only ever serves its header.
+    struct Header(Vec<u8>, Vec<ps5upload_fpkg::source::SourceFile>);
+
+    impl SourceTree for Header {
+        fn files(&self) -> &[ps5upload_fpkg::source::SourceFile] {
+            &self.1
+        }
+        fn read(&mut self, _: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
+            panic!("whole manifest read");
+        }
+        fn read_range(&mut self, _: &str, off: u64, len: usize) -> ps5upload_fpkg::Result<Vec<u8>> {
+            assert!(off == 0 && len <= 128, "read {len} bytes at {off}");
+            Ok(self.0.clone())
+        }
+        fn describe(&self) -> String {
+            "header".into()
+        }
+    }
+
+    fn header(files: u64, packs: u32, strings_at: u64, strings_len: u64) -> Vec<u8> {
+        use ps5_dump_forge_lz4::format::*;
+        let mut h = vec![0u8; 128];
+        h[..8].copy_from_slice(PAK_MAGIC);
+        for (at, v) in [
+            (8, PAK_VERSION),
+            (12, 128),
+            (20, ENDIAN_MARKER),
+            (56, packs),
+        ] {
+            h[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [(60, FILE_RECORD), (64, CHUNK_RECORD), (68, PACK_RECORD)] {
+            h[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+        }
+        h[40..48].copy_from_slice(&files.to_le_bytes());
+        h[96..104].copy_from_slice(&strings_at.to_le_bytes());
+        h[104..112].copy_from_slice(&strings_len.to_le_bytes());
+        let crc = pak_header_crc(&h).unwrap();
+        h[116..120].copy_from_slice(&crc.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn a_huge_declared_manifest_is_not_read_whole() {
+        use ps5_dump_forge_lz4::MANIFEST;
+        let tree = |h: Vec<u8>, size| {
+            Header(
+                h,
+                vec![ps5upload_fpkg::source::SourceFile {
+                    path: MANIFEST.into(),
+                    size,
+                }],
+            )
+        };
+        let big = 600 << 20;
+        // Declares 600 MiB, the file is tiny: damaged, one header read.
+        let mut t = tree(header(10, 2, 128, big), 128);
+        assert!(read_manifest(&mut t, FULL_PARSE_BYTES).is_err());
+        // Declares 600 MiB and is that long: the header counts only.
+        let mut t = tree(header(10, 2, 128, big - 128), big);
+        let (p, large) = read_manifest(&mut t, FULL_PARSE_BYTES).unwrap();
+        assert!(large);
+        assert_eq!(
+            (p.files, p.volumes, p.packed_files, p.stored_percent),
+            (10, 2, None, None)
+        );
+        // Bad version right after the magic: damaged, not read whole.
+        let mut h = header(10, 2, 128, big - 128);
+        h[8] = 9;
+        assert!(read_manifest(&mut tree(h, big), FULL_PARSE_BYTES).is_err());
     }
 }

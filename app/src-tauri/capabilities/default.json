@@ -7,12 +7,16 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "dialog:allow-open",
+    "dialog:allow-save",
     "allow-inspect",
     "allow-default-output",
     "allow-generated-output",
     "allow-start-job",
     "allow-cancel-job",
     "allow-stale-parts",
+    "allow-lz4-patch",
+    "allow-lz4-unpatch",
+    "allow-lz4-save-plan-profile",
     "allow-reveal",
     "allow-quit-app"
   ]

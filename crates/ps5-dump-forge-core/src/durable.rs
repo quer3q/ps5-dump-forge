@@ -341,6 +341,13 @@ impl<'a, O: Output> SyncEvery<'a, O> {
         Ok(self.out)
     }
 
+    /// [`finish`](Self::finish), also handing back the cadence for the next output.
+    pub(crate) fn finish_parts(mut self) -> io::Result<(O, &'a mut Cadence)> {
+        self.failed()?;
+        self.sync_point(false)?;
+        Ok((self.out, self.cadence))
+    }
+
     fn failed(&self) -> io::Result<()> {
         self.failed.as_ref().map_or(Ok(()), |e| Err(copy(e)))
     }

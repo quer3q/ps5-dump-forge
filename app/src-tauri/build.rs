@@ -9,6 +9,9 @@ const COMMANDS: &[&str] = &[
     "start_job",
     "cancel_job",
     "stale_parts",
+    "lz4_patch",
+    "lz4_unpatch",
+    "lz4_save_plan_profile",
     "reveal",
     "quit_app",
 ];

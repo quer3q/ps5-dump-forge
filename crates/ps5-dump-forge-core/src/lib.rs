@@ -21,6 +21,10 @@ mod extract;
 mod finalize;
 mod inspect;
 mod jobs;
+mod lz4;
+mod lz4_patch;
+mod lz4_profile;
+mod lz4_traces;
 mod package;
 mod portable;
 mod prefetch;
@@ -30,6 +34,7 @@ mod sdk;
 mod verify;
 #[cfg(windows)]
 mod win;
+mod zip;
 
 pub use dlc::Dlc;
 pub use extract::extraction_findings;
@@ -53,6 +58,30 @@ pub enum Format {
     Ffpfsc,
     /// `.pkg` debug FPKG.
     Pkg,
+    /// An LZ4 packed folder: a plain folder (no extension) whose assets sit in AMPR LZ4 packs
+    /// (`ampr_assets.index`, `ampr_assets-000.pak`, ...) that the injected
+    /// `fakelib/libSceAmpr.sprx` reads. Only for a title that imports `libSceAmpr`. The same
+    /// as `Folder` with [`Lz4Mode::Pack`] (kept for older requests).
+    Lz4,
+}
+
+/// What a job does with LZ4 asset packs besides its target ([`ConvertRequest::lz4`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lz4Mode {
+    /// Install the tracing runtime, so the game records what it reads (the next `Lz4` job
+    /// packs those files). A folder, `.exfat` or `.ffpkg` only: `/app0` must be writable.
+    Trace,
+    /// Decode the packs back to plain files.
+    Unpack,
+    /// Undo a trace patch: install Forge's release runtime (whatever runtime is there), drop
+    /// the journal and logs and write a fresh `ampr_emu.index`. Refused for a packed source
+    /// (unpack it first) and with the `Lz4` target (which always installs the release one).
+    Unpatch,
+    /// Pack the assets into LZ4 packs, into the request's `format`: a folder (as the `Lz4`
+    /// target), `.exfat`, `.ffpkg`, `.ffpfs` or `.ffpfsc` (not `.pkg`). An image gets its packs
+    /// straight from the source in two passes (measure, then write), with no staging folder.
+    Pack,
 }
 
 /// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same,
@@ -77,7 +106,8 @@ pub struct ConvertRequest {
     /// A game folder, `.exfat`, `.ffpkg`, `.ffpfs`, `.ffpfsc` or `.pkg`.
     pub source: PathBuf,
     pub format: Format,
-    /// The final output path (file, or directory for `Folder`). Must not exist yet.
+    /// The final output path (file, or directory for `Folder`). Must not exist yet. Ignored
+    /// with [`ConvertRequest::lz4_in_place`].
     pub output: PathBuf,
     /// Compression thread cap for `.pkg` and `.ffpfsc` builds (all cores when unset).
     #[serde(default)]
@@ -102,6 +132,42 @@ pub struct ConvertRequest {
     /// every other target.
     #[serde(default = "default_ffpfsc_level")]
     pub ffpfsc_level: u32,
+    /// Trace or unpack LZ4 packs; unset, packs travel as plain files (Forge's own trace
+    /// runtime in an unpacked dump is swapped for the release one).
+    #[serde(default)]
+    pub lz4: Option<Lz4Mode>,
+    /// When packing (`Lz4`, or [`Lz4Mode::Pack`]): a TOML packing profile (else this dump's traces, else a built-in guess).
+    /// Any other target fails preflight.
+    #[serde(default)]
+    pub lz4_profile: Option<PathBuf>,
+    /// When packing: traces copied from the console: the `*-amprtrace.zip` [`lz4_traces`] writes
+    /// (STORED entries, each checked against its CRC-32), a folder holding `ampr_commands.bin`
+    /// and `ampr_emu.index`, or that journal with its index beside it. Picks the files to pack
+    /// ahead of the dump's own traces. Any other target, or a profile too, fails preflight.
+    #[serde(default)]
+    pub lz4_traces: Option<PathBuf>,
+    /// For [`Lz4Mode::Trace`] into an `.exfat`/`.ffpkg`: free space for the trace, 64..=1024 MiB in
+    /// 64 MiB steps, 256 when unset. Ignored otherwise.
+    #[serde(default = "default_lz4_trace_space_mib")]
+    pub lz4_trace_space_mib: u32,
+    /// The output replaces the source: a patched copy is written beside the source image
+    /// (its `.part`), verified as usual, then renamed over the source once the source is seen
+    /// unchanged; on any failure the source stays as it was. Only for an `.exfat` or `.ffpkg`
+    /// source, with `format` the source's own and [`Lz4Mode::Trace`] or [`Lz4Mode::Unpatch`];
+    /// anything else is a preflight finding, as is a packed source. Needs about the image's
+    /// size of free space beside it until the rename. `output` is ignored. With
+    /// [`lz4_patch`], the explicit exceptions to "never touch the source".
+    #[serde(default)]
+    pub lz4_in_place: bool,
+}
+
+/// The trace space a request without one gets, in MiB.
+/// ponytail: measured once (Stellar Blade): ~2 MB of journal per 5 minutes of heavy loading, about
+/// 25 MB/hour, so 256 MiB is ~10 hours; the cap is 1024 MiB. Recalibrate on more titles.
+pub const DEFAULT_LZ4_TRACE_SPACE_MIB: u32 = 256;
+
+fn default_lz4_trace_space_mib() -> u32 {
+    DEFAULT_LZ4_TRACE_SPACE_MIB
 }
 
 /// The `.ffpfsc` zlib level a request without one gets.
@@ -120,7 +186,8 @@ pub type JobId = u64;
 pub enum Event {
     Progress {
         job: JobId,
-        /// `scan`, `preflight`, `write`, `verify`, `finalize`, or an FPKG build stage.
+        /// `scan`, `preflight`, `measure` (LZ4 into an image), `write`, `pack` (LZ4 folder),
+        /// `verify`, `finalize`, or an FPKG build stage.
         stage: String,
         /// Bytes over the whole job, every pass (write, verify, ...) included, so one bar
         /// fills once. `total` is an estimate that can grow; 0 before it is known.
@@ -246,6 +313,44 @@ pub struct Inspection {
     pub details: Vec<String>,
     /// Preflight findings for this source (errors and warnings), one per line.
     pub findings: Vec<String>,
+    /// AMPR / LZ4 pack facts; `None` when the title does not import `libSceAmpr` and holds
+    /// no LZ4 artifact (packs, journal, path index, Forge's runtime).
+    pub lz4: Option<Lz4Facts>,
+}
+
+/// What `inspect` found about LZ4 asset packs in a source. The containing-format facts of
+/// [`Inspection`] are unchanged; these describe the logical game inside it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Lz4Facts {
+    /// `eboot.bin` imports `libSceAmpr`.
+    pub imports_ampr: bool,
+    /// From the manifest, when the source holds packs and the manifest is sound.
+    pub packed: Option<Lz4Packed>,
+    /// A root `ampr_assets.index` starts with the pack magic but does not parse: the reason
+    /// (also a finding). `packed` is `None` then.
+    pub manifest_error: Option<String>,
+    /// The runtime at `fakelib/libSceAmpr.sprx`: `forge_release`, `forge_trace`, `other`
+    /// or `none`.
+    pub runtime: String,
+    /// Size of the trace journal (`ampr_commands.bin`), when present.
+    pub journal_bytes: Option<u64>,
+    /// With the journal and its `ampr_emu.index` both present: the name [`lz4_traces`] gives
+    /// their zip (`[GAME_TITLE]-[TITLE_ID]-amprtrace.zip`).
+    pub traces_zip: Option<String>,
+}
+
+/// Counts from an LZ4 manifest.
+#[derive(Debug, Clone, Serialize)]
+pub struct Lz4Packed {
+    /// Files the manifest lists (packed and loose).
+    pub files: u64,
+    /// Of those, the files stored in volumes. `None` when the manifest was too large to
+    /// parse (only its header counts are known; a finding says so).
+    pub packed_files: Option<u64>,
+    pub volumes: u64,
+    /// Whole percent: the stored bytes of the packed files over their logical (unpacked)
+    /// bytes. 0 with nothing packed; `None` like `packed_files`.
+    pub stored_percent: Option<u64>,
 }
 
 /// An emulator in `fakelib`/`fakelib2`, named by the file it reads from the game root.
@@ -264,6 +369,87 @@ pub struct InspectFile {
 
 pub fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     inspect::inspect(path)
+}
+
+/// What [`lz4_patch`] or [`lz4_unpatch`] did to a game folder.
+#[derive(Debug, Clone, Serialize)]
+pub struct Lz4Patch {
+    /// Files the new `ampr_emu.index` lists (the runtime included).
+    pub indexed: usize,
+    /// Stale trace files deleted from the folder's root (the journal, the logs).
+    pub removed: Vec<String>,
+    /// The runtime's known-issue line, for the report.
+    pub warning: String,
+}
+
+/// Patches a game folder in place for recording LZ4 traces: the embedded trace runtime
+/// replaces whatever `fakelib/libSceAmpr.sprx` is there, the last session's journal and logs
+/// are deleted and `ampr_emu.index` is rebuilt for the folder's files. An exception to "never
+/// touch the source", on request (with [`ConvertRequest::lz4_in_place`] for images and
+/// [`lz4_unpatch`]). Refuses an image or package (an `.exfat`/`.ffpkg` is patched by a
+/// conversion in place), a packed folder and a title whose `eboot.bin` does not import
+/// `libSceAmpr`. Each file is written under a temporary name, synced and renamed over its
+/// target; the folders are synced after. On the PS5 every file it writes is 0777.
+pub fn lz4_patch(folder: &Path) -> anyhow::Result<Lz4Patch> {
+    lz4_patch::patch(folder, lz4_patch::Runtime::Trace)
+}
+
+/// Undoes [`lz4_patch`] in place, with the same checks and writes: Forge's release runtime
+/// (0.4.2.1) replaces whatever `fakelib/libSceAmpr.sprx` is there (no backup of an earlier one
+/// exists), the journal and logs are deleted and `ampr_emu.index` is rebuilt.
+pub fn lz4_unpatch(folder: &Path) -> anyhow::Result<Lz4Patch> {
+    lz4_patch::patch(folder, lz4_patch::Runtime::Release)
+}
+
+pub use lz4_traces::Lz4Traces;
+
+/// What [`lz4_plan_profile`] resolved, as an editable TOML rules profile.
+#[derive(Debug, Clone, Serialize)]
+pub struct Lz4PlanProfile {
+    /// `[GAME_TITLE]-[TITLE_ID]-lz4profile.toml` (the generated stem, as the traces zip's).
+    pub file_name: String,
+    pub toml: String,
+    /// Files the plan packs and leaves loose (every logical file, the runtime and index too).
+    pub packed: usize,
+    pub loose: usize,
+    /// The resolution's log lines (rule source, keep-loose, auto-loose), as a job would log them.
+    pub log: Vec<String>,
+}
+
+/// Save as profile: the pack plan a Pack job of `request` would resolve (the source opened,
+/// packs decoded, traces, profile or built-in guess, the keep-loose list, auto-loose sampling),
+/// written as a TOML profile that `--lz4-profile` loads back to the same selection. Writes
+/// nothing; the LZ4 findings a job would refuse with are the error.
+pub fn lz4_plan_profile(request: &ConvertRequest) -> anyhow::Result<Lz4PlanProfile> {
+    lz4_profile::plan_profile(request)
+}
+
+/// Writes a saved profile's `toml` to `dest`, never into `source`: refused when `dest` is inside
+/// the source folder or is the source image (aliases through links or case included), or when
+/// it exists and is not a regular file (a symlink is never followed). An existing regular file
+/// is replaced only with `replace` (written beside it, then renamed over it); else refused.
+pub fn write_lz4_plan_profile(
+    source: &Path,
+    dest: &Path,
+    toml: &str,
+    replace: bool,
+) -> anyhow::Result<()> {
+    lz4_profile::write(source, dest, toml, replace)
+}
+
+/// The LZ4 trace files a traced game writes at its root: the journal, and the path index
+/// whose file ids it names. Pack takes both from one folder.
+pub const LZ4_TRACE_FILES: [&str; 2] = [ps5_dump_forge_lz4::JOURNAL, ps5_dump_forge_lz4::INDEX];
+
+/// Both [`LZ4_TRACE_FILES`] at the root of `source` (a folder or any image this app reads), to
+/// copy off the console, with the name their download takes:
+/// `[GAME_TITLE]-[TITLE_ID]-amprtrace.zip` from `param.json`, the stem exactly as
+/// [`generated_output`] builds it (the title made file-safe and cut first to keep the stem within
+/// 63 bytes; a part it lacks left out; `amprtrace.zip` without either). The inner `Err`
+/// says which file is missing; the outer one is a source that can't be read. A folder's files
+/// are opened directly; an image is read through its own reader. Only metadata is read here.
+pub fn lz4_traces(source: &Path) -> anyhow::Result<Result<Lz4Traces, String>> {
+    lz4_traces::open(source)
 }
 
 /// The default output path for `source` in `format`: in `dir`, named from the title id. An

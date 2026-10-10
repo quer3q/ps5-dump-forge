@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::Platform;
 
+/// ShadowMountPlus's folder of mount points: a plain folder, listed whenever it exists.
+const SHADOWMNT: &str = "/mnt/shadowmnt";
+
 pub(crate) struct Roots {
     list: Vec<Candidate>,
     ps5: bool,
@@ -17,8 +20,8 @@ struct Candidate {
     /// The canonical path, pinned at startup. On the PS5 a candidate that doesn't exist then
     /// is resolved each time it is used, and so is every drive.
     pinned: Option<PathBuf>,
-    /// A PS5 drive (`/mnt/usbN`, `/mnt/extN`): its folder exists with nothing plugged in, so
-    /// it is listed only while a filesystem is mounted on it.
+    /// A PS5 drive (`/mnt/usbN`, `/mnt/extN`, any `/mnt/...` but [`SHADOWMNT`]): its folder
+    /// exists with nothing plugged in, so it is listed only while a filesystem is mounted on it.
     drive: bool,
 }
 
@@ -37,7 +40,7 @@ impl Roots {
         let mut notes = Vec::new();
         let mut list = Vec::new();
         for path in candidates {
-            let drive = ps5 && path.starts_with("/mnt");
+            let drive = ps5 && path.starts_with("/mnt") && path != Path::new(SHADOWMNT);
             let candidate = |pinned| Candidate {
                 path: path.clone(),
                 pinned,
@@ -221,10 +224,12 @@ mod tests {
         assert!(roots.current().is_empty());
         std::fs::remove_dir_all(&tmp).unwrap();
 
-        // `/mnt/...` candidates are drives on the PS5 only, and never pinned.
-        let mnt = [PathBuf::from("/mnt/usb0")];
+        // `/mnt/...` candidates are drives on the PS5 only, and never pinned; ShadowMountPlus's
+        // folder isn't one.
+        let mnt = [PathBuf::from("/mnt/usb0"), PathBuf::from(SHADOWMNT)];
         let (roots, _) = Roots::new(Platform::Ps5, &mnt);
         assert!(roots.list[0].drive && roots.list[0].pinned.is_none());
+        assert!(!roots.list[1].drive);
         let (roots, _) = Roots::new(Platform::Host, &mnt);
         assert!(roots.list.iter().all(|c| !c.drive));
     }

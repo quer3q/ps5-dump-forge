@@ -46,8 +46,52 @@ release.
   not yet installed on a console. Nothing checks the decoded bytes against Oodle's own decoder; other Kraken array types (RLE,
   tANS, multi-array) are still refused.
 - [ ] Optional user-supplied FPKG key file (all key use already sits behind vendored `keys.rs`).
-- [ ] Later idea: LZ4-compressed images or containers, if ShadowMountPlus or the console ever supports them
-  (none does today; check before starting).
+- [ ] Later idea: LZ4-compressed *images* (not the ampr_emu asset packs below), if ShadowMountPlus or the
+  console ever supports them (none does today; check before starting).
+
+## LZ4 asset packs (ampr_emu 0.4.2.1)
+Host round trips and the upstream Python tools (`scripts/check-lz4.sh`) do not show hook coverage, save
+stability, speed or arm64/PS5 behaviour. Hardware gates:
+- [ ] A traced dump (writable folder, `image_rw` `.exfat`, `.ffpkg`) boots on the console and records a journal;
+  Stop/cancel of a console conversion with `--lz4-trace`.
+- [ ] **Traced `.ffpkg` (the recommended path, pending):** a plain `.ffpkg`, then LZ4 → Trace → Patch (rebuilt
+  and replaced in place), mounted `image_rw=`
+  with SMP, boots and records a journal; after closing the game (and about a minute), LZ4 → Download traces from
+  a computer's browser downloads the traces zip whole (from the image file, and from
+  its mounted folder under `/mnt/shadowmnt`); packing the original dump with them gives a folder that boots
+  and plays. Check how long the image file on disk lags the mounted image's writes, and that writes through
+  the mount update the image file's mtime (Download traces aborts a download on a change it can see: relaunch
+  the game mid-download and confirm the download fails).
+- [ ] Image patch/unpatch in place on the console (`/data`, USB): the copy needs about the image's size free
+  beside it; the rename over the source lands; a cancel or a pulled drive leaves the source intact. Unpatch
+  (release runtime) of a played traced image boots. An image replaced while SMP has it mounted: what the
+  mount sees (it keeps the old file until unmounted?).
+- [ ] In-place folder patch on a console (`lz4-patch` / LZ4 → Trace → Patch on a folder): **failed** on Stellar Blade: the
+  patched folder didn't launch (CE-107750-0), and still didn't after restoring the stock files; a plain Forge
+  `.ffpkg` of the same game launched fine. Cause found: the patch wrote its files without world-execute
+  (the PS5 app loader refuses game files without it; ps5upload forces 0777 for the same reason), and the
+  restore overwrote them in place, keeping that mode. Every file and folder Forge writes on the PS5 is now
+  0777: a folder written by the fixed payload (an LZ4 unpack of Stellar Blade on the console) boots and
+  plays. Still open: an in-place folder patch by the fixed payload boots; a failed or interrupted patch
+  leaves a folder that still boots.
+- [ ] A packed folder boots, plays, saves and loads; try levels, languages, DLC and rare accesses.
+- [ ] A packed `.ffpkg` (and `.exfat`) boots from internal and external storage.
+- [ ] Packed straight into an image (`--lz4-pack`, LZ4 → Pack → Target): `.ffpkg`, `.exfat` and `.ffpfs`
+  (and a `.ffpfsc` with each inner image) mount with SMP 1.7, boot and play from the packs. Host checks done:
+  fsck_exfat + exfatprogs, FreeBSD fsck_ufs, upstream `check-lz4.sh` on the packs taken out of the image.
+- [ ] Unpack reconstructs the assets byte-exact (checked on host). On a console: unpacking a packed
+  Stellar Blade folder (packed with traces, which also packed its `.pak`/`.utoc`/config files and failed to
+  boot with "Failed to open descriptor file …SB.uproject") gave a folder that boots and plays. Still open: a
+  byte-for-byte compare of a real unpack against the original dump.
+- [ ] Traces must not pack files the engine opens directly: fixed (traces now only narrow the built-in
+  guess; Stellar Blade packs its 5 `.ucas`, nothing else). On a console: Stellar Blade packed this way
+  (its traces, 5 `.ucas` packed) boots and plays smoothly. Still open: other titles and engines, long
+  sessions, saves.
+- [ ] Trace growth was measured once (Stellar Blade: about 2 MB per 5 minutes of heavy loading, ≈ 25 MB/hour; default 256 MiB ≈ 10 hours, cap 1 GiB): recalibrate on more titles (`ponytail:` in `core/src/lib.rs`).
+- [ ] Save stability: upstream 0.4.2.1 is a test build and some games crash when saving.
+- [ ] A pack with 0 volumes (nothing qualifies) is accepted by Forge's validator; is it accepted by the runtime?
+- [ ] A real 4 GiB volume rollover (tests use a small cap) written and read on a FAT32 stick and a console.
+- [ ] Upgrade ampr_emu when upstream ships a stable build (binaries, archive, README, pins together).
 
 ## Platforms
 - [ ] Windows core gaps marked `ponytail:`: free-space and FAT32 checks, file identity (stability and

@@ -589,7 +589,7 @@ const AMPR_LIB: &[u8] = b"libSceAmpr";
 /// segment that holds its dynamic section, which in Spider-Man 2's 179 MB `eboot.bin` starts
 /// 153 MB in. So the front is scanned, then that segment, found through the module's headers
 /// (or, when they cannot be read, the module's last [`AMPR_SEGMENT_LIMIT`] bytes).
-pub(crate) fn imports_ampr(tree: &mut dyn SourceTree, rel: &str) -> bool {
+pub fn imports_ampr(tree: &mut dyn SourceTree, rel: &str) -> bool {
     if scan_for(tree, rel, 0, AMPR_SCAN_LIMIT, AMPR_LIB) {
         return true;
     }

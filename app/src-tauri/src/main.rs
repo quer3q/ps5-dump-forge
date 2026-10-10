@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ps5_dump_forge_core::{ConvertRequest, Event, Format, Inspection, JobId, Jobs};
+use ps5_dump_forge_core::{
+    ConvertRequest, Event, Format, Inspection, JobId, Jobs, Lz4Patch, Lz4PlanProfile,
+};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// Emitted to the UI when a close or quit was held back because jobs are running.
@@ -148,6 +150,67 @@ async fn start_job(app: AppHandle, request: ConvertRequest) -> Result<JobId, Str
         state.running.fetch_add(1, Ordering::SeqCst);
         drop(quitting);
         Ok(id)
+    })
+    .await
+}
+
+/// Patches a game folder in place for LZ4 traces. Refused while a job is queued or running
+/// (it could be reading the folder). The quit lock is held throughout, so no job starts and
+/// no quit is decided mid-patch.
+// ponytail: a close request during the patch waits for it on the event loop (a few seconds
+// at most: a scan, one runtime and one index written).
+#[tauri::command]
+async fn lz4_patch(app: AppHandle, path: PathBuf) -> Result<Lz4Patch, String> {
+    patch_folder(app, path, false).await
+}
+
+/// Undoes `lz4_patch` in place (core's `lz4_unpatch`), on the same terms.
+#[tauri::command]
+async fn lz4_unpatch(app: AppHandle, path: PathBuf) -> Result<Lz4Patch, String> {
+    patch_folder(app, path, true).await
+}
+
+async fn patch_folder(app: AppHandle, path: PathBuf, unpatch: bool) -> Result<Lz4Patch, String> {
+    blocking(app, move |_, state| {
+        let quitting = state.quitting();
+        if *quitting {
+            return Err("PS5 Dump Forge is quitting".to_string());
+        }
+        if state.running.load(Ordering::SeqCst) > 0 {
+            let verb = if unpatch { "unpatch" } else { "patch" };
+            return Err(format!(
+                "a conversion is queued or running; {verb} once it has finished"
+            ));
+        }
+        let done = if unpatch {
+            ps5_dump_forge_core::lz4_unpatch(&path)
+        } else {
+            ps5_dump_forge_core::lz4_patch(&path)
+        }
+        .map_err(err);
+        drop(quitting);
+        done
+    })
+    .await
+}
+
+/// Save as profile: the pack plan `request` (a Pack request) resolves, as a TOML profile written
+/// to `dest`, the save dialog's choice (it already asked about replacing a file; never into the
+/// source, never through a symlink). Reads the source and writes only `dest`; not a job.
+#[tauri::command]
+async fn lz4_save_plan_profile(
+    app: AppHandle,
+    request: ConvertRequest,
+    dest: PathBuf,
+) -> Result<Lz4PlanProfile, String> {
+    blocking(app, move |_, _| {
+        let mut saved = ps5_dump_forge_core::lz4_plan_profile(&request).map_err(err)?;
+        ps5_dump_forge_core::write_lz4_plan_profile(&request.source, &dest, &saved.toml, true)
+            .map_err(err)?;
+        if let Some(name) = dest.file_name() {
+            saved.file_name = name.to_string_lossy().into_owned();
+        }
+        Ok(saved)
     })
     .await
 }
@@ -646,6 +709,9 @@ fn main() {
             start_job,
             cancel_job,
             stale_parts,
+            lz4_patch,
+            lz4_unpatch,
+            lz4_save_plan_profile,
             reveal,
             quit_app,
         ])

@@ -21,6 +21,7 @@ libfuzzer-sys = "0.4"
 ps5upload-fpkg = { path = "../vendor/ps5upload-fpkg" }
 ps5-dump-forge-fpkg = { path = "../crates/ps5-dump-forge-fpkg" }
 ps5-dump-forge-pfs = { path = "../crates/ps5-dump-forge-pfs" }
+ps5-dump-forge-lz4 = { path = "../crates/ps5-dump-forge-lz4" }
 
 [lib]
 path = "src/lib.rs"
@@ -77,6 +78,34 @@ bench = false
 [[bin]]
 name = "fpkg_source"
 path = "fuzz_targets/fpkg_source.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lz4_manifest"
+path = "fuzz_targets/lz4_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lz4_index"
+path = "fuzz_targets/lz4_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lz4_journal"
+path = "fuzz_targets/lz4_journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lz4_unpack"
+path = "fuzz_targets/lz4_unpack.rs"
 test = false
 doc = false
 bench = false

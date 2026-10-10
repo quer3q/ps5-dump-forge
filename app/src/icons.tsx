@@ -18,9 +18,12 @@ const PATHS = {
   finder: "M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5zM12 4v16M8 9v1.5M16 9v1.5M8.5 15.5c2 1.3 5 1.3 7 0",
   file: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5",
   up: "M12 19V5M6 11l6-6 6 6",
+  download: "M12 4v11M7 10l5 5 5-5M5 20h14",
   power: "M12 3v8M7.1 6.2a7.5 7.5 0 1 0 9.8 0",
   scale: "M12 4v16M8 20h8M5 7h14M5 7l-3 6a3 3 0 0 0 6 0zM19 7l-3 6a3 3 0 0 0 6 0z",
   compress: "M12 3v6M9 6l3 3 3-3M12 21v-6M9 18l3-3 3 3M5 12h14",
+  lock: "M6.5 11h11a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 18.5v-6A1.5 1.5 0 0 1 6.5 11zM8.5 11V8a3.5 3.5 0 0 1 7 0v3",
+  chevron: "M7 10l5 5 5-5",
 } as const;
 
 export type IconName = keyof typeof PATHS;

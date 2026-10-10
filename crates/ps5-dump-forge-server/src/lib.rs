@@ -30,9 +30,12 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
 /// Where the PS5's file browser starts: `/data`, and each drive while a filesystem is mounted
-/// on it (re-checked each time, for hot-plugged drives).
-pub const PS5_ROOTS: [&str; 11] = [
+/// on it (re-checked each time, for hot-plugged drives); `/mnt/shadowmnt` while it exists:
+/// ShadowMountPlus mounts each image under it (`<stem>_<8 hex>`, `.ffpfsc` under `pfsc/`), so
+/// a mounted traced image can be picked as a folder.
+pub const PS5_ROOTS: [&str; 12] = [
     "/data",
+    "/mnt/shadowmnt",
     "/mnt/usb0",
     "/mnt/usb1",
     "/mnt/usb2",

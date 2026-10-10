@@ -1,5 +1,7 @@
 // http build: the folder and file browser over `POST /api/list_dir` that stands in for the
-// native dialog. A modal in its own React root; the app behind it is inert.
+// native dialog. A modal in its own React root; the app behind it is inert. Three modes: a
+// folder, a file, or (`folderToo`) either: a file click picks it, "Choose this folder" the
+// folder shown.
 
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { createRoot } from "react-dom/client";
@@ -63,6 +65,18 @@ function shows(o: PickOptions, e: Entry): boolean {
   const dot = e.name.lastIndexOf(".");
   const ext = dot > 0 ? e.name.slice(dot + 1).toLowerCase() : "";
   return (o.extensions ?? []).includes(ext);
+}
+
+const IMAGES = ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
+function isImage(name: string): boolean {
+  return IMAGES.includes(name.slice(name.lastIndexOf(".") + 1).toLowerCase());
+}
+
+/** The files a file mode lists, for its empty listing: "PS5 images", ".zip files". */
+function fileKinds(o: PickOptions): string {
+  const ext = o.extensions ?? [];
+  if (ext.some((e) => IMAGES.includes(e))) return "PS5 images";
+  return `${ext.map((e) => `.${e}`).join(" or ")} files`;
 }
 
 /** "Drives", then the root holding `path`, then each folder below it. */
@@ -182,7 +196,7 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
       >
         <div className="modal-head">
           <span className="head-icon">
-            <Icon name={o.directory ? "folder" : "disc"} />
+            <Icon name={o.directory || o.folderToo ? "folder" : "disc"} />
           </span>
           <h2 id="pick-title">{o.title}</h2>
         </div>
@@ -222,7 +236,7 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
                 className="pick-row entry"
                 onClick={() => (e.dir ? go(e.path) : done(e.path))}
               >
-                <Icon name={e.dir ? "folder" : "disc"} />
+                <Icon name={e.dir ? "folder" : isImage(e.name) ? "disc" : "file"} />
                 <span className={here === null ? "pick-name mono" : "pick-name"}>
                   {here === null ? e.path : e.name}
                 </span>
@@ -238,7 +252,7 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
                 ? "No drives found."
                 : o.directory
                   ? "No folders here."
-                  : "No folders or PS5 images here."}
+                  : `No folders or ${fileKinds(o)} here.`}
             </li>
           )}
         </ul>
@@ -251,7 +265,7 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
           <button type="button" ref={cancel} onClick={() => done(null)}>
             Cancel
           </button>
-          {o.directory && (
+          {(o.directory || o.folderToo) && (
             <button
               type="button"
               className="primary"

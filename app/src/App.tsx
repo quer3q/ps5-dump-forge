@@ -12,9 +12,10 @@ import { Convert } from "./Convert";
 import { Formats } from "./Formats";
 import { Icon } from "./icons";
 import { Inspect } from "./Inspect";
+import { Lz4 } from "./Lz4";
 import { jobsReducer, type Job } from "./jobs";
 
-type Tab = "convert" | "inspect" | "formats";
+type Tab = "convert" | "lz4" | "inspect" | "formats";
 
 export function App() {
   const [tab, setTab] = useState<Tab>("convert");
@@ -99,6 +100,7 @@ export function App() {
                     </>
                   ),
                 },
+                { id: "lz4", label: "LZ4", className: "tab-lz4" },
                 { id: "inspect", label: "Inspect" },
                 { id: "formats", label: "About formats" },
               ]}
@@ -135,6 +137,14 @@ export function App() {
                 document.getElementById(tabId("screen", "formats"))?.focus();
               }}
             />
+          </div>
+          <div
+            id={panelId("screen", "lz4")}
+            role="tabpanel"
+            aria-labelledby={tabId("screen", "lz4")}
+            hidden={tab !== "lz4"}
+          >
+            <Lz4 jobs={jobs} dispatch={dispatch} />
           </div>
           <div
             id={panelId("screen", "inspect")}

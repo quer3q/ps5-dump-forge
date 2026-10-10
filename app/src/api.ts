@@ -9,9 +9,15 @@ type UnlistenFn = Unlisten;
 const invoke = transport.call;
 const listen = transport.listen;
 
-export type Format = "folder" | "exfat" | "ffpkg" | "ffpfs" | "ffpfsc" | "pkg";
-/** What a source can be: every target format is also read. */
-export type Kind = Format;
+/** What a source can be (its containing file system or package); each is also a target. */
+export type Kind = "folder" | "exfat" | "ffpkg" | "ffpfs" | "ffpfsc" | "pkg";
+/** A target: every source kind, plus the LZ4 packed folder (a folder, read as one). */
+export type Format = Kind | "lz4";
+/** What a job does with LZ4 asset packs, besides the target: install the trace runtime, write
+ * packs back as plain files, or put Forge's release runtime back. */
+/** `pack`: LZ4 packs into `format` (folder, exfat, ffpkg, ffpfs, ffpfsc); the `lz4` format is
+ * the same as `folder` with `pack`. */
+export type Lz4Mode = "trace" | "unpack" | "unpatch" | "pack";
 /** The image inside a `.ffpfsc` container. */
 export type InnerFormat = "exfat" | "ffpkg" | "ffpfs";
 /** How hard a `.pkg` build compresses (Kraken). */
@@ -35,6 +41,20 @@ export interface ConvertRequest {
   kraken_level?: KrakenLevel;
   /** For `.ffpfsc`: the zlib level, 0 (store) to 9 (smallest); missing: 6. */
   ffpfsc_level?: number;
+  /** `"trace"`: install the trace runtime (folder, `.exfat`, `.ffpkg`); `"unpack"`: write
+   * packed assets back as plain files; `"unpatch"`: install Forge's release runtime, drop the
+   * journal and logs; missing or null: none of these. */
+  lz4?: Lz4Mode | null;
+  /** With `"trace"` or `"unpatch"` on an `.exfat`/`.ffpkg` source and `format` the source's
+   * own: the verified output replaces the source (`output` is derived: a `.part` beside it). */
+  lz4_in_place?: boolean;
+  /** For the LZ4 target: a TOML rules profile (a path on the machine that runs the job). */
+  lz4_profile?: string | null;
+  /** For the LZ4 target: a trace journal (`ampr_commands.bin`) copied from elsewhere, with its
+   * `ampr_emu.index` next to it; never with `lz4_profile`. */
+  lz4_traces?: string | null;
+  /** With `"trace"` into an image: the free space added for the trace, 64–1024 MiB in 64 MiB steps; missing: 256. */
+  lz4_trace_space_mib?: number;
 }
 
 /** How the output was verified. `samples` and `seed` are 0 for full. */
@@ -95,6 +115,32 @@ export interface Emulator {
   name: string;
 }
 
+/** Counts from a sound LZ4 manifest. */
+export interface Lz4Packed {
+  /** Files the manifest lists, packed and loose. */
+  files: number;
+  /** Null with `stored_percent` for a manifest too large to inspect fully (over 64 MiB; a
+   * finding says so). */
+  packed_files: number | null;
+  volumes: number;
+  /** Whole percent: stored bytes of the packed files over their unpacked bytes. */
+  stored_percent: number | null;
+}
+
+/** LZ4 asset packs (AMPR): present when eboot.bin imports libSceAmpr or a pack, trace or
+ * runtime artifact is there. */
+export interface Lz4Facts {
+  imports_ampr: boolean;
+  packed: Lz4Packed | null;
+  /** The manifest starts like one but doesn't parse (also a finding); `packed` is null. */
+  manifest_error: string | null;
+  runtime: "forge_release" | "forge_trace" | "other" | "none";
+  /** Size of the trace journal (ampr_commands.bin), when present. */
+  journal_bytes: number | null;
+  /** With the journal and its ampr_emu.index both present: the name Get traces' zip takes. */
+  traces_zip: string | null;
+}
+
 export interface InspectFile {
   path: string;
   size: number;
@@ -127,6 +173,9 @@ export interface Inspection {
   forge_version: string | null;
   /** DLC embedded in the dump. */
   dlcs: Dlc[];
+  /** LZ4 asset packs; null (or missing from an older server) when the title has nothing to do
+   * with AMPR. */
+  lz4?: Lz4Facts | null;
   /** icon0.png as a data: URL. */
   cover: string | null;
   param_json: unknown;
@@ -135,6 +184,27 @@ export interface Inspection {
   total_bytes: number;
   details: string[];
   findings: string[];
+}
+
+/** Save as profile: the pack plan Forge resolved for a Pack request, as an editable TOML. */
+export interface Lz4PlanProfile {
+  /** `[GAME_NAME]-[TITLE_ID]-lz4profile.toml` (the app: the name saved under). */
+  file_name: string;
+  toml: string;
+  packed: number;
+  loose: number;
+  /** How the plan was resolved (rule source, keep-loose, auto-loose), as a job logs it. */
+  log: string[];
+}
+
+/** What patching (or unpatching) a folder in place for LZ4 tracing did. */
+export interface Lz4Patch {
+  /** Files listed in the fresh `ampr_emu.index`. */
+  indexed: number;
+  /** Stale trace files deleted from the folder's root (relative paths). */
+  removed: string[];
+  /** The installed runtime's known issue (`ps5_dump_forge_lz4::runtime::WARNING`). */
+  warning?: string;
 }
 
 /** One job in `GET /api/jobs` (http build): what a reloaded page rebuilds its list from. */
@@ -178,6 +248,16 @@ export const api = {
     invoke<string>("generated_output", { source, format, dir, taken }),
   startJob: (request: ConvertRequest) => invoke<JobId>("start_job", { request }),
   cancelJob: (id: JobId) => invoke<void>("cancel_job", { id }),
+  /** Patch a game folder in place for LZ4 tracing: the trace runtime in fakelib/, a fresh
+   * index, stale traces removed. Not a job; core refuses it while a job runs. */
+  lz4Patch: (source: string) => transport.lz4Patch<Lz4Patch>(source),
+  /** Put Forge's release runtime back in a game folder in place: journal and logs removed, a
+   * fresh index. Not a job; core refuses it while a job runs. */
+  lz4Unpatch: (source: string) => transport.lz4Unpatch<Lz4Patch>(source),
+  /** Save as profile for a Pack request: the app's save dialog (offering `name` in `dir`) then
+   * writes it; the http build downloads it. Reads the source, not a job. null: cancelled. */
+  savePlanProfile: (request: ConvertRequest, name: string, dir: string) =>
+    transport.savePlanProfile<Lz4PlanProfile>(request, name, dir),
   /** Leftover `.part` files in these folders (deduplicated, missing ones skipped). */
   staleParts: (dirs: string[]) => invoke<string[]>("stale_parts", { dirs }),
   /** Show a finished job's output in Finder, Explorer or its folder (Rust looks the path up by

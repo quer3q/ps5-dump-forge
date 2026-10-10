@@ -8,6 +8,7 @@ members = [
   "crates/ps5-dump-forge-core",
   "crates/ps5-dump-forge-cli",
   "crates/ps5-dump-forge-fpkg",
+  "crates/ps5-dump-forge-lz4",
   "crates/ps5-dump-forge-server",
   "app/src-tauri",
 ]
@@ -35,6 +36,7 @@ ps5-dump-forge-ufs2 = { path = "crates/ps5-dump-forge-ufs2" }
 ps5-dump-forge-pfs = { path = "crates/ps5-dump-forge-pfs" }
 ps5-dump-forge-core = { path = "crates/ps5-dump-forge-core" }
 ps5-dump-forge-fpkg = { path = "crates/ps5-dump-forge-fpkg" }
+ps5-dump-forge-lz4 = { path = "crates/ps5-dump-forge-lz4" }
 ps5-dump-forge-server = { path = "crates/ps5-dump-forge-server" }
 
 [profile.release]

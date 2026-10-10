@@ -1,5 +1,6 @@
 // About formats: one comparison table of the targets and the plain folder (console speeds from
-// ShadowMountPlus 1.7's README and release notes). Static text; nothing here talks to Rust.
+// ShadowMountPlus 1.7's README and release notes; the LZ4 packed folder's from its upstream
+// authors, labelled as theirs), then the LZ4 credits. Static text; nothing here talks to Rust.
 
 import { CardHead, FormatPill } from "./common";
 import { Icon, type IconName } from "./icons";
@@ -51,6 +52,14 @@ const ROWS: { kind: string; tagline: string; cells: [string, Rating][] }[] = [
     ],
   },
   {
+    kind: "lz4",
+    tagline: "Experimental, for games that use AMPR",
+    cells: [
+      ["30–40% faster loading, upstream's numbers", "good"],
+      ["About half the game size, upstream's numbers", "good"],
+    ],
+  },
+  {
     kind: "folder",
     tagline: "Plain game files",
     cells: [["Full drive speed", "good"], FLAT],
@@ -96,6 +105,21 @@ export function Formats() {
               ))}
             </tbody>
           </table>
+        </div>
+        <div className="credits">
+          <p className="muted">
+            Upstream's numbers: what the authors of ampr_emu and Lazy_AMPR report, not measured by
+            PS5 Dump Forge; they vary by game. ampr_emu 0.4.2.1 is an upstream test build; known
+            issue: some games crash when saving.
+          </p>
+          <p className="muted">
+            LZ4 packed folders run on ampr_emu 0.4.2.1 by drakmor (GPL-3.0), bundled unmodified.
+            Source: <span className="path">https://github.com/drakmor/ampr_emu</span>
+          </p>
+          <p className="muted">
+            The trace-then-pack workflow follows Lazy_AMPR by Nazky:{" "}
+            <span className="path">https://github.com/Nazky/Lazy_AMPR</span>
+          </p>
         </div>
       </section>
     </div>
