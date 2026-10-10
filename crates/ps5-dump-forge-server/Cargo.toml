@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 getrandom.workspace = true
 libc.workspace = true
+# `GET /api/qr`: the page's address for a phone; no image/svg features (api.rs draws the SVG).
+qrcode = { version = "0.14", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 ps5-dump-forge-core.workspace = true

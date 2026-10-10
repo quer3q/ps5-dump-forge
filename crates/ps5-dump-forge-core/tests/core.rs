@@ -7,8 +7,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use ps5_dump_forge_core::{
-    ConvertRequest, DataDirs, Event, Format, JobReport, Jobs, KrakenLevel, ScannedFolder,
-    VerifyMode, default_output, extraction_findings, inspect, rename_no_replace, stale_parts,
+    ConvertRequest, DataDirs, DeleteError, Event, Format, JobReport, Jobs, KrakenLevel,
+    ScannedFolder, VerifyMode, default_output, extraction_findings, inspect, rename_no_replace,
+    stale_parts,
 };
 use ps5upload_fpkg::source::SourceTree;
 
@@ -2767,6 +2768,57 @@ fn an_unpatch_conversion_installs_the_release_runtime() {
     result.unwrap();
     assert!(logged(&events, "installing the release runtime"));
     assert_eq!(facts_runtime(&out).0, "forge_release");
+
+    // The other targets, with a backport left out: the source is untouched, the output has
+    // the release runtime, no backport and an index of what it holds.
+    let mut exe = eboot(0x1200_0038);
+    exe.extend_from_slice(b"libSceAmpr");
+    write(&other, "eboot.bin", &exe);
+    write(
+        &other,
+        "sce_sys/param.json",
+        br#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST","sdkVersion":"0x1200000000000000"}"#,
+    );
+    write(
+        &other,
+        "fakelib/libSceAgc.sprx",
+        b"\x7fELF a system library",
+    );
+    let facts = inspect(&other).unwrap().lz4.unwrap();
+    assert_eq!(
+        (facts.runtime.as_str(), facts.shipped_runtime_version),
+        ("other", ps5_dump_forge_lz4::runtime::VERSION)
+    );
+    let before = snapshot(&other);
+    for (format, ext) in [
+        (Format::Ffpfs, "ffpfs"),
+        (Format::Ffpfsc, "ffpfsc"),
+        (Format::Pkg, "pkg"),
+    ] {
+        let out = root.join(format!("out-backport.{ext}"));
+        run(ConvertRequest {
+            remove_backport: true,
+            ..lz4_request(&other, format, &out, Some(Lz4Mode::Unpatch))
+        })
+        .1
+        .unwrap_or_else(|e| panic!("{ext}: {e}"));
+        assert_eq!(
+            snapshot(&other),
+            before,
+            "{ext}: the source is never touched"
+        );
+        let found = inspect(&out).unwrap();
+        assert!(found.backport.is_empty(), "{ext}: {:?}", found.backport);
+        assert_eq!(found.lz4.unwrap().runtime, "forge_release", "{ext}");
+        let back = root.join(format!("back-{ext}"));
+        run(request(&out, Format::Folder, &back)).1.unwrap();
+        assert!(!back.join("fakelib/libSceAgc.sprx").exists(), "{ext}");
+        // The `.pkg` builder adds its keystone after the index is written.
+        if format == Format::Pkg {
+            std::fs::remove_file(back.join("sce_sys/keystone")).unwrap();
+        }
+        assert_indexes_folder(&back);
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2940,6 +2992,7 @@ fn lz4_pack_straight_into_each_image() {
                 ..request(&src, format, &image)
             });
             let report = result.unwrap_or_else(|e| panic!("{rules} {ext}: {e}"));
+            one_bar(&events);
             let order = stages(&events);
             let at = |s: &str| order.iter().position(|x| *x == s).unwrap();
             assert!(
@@ -3061,4 +3114,228 @@ fn cancel_lz4_into_an_image_leaves_nothing() {
         "verify",
         true,
     );
+}
+
+/// The job's one bar, as `(stage, done, total)` per progress event, checked the way the UI
+/// shows it (the largest fraction yet): `done` never goes back, and the bar is full only once
+/// no byte pass is left (nothing after it moves `done`). Returns the events.
+fn one_bar(events: &[Event]) -> Vec<(&str, u64, u64)> {
+    let bar: Vec<(&str, u64, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Progress {
+                stage, done, total, ..
+            } => Some((stage.as_str(), *done, *total)),
+            _ => None,
+        })
+        .collect();
+    for pair in bar.windows(2) {
+        assert!(
+            pair[0].1 <= pair[1].1,
+            "done went back: {pair:?} in {bar:?}"
+        );
+    }
+    if let Some(full) = bar.iter().position(|&(_, d, t)| t > 0 && d >= t) {
+        assert!(
+            bar[full..].iter().all(|&(_, d, _)| d == bar[full].1),
+            "full at {:?} with work left: {bar:?}",
+            bar[full]
+        );
+    }
+    bar
+}
+
+/// LZ4 packs into an `.ffpfs` (measure, write, verify as written and through the packs):
+/// measuring and auto-loose sampling reserve the passes after them, so the write moves the
+/// bar on from where measuring left it. Compressible and RAW-heavy packs, fast and full.
+#[test]
+fn lz4_pack_into_an_image_is_one_bar() {
+    let root = dir("lz4-pack-bar");
+    let src = root.join("src");
+    ampr_game(&src);
+    // Sampled (noise.bin kept loose), or noise.bin packed as RAW chunks.
+    for (tag, extra) in [("sampled", ""), ("raw", "auto_loose_large_files = false\n")] {
+        let toml = root.join(format!("{tag}.toml"));
+        std::fs::write(
+            &toml,
+            format!(
+                "[pack]\ndefault_action = \"compress\"\nauto_loose_min_file_size = \"100KiB\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        for full_verify in [false, true] {
+            let out = root.join(format!("{tag}-{full_verify}.ffpfs"));
+            let (events, result) = run(ConvertRequest {
+                lz4_profile: Some(toml.clone()),
+                full_verify,
+                ..lz4_request(&src, Format::Ffpfs, &out, Some(Lz4Mode::Pack))
+            });
+            result.unwrap_or_else(|e| panic!("{tag} {full_verify}: {e}"));
+            assert_eq!(
+                logged(&events, "auto-loose: 1 large files kept loose"),
+                tag == "sampled"
+            );
+            let bar = one_bar(&events);
+            let fraction = |&(_, d, t): &(&str, u64, u64)| d as f64 / t.max(1) as f64;
+            let shown = |upto: usize| bar[..upto].iter().map(fraction).fold(0.0, f64::max);
+            let after = |stage: &str| bar.iter().rposition(|e| e.0 == stage).unwrap() + 1;
+            let (measured, written) = (shown(after("measure")), shown(after("write")));
+            assert!(
+                measured < written && written < 1.0,
+                "{tag} {full_verify}: measured {measured}, written {written}: {bar:?}"
+            );
+            // Auto-loose sampling, in preflight before the measure pass, is a sliver of it.
+            let sampled = shown(bar.iter().position(|e| e.0 == "measure").unwrap());
+            assert!(
+                (sampled > 0.0) == (tag == "sampled") && sampled < measured,
+                "{bar:?}"
+            );
+            assert_eq!(
+                bar.last().map(|e| (e.0, e.1 == e.2)),
+                Some(("finalize", true))
+            );
+        }
+    }
+    assert!(stale_parts(&root).is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// What `delete_path` refused, or "ok".
+fn deleted(jobs: &Jobs, path: &Path, protected: &[PathBuf]) -> &'static str {
+    match jobs.delete_path(path, protected) {
+        Ok(()) => "ok",
+        Err(DeleteError::Refused(_)) => "refused",
+        Err(DeleteError::Missing(_)) => "missing",
+        Err(DeleteError::Busy(_)) => "busy",
+        Err(DeleteError::Failed(e)) => panic!("{}: {e}", path.display()),
+    }
+}
+
+#[test]
+fn delete_removes_a_file_or_folder_but_not_through_links() {
+    let root = dir("delete");
+    let jobs = Jobs::new(|_| {});
+    write(&root, "file.bin", b"x");
+    assert_eq!(deleted(&jobs, &root.join("file.bin"), &[]), "ok");
+    assert!(!root.join("file.bin").exists());
+    game(&root.join("game"));
+    write(&root, "outside/keep.bin", b"keep");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("outside"), root.join("game/data/link")).unwrap();
+    // Another spelling of `game`.
+    assert_eq!(deleted(&jobs, &root.join("game/data/.."), &[]), "ok");
+    assert!(!root.join("game").exists());
+    assert_eq!(
+        std::fs::read(root.join("outside/keep.bin")).unwrap(),
+        b"keep"
+    );
+    assert_eq!(deleted(&jobs, &root.join("game"), &[]), "missing");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn delete_refuses_roots_links_and_special_files() {
+    let root = dir("delete-refused");
+    let jobs = Jobs::new(|_| {});
+    let games = root.join("games");
+    write(&games, "a/eboot.bin", b"x");
+    let keep = [games.clone()];
+    assert_eq!(deleted(&jobs, Path::new(""), &[]), "refused");
+    assert_eq!(
+        deleted(&jobs, root.ancestors().last().unwrap(), &[]),
+        "refused"
+    );
+    assert_eq!(deleted(&jobs, &games, &keep), "refused");
+    assert_eq!(deleted(&jobs, &root, &keep), "refused");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&games, root.join("link")).unwrap();
+        assert_eq!(deleted(&jobs, &root.join("link"), &[]), "refused");
+        // To the OS `link/` and `link/.` name the target; still the link, still refused.
+        let spelled = root.join("link").into_os_string().into_string().unwrap();
+        for p in [format!("{spelled}/"), format!("{spelled}/.")] {
+            assert_eq!(deleted(&jobs, Path::new(&p), &[]), "refused", "{p}");
+        }
+        let fifo = std::ffi::CString::new(root.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert_eq!(deleted(&jobs, &root.join("fifo"), &[]), "refused");
+    }
+    assert!(games.join("a/eboot.bin").exists());
+    // Inside a protected root is what deleting is for.
+    assert_eq!(deleted(&jobs, &games.join("a"), &keep), "ok");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Nothing an unfinished job uses, running or queued, is deleted, nor anything around it; a
+/// sibling with a similar name is. Once the jobs are done, their paths are free again.
+#[test]
+fn delete_leaves_what_unfinished_jobs_use() {
+    let root = dir("delete-busy");
+    let src = root.join("src");
+    game(&src);
+    let queued = root.join("queued");
+    game(&queued);
+    write(&root, "src2/file.bin", b"x");
+    let out = root.join("out.ffpfs");
+
+    // Held on the first write progress, with its `.part` open.
+    let (at_tx, at_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel();
+    let state = Mutex::new((Some(at_tx), go_rx, done_tx));
+    let jobs = Jobs::new(move |e| {
+        let mut s = state.lock().unwrap();
+        match e {
+            Event::Progress { ref stage, .. } if stage == "write" => {
+                if let Some(tx) = s.0.take() {
+                    tx.send(()).unwrap();
+                    s.1.recv().unwrap();
+                }
+            }
+            Event::Done { result, .. } => s.2.send(result.map(|_| ())).unwrap(),
+            _ => {}
+        }
+    });
+    jobs.start(request(&src, Format::Ffpfs, &out));
+    at_rx.recv().unwrap();
+    // Queued through a link, with a journal whose index beside it it reads too.
+    let aliases = root.join("aliases");
+    std::fs::create_dir_all(&aliases).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&queued, aliases.join("game")).unwrap();
+    #[cfg(not(unix))]
+    let aliases = queued.clone();
+    write(&root, "traces/ampr_commands.bin", b"j");
+    write(&root, "traces/ampr_emu.index", b"i");
+    let mut waiting = request(&aliases.join("game"), Format::Lz4, &root.join("queued-out"));
+    waiting.lz4_traces = Some(root.join("traces/ampr_commands.bin"));
+    let waiting = jobs.start(waiting);
+    let [part] = &stale_parts(&root)[..] else {
+        panic!("one .part while writing");
+    };
+    let index = root.join("traces/ampr_emu.index");
+    for busy in [
+        &src,
+        &src.join("data"),
+        part,
+        &root,
+        &queued,
+        &aliases,
+        &index,
+    ] {
+        assert_eq!(deleted(&jobs, busy, &[]), "busy", "{}", busy.display());
+    }
+    assert_eq!(deleted(&jobs, &root.join("src2"), &[]), "ok");
+
+    jobs.cancel(waiting);
+    go_tx.send(()).unwrap();
+    let mut results = [done_rx.recv().unwrap(), done_rx.recv().unwrap()];
+    results.sort();
+    assert_eq!(results, [Ok(()), Err("cancelled".to_string())]);
+    for free in [&src, &queued, &out] {
+        assert_eq!(deleted(&jobs, free, &[]), "ok", "{}", free.display());
+    }
+    jobs.cancel_all_and_wait();
+    let _ = std::fs::remove_dir_all(root);
 }

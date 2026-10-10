@@ -194,6 +194,24 @@ async fn patch_folder(app: AppHandle, path: PathBuf, unpatch: bool) -> Result<Lz
     .await
 }
 
+/// Deletes a file or folder for good (core's `Jobs::delete_path`; the UI asks first): never a
+/// drive root, the home folder or a folder holding it, nor anything an unfinished job uses.
+/// Under the quit lock, like `lz4_patch`.
+#[tauri::command]
+async fn delete_path(app: AppHandle, path: PathBuf) -> Result<(), String> {
+    blocking(app, move |app, state| {
+        let quitting = state.quitting();
+        if *quitting {
+            return Err("PS5 Dump Forge is quitting".to_string());
+        }
+        let keep: Vec<PathBuf> = std::env::home_dir().into_iter().collect();
+        let done = state.jobs(app).delete_path(&path, &keep);
+        drop(quitting);
+        done.map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// Save as profile: the pack plan `request` (a Pack request) resolves, as a TOML profile written
 /// to `dest`, the save dialog's choice (it already asked about replacing a file; never into the
 /// source, never through a symlink). Reads the source and writes only `dest`; not a job.
@@ -263,6 +281,24 @@ async fn reveal(app: AppHandle, id: JobId) -> Result<(), String> {
     .await
 }
 
+/// The header's GitHub button: the project page in the default browser. A fixed URL, so the
+/// webview can't have anything else opened.
+#[tauri::command]
+async fn open_repo() -> Result<(), String> {
+    const REPO: &str = "https://github.com/quer3q/ps5-dump-forge";
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        host_env(&mut c);
+        c
+    };
+    run(cmd.arg(REPO)).map_err(|e| format!("could not open {REPO}: {e}"))
+}
+
 // macOS (`open -R`) and Windows (Explorer's `/select,`) select the file; Linux has no portable
 // way to, so `xdg-open` opens its folder. ponytail: the Windows and Linux branches are untested
 // on real machines.
@@ -287,6 +323,10 @@ fn reveal_path(path: &Path) -> std::io::Result<()> {
         host_env(&mut c);
         c
     };
+    run(&mut cmd)
+}
+
+fn run(cmd: &mut std::process::Command) -> std::io::Result<()> {
     let status = cmd.status()?;
     // Explorer exits non-zero even when it worked; elsewhere a failure means it didn't show
     // (e.g. the output was moved or deleted since).
@@ -712,7 +752,9 @@ fn main() {
             lz4_patch,
             lz4_unpatch,
             lz4_save_plan_profile,
+            delete_path,
             reveal,
+            open_repo,
             quit_app,
         ])
         .build(tauri::generate_context!());

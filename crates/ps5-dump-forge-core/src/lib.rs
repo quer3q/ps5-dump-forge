@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 mod backport;
 mod convert;
+mod delete;
 // The PS5 (FreeBSD) destination probe; also built for macOS tests.
 #[cfg(any(target_os = "freebsd", all(test, target_os = "macos")))]
 mod dest;
@@ -36,6 +37,7 @@ mod verify;
 mod win;
 mod zip;
 
+pub use delete::DeleteError;
 pub use dlc::Dlc;
 pub use extract::extraction_findings;
 pub use finalize::rename_no_replace;
@@ -261,6 +263,15 @@ impl Jobs {
         self.inner.cancel(job);
     }
 
+    /// Deletes `path`, a file or a folder (links inside are removed, not followed), for good.
+    /// Refused for a link, a special file, a drive or volume root, any of `protected` or a
+    /// folder holding one, and anything at, in or around what an unfinished job reads or
+    /// writes; no job is admitted while it runs. The third explicit exception to "never touch
+    /// the source", with the LZ4 patches.
+    pub fn delete_path(&self, path: &Path, protected: &[PathBuf]) -> Result<(), DeleteError> {
+        self.inner.delete_path(path, protected)
+    }
+
     /// Cancel everything and wait until every job has cleaned up (app close).
     pub fn cancel_all_and_wait(&self) {
         self.inner.cancel_all_and_wait();
@@ -332,6 +343,8 @@ pub struct Lz4Facts {
     /// The runtime at `fakelib/libSceAmpr.sprx`: `forge_release`, `forge_trace`, `other`
     /// or `none`.
     pub runtime: String,
+    /// The ampr_emu version of the runtimes Forge ships (and installs on unpatch).
+    pub shipped_runtime_version: &'static str,
     /// Size of the trace journal (`ampr_commands.bin`), when present.
     pub journal_bytes: Option<u64>,
     /// With the journal and its `ampr_emu.index` both present: the name [`lz4_traces`] gives

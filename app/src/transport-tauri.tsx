@@ -26,6 +26,7 @@ export const transport: Transport = {
     event === "jobs://restore" ? Promise.resolve(() => {}) : listen<T>(event, (e) => f(e.payload)),
   pick,
   useOffline: () => false,
+  address: () => null,
   lz4Patch: (path) => invoke("lz4_patch", { path }),
   lz4Unpatch: (path) => invoke("lz4_unpatch", { path }),
   savePlanProfile: async (request, name, dir) => {

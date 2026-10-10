@@ -103,14 +103,27 @@ export async function call<T>(cmd: string, args?: Record<string, unknown>): Prom
   return res.data as T;
 }
 
-/** `GET /api/session`'s path separator (`"/"` or `"\\"`), or null when it doesn't answer. */
-export async function serverSeparator(): Promise<string | null> {
+let address: string | null = null;
+
+/** The server's `host:port` from its session's `url` (the console's own address, never the
+ * viewer's `location`), once `serverSession` read it; null before, or when it has none. */
+export function serverAddress(): string | null {
+  return address;
+}
+
+/** `GET /api/session`: its path separator (`"/"` or `"\\"`) and address (`serverAddress`),
+ * null where it doesn't answer or says nothing usable. */
+export async function serverSession(): Promise<{ separator: string | null; address: string | null }> {
   try {
     const res = await request("GET", "/api/session", undefined, 3000);
-    const sep = (res.data as { separator?: unknown } | null)?.separator;
-    return res.status === 200 && (sep === "/" || sep === "\\") ? sep : null;
+    const s = res.status === 200 ? (res.data as { separator?: unknown; url?: unknown } | null) : null;
+    const sep = s?.separator;
+    // `http://<ip>:<port>`; a server that couldn't tell its IP says so in words: none then.
+    const host = typeof s?.url === "string" ? /^https?:\/\/([\w.:[\]-]+)\/?$/.exec(s.url)?.[1] : undefined;
+    address = host ?? null;
+    return { separator: sep === "/" || sep === "\\" ? sep : null, address };
   } catch {
-    return null;
+    return { separator: null, address: null };
   }
 }
 

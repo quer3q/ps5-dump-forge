@@ -91,6 +91,8 @@ stability, speed or arm64/PS5 behaviour. Hardware gates:
 - [ ] Save stability: upstream 0.4.2.1 is a test build and some games crash when saving.
 - [ ] A pack with 0 volumes (nothing qualifies) is accepted by Forge's validator; is it accepted by the runtime?
 - [ ] A real 4 GiB volume rollover (tests use a small cap) written and read on a FAT32 stick and a console.
+- [ ] Convert's **AMPR runtime** switch (install where none, replace another runtime with the bundled
+  0.4.2.1; host tests over every target): a game converted with it boots and plays on a console.
 - [ ] Upgrade ampr_emu when upstream ships a stable build (binaries, archive, README, pins together).
 
 ## Platforms
@@ -108,7 +110,14 @@ stability, speed or arm64/PS5 behaviour. Hardware gates:
 - [ ] Batch queue screen, History.
 - [ ] Inspect: a **Verify** action for an existing image or package (core has no standalone verify API yet).
 - [ ] Leftover `.part` files: offer deletion (today list-only on Inspect), limited to this app's
-  `<name>.<job>-<pid>.part` pattern, never while a job runs.
+  `<name>.<job>-<pid>.part` pattern, never while a job runs. Separate from Inspect's Delete, which removes
+  only the inspected source.
+- [ ] Inspect's Delete (done on the host: core tests `delete_*`, the server route test, `smoke.mjs` on
+  disposable fixtures): a Linux bind mount from the same filesystem shares its `st_dev`, so a folder
+  holding one is not refused and `remove_dir_all` would empty it before failing (needs
+  `/proc/self/mountinfo`); the other-volume refusal has no test (mounting needs root); the job table stays
+  locked through a removal, so a big folder holds off job starts and finishes meanwhile (`ponytail:` in
+  `jobs.rs`).
 - [ ] Progress: show what each stage counts (bytes vs. blocks) instead of always bytes.
 - [ ] macOS: confirm-before-quit for Dock Quit, logout and shutdown (needs an app delegate; today jobs are
   cancelled and cleaned up without asking). On macOS 11 the quit prompt doesn't block keyboard input behind it.
@@ -173,6 +182,12 @@ real restart. Results in [ps5/README.md](ps5/README.md).
   verification" switch on and off.
 - [ ] Hardware, not yet recorded: reload restoring a running job in the PS5 browser, the Stop button (the
   `/api/quit` route itself ended the payload cleanly), a second load answering "already running".
+- [ ] Hardware, this batch: the start notice names the tile (no URL); the header's address is the
+  console's LAN address, in its browser and a computer's, and a phone scans the big QR code (How to
+  connect) off the TV; How LZ4 works opens offline (AppCache) with
+  Escape, Tab and focus return working in the PS5 browser; Inspect's Delete of a disposable folder and
+  image on `/data` (and USB) frees its space (U6); a long LZ4 pack into an image moves its bar through
+  measure, write and verify (host: `lz4_pack_into_an_image_is_one_bar`, `check-poller.mjs`).
 - [ ] A 100 GB+ job on `/data` with no kernel panic (87 GB ran clean); rest mode during a job
   (`sceSystemServicePowerTick` links but is untested; rest entered by hand has no clean-failure guarantee).
 - [ ] `panic=abort`: a job panic ends the payload (its `.part` stays, listed on the next start). Try

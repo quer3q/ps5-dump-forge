@@ -43,6 +43,13 @@ export type Action =
   | { type: "restore"; e: JobsRestore; at: number }
   | { type: "dismiss"; id: JobId };
 
+/** The bar for `done` of `total`: never back, and short of full until the job succeeds (core's
+ * estimate can be met before its last pass ends). */
+function bar(shown: number, done: number, total: number): number {
+  return Math.max(shown, total > 0 ? Math.min(UNFINISHED, done / total) : 0);
+}
+const UNFINISHED = 0.99;
+
 function blank(id: JobId): Job {
   return { id, done: 0, total: 0, shown: 0, stageAt: 0, stageDone: 0, log: [] };
 }
@@ -52,12 +59,17 @@ function fromSnapshot(j: Job, s: SnapshotJob, at: number): Job {
   let k: Job = { ...j, request: s.request ?? j.request, log: s.log.slice(-LOG_LINES) };
   const p = s.progress;
   if (p) {
-    const shown = Math.max(j.shown, p.total > 0 ? Math.min(1, p.done / p.total) : 0);
+    const shown = bar(j.shown, p.done, p.total);
     k = { ...k, stage: p.stage, done: p.done, total: p.total, shown, stageAt: at, stageDone: p.done };
     k = { ...k, etaMs: undefined, speed: undefined };
   }
-  if (s.done) k = { ...k, result: s.done.result, etaMs: undefined, speed: undefined };
+  if (s.done) k = finish(k, s.done.result);
   return k;
+}
+
+/** The job's result: full only on success. */
+function finish(j: Job, result: JobResult): Job {
+  return { ...j, result, shown: "Ok" in result ? 1 : j.shown, etaMs: undefined, speed: undefined };
 }
 
 function update(jobs: Job[], id: JobId, f: (j: Job) => Job): Job[] {
@@ -75,7 +87,7 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
     case "progress":
       return update(jobs, a.e.job, (j) => {
         const { stage, done, total } = a.e;
-        const shown = Math.max(j.shown, total > 0 ? Math.min(1, done / total) : 0);
+        const shown = j.result ? j.shown : bar(j.shown, done, total);
         if (stage !== j.stage) {
           return {
             ...j,
@@ -98,12 +110,7 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
     case "log":
       return update(jobs, a.e.job, (j) => ({ ...j, log: [...j.log, a.e.line].slice(-LOG_LINES) }));
     case "done":
-      return update(jobs, a.e.job, (j) => ({
-        ...j,
-        result: a.e.result,
-        etaMs: undefined,
-        speed: undefined,
-      }));
+      return update(jobs, a.e.job, (j) => finish(j, a.e.result));
     case "restore": {
       // `replace`: the server's list is the whole truth (a reload, or the payload restarted,
       // which reuses ids), so each job is only what the snapshot says.

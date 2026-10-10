@@ -17,7 +17,9 @@
     "allow-lz4-patch",
     "allow-lz4-unpatch",
     "allow-lz4-save-plan-profile",
+    "allow-delete-path",
     "allow-reveal",
+    "allow-open-repo",
     "allow-quit-app"
   ]
 }

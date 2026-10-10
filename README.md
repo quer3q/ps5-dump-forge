@@ -14,8 +14,12 @@ FPKG packages, and back again. Fully offline, no settings.
 
 - **Any source to any target**, streamed straight through: no temporary copy, not even the image inside a `.ffpfsc`.
 - **Verified output**: read back before it gets its final name; a fast sampled check by default, every byte optionally.
-- **Never touches your dump**: junk (`.DS_Store`, `._*`, ...) is skipped, not deleted; bad file names are reported up front, never renamed.
+- **Never touches your dump** unless you ask (LZ4 Patch/Unpatch, Inspect's Delete): junk (`.DS_Store`, `._*`, ...) is skipped, not deleted; bad file names are reported up front, never renamed.
 - **Inspect** a dump or image: cover, title, required firmware, backport firmware (`fakelib/`), embedded DLC, `param.json`, leftover `.part` files.
+- **Delete** the inspected dump or image (the trash button; it asks first: **No** / **Yes, delete**). It is
+  gone for good (no Trash, no undo), and a folder that fails part way may be partly deleted. Refused: a
+  link, a drive or volume root, a folder with another drive mounted inside, the file browser's roots (the
+  app: your home folder) and folders holding them, and anything a queued or running job uses.
 - **Runs on the PS5 itself**: converts on the console's own storage, driven from its browser or any browser on the network.
 - **Writes onto USB sticks and SD cards** formatted exFAT or FAT32.
 - **Fast**: an 89 GB game becomes `.exfat`/`.ffpkg` in about 2–2.5 min (write + verify) on an Apple Silicon Mac; `.fpkg` in ≈ 5 min.
@@ -53,8 +57,10 @@ webkit autoloader.
 
 - **Load it** with any ELF loader: send it to elfldr's port 9021 (`nc -w 3 <ps5-ip> 9021 <
   ps5-dump-forge-<version>-ps5.elf`, or any ELF sender), or list it in an autoloader's `autoload.txt`.
-  A notification shows the address.
-- **Open the UI** in the PS5 browser or any browser on the same network: `http://<ps5-ip>:8095`. The file
+  A notification says to open the PS5 Dump Forge tile.
+- **Open the UI** from the tile, or in any browser on the same network: `http://<ps5-ip>:8095`. The page
+  shows that address next to the logo: click it for a QR code to scan with a phone (About shows the code
+  and the address too; also in the log). The file
   browser starts at `/data` (the internal SSD) and the drives that are mounted (`/mnt/usb0..7`,
   `/mnt/ext0..1`); the output goes next to the source by default (e.g. `/data/homebrew`). Closing the
   browser doesn't stop a job; reopening the page picks it up again.
@@ -63,8 +69,8 @@ webkit autoloader.
   restart (once the jailbreak or autoloader has run), the tile starts Forge again from that copy (or from a
   `ps5-dump-forge.elf` at a USB drive's root). Open the tile once while Forge runs, so the browser keeps the page.
 - **No access control.** No password, pairing or other check: anyone who can reach the console on the network,
-  and any web page open in a browser there, can browse its files and start jobs. Use it on a trusted network
-  only.
+  and any web page open in a browser there, can browse its files, start jobs and delete files and folders
+  (the page's question is not a password). Use it on a trusted network only.
 - **USB output is experimental**: not tested on hardware. Each job first probes the output folder and refuses
   what it isn't sure of; the job log says what the probe saw. Hardware runs so far used `/data` only.
 - **Logs**: `/data/ps5-dump-forge/serve-<pid>.txt`. Each start deletes older runs' logs, keeping the
@@ -158,10 +164,12 @@ folder to an image is still an ordinary second convert (the packs are carried al
 > **ampr_emu 0.4.2.1 is an upstream test build; known issue: some games crash when saving.** Forge logs
 > this on every trace and pack job.
 
-Everything LZ4 is in the app's **LZ4** tab, in two scenarios: **Trace** (Patch or Unpatch a game folder,
-`.exfat` or `.ffpkg`; Download traces in the console web UI once it holds a journal) and **Pack** (pack by
-traces or a profile; Unpack when the source is already packed). The Convert tab copies a packed folder as
-it is.
+Everything LZ4 is in the app's **LZ4** tab (experimental; **How LZ4 works** there shows the steps below
+in short, offline), in two scenarios: **Trace** (Patch or Unpatch a game folder,
+`.exfat` or `.ffpkg`; Download traces in the console web UI once it holds a journal) and **Pack/Unpack** (pack by
+traces or a profile into an LZ4 packed folder, `.ffpkg`, `.exfat` or `.ffpfs`; Unpack a packed source to a
+folder, `.ffpkg`, `.exfat` or `.ffpfs`). `.ffpfsc` is CLI only there; any packed or unpacked folder
+converts to every format in Convert. The Convert tab copies a packed folder as it is.
 
 Which files to pack comes from a recording, so it takes two converts:
 
@@ -169,7 +177,7 @@ Which files to pack comes from a recording, so it takes two converts:
    convert it with `--lz4-trace` (CLI) to a folder or image. Forge installs ampr_emu's trace runtime,
    which records every file the game reads into `ampr_commands.bin` on the title's own storage. Run it on the console and play one long
    session through everything that matters (levels, languages, DLC). Only the **last** session is used.
-2. **Pack.** Convert the traced dump (or the folder you copied back) with `--to lz4` / **LZ4** → **Pack**. Forge reads the
+2. **Pack.** Convert the traced dump (or the folder you copied back) with `--to lz4` / **LZ4** → **Pack/Unpack**. Forge reads the
    journal, packs the files the game read, except those the engine opens directly (container indexes, configs, media), leaves the rest loose, swaps the trace runtime for the release one
    and removes the journal and logs. Or pass `--lz4-profile x.toml` to choose the files yourself; without
    a recording or a profile it falls back to a built-in guess, which is less reliable.
@@ -188,8 +196,8 @@ Which files to pack comes from a recording, so it takes two converts:
    [-o x.toml]`) saves the plan Pack would use, after all of the above, as an editable TOML,
    `[Game title]-[TITLE_ID]-lz4profile.toml`: one rule per kind of packing listing the exact paths.
    Edit it, then pack with **Use a rules profile** / `--lz4-profile`.
-3. Or pack straight into an image: **LZ4** → **Pack** → Target **.ffpkg** (or `.exfat`, `.ffpfs`,
-   `.ffpfsc`), CLI `convert <dump> --to ffpkg --lz4-pack [--lz4-traces <zip|folder|journal>]
+3. Or pack straight into an image: **LZ4** → **Pack/Unpack** → Target **.ffpkg** (or `.exfat`, `.ffpfs`;
+   the CLI also `.ffpfsc`), CLI `convert <dump> --to ffpkg --lz4-pack [--lz4-traces <zip|folder|journal>]
    [--lz4-profile x.toml]`. `.fpkg` is not offered (packing into a package is not supported yet). The
    image is verified as written and through its packs (the logical files against the source).
 
@@ -202,7 +210,8 @@ where the same game's folder patched in place did not (see below), so record in 
    the image's size next to it for a while; if anything fails, the image stays as it was. CLI:
    `ps5-dump-forge convert <image.ffpkg> --lz4-trace --lz4-in-place [--lz4-trace-space MiB]`. (Or convert a
    traced copy to a new image: `--to ffpkg --lz4-trace`.)
-2. **Mount it writable** with ShadowMountPlus (`image_rw=`): a read-only mount records nothing.
+2. **Mount it writable** with ShadowMountPlus (`image_rw=`): a read-only mount records nothing. Turn off any
+   fakelib updater while tracing: it puts its own `fakelib/libSceAmpr.sprx` back, and nothing is recorded.
 3. **Play** one long session. Each launch overwrites the previous session's trace.
 4. **Close the game and wait about a minute**: while the image is mounted, its file on disk can lag
    behind what the game wrote.
@@ -213,14 +222,14 @@ where the same game's folder patched in place did not (see below), so record in 
    still packs: the reader stops at the last whole record. A download fails (rather than mix two
    sessions) if the game or a sync changes the source meanwhile: close the game and download again.
 6. **Pack** the original dump on the computer: `--to lz4 --lz4-traces <the zip>` (CLI) / **LZ4** →
-   **Pack** → **Traces**, pick the zip (UI). No need to unzip: Forge reads the zip directly and checks each
+   **Pack/Unpack** → **Traces**, pick the zip (UI). No need to unzip: Forge reads the zip directly and checks each
    file's CRC-32. A folder holding both files (the same control, or the CLI path of that folder) and the CLI's
    `ampr_commands.bin` path with the index beside it work too. The traces must belong to this dump: every file the
    copied index lists (the runtime, index, journal and logs aside) must be in it, so pack the same dump
    the traced copy was made from. Extra files in the dump (a scene `.nfo`, say) are fine: the game never
    read them, so they stay loose, and the log names them. A profile and traces exclude each other.
 
-Or copy the whole traced image back to the computer and pack it directly (**LZ4** → **Pack** on the
+Or copy the whole traced image back to the computer and pack it directly (**LZ4** → **Pack/Unpack** on the
 image: it packs by its own traces, and says so). That moves the whole game instead of two files.
 
 **Patching a folder** (in place, no second copy; CLI: `ps5-dump-forge lz4-patch <folder>`) is offered but
@@ -234,9 +243,14 @@ off the console the same way (Download traces on the folder, or copy both files 
 `convert <image> --lz4-unpatch --lz4-in-place` for an `.exfat`/`.ffpkg`) undoes a patch: Forge's release
 runtime (0.4.2.1) replaces whatever runtime is there (no backup of an earlier one exists), the journal and
 logs are deleted and a fresh `ampr_emu.index` is written. A folder changes in place; an image is rebuilt
-and replaced like Patch. `--lz4-unpatch` also works on an ordinary convert into a new output.
+and replaced like Patch. `--lz4-unpatch` also works on an ordinary convert into a new output; in the app
+that is Convert's **AMPR runtime** switch, shown for an AMPR title (not packed) whose
+`fakelib/libSceAmpr.sprx` is missing (**Install**) or not a runtime Forge ships (**Replace**: other bytes
+may be newer or older, not necessarily outdated), on for each new source. The output gets the bundled
+release runtime, without the journal and logs and with a fresh `ampr_emu.index`; the source is left as it
+is, and off copies the runtime unchanged. Forge's own trace runtime is swapped in any case.
 
-`--lz4-unpack` (converting to anything with the option on; UI: **LZ4** → **Unpack**) restores the loose assets byte for byte; the
+`--lz4-unpack` (converting to anything with the option on; UI: **LZ4** → **Pack/Unpack** on a packed source) restores the loose assets byte for byte; the
 runtime and its `ampr_emu.index` stay, so the folder keeps working.
 
 Things to know:
@@ -246,8 +260,8 @@ Things to know:
   `--lz4-trace-space` MiB (default 256, 64 to 1024 in steps of 64) of free room in such an image. Measured on Stellar Blade: about 2 MB of journal per 5 minutes of heavy loading, ≈ 25 MB/hour, so 256 MiB ≈ 10 hours.
   `.ffpfs`, `.ffpfsc` and `.pkg` cannot be traced.
 - **Only AMPR titles.** A game whose `eboot.bin` does not import `libSceAmpr` is refused.
-- **Patch and Unpatch are the only operations that change your source.** Keep the original dump to pack
-  from. Only a folder, `.exfat` or `.ffpkg` can be patched (`.ffpfs`, `.ffpfsc` and `.pkg` are read-only on
+- **Patch and Unpatch are the only LZ4 operations that change your source** (Inspect's Delete removes it).
+  Keep the original dump to pack from. Only a folder, `.exfat` or `.ffpkg` can be patched (`.ffpfs`, `.ffpfsc` and `.pkg` are read-only on
   the console), and a packed source must be unpacked first.
 - **Checks are CRCs.** The pack's checksums detect corruption; they do not authenticate anything.
 - **Barely tested on a console.** A folder patched in place did not launch (CE-107750-0); the traced

@@ -226,5 +226,13 @@ fn every_target_publishes_on_this_volume() {
     );
     assert!(!late.exists(), "a failed job published its output");
     assert_clean(&out);
+
+    // Deleting on this volume: a file and a folder, each with its folder synced after.
+    let jobs = Jobs::new(|_| {});
+    for name in ["game.exfat", "game-folder"] {
+        jobs.delete_path(&out.join(name), &[])
+            .unwrap_or_else(|e| panic!("deleting {name} on {fs}: {e}"));
+        assert!(!out.join(name).exists(), "{name} is still there");
+    }
     let _ = std::fs::remove_dir_all(&base);
 }

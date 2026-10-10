@@ -1,20 +1,21 @@
 // Pieces shared by the screens.
 
-import { useEffect, useRef, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { createRoot } from "react-dom/client";
 
-import { pick, prettyBytes, type Format, type Inspection, type Kind, type Lz4Facts } from "./api";
-import { basename, trimSep } from "./paths";
+import { pick, prettyBytes, serverAddress, type Format, type Inspection, type Kind, type Lz4Facts } from "./api";
+import { basename, SEPARATORS, trimSep } from "./paths";
 import { useCoverGlow } from "./glow";
 import { Icon, type IconName } from "./icons";
 
 const KIND_LABEL: Record<Format, string> = {
   folder: "Folder",
-  exfat: ".exfat",
-  ffpkg: ".ffpkg",
-  ffpfs: ".ffpfs",
-  ffpfsc: ".ffpfsc",
-  pkg: ".fpkg", // the debug FPKG's display name; its file still ends in .pkg
-  lz4: "LZ4 packed folder",
+  exfat: "exfat",
+  ffpkg: "ffpkg",
+  ffpfs: "ffpfs",
+  ffpfsc: "ffpfsc",
+  pkg: "fpkg", // the debug FPKG's display name; its file still ends in .pkg
+  lz4: "LZ4", // an LZ4 packed folder
 };
 
 /** What a source can be, in picker order; also the target picker's formats. The LZ4 packed
@@ -31,9 +32,19 @@ export function FormatPill({ kind }: { kind: string }) {
   return <span className={known ? `tag fmt fmt-${kind}` : "tag"}>{kindLabel(kind)}</span>;
 }
 
+/** The image formats' names (no dot) as words in running text. */
+const FORMAT_NAME = /\b(ffpfsc|ffpfs|ffpkg|exfat|fpkg)\b/;
+
+/** Running text with every format name in bold, so it reads as a name. Only for copy: a path
+ * or file name (`game.ffpkg`) keeps its dot and stays plain. */
+export function Prose({ text }: { text: string }) {
+  return <>{text.split(FORMAT_NAME).map((part, i) => (i % 2 ? <b key={i}>{part}</b> : part))}</>;
+}
+
 /** A card's title row: icon + title, actions on the right. */
 export function CardHead(props: {
-  icon: IconName;
+  /** Left out where the title stands alone (How to connect). */
+  icon?: IconName;
   title: string;
   id?: string;
   /** The heading can take focus from code (tabIndex -1), e.g. when the control that had it
@@ -43,9 +54,11 @@ export function CardHead(props: {
 }) {
   return (
     <header className="card-head">
-      <span className="head-icon">
-        <Icon name={props.icon} />
-      </span>
+      {props.icon && (
+        <span className="head-icon">
+          <Icon name={props.icon} />
+        </span>
+      )}
       <h2 id={props.id} tabIndex={props.focusable ? -1 : undefined}>
         {props.title}
       </h2>
@@ -70,8 +83,9 @@ export function panelId(prefix: string, id: string): string {
 export function TabList<T extends string>(props: {
   label: string;
   prefix: string;
-  /** `className`: extra classes on that tab's button (the LZ4 tab's straps). */
-  tabs: { id: T; label: ReactNode; className?: string }[];
+  /** `className`: extra classes on that tab's button (the LZ4 tab's straps). `sep`: a divider
+   * before it (drawn only; the keys still move through every tab). */
+  tabs: { id: T; label: ReactNode; className?: string; sep?: boolean }[];
   value: T;
   onChange: (id: T) => void;
   className?: string;
@@ -99,7 +113,7 @@ export function TabList<T extends string>(props: {
     >
       {props.tabs.map((t) => {
         const on = t.id === props.value;
-        return (
+        const tab = (
           <button
             key={t.id}
             type="button"
@@ -114,6 +128,7 @@ export function TabList<T extends string>(props: {
             {t.label}
           </button>
         );
+        return t.sep ? [<span key={`${t.id}-sep`} className="tab-sep" aria-hidden="true" />, tab] : tab;
       })}
     </div>
   );
@@ -196,21 +211,141 @@ export function PathLine({ path, prefix }: { path: string; prefix?: string }) {
   );
 }
 
+// ---- Dialogs over the whole app (the LZ4 help, the delete question) ----
+
+const overlays = new Set<() => void>();
+
+/** Closes every open dialog (as if cancelled): the quit prompt never stacks behind one. */
+export function closeOverlays(): void {
+  for (const close of [...overlays]) close();
+}
+
+/**
+ * A dialog in its own React root, like the http Picker: the app behind it (header, every
+ * screen) is inert. `onClosed` runs once it closes; focus goes back to what had it.
+ */
+export function openOverlay(render: (close: () => void) => ReactNode, onClosed?: () => void): void {
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const app = document.getElementById("root");
+  app?.setAttribute("inert", "");
+  app?.setAttribute("aria-hidden", "true");
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    overlays.delete(close);
+    if (overlays.size === 0) {
+      app?.removeAttribute("inert");
+      app?.removeAttribute("aria-hidden");
+    }
+    setTimeout(() => {
+      root.unmount();
+      host.remove();
+      opener?.focus();
+    }, 0);
+    onClosed?.();
+  };
+  overlays.add(close);
+  root.render(render(close));
+}
+
+const FOCUSABLE = 'button:not(:disabled), a[href], input:not(:disabled), [tabindex]:not([tabindex="-1"])';
+
+/** An overlay's backdrop and box: Escape and a click outside close it, Tab stays inside (old
+ * WebKit has no `inert`). Give the first control `autoFocus`. */
+export function Modal(props: {
+  close: () => void;
+  className: string;
+  role?: "dialog" | "alertdialog";
+  labelledBy: string;
+  describedBy?: string;
+  children: ReactNode;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      props.close();
+    } else if (e.key === "Tab" && box.current) {
+      const all = [...box.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
+      if (all.length === 0) return;
+      const i = all.indexOf(document.activeElement as HTMLElement);
+      if (e.shiftKey && i <= 0) {
+        e.preventDefault();
+        all[all.length - 1].focus();
+      } else if (!e.shiftKey && i === all.length - 1) {
+        e.preventDefault();
+        all[0].focus();
+      }
+    }
+  };
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) props.close();
+      }}
+    >
+      <div
+        className={props.className}
+        role={props.role ?? "dialog"}
+        aria-modal="true"
+        aria-labelledby={props.labelledBy}
+        aria-describedby={props.describedBy}
+        ref={box}
+        onKeyDown={onKey}
+      >
+        {props.children}
+      </div>
+    </div>
+  );
+}
+
+// ---- Deleted sources ----
+
+const deletedSubs = new Set<(path: string) => void>();
+
+/** Calls `f` with every path Inspect deletes; returns the unsubscribe. */
+export function onDeleted(f: (path: string) => void): () => void {
+  deletedSubs.add(f);
+  return () => void deletedSubs.delete(f);
+}
+
+export function notifyDeleted(path: string): void {
+  for (const f of deletedSubs) f(path);
+}
+
+/** `path` is `dir` or inside it, by spelling (the server compared the real paths). */
+export function isWithin(path: string, dir: string): boolean {
+  const p = trimSep(path);
+  const d = trimSep(dir);
+  return p === d || (p.startsWith(d) && SEPARATORS.test(p[d.length] ?? ""));
+}
+
+/** The picker for a game folder or an image file; `onPick` unless cancelled. */
+export async function pickSource(
+  what: "folder" | "image",
+  onPick: (path: string, isImage: boolean) => void,
+): Promise<void> {
+  const p =
+    what === "folder"
+      ? await pick({ directory: true, title: "Game folder" })
+      : await pick({
+          directory: false,
+          title: "Game image",
+          filterName: "PS5 image or package",
+          extensions: IMAGE_EXTENSIONS,
+        });
+  if (p !== null) onPick(p, what === "image");
+}
+
 /** "Choose folder…" / "Choose image…": a game folder or an image file. */
 function PickButtons(props: { onPick: (path: string, isImage: boolean) => void; big?: boolean }) {
-  const pickFolder = async () => {
-    const p = await pick({ directory: true, title: "Game folder" });
-    if (p !== null) props.onPick(p, false);
-  };
-  const pickImage = async () => {
-    const p = await pick({
-      directory: false,
-      title: "Game image",
-      filterName: "PS5 image or package",
-      extensions: IMAGE_EXTENSIONS,
-    });
-    if (p !== null) props.onPick(p, true);
-  };
+  const pickFolder = () => pickSource("folder", props.onPick);
+  const pickImage = () => pickSource("image", props.onPick);
   return (
     <>
       <button className={props.big ? "primary" : "small"} onClick={pickFolder}>
@@ -238,6 +373,10 @@ export function SourceCard(props: {
   full?: boolean;
   /** Keeps element ids apart per screen; default "i" with `full`, else "c". */
   prefix?: string;
+  /** Stands in for the default empty state (the LZ4 tab's). */
+  empty?: ReactNode;
+  /** More buttons in the title row once a source is chosen (Inspect's Delete). */
+  actions?: ReactNode;
 }) {
   const { path, ins } = props;
   const headId = `${props.prefix ?? (props.full ? "i" : "c")}-source`;
@@ -261,9 +400,12 @@ export function SourceCard(props: {
       aria-labelledby={headId}
     >
       <CardHead icon="disc" title="Source" id={headId} focusable>
+        {path && props.actions}
         {path && <PickButtons onPick={props.onPick} />}
       </CardHead>
-      {!path ? (
+      {!path && props.empty ? (
+        props.empty
+      ) : !path ? (
         <div className="empty">
           <span className="empty-icon">
             <Icon name="disc" />
@@ -392,13 +534,21 @@ export function lz4Traced(f: Lz4Facts | null | undefined): boolean {
 }
 
 /** LZ4 asset packs, as the CLI's `inspect` line says it ("LZ4 (AMPR): packed, …"): the state
- * as the value, the details under it. A traced source's tile gets the neon straps. */
+ * as the value, the details under it. Packed gets the green neon straps, a traced source the
+ * lime, magenta and cyan ones; damaged packs keep the warning colour and no straps. */
 function Lz4Tile({ facts }: { facts: Lz4Facts }) {
   const { state, detail } = lz4State(facts);
   const notes = [detail];
   if (!facts.imports_ampr) notes.push("eboot.bin does not import libSceAmpr");
+  const look = facts.packed
+    ? " neon packed"
+    : facts.manifest_error !== null
+      ? " damaged"
+      : lz4Traced(facts)
+        ? " neon"
+        : "";
   return (
-    <div className={lz4Traced(facts) ? "tile wide neon" : "tile wide"}>
+    <div className={`tile wide${look}`}>
       <dt>LZ4 (AMPR)</dt>
       <dd>
         <span className="value">{state}</span>
@@ -566,5 +716,96 @@ export function InspectSummary({ ins, full = false }: { ins: Inspection; full?: 
       )}
       <Findings lines={ins.findings} />
     </div>
+  );
+}
+
+/** A button that opens a short menu of choices: the native dialog picks files or folders,
+ * never both (rfd), so the kind is asked first. Esc or a click outside closes it; focus goes
+ * back to the button before the choice runs, so a cancelled dialog leaves it there. */
+export function ChooseMenu<K extends string>(props: {
+  id: string;
+  label: ReactNode;
+  /** The menu's accessible name. */
+  menuLabel: string;
+  items: { id: K; icon: IconName; label: string }[];
+  onChoose: (what: K) => void;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLSpanElement>(null);
+  const btn = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    box.current?.querySelector<HTMLElement>("[role=menuitem]")?.focus();
+    // mousedown, not blur: WebKit doesn't focus a clicked button, so a blur would close the
+    // menu before the item's click lands.
+    const outside = (e: MouseEvent) => {
+      if (!box.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", outside);
+    return () => document.removeEventListener("mousedown", outside);
+  }, [open]);
+  const choose = (what: K) => {
+    setOpen(false);
+    btn.current?.focus();
+    props.onChoose(what);
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (!open) return;
+    const items = [...(box.current?.querySelectorAll<HTMLElement>("[role=menuitem]") ?? [])];
+    const i = items.indexOf(document.activeElement as HTMLElement);
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setOpen(false);
+      btn.current?.focus();
+    } else if (e.key === "Tab") {
+      setOpen(false);
+    } else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && items.length > 0) {
+      e.preventDefault();
+      items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+    }
+  };
+  return (
+    <span className="menu-wrap" ref={box} onKeyDown={onKey}>
+      <button
+        id={props.id}
+        ref={btn}
+        className={props.className ?? "small"}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        {props.label}
+        <Icon name="chevron" />
+      </button>
+      {open && (
+        <span className="menu" role="menu" aria-label={props.menuLabel}>
+          {props.items.map((it) => (
+            <button key={it.id} type="button" role="menuitem" onClick={() => choose(it.id)}>
+              <Icon name={it.icon} />
+              {it.label}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** http build: the page's url as a QR code for a phone, drawn by the server (`GET /api/qr`).
+ * Nothing in the app (no address) or when it doesn't load. */
+export function AddressQr(props: { size: number }) {
+  const [failed, setFailed] = useState(false);
+  const address = serverAddress();
+  if (!address || failed) return null;
+  return (
+    <img
+      className="qr"
+      src="/api/qr"
+      width={props.size}
+      height={props.size}
+      alt={`QR code: http://${address}`}
+      onError={() => setFailed(true)}
+    />
   );
 }

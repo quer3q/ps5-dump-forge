@@ -1,7 +1,7 @@
 // Convert: source → target format → output → Build, then one row per job below the cards.
 // LZ4 asset packs (trace, pack, unpack, the in-place patch) have their own screen (Lz4.tsx).
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   api,
@@ -13,7 +13,16 @@ import {
   type JobId,
   type KrakenLevel,
 } from "./api";
-import { CardHead, classify, emulatorNames, FormatPicker, kindLabel, SourceCard } from "./common";
+import {
+  CardHead,
+  classify,
+  emulatorNames,
+  FormatPicker,
+  isWithin,
+  kindLabel,
+  onDeleted,
+  SourceCard,
+} from "./common";
 import { Icon } from "./icons";
 import { JobsCard } from "./JobList";
 import type { Action, Job } from "./jobs";
@@ -37,7 +46,7 @@ const DEFAULT_FORMAT: Format = "ffpkg"; // what ShadowMountPlus recommends
 export function Convert(props: {
   jobs: Job[];
   dispatch: (a: Action) => void;
-  /** Show the "About formats" tab. */
+  /** Show the "About" tab. */
   onCompare: () => void;
 }) {
   const [source, setSource] = useState<string | null>(null);
@@ -56,6 +65,9 @@ export function Convert(props: {
   const [krakenLevel, setKrakenLevel] = useState<KrakenLevel>("fast");
   /** The `.ffpfsc` zlib level, 0–9; kept across sources and targets. */
   const [ffpfscLevel, setFfpfscLevel] = useState(DEFAULT_FFPFSC_LEVEL);
+  /** Install or replace the AMPR runtime in the output; on for each new source (offered only
+   * where `runtimeCard` says). */
+  const [runtimeOn, setRuntimeOn] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
@@ -71,6 +83,7 @@ export function Convert(props: {
     setSourceIsImage(isImage);
     setFormat(fmt);
     setRemoveBackport(false);
+    setRuntimeOn(true);
     setIns(null);
     setInsError(null);
     setError(null);
@@ -86,6 +99,21 @@ export function Convert(props: {
       if (seq === sourceSeq.current) setInspecting(false);
     }
   };
+
+  // Inspect deleted this source (or the folder holding it): forget it, and any late answer.
+  useEffect(
+    () =>
+      onDeleted((gone) => {
+        if (source === null || !isWithin(source, gone)) return;
+        sourceSeq.current++;
+        setSource(null);
+        setIns(null);
+        setInsError(null);
+        setInspecting(false);
+        setError(null);
+      }),
+    [source],
+  );
 
   const pickFormat = (fmt: Format) => {
     setFormat(fmt);
@@ -107,6 +135,19 @@ export function Convert(props: {
       : lz4.runtime === "forge_trace"
         ? "This packed dump carries the LZ4 trace runtime: unpack or pack it again in the LZ4 tab first."
         : null;
+
+  // An AMPR title, not packed, whose runtime isn't Forge's: offer the bundled one in the output
+  // (core's unpatch), none -> install, other -> replace. Hidden when an older backend doesn't
+  // say which version it ships. Forge's trace runtime is swapped by core anyway.
+  const shipped = lz4?.shipped_runtime_version;
+  const runtimeCard =
+    !!lz4 &&
+    !!shipped &&
+    lz4.imports_ampr &&
+    !lz4.packed &&
+    !lz4.manifest_error &&
+    (lz4.runtime === "none" || lz4.runtime === "other");
+  const installRuntime = runtimeCard && runtimeOn;
 
   // Build would certainly fail: say why next to it instead.
   const hard = ins ? ins.findings.filter((l) => classify(l).kind === "block") : [];
@@ -130,7 +171,8 @@ export function Convert(props: {
       full_verify: fullVerify,
       kraken_level: krakenLevel,
       ffpfsc_level: ffpfscLevel,
-      lz4: null, // LZ4 tracing and unpacking start from the LZ4 tab
+      // LZ4 tracing and unpacking start from the LZ4 tab; here only the runtime card.
+      lz4: installRuntime ? "unpatch" : null,
     };
     submittingRef.current = true;
     setSubmitting(true);
@@ -194,6 +236,39 @@ export function Convert(props: {
               onLevel={setFfpfscLevel}
             />
           )}
+          {runtimeCard && (
+            <div className="field ampr-runtime">
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  className="visually-hidden"
+                  checked={runtimeOn}
+                  onChange={(e) => setRuntimeOn(e.target.checked)}
+                />
+                <span className="switch-track" aria-hidden="true" />
+                <span>
+                  {lz4.runtime === "none" ? "Install" : "Replace"} the AMPR runtime (ampr_emu{" "}
+                  {shipped})
+                  <span className="muted hint">
+                    {lz4.runtime === "none"
+                      ? "This game uses AMPR but has no fakelib/libSceAmpr.sprx: the output gets the bundled one."
+                      : "fakelib/libSceAmpr.sprx isn't a runtime Forge ships (it may be newer or older): the output gets the bundled one instead."}{" "}
+                    The trace journal and logs are left out and a fresh ampr_emu.index is written.
+                    Only the output changes, never the source. Off: copied as it is.
+                  </span>
+                </span>
+              </label>
+              {installRuntime && (
+                <p className="note-line warn">
+                  <Icon name="warn" />
+                  <span>
+                    ampr_emu {shipped} is an upstream test build; known issue: some games crash
+                    when saving.
+                  </span>
+                </p>
+              )}
+            </div>
+          )}
           {ins && ins.backport.length > 0 && (
             <div className="field backport">
               <label className="switch">
@@ -254,7 +329,7 @@ export function Convert(props: {
                 <p className="note-line warn">
                   <Icon name="warn" />
                   <span>
-                    Likely to fail as {kindLabel(format)}: it refuses file names listed in Source.
+                    Likely to fail as <b>{kindLabel(format)}</b>: it refuses file names listed in Source.
                   </span>
                 </p>
               )}
@@ -264,7 +339,7 @@ export function Convert(props: {
                   <span>
                     {collides
                       ? "A job is already writing this file: Build again would fail. Pick another name."
-                      : `Already building this game as ${kindLabel(format)}; Build again makes a second copy.`}
+                      : <>Already building this game as <b>{kindLabel(format)}</b>; Build again makes a second copy.</>}
                   </span>
                 </p>
               )}

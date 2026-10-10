@@ -619,6 +619,12 @@ fn auto_loose(
         .map(|(i, k)| block(i, k))
         .sum();
     let (mut base, mut loose, mut packed) = (0u64, Vec::new(), Vec::new());
+    // A sliver of the job: every pass after it reads each file at least once.
+    let rest = tree
+        .files()
+        .iter()
+        .fold(0u64, |sum, f| sum.saturating_add(f.size));
+    ctx.expect_rest(total.saturating_add(rest));
     ctx.progress("preflight", 0, total);
     for (i, ks) in &picks {
         ctx.check()?;

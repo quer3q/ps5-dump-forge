@@ -1148,6 +1148,7 @@ mod tests {
             packed,
             manifest_error: None,
             runtime: runtime.into(),
+            shipped_runtime_version: "0.4.2.1",
             journal_bytes,
             traces_zip: None,
         };

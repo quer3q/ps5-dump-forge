@@ -167,6 +167,15 @@ fn session_and_headers() {
     assert_eq!(v["self_copy"], "none"); // a host build carries no copy of itself
     assert_eq!(v["instance"].as_str().unwrap().len(), 16);
     assert_eq!(v["separator"], std::path::MAIN_SEPARATOR_STR);
+    assert_eq!(v["url"], format!("http://{}", srv.addr));
+    // The url as a QR code for a phone: an SVG, dark on white.
+    let (qr_status, qr_head, svg) = exchange(srv.addr, b"GET /api/qr HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(qr_status, 200);
+    assert!(qr_head.contains("Content-Type: image/svg+xml"), "{qr_head}");
+    assert!(
+        svg.starts_with("<svg") && svg.contains("fill=\"#000\" d=\"M"),
+        "{svg}"
+    );
     assert!(v.get("paired").is_none());
     assert!(head.contains("Cache-Control: no-store"), "{head}");
     for gone in [
@@ -843,6 +852,40 @@ fn stale_parts_are_capped() {
     assert_eq!(parts[0], s(&srv.root.join("g0000.exfat.1-1.part")));
 }
 
+/// `POST /api/delete_path`: `null` once gone; refusals 400, missing 404. Links inside a
+/// deleted folder go, what they point at stays.
+#[test]
+fn delete_path_route() {
+    let srv = start("delete");
+    let outside = dir("delete-outside");
+    write(&outside, "keep.bin", b"keep");
+    game(&srv.root.join("game"));
+    symlink(outside.join("keep.bin"), srv.root.join("game/link")).unwrap();
+    write(&srv.root, "a.exfat", b"image");
+    symlink(srv.root.join("a.exfat"), srv.root.join("alias.exfat")).unwrap();
+    let del = |path: &Path| srv.post("/api/delete_path", json!({ "path": s(path) }));
+    let refused = |path: &Path| {
+        let (status, v) = del(path);
+        assert_eq!(status, 400, "{}: {v}", path.display());
+        assert!(v["error"].is_string(), "{v}");
+    };
+    refused(&srv.root); // a browse root
+    refused(srv.root.parent().unwrap()); // a folder holding one
+    refused(Path::new("/"));
+    refused(Path::new(""));
+    refused(&srv.root.join("alias.exfat")); // a link itself
+    assert_eq!(del(&srv.root.join("nope")).0, 404);
+    assert_eq!(
+        exchange(srv.addr, raw_post("/api/delete_path", "{}").as_bytes()).0,
+        400
+    );
+    assert_eq!(del(&srv.root.join("a.exfat")), (200, Value::Null));
+    assert_eq!(del(&srv.root.join("game")), (200, Value::Null));
+    assert!(!srv.root.join("a.exfat").exists() && !srv.root.join("game").exists());
+    assert_eq!(std::fs::read(outside.join("keep.bin")).unwrap(), b"keep");
+    std::fs::remove_dir_all(&outside).unwrap();
+}
+
 #[test]
 fn quit_closes_admission() {
     let srv = start("quit");
@@ -861,6 +904,12 @@ fn quit_closes_admission() {
     let req = request(&srv.root.join("game"), &srv.root.join("x.exfat"));
     let (status, v) = srv.post("/api/start_job", req);
     assert_eq!(status, 409, "{v}");
+    let (status, v) = srv.post(
+        "/api/delete_path",
+        json!({ "path": s(&srv.root.join("game")) }),
+    );
+    assert_eq!(status, 409, "{v}");
+    assert!(srv.root.join("game").exists());
     assert_eq!(srv.post("/api/quit", json!({})), (200, json!({})));
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(srv.exits.lock().unwrap().len(), 1);

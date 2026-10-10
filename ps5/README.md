@@ -66,19 +66,21 @@ FORGE_DEBUG_API=1 ps5/build.sh   # bring-up only: adds POST /api/debug; never sh
   `statfs` names it as its own mount point with blocks: those folders exist with nothing plugged in;
   re-checked on each use), canonicalized and logged; on a computer the `--root` folders.
 - **No protections, by decision**: no pairing, token, `Host`/`Origin`/CSRF checks, security headers or
-  path confinement; paths go to core as given, as in the Tauri app. No delete route, and none may be added.
+  path confinement; paths go to core as given, as in the Tauri app. One delete route, by user decision
+  (`delete_path`, Inspect's; the page's question authenticates nobody).
 - Limits: head 16 KiB, body 1 MiB (`Content-Length` only), 10 s per request, 30 s per write (a download:
   per 1 MiB chunk), 16 handler
   threads (then 503), 8 unfinished jobs (then 429), 2 inspections or naming requests at once (429,
   `Retry-After: 1`), 32 finished jobs and 200 log lines each kept, `list_dir` 10,000 entries (`truncated`),
   `stale_parts` 1,000. `compression_threads: null` is `max(1, cores − 1)`.
-- Errors are `{"error": "<text>"}` with 400 / 404 / 409 (stopping) / 413 / 429 / 500; core errors are the
+- Errors are `{"error": "<text>"}` with 400 / 404 / 409 (stopping, a path a job uses) / 413 / 429 / 500; core errors are the
   Tauri commands' `format!("{e:#}")`. API replies are `Cache-Control: no-store`; `index.html` and the
   AppCache manifest `no-cache`; hashed `assets/*` a year, immutable.
 
 | Route | Body | Returns |
 |---|---|---|
-| `GET /api/session` | | `{app: "ps5-dump-forge", version, platform: "ps5"\|"host", instance, stopping, self_copy, separator: "/"\|"\\"}` |
+| `GET /api/session` | | `{app: "ps5-dump-forge", version, platform: "ps5"\|"host", instance, stopping, self_copy, separator: "/"\|"\\", url}` (`url`: the page header's host:port) |
+| `GET /api/qr` | | `url` as a QR code, `image/svg+xml` (the header's and About's); 404 when the server can't tell its IP |
 | `POST /api/inspect` | `{path}` | `Inspection` |
 | `POST /api/default_output` | `{source, format, dir}` | path |
 | `POST /api/generated_output` | `{source, format, dir, taken}` | path |
@@ -89,6 +91,7 @@ FORGE_DEBUG_API=1 ps5/build.sh   # bring-up only: adds POST /api/debug; never sh
 | `POST /api/lz4_unpatch` | `{source}` | `Lz4Patch` (release runtime); 409 while a job is queued or running |
 | `POST /api/lz4_plan_profile` | `{request}` (a Pack `start_job` body) | `Lz4PlanProfile` `{file_name, toml, packed, loose, log}`: Save as profile; reads only (counts as an inspection, 429 past 2); the page downloads `toml` as `file_name` |
 | `GET /api/lz4_traces?source=` | | both trace files as one zip download (below) |
+| `POST /api/delete_path` | `{path}` | `null`: the file or folder is gone for good (below); 400 refused, 404 missing, 409 a job uses it or stopping, 500 failed (a folder may be partly gone) |
 | `POST /api/list_dir` | `{path: string\|null}` | `{path, parent, entries: [{name, path, dir, size}], truncated}` |
 | `GET /api/jobs` | | `{instance, jobs: [{id, request, progress, done, log, log_total}]}` |
 | `POST /api/quit` | `{}` | `{}`, then cancels every job, waits for cleanup and exits |
@@ -108,6 +111,14 @@ relaunched on a writable mount truncates its journal) ends the transfer short an
 counts as an inspection (the 2-at-once cap), the transfer doesn't; jobs may run meanwhile. A read failing
 mid-transfer closes the connection short of `Content-Length`.
 
+`delete_path` (core's `Jobs::delete_path`): a file, or a folder with what is inside (links removed, not
+followed), then its folder fsynced. Refused (400): an empty path, a link itself, a special file, a volume
+root or mount point, a folder with another volume mounted inside (by `st_dev`), every browse root
+(configured and mounted now) and the folders holding one. 409: anything at, in or above what an unfinished
+job reads or writes (source, output, `.part`s, profile, traces), by identity after resolving links. The
+check and the removal hold the job table and admission, so no job or quit starts in between. No Trash, no
+undo.
+
 `instance` is random per start, so the page notices a restart and rebuilds its job list. `list_dir` with
 `null` lists the roots; directories first, then by name; non-UTF-8 names left out; symlinks resolved.
 Events keep core's serde shape (`{"Ok": …}` / `{"Err": "cancelled"}`); ids stay below 2^53. A job's table
@@ -115,7 +126,9 @@ entry is made by its first event (core can emit `Done` before `Jobs::start` retu
 admission first (`start_job` → 409); on a computer SIGINT/SIGTERM does the same. A port already taken by
 Forge notifies "already running at <url>" and exits 0; by anything else, exits 1.
 
-- The URL shown uses the address of a UDP `connect` toward the internet (no packet sent).
+- The URL (session `url`, the page header, the host's start notice, the PS5 serve log) uses the address of
+  a UDP `connect` toward the internet (no packet sent). On the PS5 the start notification only says to
+  open the PS5 Dump Forge tile.
 - The web bundle: `npm run build:http` (Vite mode `http`) writes `app/dist-http` with `transport-http.tsx`
   in place of Tauri (`Picker.tsx` for the dialogs, `http-client.ts`'s poller for the events); `build.rs`
   embeds it, or a placeholder page with a warning (`FORGE_REQUIRE_WEB=1`, set by `ps5/build.sh`, makes that

@@ -4,7 +4,7 @@
 import { useRef, useState } from "react";
 
 import { api, errorText, pick, type Format, type InnerFormat, type KrakenLevel } from "./api";
-import { basename, dirname, FormatPicker, IMAGE_EXTENSIONS, joinPath, SEPARATORS } from "./common";
+import { basename, dirname, FormatPicker, IMAGE_EXTENSIONS, joinPath, kindLabel, Prose, SEPARATORS } from "./common";
 import { Icon, type IconName } from "./icons";
 import type { Job } from "./jobs";
 
@@ -12,7 +12,7 @@ import type { Job } from "./jobs";
 export const FORMAT_INFO: Record<Format, string> = {
   folder: "Unpack an image or package back into a plain game folder.",
   exfat:
-    "For games that misbehave as .ffpkg and only run like external-drive content. Also opens on a Mac or PC.",
+    "For games that misbehave as ffpkg and only run like external-drive content. Also opens on a Mac or PC.",
   ffpkg: "Recommended. The PS5's own file system (UFS2). Writable mounts possible.",
   ffpfs: "Experimental. The PS5's PFS file system, uncompressed. File names must be plain ASCII.",
   ffpfsc: "Experimental. Smallest: a compressed container around one image, always mounted read-only.",
@@ -24,11 +24,11 @@ export const FORMAT_INFO: Record<Format, string> = {
  * only; the word itself says it). */
 export function Lead({ text }: { text: string }) {
   const word = /^(Recommended|Experimental)\b/.exec(text)?.[1];
-  if (!word) return <>{text}</>;
+  if (!word) return <Prose text={text} />;
   return (
     <>
       <span className={word === "Recommended" ? "lead-good" : "lead-warn"}>{word}</span>
-      {text.slice(word.length)}
+      <Prose text={text.slice(word.length)} />
     </>
   );
 }
@@ -106,7 +106,7 @@ export function FfpfscField(props: {
       </span>
       <FormatPicker
         name={`${props.prefix}-inner-format`}
-        label="Image inside the .ffpfsc"
+        label="Image inside the ffpfsc"
         className="inner"
         formats={INNER_FORMATS}
         value={props.inner}
@@ -237,8 +237,8 @@ function checkName(name: string, format: Format): { name: string; error?: string
       name,
       error:
         format === "pkg"
-          ? `Ends in .${ext}, but .fpkg is saved as .pkg: the extension picks the driver.`
-          : `Ends in .${ext}, but the target is .${format}: the extension picks the driver.`,
+          ? `Ends in .${ext}, but fpkg is saved as .pkg: the extension picks the driver.`
+          : `Ends in .${ext}, but the target is ${kindLabel(format)}: the extension picks the driver.`,
     };
   else saved = `${name}.${format}`;
   const error = tooLong(saved.slice(0, saved.lastIndexOf(".")));
@@ -407,7 +407,7 @@ export function OutputField(props: { out: Output; source: string | null; prefix:
       )}
       {out.named.error && (
         <p className="bad field-error" id={`${id}-error`}>
-          {out.named.error}
+          <Prose text={out.named.error} />
         </p>
       )}
       {source && (

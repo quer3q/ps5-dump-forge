@@ -1,9 +1,9 @@
 // LZ4: ampr_emu asset packs for a title that uses AMPR. Two scenarios: Trace (Patch or Unpatch
 // the source itself: a folder in place by one request, an .exfat/.ffpkg by a job that rebuilds
-// it and replaces it once verified) and Pack (an LZ4 packed folder from traces, a profile or a
-// guess; Unpack instead for a packed source). Jobs join the shared list below.
+// it and replaces it once verified) and Pack/Unpack (an LZ4 packed folder or plain image from
+// traces, a profile or a guess; Unpack for a packed source). Jobs join the shared list below.
 
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   api,
@@ -13,28 +13,34 @@ import {
   web,
   type ConvertRequest,
   type Format,
-  type InnerFormat,
   type Inspection,
   type JobId,
-  type KrakenLevel,
   type Lz4Facts,
   type Lz4Patch,
   type Lz4PlanProfile,
 } from "./api";
-import { CardHead, classify, FormatPicker, kindLabel, KINDS, SourceCard } from "./common";
+import {
+  CardHead,
+  ChooseMenu,
+  classify,
+  FormatPicker,
+  isWithin,
+  kindLabel,
+  onDeleted,
+  pickSource as openPicker,
+  Prose,
+  SourceCard,
+} from "./common";
+import { openLz4Help } from "./Lz4Help";
 import { Icon } from "./icons";
 import { JobsCard } from "./JobList";
 import { dirname } from "./paths";
 import type { Action, Job } from "./jobs";
 import {
-  DEFAULT_FFPFSC_LEVEL,
-  FfpfscField,
   FORMAT_INFO,
   GenerateSwitch,
-  KrakenField,
   Lead,
   OutputField,
-  PkgWarning,
   running,
   useOutput,
   VerifySwitch,
@@ -42,7 +48,7 @@ import {
 
 type Scenario = "trace" | "pack";
 const SCENARIOS: Scenario[] = ["trace", "pack"];
-const SCENARIO_LABEL: Record<Scenario, string> = { trace: "Trace", pack: "Pack" };
+const SCENARIO_LABEL: Record<Scenario, string> = { trace: "Trace", pack: "Pack/Unpack" };
 
 /** What Trace does to the source. */
 type TraceAct = "patch" | "unpatch";
@@ -67,8 +73,8 @@ function scenarioInfo(s: Scenario, packed: boolean): string {
   if (s === "trace")
     return "Makes this game record which assets it reads while you play (ampr_commands.bin), for Pack to use. Unpatch puts the release runtime back.";
   return packed
-    ? "Writes the game's LZ4 packs back as plain files, into a folder or any image."
-    : FORMAT_INFO.lz4;
+    ? "Unpack: writes the game's LZ4 packs back as plain files, into a folder or a plain image."
+    : "Pack: packs the game's assets into LZ4 volumes that the bundled AMPR emulator (ampr_emu) reads while the game runs, into a folder or a plain image. A packed source is unpacked instead.";
 }
 
 /** One line under the Patch / Unpatch picker. */
@@ -86,7 +92,7 @@ function traceInfo(a: TraceAct, image: boolean): string {
 function scenarioWhy(s: Scenario, lz4: Lz4Facts | null): string | null {
   if (s === "pack") return lz4?.imports_ampr || lz4?.packed ? null : "the game doesn't use AMPR";
   if (!lz4?.imports_ampr) return "the game doesn't use AMPR";
-  if (lz4.packed) return "the source is LZ4 packed: unpack it first (Pack)";
+  if (lz4.packed) return "the source is LZ4 packed: unpack it first";
   if (lz4.manifest_error !== null) return "its LZ4 packs are damaged";
   return null;
 }
@@ -101,9 +107,12 @@ function defaultScenario(lz4: Lz4Facts | null, kind: string): Scenario | null {
   return order.find((s) => scenarioWhy(s, lz4) === null) ?? null;
 }
 
-/** Pack's targets, in picker order: the LZ4 packed folder, then the images it packs straight
- * into (not .fpkg). */
-const PACK_FORMATS: Format[] = ["lz4", "ffpkg", "exfat", "ffpfs", "ffpfsc"];
+/** Pack's targets, in picker order: the LZ4 packed folder, then the plain images it packs
+ * straight into. Unpack's: a folder or the same images. The tab offers no .ffpfsc or .fpkg
+ * (core and the CLI still do): Convert turns the folder into any format. */
+const PACK_FORMATS: Format[] = ["lz4", "ffpkg", "exfat", "ffpfs"];
+const UNPACK_FORMATS: Format[] = ["folder", "ffpkg", "exfat", "ffpfs"];
+const ANY_FORMAT = "Need ffpfsc or fpkg? Write a folder here, then convert it to any format on the Convert tab.";
 
 /** Pack's or Unpack's target: Unpack starts on a folder, Pack on its chosen target. */
 function packTarget(lz4: Lz4Facts | null, packFormat: Format): Format {
@@ -129,9 +138,6 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
   const [format, setFormat] = useState<Format>("folder");
   /** Pack's target: the LZ4 packed folder or an image. */
   const [packFormat, setPackFormat] = useState<Format>("lz4");
-  const [inner, setInner] = useState<InnerFormat>("exfat");
-  const [krakenLevel, setKrakenLevel] = useState<KrakenLevel>("fast");
-  const [ffpfscLevel, setFfpfscLevel] = useState(DEFAULT_FFPFSC_LEVEL);
   const [fullVerify, setFullVerify] = useState(false);
   /** The free space a traced image gets, 64 MiB to 1 GiB; kept across sources. */
   const [traceMib, setTraceMib] = useState(DEFAULT_TRACE_MIB);
@@ -212,6 +218,23 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
     }
     if (again && source !== null) void inspectSource(source, false);
   }, [props.jobs, source]);
+
+  // Inspect deleted this source (or the folder holding it): forget it, and any late answer.
+  useEffect(
+    () =>
+      onDeleted((gone) => {
+        if (source === null || !isWithin(source, gone)) return;
+        sourceSeq.current++;
+        setSource(null);
+        setIns(null);
+        setInsError(null);
+        setInspecting(false);
+        setPatched(null);
+        setSaved(null);
+        setError(null);
+      }),
+    [source],
+  );
 
   const pickSource = async (path: string, isImage: boolean) => {
     setSource(path);
@@ -331,11 +354,9 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
     // Rebuilt in place: core writes a .part beside the source and derives the rest.
     output: imageTrace ? source : target,
     compression_threads: null,
-    inner: fmt === "ffpfsc" ? inner : null,
+    inner: null,
     remove_backport: false,
     full_verify: fullVerify,
-    kraken_level: krakenLevel,
-    ffpfsc_level: ffpfscLevel,
     lz4: imageTrace
       ? traceAct === "patch"
         ? "trace"
@@ -416,10 +437,16 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
           error={insError}
           ins={ins}
           prefix="l"
+          empty={<Lz4Empty onPick={pickSource} />}
         />
 
         <section className="card" aria-labelledby="l-lz4">
-          <CardHead icon="compress" title="LZ4 asset packs" id="l-lz4" />
+          <CardHead icon="compress" title="LZ4 asset packs" id="l-lz4">
+            <button type="button" className="small help-btn" onClick={openLz4Help}>
+              <Icon name="info" />
+              How LZ4 works
+            </button>
+          </CardHead>
           <SegPicker
             name="l-scenario"
             label="LZ4 scenario"
@@ -457,15 +484,15 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
             <p className="note-line warn lz4-why">
               <Icon name="warn" />
               <span>
-                Can't patch or unpatch {kindLabel(kind)}: it is read-only on the console, so the
-                game can't write its trace there. Convert it to .ffpkg (or .exfat) on the Convert
-                tab, then patch that.
+                Can't patch or unpatch <b>{kindLabel(kind)}</b>: it is read-only on the console, so
+                the game can't write its trace there. Convert it to <b>ffpkg</b> (or <b>exfat</b>) on
+                the Convert tab, then patch that.
               </span>
             </p>
           )}
           {scenario === "trace" && !readOnly && ins && source && (
             <>
-              {web && journal !== null && <TracesDownload source={source} ins={ins} />}
+              {journal !== null && <RecordedTraces source={source} ins={ins} />}
               <span className="label target-label" aria-hidden="true">
                 Action
               </span>
@@ -499,11 +526,12 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                 )}
                 {traceAct === "patch" && (
                   <p className="muted hint">
-                    Play, then pick this source again: Pack uses the traces it recorded
+                    Play, then pick this source again: Pack/Unpack uses the traces it recorded
                     {web && ", and Trace offers them as a zip for a computer"}. Each launch
                     overwrites the previous session's trace.
                   </p>
                 )}
+                {traceAct === "patch" && <FakelibWarning />}
                 {traceAct === "patch" && sourceIsImage && (
                   <>
                     <label className="label range-label" htmlFor="l-trace-mib">
@@ -601,20 +629,14 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
               <p className="muted desc">
                 <Lead text={FORMAT_INFO[fmt]} />
               </p>
-              {fmt === "ffpfsc" && (
-                <FfpfscField
-                  prefix="l-pack"
-                  inner={inner}
-                  onInner={setInner}
-                  level={ffpfscLevel}
-                  onLevel={setFfpfscLevel}
-                />
-              )}
               {fmt !== "lz4" && (
                 <p className="muted hint">
                   Packs into the image directly: no temporary folder; the packed files are read twice.
                 </p>
               )}
+              <p className="muted hint">
+                <Prose text={ANY_FORMAT} />
+              </p>
             </>
           )}
           {scenario === "pack" && lz4?.packed && (
@@ -627,7 +649,7 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                 label="Target format"
                 value={fmt}
                 onChange={pickFormat}
-                formats={KINDS}
+                formats={UNPACK_FORMATS}
               />
               <p className="muted desc">
                 <Lead
@@ -638,17 +660,9 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                   }
                 />
               </p>
-              {fmt === "pkg" && <PkgWarning />}
-              {fmt === "ffpfsc" && (
-                <FfpfscField
-                  prefix="l"
-                  inner={inner}
-                  onInner={setInner}
-                  level={ffpfscLevel}
-                  onLevel={setFfpfscLevel}
-                />
-              )}
-              {fmt === "pkg" && <KrakenField prefix="l" value={krakenLevel} onChange={setKrakenLevel} />}
+              <p className="muted hint">
+                <Prose text={ANY_FORMAT} />
+              </p>
               <div className="field lz4">
                 <p className="muted hint">
                   {lz4.packed.packed_files === null
@@ -664,30 +678,34 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
           {showButton && (
             <div className="build-row">
               {outputJob && <GenerateSwitch out={out} source={source} />}
-              <button
-                className="primary"
-                onClick={folderTrace ? runFolder : start}
-                disabled={
-                  !!blockReason || submitting || (outputJob && (!target || !!named.error))
-                }
-              >
-                <Icon name="bolt" />
-                {verb}
-              </button>
-              {packing && (
+              {/* Save as profile sits left of Pack, also in the tab order. */}
+              <span className="build-actions">
+                {packing && (
+                  <button
+                    className="neon-btn"
+                    onClick={savePlan}
+                    disabled={!!blockReason || saving || pending > 0}
+                    title={
+                      pending > 0
+                        ? "Wait for the running jobs to finish"
+                        : "Save the files Pack would pack as an editable rules profile"
+                    }
+                  >
+                    <Icon name="download" />
+                    {saving ? "Saving…" : "Save as profile"}
+                  </button>
+                )}
                 <button
-                  onClick={savePlan}
-                  disabled={!!blockReason || saving || pending > 0}
-                  title={
-                    pending > 0
-                      ? "Wait for the running jobs to finish"
-                      : "Save the files Pack would pack as an editable rules profile"
+                  className="primary"
+                  onClick={folderTrace ? runFolder : start}
+                  disabled={
+                    !!blockReason || submitting || (outputJob && (!target || !!named.error))
                   }
                 >
-                  <Icon name="download" />
-                  {saving ? "Saving…" : "Save as profile"}
+                  <Icon name="bolt" />
+                  {verb}
                 </button>
-              )}
+              </span>
             </div>
           )}
           {(blockReason || formatWarn > 0 || dupe || error || patchDone || savedHere) && (
@@ -713,7 +731,7 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
               {!blockReason && formatWarn > 0 && (
                 <p className="note-line warn">
                   <Icon name="warn" />
-                  <span>Likely to fail as {kindLabel(fmt)}: it refuses file names listed in Source.</span>
+                  <span>Likely to fail as <b>{kindLabel(fmt)}</b>: it refuses file names listed in Source.</span>
                 </p>
               )}
               {dupe && (
@@ -722,7 +740,7 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                   <span>
                     {collides
                       ? `A job is already writing this ${fmt === "folder" || fmt === "lz4" ? "folder" : "file"}: ${verb} again would fail. Pick another name.`
-                      : `Already writing this game as ${kindLabel(fmt)}; ${verb} again makes a second copy.`}
+                      : <>Already writing this game as <b>{kindLabel(fmt)}</b>; {verb} again makes a second copy.</>}
                   </span>
                 </p>
               )}
@@ -755,7 +773,7 @@ function SegPicker<T extends string>(props: {
         return (
           <label
             key={o}
-            className={`seg-choice fmt-lz4${props.value === o ? " on" : ""}`}
+            className={`seg-choice lz4-y${props.value === o ? " on" : ""}`}
             title={why ?? undefined}
           >
             <input
@@ -803,22 +821,30 @@ function ruleSource(profile: string | null, traces: string | null, journalBytes:
 
 const INDEX = "ampr_emu.index";
 
-/** Trace, web build, a source with a journal: its traces as one zip from the server (the route
- * streams it out of a folder or any image), to pack the original dump on a computer. */
-function TracesDownload(props: { source: string; ins: Inspection }) {
+/** Trace, a source with a journal: what was recorded. The web build offers the traces as one
+ * zip from the server (the route streams it out of a folder or any image), to pack the
+ * original dump on a computer; the app has them at hand for Pack/Unpack. */
+function RecordedTraces(props: { source: string; ins: Inspection }) {
   const zip = props.ins.lz4?.traces_zip ?? null;
   const index = props.ins.files.find((f) => f.path === INDEX)?.size ?? 0;
   const total = (props.ins.lz4?.journal_bytes ?? 0) + index;
   return (
     <div className="field lz4 recorded">
       <span className="label">Recorded traces</span>
-      <p className="muted hint">
-        Close the game and wait about a minute first: while the image is mounted, its file on disk
-        can lag behind what the game wrote. Use a computer's browser opened at this console's Forge
-        address, then pick the zip in LZ4 → Pack → Traces on your computer. A download fails if the
-        game or a sync changes the source meanwhile: close the game and download again.
-      </p>
-      {zip !== null ? (
+      {!web ? (
+        <p className="muted hint">
+          ampr_commands.bin ({prettyBytes(props.ins.lz4?.journal_bytes ?? 0)}): Pack/Unpack loads
+          these traces by itself.
+        </p>
+      ) : (
+        <p className="muted hint">
+          Close the game and wait about a minute first: while the image is mounted, its file on disk
+          can lag behind what the game wrote. Use a computer's browser opened at this console's Forge
+          address, then pick the zip in LZ4 → Pack/Unpack → Traces on your computer. A download fails
+          if the game or a sync changes the source meanwhile: close the game and download again.
+        </p>
+      )}
+      {!web ? null : zip !== null ? (
         <div className="row downloads">
           <a
             className="button"
@@ -838,6 +864,56 @@ function TracesDownload(props: { source: string; ins: Inspection }) {
         </p>
       )}
       <p className="muted hint">A journal cut off at the end still packs: Pack stops at its last whole record.</p>
+      <FakelibWarning recorded />
+    </div>
+  );
+}
+
+/** Before and after tracing: a fakelib updater puts its own libSceAmpr.sprx back over the
+ * trace runtime, so nothing is recorded. */
+function FakelibWarning({ recorded = false }: { recorded?: boolean }) {
+  return (
+    <p className="note-line warn">
+      <Icon name="warn" />
+      <span>
+        {recorded ? "Few or no traces? " : ""}Turn off any fakelib updater while tracing: it
+        overwrites fakelib/libSceAmpr.sprx, and then nothing is recorded
+        {recorded ? ". Turn it off, Patch again and replay." : "."}
+      </span>
+    </p>
+  );
+}
+
+/** The LZ4 tab's empty Source: one yellow Choose source… (a game folder or an image, asked
+ * first: the native dialogs pick one kind) and what to expect. */
+function Lz4Empty({ onPick }: { onPick: (path: string, isImage: boolean) => void }) {
+  return (
+    <div className="empty lz4">
+      <span className="empty-icon">
+        <Icon name="compress" />
+      </span>
+      <p className="empty-title">Choose a game that uses AMPR</p>
+      <p className="muted">
+        <Lead text="Experimental: traces and LZ4 packs for ampr_emu. No guarantee the game runs afterwards; keep your original dump." />
+      </p>
+      <div className="row center">
+        <ChooseMenu
+          id="l-choose-source"
+          className="lz4-btn"
+          label={
+            <>
+              <Icon name="folder" />
+              Choose source…
+            </>
+          }
+          menuLabel="Source"
+          items={[
+            { id: "folder", icon: "folder", label: "Game folder…" },
+            { id: "image", icon: "disc", label: "Image…" },
+          ]}
+          onChoose={(what) => void openPicker(what, onPick)}
+        />
+      </div>
     </div>
   );
 }
@@ -908,7 +984,16 @@ function TracesControl(props: {
               Choose…
             </button>
           ) : (
-            <ChooseMenu id={`${id}-choose`} onChoose={props.onChoose} />
+            <ChooseMenu
+              id={`${id}-choose`}
+              label="Choose…"
+              menuLabel="Traces"
+              items={[
+                { id: "zip", icon: "file", label: "Zip…" },
+                { id: "folder", icon: "folder", label: "Folder…" },
+              ]}
+              onChoose={props.onChoose}
+            />
           )}
         </span>
       </div>
@@ -924,72 +1009,6 @@ function TracesControl(props: {
         </button>
       )}
     </div>
-  );
-}
-
-/** Desktop: the native dialog picks files or folders, never both (rfd), so Choose… opens a
- * two-item menu first. Esc or a click outside closes it. */
-function ChooseMenu(props: { id: string; onChoose: (what: "zip" | "folder") => void }) {
-  const [open, setOpen] = useState(false);
-  const box = useRef<HTMLSpanElement>(null);
-  const btn = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    box.current?.querySelector<HTMLElement>("[role=menuitem]")?.focus();
-    // mousedown, not blur: WebKit doesn't focus a clicked button, so a blur would close the
-    // menu before the item's click lands.
-    const outside = (e: MouseEvent) => {
-      if (!box.current?.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", outside);
-    return () => document.removeEventListener("mousedown", outside);
-  }, [open]);
-  const choose = (what: "zip" | "folder") => {
-    setOpen(false);
-    btn.current?.focus();
-    props.onChoose(what);
-  };
-  const onKey = (e: KeyboardEvent) => {
-    if (!open) return;
-    const items = [...(box.current?.querySelectorAll<HTMLElement>("[role=menuitem]") ?? [])];
-    const i = items.indexOf(document.activeElement as HTMLElement);
-    if (e.key === "Escape") {
-      e.preventDefault();
-      setOpen(false);
-      btn.current?.focus();
-    } else if (e.key === "Tab") {
-      setOpen(false);
-    } else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && items.length > 0) {
-      e.preventDefault();
-      items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
-    }
-  };
-  return (
-    <span className="menu-wrap" ref={box} onKeyDown={onKey}>
-      <button
-        id={props.id}
-        ref={btn}
-        className="small"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => setOpen((o) => !o)}
-      >
-        Choose…
-        <Icon name="chevron" />
-      </button>
-      {open && (
-        <span className="menu" role="menu" aria-label="Traces">
-          <button type="button" role="menuitem" onClick={() => choose("zip")}>
-            <Icon name="file" />
-            Zip…
-          </button>
-          <button type="button" role="menuitem" onClick={() => choose("folder")}>
-            <Icon name="folder" />
-            Folder…
-          </button>
-        </span>
-      )}
-    </span>
   );
 }
 

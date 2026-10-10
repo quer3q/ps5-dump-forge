@@ -77,11 +77,12 @@ async function run(): Promise<void> {
   } catch (e) {
     return show({ ok: false, failure: "load", message: `Couldn't load the page: ${e}` });
   }
-  // The server's separator before anything renders a path. ponytail: a server that doesn't
-  // answer now (a LAN viewer while it's down) keeps "/", the PS5's.
-  const sep = await client.serverSeparator();
+  // The server's separator before anything renders a path, and its address for the header.
+  // ponytail: a server that doesn't answer now (a LAN viewer while it's down) keeps "/", the
+  // PS5's, and shows no address.
+  const { separator } = await client.serverSession();
   if (appShown) return;
-  if (sep) setServerSeparator(sep);
+  if (separator) setServerSeparator(separator);
   appShown = true;
   client.start();
   root.render(

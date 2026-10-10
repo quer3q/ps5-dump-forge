@@ -12,7 +12,9 @@ const COMMANDS: &[&str] = &[
     "lz4_patch",
     "lz4_unpatch",
     "lz4_save_plan_profile",
+    "delete_path",
     "reveal",
+    "open_repo",
     "quit_app",
 ];
 

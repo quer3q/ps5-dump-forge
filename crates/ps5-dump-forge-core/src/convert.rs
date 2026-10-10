@@ -771,6 +771,8 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
                         &mut cadence,
                     )?;
                     ctx.progress("verify", 0, 1);
+                    // The source's files and their read-back through the packs come after.
+                    ctx.reserve(summary.checked_bytes);
                     physical = Some(written.expected(ctx, mode)?);
                     (part, file, size, wrapped)
                 }
@@ -797,6 +799,8 @@ fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     ctx.check()?;
 
     ctx.progress("verify", 0, 1);
+    // Packed, the image's read-back as written comes first.
+    ctx.reserve(physical_check);
     let expected = hashing.expected(ctx, mode)?;
     // The source is read no more: its handles close before the output may replace it
     // (Windows refuses to rename over an open file).
@@ -963,7 +967,27 @@ fn measure_packs(
         "LZ4 into an image: packing straight into it, no temporary folder; the packed files are \
          read twice (measure, then write)",
     );
-    ctx.expect_rest(total);
+    // Measuring never fills the bar: the write reads about every byte again (the packs are
+    // at most their source's size, a little over for RAW-heavy ones), and the check reads
+    // back about the same sample twice, as written and through the packs. The write pass
+    // renews this from the plan.
+    let bytes = tree
+        .files()
+        .iter()
+        .fold(0u64, |sum, f| sum.saturating_add(f.size));
+    let fast = Mode::Fast {
+        seed: 0,
+        seam: true,
+    };
+    let check = match req.full_verify {
+        true => bytes,
+        false => verify::summary(tree.files(), fast).checked_bytes,
+    };
+    ctx.expect_rest(
+        total
+            .saturating_add(bytes)
+            .saturating_add(check.saturating_mul(2)),
+    );
     ctx.progress("measure", 0, total);
     let started = std::time::Instant::now();
     let m = ps5_dump_forge_lz4::writer::measure(
@@ -1138,10 +1162,12 @@ fn content(
     let Some(physical) = physical else {
         return verify::compare(expected, tree.as_mut(), ctx, mode);
     };
+    ctx.reserve(verify::summary(&expected.files, mode).checked_bytes);
     let mut checks: Vec<String> = verify::compare(physical, tree.as_mut(), ctx, mode)?
         .into_iter()
         .map(|c| format!("as written, {c}"))
         .collect();
+    ctx.reserve(0);
     checks.extend(pack_checks(expected, tree, runtime, ctx, mode)?);
     Ok(checks)
 }

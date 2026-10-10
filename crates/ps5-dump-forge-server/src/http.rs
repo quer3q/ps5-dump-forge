@@ -62,6 +62,11 @@ impl Response {
         }
     }
 
+    /// An SVG drawn per request (`GET /api/qr`).
+    pub fn svg(body: String) -> Self {
+        Self::new(200, "image/svg+xml", Cow::Owned(body.into_bytes()))
+    }
+
     /// `{"error": text}`, the shape of every refusal.
     pub fn error(status: u16, text: impl std::fmt::Display) -> Self {
         let body = serde_json::json!({ "error": text.to_string() }).to_string();

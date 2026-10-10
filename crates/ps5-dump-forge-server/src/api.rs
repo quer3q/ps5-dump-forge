@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use ps5_dump_forge_core::{ConvertRequest, Event, Format, JobId, Jobs};
+use ps5_dump_forge_core::{ConvertRequest, DeleteError, Event, Format, JobId, Jobs};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -204,6 +204,7 @@ impl Server {
         };
         match (post, api) {
             (false, "session") => Ok(self.session()),
+            (false, "qr") => self.qr(),
             (true, "inspect") => self.inspect(body),
             (true, "default_output") => {
                 let arg: OutputArg = parse(body)?;
@@ -243,6 +244,7 @@ impl Server {
             (true, "lz4_unpatch") => self.lz4_patch(body, true),
             (false, "lz4_traces") => self.lz4_traces(&head.query),
             (true, "list_dir") => self.list_dir(body),
+            (true, "delete_path") => self.delete_path(body),
             #[cfg(target_env = "ps5")]
             (true, "debug_bench") if crate::debug::ENABLED => {
                 #[derive(Deserialize)]
@@ -302,7 +304,20 @@ impl Server {
             "self_copy": crate::self_copy_status(),
             // The page joins and splits paths with it ("\\" on a Windows host).
             "separator": std::path::MAIN_SEPARATOR_STR,
+            // The page shows it: the console's own page is on 127.0.0.1.
+            "url": self.url,
         }))
+    }
+
+    /// `GET /api/qr`: the session's `url` as a QR code (SVG) for a phone to open. 404 when the
+    /// server couldn't tell its IP (its url then names it in words).
+    fn qr(&self) -> Reply {
+        if self.url.contains(' ') {
+            return Err(Response::error(404, "no address to show"));
+        }
+        let code = qrcode::QrCode::with_error_correction_level(&self.url, qrcode::EcLevel::L)
+            .map_err(|e| Response::error(500, format!("internal error: {e}")))?;
+        Ok(Response::svg(qr_svg(&code)))
     }
 
     fn inspect(&self, body: &[u8]) -> Reply {
@@ -386,6 +401,29 @@ impl Server {
         }
         .map_err(core)?;
         Ok(Response::json(&done))
+    }
+
+    /// Deletes a file or folder for good (core's `Jobs::delete_path`; the page asks first).
+    /// Never a browse root or a folder holding one, configured or mounted now, nor anything an
+    /// unfinished job uses. Admission is held, so no quit lands mid-delete.
+    fn delete_path(&self, body: &[u8]) -> Reply {
+        let arg: PathArg = parse(body)?;
+        let _admission = lock(&self.admission);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Response::error(409, "PS5 Dump Forge is stopping"));
+        }
+        let mut keep = self.roots.current();
+        keep.extend(self.opts.roots.iter().cloned());
+        self.jobs.delete_path(&arg.path, &keep).map_err(|e| {
+            let status = match e {
+                DeleteError::Refused(_) => 400,
+                DeleteError::Missing(_) => 404,
+                DeleteError::Busy(_) => 409,
+                DeleteError::Failed(_) => 500,
+            };
+            Response::error(status, e.to_string())
+        })?;
+        Ok(Response::json(&()))
     }
 
     /// `GET ?source=<path>` (percent-encoded): both LZ4 trace files at the root of a folder or
@@ -541,6 +579,23 @@ impl Server {
     }
 }
 
+/// Dark modules on white with a 2-module quiet zone (the page pads it further); one path,
+/// crisp edges, scaled by CSS.
+fn qr_svg(code: &qrcode::QrCode) -> String {
+    let (w, q) = (code.width(), 2);
+    let mut d = String::new();
+    for (i, c) in code.to_colors().iter().enumerate() {
+        if *c == qrcode::Color::Dark {
+            d += &format!("M{},{}h1v1h-1z", i % w + q, i / w + q);
+        }
+    }
+    let n = w + 2 * q;
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {n} {n}\" shape-rendering=\"crispEdges\">\
+         <rect width=\"{n}\" height=\"{n}\" fill=\"#fff\"/><path fill=\"#000\" d=\"{d}\"/></svg>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,7 +733,18 @@ mod tests {
         // Job 2's `.part` isn't stale: `stale_parts` waited for its admission.
         assert_eq!(r.status, 200);
         assert_eq!(r.text(), json!([old]).to_string());
+        // Nothing an unfinished job uses is deleted, nor a folder holding it; the rest is.
+        for busy in [&live, &tmp] {
+            let r = post(&server, "delete_path", json!({ "path": busy }));
+            assert_eq!(r.status, 409, "{}", r.text());
+        }
+        let r = post(&server, "delete_path", json!({ "path": old }));
+        assert_eq!((r.status, r.text()), (200, "null".to_string()));
+        assert!(!old.exists() && live.exists());
         assert!(server.stop());
+        let r = post(&server, "delete_path", json!({ "path": live }));
+        assert_eq!(r.status, 409);
+        assert!(r.text().contains("stopping"), "{}", r.text());
         assert!(
             lock(&server.table)
                 .unfinished()

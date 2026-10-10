@@ -151,11 +151,9 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
     let local = listener.local_addr()?;
     let interrupt = opts.interrupt;
     let server = Arc::new(api::Server::new(opts, local)?);
-    let or_tile = match cfg!(target_env = "ps5") {
-        true => " or the PS5 Dump Forge tile",
-        false => "",
-    };
-    (server.opts.notify)(&format!("PS5 Dump Forge: open {}{or_tile}", server.url));
+    (server.opts.notify)(&started(&server.url, cfg!(target_env = "ps5")));
+    #[cfg(target_env = "ps5")]
+    eprintln!("ps5-dump-forge serve: listening on {}", server.url);
     #[cfg(target_env = "ps5")]
     tile::install(local.port());
     if let Some(flag) = interrupt {
@@ -195,6 +193,15 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
             });
     }
     Ok(())
+}
+
+/// The notice once serving. The console's own browser opens the page from the tile; the
+/// address is in the page's header (and the log) for anyone else on the network.
+fn started(url: &str, ps5: bool) -> String {
+    match ps5 {
+        true => "PS5 Dump Forge is running: open the PS5 Dump Forge tile".into(),
+        false => format!("PS5 Dump Forge: open {url}"),
+    }
 }
 
 /// One handler thread; frees its place even when the handler unwinds.
@@ -271,4 +278,19 @@ fn random_hex(n: usize) -> io::Result<String> {
     let mut bytes = vec![0u8; n];
     getrandom::fill(&mut bytes).map_err(|e| io::Error::other(format!("no randomness: {e}")))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn started_notice() {
+        let url = "http://192.168.1.20:8095";
+        assert_eq!(
+            super::started(url, false),
+            "PS5 Dump Forge: open http://192.168.1.20:8095"
+        );
+        let ps5 = super::started(url, true);
+        assert!(ps5.contains("open the PS5 Dump Forge tile"), "{ps5}");
+        assert!(!ps5.contains("http"), "{ps5}");
+    }
 }

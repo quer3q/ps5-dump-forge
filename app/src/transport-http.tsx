@@ -4,7 +4,7 @@
 
 import { useSyncExternalStore } from "react";
 
-import { call, getStatus, listen, watchStatus } from "./http-client";
+import { call, getStatus, listen, serverAddress, watchStatus } from "./http-client";
 import { setServerSeparator } from "./paths";
 import { pick } from "./Picker";
 import type { Transport } from "./transport";
@@ -19,6 +19,7 @@ export const transport: Transport = {
   listen,
   pick,
   useOffline: () => useSyncExternalStore(watchStatus, getStatus).offline,
+  address: serverAddress,
   lz4Patch: (source) => call("lz4_patch", { source }),
   lz4Unpatch: (source) => call("lz4_unpatch", { source }),
   // The server resolves the plan; the browser saves the TOML as a download.

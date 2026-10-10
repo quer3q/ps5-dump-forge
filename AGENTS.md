@@ -16,8 +16,8 @@ write safety, console speeds).
   rename (`finalize.rs`; macOS exFAT has none: check, then rename; FreeBSD: hard link where the folder has
   them, U3), BLAKE3 verification (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads, fast sample
   or full), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
-  generated output names), `prefetch.rs` (read-ahead thread). FreeBSD/PS5 only: `dest.rs` (destination
-  probe, U1), `durable.rs` (`sync_retry`, `SyncEvery`, drive-removal check; U4/U5/U7). Its `lib.rs` is the
+  generated output names), `prefetch.rs` (read-ahead thread), `delete.rs` (Inspect's delete). FreeBSD/PS5
+  only: `dest.rs` (destination probe, U1), `durable.rs` (`sync_retry`, `SyncEvery`, drive-removal check; U4/U5/U7). Its `lib.rs` is the
   public API the CLI, the app and the server build against.
 - `crates/ps5-dump-forge-exfat`: forward-only exFAT writer (512 B sectors, 64 KiB clusters), ported
   from MkPFS. `crates/ps5-dump-forge-ufs2`: write-once UFS2 writer for the one SMP geometry
@@ -83,12 +83,18 @@ write safety, console speeds).
   write from `HashingTree(PackedTree(HashingTree(logical)))`, verify as written, then `reader::unpack` of
   the image (every runtime check) and the logical files against the source, same fast/full policy.
   Pack and trace need a title whose `eboot.bin` imports `libSceAmpr`. Compression is `lz4_flex`.
-  In the UI every LZ4 action lives in the LZ4 tab (`app/src/Lz4.tsx`), two scenarios: **Trace** (a folder,
+  In the UI every LZ4 action lives in the LZ4 tab (`app/src/Lz4.tsx`; **How LZ4 works**, a short
+  text how-to behind a red button, in `Lz4Help.tsx`), two scenarios: **Trace** (a folder,
   `.exfat` or `.ffpkg`: Patch / Unpatch; a folder through `lz4_patch`/`lz4_unpatch`, an image through a
   conversion with `lz4: "trace"|"unpatch"`, `format` = the source's, `lz4_in_place: true`; Download traces
-  in the web build once a journal is there) and **Pack** (traces as a zip or folder, locked to the source's
-  own when it is traced; a profile instead; Unpack when the source is packed). Convert has no LZ4 controls
-  and sends `lz4: null`.
+  in the web build once a journal is there) and **Pack/Unpack** (traces as a zip or folder, locked to the source's
+  own when it is traced; a profile instead; Unpack when the source is packed). Its target pickers are a UI
+  limit (core and CLI keep `.ffpfsc`): Pack LZ4 folder/`.ffpkg`/`.exfat`/`.ffpfs`, Unpack
+  folder/`.ffpkg`/`.exfat`/`.ffpfs`; a folder converts to anything in Convert. Convert sends `lz4: null`
+  except for its **AMPR runtime** switch (an AMPR title, not packed, no damaged manifest, runtime `none`:
+  install, or `other`: replace; shown only when inspect reports `Lz4Facts.shipped_runtime_version`; on for
+  each new source): on, it sends `lz4: "unpatch"`, never `lz4_in_place`. Job rows: an LZ4 tab job has a
+  yellow edge and an `LZ4 pack|unpack|trace|unpatch` tag; Convert's runtime job is tagged `AMPR runtime`.
 - The recommended trace path is a traced `.ffpkg` mounted `image_rw=`, then **Download traces** (http build
   only; the desktop app points at Pack): `GET /api/lz4_traces?source=` streams one STORED zip
   (`[GAME_TITLE]-[TITLE_ID]-amprtrace.zip`: the generated output stem, one implementation, + `-amprtrace.zip`) of
@@ -144,7 +150,7 @@ write safety, console speeds).
   `lz4_save_plan_profile {request, dest}` (dest from the save dialog, `dialog:allow-save`). UI: a secondary
   **Save as profile** beside Pack.
 - Never touch the source: junk (`.DS_Store`, `._*`, `.fseventsd`, ...) is filtered, not deleted.
-  Two exceptions, by user decision, both explicit requests:
+  Three exceptions, by user decision, all explicit requests:
   1. The LZ4 folder patch and unpatch (`lz4_patch`/`lz4_unpatch`, CLI `lz4-patch`/`lz4-unpatch`, server
      `POST /api/lz4_patch`/`POST /api/lz4_unpatch` `{source}`, Tauri `lz4_patch`/`lz4_unpatch` `{path}`)
      change a plain game folder of an AMPR title: the trace (unpatch: release) runtime replaces any
@@ -162,15 +168,28 @@ write safety, console speeds).
      the source's `SourceStamp`, closes the source and renames the part over it (`Part::replace`, one
      atomic rename, folder synced). Any failure leaves the source byte-identical and the `.part` deleted.
      The server's stale-part filter takes an in-place job's `.part` from its source.
+  3. Deleting the inspected source (Inspect's trash button, after a No / **Yes, delete** question; core
+     `Jobs::delete_path(path, protected)` → `DeleteError` `Refused`/`Missing`/`Busy`/`Failed`,
+     `core/src/delete.rs`; server `POST /api/delete_path` `{path}` → `null`, 400/404/409/500, 409 also
+     while stopping; Tauri `delete_path` `{path}`). A file (`remove_file`) or folder (`remove_dir_all`:
+     links inside removed, not followed), then its folder synced; no Trash, no undo, and a folder that
+     fails part way may be partly gone (the error says so). Refused: an empty path, a link itself, a
+     special file, a volume root or mount point, a folder with another volume mounted inside (unix, by
+     `st_dev`; a same-filesystem Linux bind mount is not caught), each `protected` path and folders holding
+     it (server: browse roots, configured and current; app: the home folder), and anything at, in or above
+     an unfinished job's source, output, `.part`s, profile or traces (a lone journal's index too), compared
+     by identity after canonicalize, links on the typed path included. Check and removal run with the job
+     table locked, so no job is admitted between them. Leftover `.part` cleanup is separate (`TODO.md`).
   The user takes the journal and index off the console (Download traces) and packs on a computer
   (`--lz4-traces`).
 - Names are never renamed: bad names (non-NFC, exFAT/PFS case collisions, forbidden chars, non-ASCII
   in PFS) fail preflight with every offender listed.
 - `.pkg` is built with `BuildRequest::production` only (plaintext `PPRPLAIN-NOAUTH!`, Kraken);
   installing needs kstuff + fpkg-enable + ppr-patch. Debug keys are embedded.
-- The UI calls the debug FPKG `.fpkg` (a label only): its files, the `Format`/`Kind` id and the CLI
-  flag stay `pkg`. The default target is `.ffpkg` (SMP 1.7's recommendation; `.exfat` is for
-  compatibility). Format copy and the About formats table (`app/src/Formats.tsx`: one table, Console
+- The UI names formats without the dot (`ffpkg`, `exfat`, `ffpfs`, `ffpfsc`, `fpkg`; `KIND_LABEL` in
+  `common.tsx`), and in running text in bold (`Prose`); paths and file names keep the extension. It calls
+  the debug FPKG `fpkg` (a label only): its files, the `Format`/`Kind` id and the CLI flag stay `pkg`. The default target is `.ffpkg` (SMP 1.7's recommendation; `.exfat` is for
+  compatibility). Format copy and the About tab's formats table (`app/src/Formats.tsx`: one table, Console
   speed and Size on disk for every target plus the plain folder) follow ShadowMountPlus 1.7's README and
   release notes.
 - No settings and no config file: the UI keeps choices in memory until it closes. Defaults: target
@@ -179,7 +198,10 @@ write safety, console speeds).
   `fast` only), no extra free space beyond each format's built-in spare, output next to the source (an
   empty output `dir` is the source's folder, never the process's working directory).
 - Progress is one bar per job: `Event::Progress` `done`/`total` span every pass (write, verify,
-  ...); `Ctx::expect_rest` renews the estimate as each pass learns its size.
+  ...); `Ctx::expect_rest` renews the estimate as each pass learns its size. No pass fills the bar while
+  another is left: LZ4 measuring and auto-loose sampling count the write and check passes after them,
+  and `Ctx::reserve` holds back a packed image's check through its packs while it is checked as written.
+  The UI keeps the bar under 100% until `Done` is `Ok`.
 - The Tauri app has no HTTP sidecar and no `tauri-plugin-fs`; the capability grants only the app's
   commands, dialogs and event listening. The web UI is a separate build served by `serve`.
 - Verification: fast by default everywhere (every structural check + seeded BLAKE3 sample of 8 MiB
@@ -189,11 +211,17 @@ write safety, console speeds).
   `--cfg libc_unstable_freebsd_version="11"` (the env var is ignored by libc ≥ 0.2.187) and struct-size
   asserts in the CLI. `panic=abort`.
 - The server has **no protections** by user decision: no pairing, token, Host/Origin/CSRF checks or path
-  confinement, and no delete route. Don't re-add them.
+  confinement. Don't re-add them. Its one delete route (`delete_path`, Inspect's, by user decision)
+  refuses only what exception 3 lists; the page's question is UI, not authentication.
 - Tile `PDFG00001` "PS5 Dump Forge" (deeplink to `http://127.0.0.1:<port>/`), never written without our
   owner file. Self copy: `ps5/build.sh` builds twice; the release ELF embeds stage 1 and saves it to
   `/data/ps5-dump-forge/ps5-dump-forge.elf`. Launch on open: the AppCache'd page asks elfldr
   (`GET :9021/<elf>?args=serve`) only from the console's own browser at load.
+  On the PS5 the start notice says to open the tile (no URL; the serve log has it); the page header
+  shows the server's host:port from `GET /api/session` `url`, never the viewer's `location`, then
+  its QR code (`GET /api/qr`: that `url` as an SVG the server draws with the `qrcode` crate, so the
+  desktop bundle has no encoder; 404 when the server can't tell its IP). The address + QR is one button
+  that opens "How to connect" (the big code); About names the address. The desktop app shows no QR.
 - PS5 writes: a retried fsync fails the job; USB is never hardware-tested, so the destination probe decides
   (never the path or fs name) and fails closed. Debug routes (`FORGE_DEBUG_API`) never ship; `release-ps5.sh`
   refuses them.

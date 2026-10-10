@@ -31,6 +31,8 @@ export interface Transport {
   pick(o: PickOptions): Promise<string | null>;
   /** The server can't be reached right now (http only). */
   useOffline(): boolean;
+  /** The server's `host:port` as its session reports it (http only; the app: null). */
+  address(): string | null;
   /** Patch a game folder in place for LZ4 tracing (api.ts `Lz4Patch`). Its own function: the
    * Tauri command takes `path`, the route `source`. */
   lz4Patch<T>(source: string): Promise<T>;

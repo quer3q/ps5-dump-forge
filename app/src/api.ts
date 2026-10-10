@@ -135,6 +135,9 @@ export interface Lz4Facts {
   /** The manifest starts like one but doesn't parse (also a finding); `packed` is null. */
   manifest_error: string | null;
   runtime: "forge_release" | "forge_trace" | "other" | "none";
+  /** The ampr_emu version of the runtimes Forge ships (and installs on unpatch), e.g.
+   * "0.4.2.1"; missing from an older backend. */
+  shipped_runtime_version?: string;
   /** Size of the trace journal (ampr_commands.bin), when present. */
   journal_bytes: number | null;
   /** With the journal and its ampr_emu.index both present: the name Get traces' zip takes. */
@@ -235,6 +238,9 @@ export const pick = (o: PickOptions): Promise<string | null> => transport.pick(o
 /** The server can't be reached (http build); polling goes on. */
 export const useOffline = transport.useOffline;
 
+/** The server's `host:port` from its session (http build); null in the app or when unknown. */
+export const serverAddress = transport.address;
+
 export const api = {
   inspect: (path: string) => invoke<Inspection>("inspect", { path }),
   defaultOutput: (source: string, format: Format, dir: string) =>
@@ -258,11 +264,16 @@ export const api = {
    * writes it; the http build downloads it. Reads the source, not a job. null: cancelled. */
   savePlanProfile: (request: ConvertRequest, name: string, dir: string) =>
     transport.savePlanProfile<Lz4PlanProfile>(request, name, dir),
+  /** Delete a file or folder for good (the page asks first). Refused for a link, a drive or
+   * browse root or a folder holding one, and anything an unfinished job reads or writes. */
+  deletePath: (path: string) => invoke<null>("delete_path", { path }).then(() => undefined),
   /** Leftover `.part` files in these folders (deduplicated, missing ones skipped). */
   staleParts: (dirs: string[]) => invoke<string[]>("stale_parts", { dirs }),
   /** Show a finished job's output in Finder, Explorer or its folder (Rust looks the path up by
    * job id). The http build does nothing here: the job row shows the path instead. */
   reveal: (id: JobId) => invoke<void>("reveal", { id }),
+  /** The app's GitHub button: the project page in the default browser (the http build links it). */
+  openRepo: () => invoke<void>("open_repo"),
   /** Cancel every job, wait for cleanup, exit. http build: resolves once the server is gone. */
   quitApp: () => invoke<void>("quit_app"),
 };

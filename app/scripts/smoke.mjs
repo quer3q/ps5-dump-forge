@@ -117,6 +117,7 @@ const manText = await man.text();
 const manLines = manText.split("\n");
 const cachedFiles = manLines.slice(manLines.indexOf("CACHE:") + 1, manLines.indexOf("NETWORK:")).filter(Boolean);
 for (const r of refs) assert.ok(cachedFiles.includes(new URL(r, `${ORIGIN}/`).pathname.slice(1)), `${r} in the manifest`);
+// The logo (bundled, so the page works offline).
 assert.ok(cachedFiles.some((r) => r.endsWith(".png")), "the logo");
 for (const r of cachedFiles) {
   const res = await fetch(new URL(r, `${ORIGIN}/`));
@@ -142,7 +143,8 @@ for (const [what, res, want] of checks) {
 const sessionRes = await raw("GET", "/api/session");
 assert.equal(sessionRes.headers["cache-control"], "no-store", "API replies are never cached");
 const session = sessionRes.data;
-assert.deepEqual(Object.keys(session).sort(), ["app", "instance", "platform", "self_copy", "separator", "stopping", "version"]);
+assert.deepEqual(Object.keys(session).sort(), ["app", "instance", "platform", "self_copy", "separator", "stopping", "url", "version"]);
+assert.ok(session.url.startsWith("http://") && session.url.endsWith(`:${PORT}`), `session url ${session.url}`);
 assert.equal(session.separator, process.platform === "win32" ? "\\" : "/");
 assert.equal(session.self_copy, "none"); // a host build carries no copy of itself
 assert.equal(session.app, "ps5-dump-forge");
@@ -274,6 +276,19 @@ mkdirSync(`${root}/no index`);
 writeFileSync(`${root}/no index/ampr_commands.bin`, "x");
 assert.equal((await realFetch(traceUrl(`${root}/no index`))).status, 404);
 assert.equal((await realFetch(traceUrl(game))).status, 404);
+// Delete (Inspect's, after the page asks): disposable fixtures only. A file and a folder go;
+// a browse root, a folder holding one, an empty path and a missing one are refused.
+assert.equal(await a.c.call("delete_path", { path: zipPath }), null);
+assert.equal(await a.c.call("delete_path", { path: `${root}/no index` }), null);
+assert.ok(!(await a.c.call("list_dir", { path: root })).entries.some((e) => e.name === "traces.zip" || e.name === "no index"), "both gone");
+const delStatus = async (path) => (await raw("POST", "/api/delete_path", json, JSON.stringify({ path }))).status;
+assert.equal(await delStatus(root), 400, "a browse root");
+assert.equal(await delStatus(dirname(root)), 400, "a folder holding a browse root");
+assert.equal(await delStatus(""), 400, "an empty path");
+assert.equal(await delStatus(`${root}/no index`), 404, "already gone");
+assert.equal((await raw("POST", "/api/delete_path", json, "{}")).status, 400, "no path");
+assert.ok((await a.c.call("list_dir", { path: traced })).entries.length > 0, "the rest is untouched");
+console.log("delete_path: a file and a folder deleted; browse root, its parent, empty 400; missing 404");
 console.log(`lz4_traces: a ${zip.length}-byte zip of a 3 MiB journal and its index, entries byte for byte; no index or no traces 404`);
 
 // Every request: POSTs carry JSON; nothing else (no token, no custom header).

@@ -306,6 +306,7 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         packed,
         manifest_error,
         runtime: runtime.to_string(),
+        shipped_runtime_version: ps5_dump_forge_lz4::runtime::VERSION,
         journal_bytes,
         traces_zip: (journal_bytes.is_some() && size(tree, INDEX).is_some()).then(|| {
             let param = size(tree, "sce_sys/param.json")

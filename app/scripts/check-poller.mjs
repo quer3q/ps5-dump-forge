@@ -102,3 +102,46 @@ await c.call("quit_app");
 assert.ok(now <= 4000, `resolved once gone (${now} ms)`);
 globalThis.setTimeout = realSetTimeout;
 console.log(`quit: still answering -> rejects at the deadline (${answers} answers), gone -> resolves`);
+
+// The session read before the app renders: the separator, and the address the header shows
+// (the server's own url, never the page's location); none from an older server or one that
+// couldn't tell its IP.
+const session = (body) => (globalThis.fetch = async () => new Response(JSON.stringify(body), { status: 200 }));
+session({ separator: "/", url: "http://192.168.1.20:8095" });
+assert.deepEqual(await c.serverSession(), { separator: "/", address: "192.168.1.20:8095" });
+assert.equal(c.serverAddress(), "192.168.1.20:8095");
+session({ separator: "\\", url: "http://this PS5's IP address:8095" });
+assert.deepEqual(await c.serverSession(), { separator: "\\", address: null });
+session({ separator: "/" });
+assert.deepEqual(await c.serverSession(), { separator: "/", address: null });
+console.log("session: separator and address; no address from an older server or one without its IP");
+
+// The job bar (src/jobs.ts): never back, short of full until the job succeeds, even when
+// core's estimate is met before its last pass (R1's plateau, fixed in core; this only guards).
+const step = (jobs, stage, done, total, at = 0) => jobsReducer(jobs, { type: "progress", e: { kind: "progress", job: 1, stage, done, total }, at });
+let js = jobsReducer([], { type: "started", id: 1, request });
+const seen = [];
+for (const [stage, done, total] of [
+  ["preflight", 25, 125],
+  ["measure", 123, 434],
+  ["write", 123, 243],
+  ["write", 131, 243],
+  ["verify", 139, 243],
+  ["verify", 243, 243],
+  ["finalize", 243, 243],
+]) {
+  js = step(js, stage, done, total);
+  seen.push(js[0].shown);
+}
+assert.deepEqual(seen, [...seen].sort((x, y) => x - y), "the bar only grows");
+assert.ok(seen[3] > seen[2], "writing moves it");
+assert.ok(seen.every((f) => f < 1), `short of full before done: ${seen}`);
+assert.equal(jobsReducer(js, { type: "done", e: ok(1) })[0].shown, 1, "done Ok: full");
+const failed = jobsReducer(js, { type: "done", e: { kind: "done", job: 1, result: { Err: "cancelled" } } })[0];
+assert.ok(failed.shown < 1, "cancelled: not full");
+// A reload restores the last progress the same way: a full estimate isn't a full bar.
+const restored = jobsReducer([], { type: "restore", e: { replace: true, jobs: [job(1, { progress: prog(1, 100) })] }, at: 0 });
+assert.ok(restored[0].shown < 1 && !restored[0].result, "restored mid-job: short of full");
+const restoredDone = jobsReducer([], { type: "restore", e: { replace: true, jobs: [job(1, { progress: prog(1, 100), done: ok(1) })] }, at: 0 });
+assert.equal(restoredDone[0].shown, 1, "restored done: full");
+console.log(`jobs: one bar ${seen.map((f) => Math.floor(100 * f)).join(" -> ")}%, full only on success, also after a reload`);

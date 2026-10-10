@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -28,6 +29,8 @@ struct State {
     /// Waiting and running jobs; the front one runs.
     queue: VecDeque<JobId>,
     cancels: HashMap<JobId, Arc<AtomicBool>>,
+    /// What each unfinished job reads or writes, which [`Inner::delete_path`] leaves alone.
+    paths: HashMap<JobId, Vec<PathBuf>>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -53,6 +56,19 @@ impl Inner {
         self.turn.notify_all();
     }
 
+    /// Deletes `path` with the table locked: no job is admitted between the check and the
+    /// removal, and none that reads or writes anything at, in or around `path` is unfinished.
+    // ponytail: the lock is held through the removal, so a large folder holds off starting,
+    // cancelling and finishing jobs until it is gone.
+    pub(crate) fn delete_path(
+        &self,
+        path: &Path,
+        protected: &[PathBuf],
+    ) -> Result<(), crate::DeleteError> {
+        let state = self.state();
+        crate::delete::delete(path, protected, state.paths.values().flatten())
+    }
+
     pub(crate) fn cancel_all_and_wait(&self) {
         let threads = {
             let mut state = self.state();
@@ -75,6 +91,7 @@ pub(crate) fn start(inner: &Arc<Inner>, request: ConvertRequest) -> JobId {
     state.threads.retain(|t| !t.is_finished());
     state.queue.push_back(job);
     state.cancels.insert(job, cancel.clone());
+    state.paths.insert(job, used_paths(job, &request));
     let worker = inner.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("forge-job-{job}"))
@@ -84,6 +101,7 @@ pub(crate) fn start(inner: &Arc<Inner>, request: ConvertRequest) -> JobId {
         Err(e) => {
             state.queue.retain(|j| *j != job);
             state.cancels.remove(&job);
+            state.paths.remove(&job);
             drop(state);
             (inner.emit)(Event::Done {
                 job,
@@ -92,6 +110,30 @@ pub(crate) fn start(inner: &Arc<Inner>, request: ConvertRequest) -> JobId {
         }
     }
     job
+}
+
+/// The paths a job reads or writes: source, output (the source, in place), its `.part`s
+/// (`finalize::part_path`, and `Part::replace`'s `.orig.part`), profile and traces (with a
+/// lone journal's index).
+fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
+    let out = if req.lz4_in_place {
+        &req.source
+    } else {
+        &req.output
+    };
+    let part = crate::finalize::part_path(out, job);
+    let orig = part.with_extension("orig.part");
+    let mut paths = vec![req.source.clone(), out.clone(), part, orig];
+    paths.extend(req.lz4_profile.iter().chain(&req.lz4_traces).cloned());
+    // A journal named on its own is read with the index beside it.
+    if let Some(traces) = &req.lz4_traces
+        && !traces
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+    {
+        paths.push(traces.with_file_name(crate::LZ4_TRACE_FILES[1]));
+    }
+    paths
 }
 
 impl Inner {
@@ -120,6 +162,8 @@ impl Inner {
             Err(_) if cancel.load(Ordering::Relaxed) => Err("cancelled".to_string()),
             Err(e) => Err(format!("{e:#}")),
         };
+        // Its files are settled (published or cleaned up): they may be deleted from now on.
+        self.state().paths.remove(&job);
         (self.emit)(Event::Done { job, result });
     }
 
@@ -147,6 +191,7 @@ impl Drop for Leave<'_> {
             let mut state = self.0.state();
             state.queue.retain(|j| *j != self.1);
             state.cancels.remove(&self.1);
+            state.paths.remove(&self.1);
         }
         self.0.turn.notify_all();
     }
@@ -214,6 +259,8 @@ pub(crate) struct Ctx<'a> {
     base: Cell<u64>,
     /// (done, total) of the running pass.
     pass: Cell<(u64, u64)>,
+    /// Bytes of passes after those [`Ctx::expect_rest`] is told of, set by [`Ctx::reserve`].
+    later: Cell<u64>,
     /// U7: the source's and destination's mount points, with their `st_dev` at job start.
     #[cfg(target_os = "freebsd")]
     pub mounts: RefCell<Vec<crate::durable::Watched>>,
@@ -230,6 +277,7 @@ impl<'a> Ctx<'a> {
             expected: Cell::new(0),
             base: Cell::new(0),
             pass: Cell::new((0, 0)),
+            later: Cell::new(0),
             #[cfg(target_os = "freebsd")]
             mounts: RefCell::new(Vec::new()),
         }
@@ -268,9 +316,18 @@ impl<'a> Ctx<'a> {
 
     /// Starts a pass: it and every pass after it move `bytes` in total. Renewed as each
     /// pass learns its size, so progress is one bar for the whole job that ends at 100%.
+    /// Plus what [`Ctx::reserve`] holds back, so no pass fills the bar while one is left.
     pub(crate) fn expect_rest(&self, bytes: u64) {
         self.close_pass();
-        self.expected.set(self.base.get().saturating_add(bytes));
+        let rest = bytes.saturating_add(self.later.get());
+        self.expected.set(self.base.get().saturating_add(rest));
+    }
+
+    /// Holds back `bytes` for passes that come after the ones the next [`Ctx::expect_rest`]
+    /// counts (a packed image's check through its packs while it is checked as written);
+    /// 0 once they are the ones it counts.
+    pub(crate) fn reserve(&self, bytes: u64) {
+        self.later.set(bytes);
     }
 
     fn close_pass(&self) {

@@ -9,6 +9,7 @@ import {
   web,
   prettyBytes,
   prettyDuration,
+  type ConvertRequest,
   type Format,
   type JobId,
   type JobReport,
@@ -58,16 +59,18 @@ const STAGES: Record<string, string> = {
   plan: "Planning",
   compress: "Compressing",
   write: "Writing",
+  measure: "Measuring packs",
   pack: "Packing",
   verify: "Verifying",
   finalize: "Finishing",
 };
 
-/** What a stage's byte rate measures: verify reads the output back, compress counts the
- * uncompressed bytes it took in, the rest write. */
+/** What a stage's byte rate measures: verify reads the output back, compress and measure
+ * (packing without writing, to size the packs) count the uncompressed bytes they took in, the
+ * rest write. */
 function rateLabel(stage: string): string {
   if (stage === "verify") return "read";
-  if (stage === "compress") return "compress";
+  if (stage === "compress" || stage === "measure") return "compress";
   if (stage === "pack") return "pack";
   return "write";
 }
@@ -80,6 +83,25 @@ function revealLabel(): string {
   if (web) return "Show path";
   if (IS_MAC) return "Show in Finder";
   return navigator.userAgent.includes("Windows") ? "Show in Explorer" : "Show in folder";
+}
+
+/** What a job does with LZ4, for its row: the label, and whether it is an LZ4 tab job (the
+ * yellow accent). A legacy `lz4` target is a pack into a folder. Convert's runtime
+ * replacement (`unpatch` without `lz4_in_place`) is no LZ4 tab job and never "packing". */
+function lz4Job(r: ConvertRequest | undefined): { label: string; tab: boolean } | null {
+  if (!r) return null;
+  const mode = r.lz4 ?? (r.format === "lz4" ? "pack" : null);
+  if (mode === "pack") return { label: "LZ4 pack", tab: true };
+  if (mode === "unpack") return { label: "LZ4 unpack", tab: true };
+  if (mode === "trace") return { label: "LZ4 trace", tab: true };
+  if (mode === "unpatch")
+    return r.lz4_in_place ? { label: "LZ4 unpatch", tab: true } : { label: "AMPR runtime", tab: false };
+  return null;
+}
+
+/** The target as its pill shows it: a pack into a folder writes an LZ4 packed folder. */
+function targetKind(r: ConvertRequest): string {
+  return r.lz4 === "pack" && r.format === "folder" ? "lz4" : r.format;
 }
 
 function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => void }) {
@@ -144,6 +166,10 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
   else if (job.stage === undefined) [status, tone] = ["Queued", ""];
   else [status, tone] = [STAGES[job.stage] ?? job.stage, "blue"];
   const running = !result && job.stage !== undefined;
+  const lz4 = lz4Job(job.request);
+  // Packing straight into an image: its write pass packs too.
+  if (running && job.stage === "write" && lz4?.label === "LZ4 pack" && targetKind(job.request!) !== "lz4")
+    status = "Packing and writing";
 
   // A job just started here scrolls into view inside the job list, which may already be
   // scrolled; restored ones (a reload) leave the list at its top, the newest job.
@@ -153,9 +179,10 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
   }, [fresh]);
 
   return (
-    <article className="job" aria-label={name} ref={ref}>
+    <article className={lz4?.tab ? "job lz4" : "job"} aria-label={name} ref={ref}>
       <header className="job-head">
-        {job.request && <FormatPill kind={job.request.format} />}
+        {job.request && <FormatPill kind={targetKind(job.request)} />}
+        {lz4 && <span className={lz4.tab ? "tag lz4" : "tag"}>{lz4.label}</span>}
         <div className="job-name">
           <strong title={job.request?.output}>{name}</strong>
           {job.request && <PathLine path={job.request.source} prefix="from " />}
@@ -263,7 +290,7 @@ function FailureText({ err, format }: { err: string; format?: Format }) {
   return (
     <div className="error-box">
       <strong className="error-title">
-        Can't build this game{format ? ` as ${kindLabel(format)}` : ""}:
+        Can't build this game{format && <> as <b>{kindLabel(format)}</b></>}:
       </strong>
       {err.slice(pre[0].length)}
     </div>
