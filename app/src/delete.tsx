@@ -1,4 +1,4 @@
-// The one "Delete this folder/image?" question, shared by Inspect and the Library. It only
+// The one "Delete this folder/image?" question, shared by Edit and the Library. It only
 // asks; the caller makes the api call and owns the errors and the operation guards.
 
 import { Modal, openOverlay } from "./common";

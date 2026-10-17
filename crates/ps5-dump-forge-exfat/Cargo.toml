@@ -6,5 +6,6 @@ version.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ps5-dump-forge-patch.workspace = true
 ps5upload-fpkg.workspace = true
 unicode-normalization.workspace = true

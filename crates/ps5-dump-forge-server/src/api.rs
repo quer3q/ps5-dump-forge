@@ -2,11 +2,12 @@
 //! call on the paths as given and the same `format!("{e:#}")` error text. The server adds
 //! only limits: on jobs, concurrent inspections and listing sizes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,8 @@ const SLOT_WAIT: std::time::Duration = if cfg!(test) {
 /// How long `quit {"if_idle": true}` waits for admission before answering busy.
 const IDLE_WAIT: Duration = Duration::from_secs(1);
 const LIST_MAX: usize = 10_000;
+/// How long an upload may wait for its next bytes (no limit on the whole: a GiB takes minutes).
+const UPLOAD_IDLE: Duration = Duration::from_secs(30);
 const STALE_MAX: usize = 1_000;
 
 type Reply = Result<Response, Response>;
@@ -66,6 +69,9 @@ pub(crate) struct Server {
     streaming: Arc<AtomicUsize>,
     /// A `self_update` is waiting on elfldr.
     updating: AtomicBool,
+    /// Staged files being uploaded (`edit_upload`): one upload per file at a time, and no
+    /// discard of a staging folder with one in flight.
+    uploads: Mutex<HashSet<PathBuf>>,
     cores: usize,
     /// Tests widen the gap between `Jobs::start` returning and the table admitting the job.
     #[cfg(test)]
@@ -112,6 +118,123 @@ fn readable(path: &Path) -> Result<(), Response> {
         _ => Ok(()),
     }
 }
+
+/// Core's delete refusal as its status: 400, 404, 409 or 500.
+fn deleted(e: DeleteError) -> Response {
+    let status = match e {
+        DeleteError::Refused(_) => 400,
+        DeleteError::Missing(_) => 404,
+        DeleteError::Busy(_) => 409,
+        DeleteError::Failed(_) => 500,
+    };
+    Response::error(status, e.to_string())
+}
+
+/// A game path's components: relative, `/`-separated, no empty, `.` or `..` component, no `\`
+/// or NUL (and on Windows no `:`, which `PathBuf::push` would read as a drive).
+// ponytail: core's `Edit` path rule, restated (core keeps its check private); kept in step by
+// hand, and core checks the edit job's paths again anyway.
+fn game_path(path: &str) -> Result<Vec<&str>, Response> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let bad = |c: &str| {
+        matches!(c, "" | "." | "..")
+            || c.contains(['\\', '\0'])
+            || (cfg!(windows) && c.contains(':'))
+    };
+    match parts.iter().any(|c| bad(c)) {
+        true => Err(Response::error(400, format!("bad game path: {path:?}"))),
+        false => Ok(parts),
+    }
+}
+
+/// `<source>.forge-upload-<pid>.part` beside an absolute source: a `.part`, so `stale_parts`
+/// lists a leftover and the Library skips it.
+fn staging_dir(source: &Path) -> Result<PathBuf, Response> {
+    let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
+        return Err(Response::error(
+            400,
+            "bad request: source must be a file or folder path",
+        ));
+    };
+    if !source.is_absolute() {
+        return Err(Response::error(
+            400,
+            "bad request: source must be an absolute path",
+        ));
+    }
+    let mut name = name.to_os_string();
+    name.push(format!(".forge-upload-{}.part", std::process::id()));
+    Ok(parent.join(name))
+}
+
+/// One folder of the staging tree, made unless it is there (0777 on the PS5).
+fn make_dir(dir: &Path) -> Result<(), Response> {
+    match std::fs::create_dir(dir) {
+        // By path: opening a folder fails on Windows (and is only needed on FreeBSD).
+        #[cfg(target_os = "freebsd")]
+        Ok(()) => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+                true => Ok(()),
+                false => {
+                    let text = format!("{}: not a folder", dir.display());
+                    return Err(Response::error(409, text));
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
+    .map_err(|e| core(format!("{}: {e}", dir.display())))
+}
+
+/// CE-107750-0: what the game reads on the PS5 is 0777, set explicitly (the create mode is
+/// masked by the umask), as core's `finalize::open_up`. A no-op off FreeBSD.
+fn open_up(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o777))?;
+    }
+    let _ = file;
+    Ok(())
+}
+
+/// Exactly `length` bytes of `body` into `file`. A client that ends early or stalls (any read
+/// error) is `UnexpectedEof` (a 400); a failed write keeps its own kind (a 500).
+fn copy_body(body: &mut dyn Read, file: &mut std::fs::File, length: u64) -> std::io::Result<()> {
+    let eof = |text: String| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, text);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut left = length;
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = match body.read(&mut buf[..want]) {
+            Ok(0) => return Err(eof("the upload ended early".into())),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(eof(format!("reading the upload: {e}"))),
+        };
+        file.write_all(&buf[..n])?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+/// One upload in [`Server::uploads`]; frees its file when dropped, also on unwind.
+struct Uploading<'a>(&'a Mutex<HashSet<PathBuf>>, PathBuf);
+
+impl Drop for Uploading<'_> {
+    fn drop(&mut self) {
+        lock(self.0).remove(&self.1);
+    }
+}
+
+/// Makes each upload's temporary name unique within this process.
+static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One running inspection; frees its place even when core panics.
 struct Inspecting<'a>(&'a AtomicUsize);
@@ -330,6 +453,7 @@ impl Server {
             waiting: AtomicUsize::new(0),
             streaming: Arc::new(AtomicUsize::new(0)),
             updating: AtomicBool::new(false),
+            uploads: Mutex::new(HashSet::new()),
             cores,
             opts,
             #[cfg(test)]
@@ -356,6 +480,14 @@ impl Server {
             Ok(head) => head,
             Err(r) => return r,
         };
+        if head.method == "POST" && head.path == http::UPLOAD {
+            let length = head.header("content-length").map(|_| head.length as u64);
+            let query = head.query.clone();
+            let mut body = http::BodyReader::new(stream, &mut head, UPLOAD_IDLE);
+            return self
+                .edit_upload(&query, length, &mut body)
+                .unwrap_or_else(|r| r);
+        }
         match http::read_body(stream, &mut head, deadline) {
             Ok(body) => self.route(&head, &body).unwrap_or_else(|r| r),
             Err(r) => r,
@@ -416,8 +548,11 @@ impl Server {
             (false, "lz4_traces") => self.lz4_traces(&head.query),
             (true, "list_dir") => self.list_dir(body),
             (true, "delete_path") => self.delete_path(body),
+            (true, "edit_discard") => self.edit_discard(body),
             (true, "library_scan") => self.library_scan(body),
             (true, "library_cover") => self.library_cover(body),
+            (true, "host_tree") => self.host_tree(body),
+            (true, "edit_check") => self.edit_check(body),
             #[cfg(target_env = "ps5")]
             (true, "debug_bench") if crate::debug::ENABLED => {
                 #[derive(Deserialize)]
@@ -539,6 +674,48 @@ impl Server {
         Ok(Response::json(&cover))
     }
 
+    /// The Edit tab's preview of a host file or folder: core's listing, capped like an
+    /// inspection. 404 when nothing is at `path` (checked by core's own read, so a path gone
+    /// while waiting for a slot is a 404 too); stopping cancels a scan under way.
+    fn host_tree(&self, body: &[u8]) -> Reply {
+        let arg: PathArg = parse(body)?;
+        let listed = self.capped(|| {
+            Ok::<_, std::convert::Infallible>(ps5_dump_forge_core::host_tree(
+                &arg.path,
+                &self.stopping,
+            ))
+        })?;
+        listed.map(|tree| Response::json(&tree)).map_err(|e| {
+            let missing = e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if missing {
+                Response::error(404, format!("{e:#}"))
+            } else {
+                core(e)
+            }
+        })
+    }
+
+    /// `{request}`: which way the Edit tab's request can be applied, in place or by a rebuild
+    /// (core's `Jobs::edit_check`, an `EditCheck`; read errors are findings in it). It reads
+    /// the image, so it is capped like an inspection. 400 for a source or added file that is
+    /// a FIFO or device.
+    fn edit_check(&self, body: &[u8]) -> Reply {
+        let request = parse::<StartArg>(body)?.request;
+        // A FIFO or device would block core's open, holding a read slot for good.
+        readable(&request.source)?;
+        for edit in &request.edits {
+            if let ps5_dump_forge_core::Edit::Add { from, .. } = edit {
+                readable(from)?;
+            }
+        }
+        let check =
+            self.capped(|| Ok::<_, std::convert::Infallible>(self.jobs.edit_check(&request)))?;
+        Ok(Response::json(&check))
+    }
+
     /// Runs a core call that reads a source, at most [`MAX_INSPECTIONS`] at once; the rest
     /// wait for a slot (at most [`MAX_WAITING`] of them), up to [`SLOT_WAIT`], then get a 429.
     /// A 409 once stopping, before and after taking the slot.
@@ -647,16 +824,140 @@ impl Server {
         }
         let mut keep = self.roots.current();
         keep.extend(self.opts.roots.iter().cloned());
-        self.jobs.delete_path(&arg.path, &keep).map_err(|e| {
-            let status = match e {
-                DeleteError::Refused(_) => 400,
-                DeleteError::Missing(_) => 404,
-                DeleteError::Busy(_) => 409,
-                DeleteError::Failed(_) => 500,
-            };
-            Response::error(status, e.to_string())
-        })?;
+        self.jobs.delete_path(&arg.path, &keep).map_err(deleted)?;
         Ok(Response::json(&()))
+    }
+
+    /// `POST ?source=<abs source>&path=<game path>` (both percent-encoded), the raw file as the
+    /// body (`Content-Length` required, no size limit): streamed into the source's staging
+    /// folder `<source>.forge-upload-<pid>.part/<path>` (made on first use, 0777 on the PS5),
+    /// replacing a file staged there before only once the whole body is in (a failed upload
+    /// changes nothing). `{"path": <the staged file>}`, an edit's `Add.from`. 409 while
+    /// another upload of the same file is in flight; refused once stopping.
+    // ponytail: checked by path, then created by path; a link swapped into the staging folder
+    // between the two needs write access to the storage.
+    fn edit_upload(&self, query: &str, length: Option<u64>, body: &mut dyn Read) -> Reply {
+        let Some(length) = length else {
+            return Err(Response::error(411, "bad request: needs Content-Length"));
+        };
+        let arg = |key: &str| {
+            http::query_value(query, key)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    let text = format!("bad request: needs {key}=, percent-encoded");
+                    Response::error(400, text)
+                })
+        };
+        let source = PathBuf::from(arg("source")?);
+        let path = arg("path")?;
+        let parts = game_path(&path)?;
+        staging_dir(&source)?;
+        // Every key and the staging folder come from the canonical source, so two spellings
+        // of one source (a linked parent, macOS `/tmp`) share one staging tree.
+        let Ok(source) = source.canonicalize() else {
+            let text = format!("{}: no such file or folder", source.display());
+            return Err(Response::error(404, text));
+        };
+        let mut dir = staging_dir(&source)?;
+        self.refuse_if_stopping()?;
+        let (name, parents) = parts.split_last().unwrap_or((&"", &[]));
+        let staged = parents
+            .iter()
+            .fold(dir.clone(), |d, p| d.join(p))
+            .join(name);
+        // Claimed before any folder is made, so a discard waits for it or goes first.
+        let _uploading = {
+            let mut uploads = lock(&self.uploads);
+            if !uploads.insert(staged.clone()) {
+                let text = format!("{path}: another upload of it is in flight");
+                return Err(Response::error(409, text));
+            }
+            Uploading(&self.uploads, staged.clone())
+        };
+        // Not a file an unfinished job uses (an edit's added file, by identity: a case alias
+        // or a linked parent counts), nor a new file inside a folder an unfinished edit adds
+        // (core's check matches a path not there yet only by spelling): replacing it would
+        // fail that job, or change what a queued one adds. Under admission, so a job that has
+        // started is in both tables.
+        // ponytail: checked once, before the body; a job started while the body streams in
+        // that adds this file sees it replaced (its unchanged-file check fails it).
+        let used = {
+            let _admission = lock(&self.admission);
+            let canonical = |p: PathBuf| p.canonicalize().unwrap_or(p);
+            self.jobs.uses(&staged)
+                || (lock(&self.table).adds().into_iter())
+                    .map(canonical)
+                    .any(|a| staged.starts_with(a))
+        };
+        if used {
+            let text = format!("{path}: an unfinished job is using it");
+            return Err(Response::error(409, text));
+        }
+        make_dir(&dir)?;
+        for part in parents {
+            dir.push(part);
+            make_dir(&dir)?;
+        }
+        if std::fs::symlink_metadata(&staged).is_ok_and(|m| !m.is_file()) {
+            let text = format!("{path}: something other than a file is staged there");
+            return Err(Response::error(409, text));
+        }
+        // Into an exclusive temporary name, renamed over the staged file once the whole body
+        // is in, so a failed replacement keeps the file uploaded before.
+        let seq = UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+        // Short and apart from the target's name, so a 255-byte name still fits.
+        let temp = dir.join(format!(".forge-upload-{}-{seq}.tmp", std::process::id()));
+        let failed = |e: std::io::Error| core(format!("{}: {e}", staged.display()));
+        let mut file = (std::fs::File::options().write(true).create_new(true))
+            .open(&temp)
+            .map_err(failed)?;
+        let copied = (|| {
+            open_up(&file)?;
+            copy_body(body, &mut file, length)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &staged)
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&temp);
+            return Err(match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => Response::error(400, e),
+                _ => failed(e),
+            });
+        }
+        Ok(Response::json(&json!({ "path": staged })))
+    }
+
+    /// `{source}`: deletes the source's staging folder (`edit_upload`), as `delete_path`
+    /// deletes (refused while an unfinished job uses it), 409 while an upload into it is in
+    /// flight; `null`, also when there is none.
+    fn edit_discard(&self, body: &[u8]) -> Reply {
+        let arg: SourceArg = parse(body)?;
+        staging_dir(&arg.source)?;
+        // As `edit_upload` names it: from the canonical source, or a gone source's canonical
+        // folder; with neither there is nothing to remove.
+        let source = arg.source.canonicalize().ok().or_else(|| {
+            let parent = arg.source.parent()?.canonicalize().ok()?;
+            Some(parent.join(arg.source.file_name()?))
+        });
+        let Some(source) = source else {
+            return Ok(Response::json(&()));
+        };
+        let staging = staging_dir(&source)?;
+        let _admission = lock(&self.admission);
+        self.refuse_if_stopping()?;
+        let mut keep = self.roots.current();
+        keep.extend(self.opts.roots.iter().cloned());
+        // Held through the removal: an upload that comes later makes the folder afresh.
+        let uploads = lock(&self.uploads);
+        if uploads.iter().any(|p| p.starts_with(&staging)) {
+            let text = format!("{}: an upload into it is in flight", staging.display());
+            return Err(Response::error(409, text));
+        }
+        match self.jobs.delete_path(&staging, &keep) {
+            Ok(()) | Err(DeleteError::Missing(_)) => Ok(Response::json(&())),
+            Err(e) => Err(deleted(e)),
+        }
     }
 
     /// `GET ?source=<path>` (percent-encoded): both LZ4 trace files at the root of a folder or
@@ -723,14 +1024,21 @@ impl Server {
         }
         // After the listing and under admission: a job whose `.part` was listed was started
         // before this, so it is in the table by now.
-        let running = {
+        let (running, adds) = {
             let _admission = lock(&self.admission);
-            lock(&self.table).unfinished()
+            let table = lock(&self.table);
+            (table.unfinished(), table.adds())
         };
         let theirs = table::running_parts(&running);
+        // A staging folder (`edit_upload`) is a `.part` too: not stale while an unfinished
+        // edit job adds from it or an upload into it is in flight.
+        let mut busy: Vec<PathBuf> = (adds.into_iter())
+            .map(|a| a.canonicalize().unwrap_or(a))
+            .collect();
+        busy.extend(lock(&self.uploads).iter().cloned());
         let parts: Vec<PathBuf> = found
             .into_iter()
-            .filter(|p| !theirs.contains(p))
+            .filter(|p| !theirs.contains(p) && !busy.iter().any(|b| b.starts_with(p)))
             .take(STALE_MAX)
             .collect();
         Ok(Response::json(&parts))
@@ -1157,6 +1465,9 @@ mod tests {
             lz4_traces: None,
             lz4_trace_space_mib: 256,
             lz4_in_place: false,
+            edits: Vec::new(),
+            extract: Vec::new(),
+            edit_rebuild: false,
             archive_password: None,
         });
         let starter = {
@@ -1206,6 +1517,95 @@ mod tests {
         let open = || {
             std::fs::OpenOptions::new()
                 .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+        };
+        while open().is_err() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.jobs.cancel_all_and_wait();
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// `start_job` passes an edit job's `edits` (and `edit_rebuild`) through, never checks its
+    /// `output`, and keys it by its source. While it is unfinished (queued behind a job blocked
+    /// on a FIFO), a file it adds can't be uploaded again (409), its staging folder isn't a
+    /// stale `.part`, and discard refuses it; once it is done, all three go through.
+    #[cfg(unix)]
+    #[test]
+    fn edit_job_pass_through() {
+        let tmp = dir("editjob");
+        let game = tmp.join("game");
+        std::fs::create_dir(&game).unwrap();
+        let fifo = tmp.join("block.ffpfs");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let server = Arc::new(server());
+        // Job 1, past the API's source check (a FIFO is refused): blocks opening it.
+        let blocker = json!({
+            "source": fifo, "format": "exfat", "output": tmp.join("blocked.exfat"),
+        });
+        server.jobs.start(serde_json::from_value(blocker).unwrap());
+        let r = upload(&server, &game, "data/x.bin", b"new");
+        assert_eq!(r.status, 200, "{}", r.text());
+        let staged: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
+        let staged = PathBuf::from(staged["path"].as_str().unwrap());
+        let edits = json!([
+            { "op": "add", "from": staged, "to": "data/x.bin" },
+            { "op": "delete", "path": "old" },
+        ]);
+        // An output nobody could write: an edit job's is ignored.
+        let request = json!({ "request": {
+            "source": game, "format": "exfat", "output": "/nonexistent/no/out.exfat",
+            "edits": edits, "edit_rebuild": true,
+        }});
+        let r = post(&server, "start_job", request);
+        assert_eq!((r.status, r.text()), (200, "2".to_string()));
+        let jobs = lock(&server.table).snapshot();
+        let admitted = &jobs.iter().find(|j| j["id"] == 2).unwrap()["request"];
+        assert_eq!(admitted["edits"], edits);
+        assert_eq!(admitted["edit_rebuild"], true);
+        assert!(
+            lock(&server.table)
+                .unfinished()
+                .contains(&(2, game.clone()))
+        );
+
+        let r = upload(&server, &game, "data/x.bin", b"newer");
+        assert_eq!(r.status, 409, "{}", r.text());
+        assert!(
+            r.text().contains("an unfinished job is using it"),
+            "{}",
+            r.text()
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+        assert_eq!(upload(&server, &game, "data/y.bin", b"y").status, 200);
+        let r = post(&server, "stale_parts", json!({ "dirs": [tmp] }));
+        assert_eq!(r.text(), "[]");
+        let r = post(&server, "edit_discard", json!({ "source": game }));
+        assert_eq!(r.status, 409, "{}", r.text());
+
+        server.jobs.cancel(2);
+        let start = Instant::now();
+        while !lock(&server.table).adds().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(upload(&server, &game, "data/x.bin", b"newer").status, 200);
+        let r = post(&server, "stale_parts", json!({ "dirs": [tmp] }));
+        assert_eq!(
+            r.text(),
+            json!([staged.parent().unwrap().parent().unwrap()]).to_string()
+        );
+        let r = post(&server, "edit_discard", json!({ "source": game }));
+        assert_eq!((r.status, r.text()), (200, "null".to_string()));
+        assert!(!staged.exists() && game.exists());
+
+        use std::os::unix::fs::OpenOptionsExt;
+        let open = || {
+            (std::fs::OpenOptions::new().write(true))
                 .custom_flags(libc::O_NONBLOCK)
                 .open(&fifo)
         };
@@ -1322,6 +1722,126 @@ mod tests {
         assert_eq!(r.status, 409);
         assert!(r.text().contains("stopping"), "{}", r.text());
         assert!(!server.updating.load(Ordering::SeqCst));
+    }
+
+    /// One request over a real socket, through `handle`; the raw reply.
+    fn over_tcp(server: &Arc<Server>, request: &[u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = server.clone();
+        let t = std::thread::spawn(move || s.handle(listener.accept().unwrap().0));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request).unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        t.join().unwrap();
+        reply
+    }
+
+    fn upload(server: &Server, source: &Path, path: &str, body: &[u8]) -> Response {
+        let query = format!(
+            "source={}&path={}",
+            percent_encode(&source.to_string_lossy()),
+            percent_encode(path)
+        );
+        (server.edit_upload(&query, Some(body.len() as u64), &mut &body[..])).unwrap_or_else(|r| r)
+    }
+
+    /// Upload (over the socket past `BODY_MAX`, and directly), replacing, refusals, the
+    /// staging folder as a stale `.part`, and discard (twice: the second is a no-op).
+    #[test]
+    fn edit_upload_and_discard() {
+        let root = std::env::temp_dir().join(format!("forge-api-upload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Canonical, as the reply's paths are (a macOS temp dir is under a link).
+        let root = root.canonicalize().unwrap();
+        let source = root.join("game.ffpkg");
+        std::fs::write(&source, b"image").unwrap();
+        let server = Arc::new(server());
+        let staging = root.join(format!(
+            "game.ffpkg.forge-upload-{}.part",
+            std::process::id()
+        ));
+
+        let big: Vec<u8> = (0..http::BODY_MAX as u32 * 2 + 7)
+            .map(|i| i as u8)
+            .collect();
+        let target = format!(
+            "/api/edit_upload?source={}&path=data%2Fa%20b.bin",
+            percent_encode(&source.to_string_lossy())
+        );
+        let head = format!(
+            "POST {target} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            big.len()
+        );
+        let reply = over_tcp(&server, &[head.as_bytes(), &big].concat());
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        let staged = staging.join("data").join("a b.bin");
+        let body = reply.split_once("\r\n\r\n").unwrap().1;
+        let found: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(found["path"], json!(staged));
+        assert_eq!(std::fs::read(&staged).unwrap(), big);
+
+        // A second upload to the same path replaces the file.
+        assert_eq!(upload(&server, &source, "data/a b.bin", b"new").status, 200);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+
+        for bad in ["", "/abs", "a/../b", "a//b", "./a", "a/", "a\\b", "a\0b"] {
+            assert_eq!(upload(&server, &source, bad, b"x").status, 400, "{bad:?}");
+        }
+        // A folder is in the way, then a file is.
+        assert_eq!(upload(&server, &source, "data", b"x").status, 409);
+        assert_eq!(upload(&server, &source, "data/a b.bin/c", b"x").status, 409);
+        let missing = root.join("gone.exfat");
+        assert_eq!(upload(&server, &missing, "a", b"x").status, 404);
+        assert_eq!(
+            upload(&server, Path::new("rel.exfat"), "a", b"x").status,
+            400
+        );
+        let r = server.edit_upload("source=%2Fx&path=a", None, &mut &b""[..]);
+        assert_eq!(r.unwrap_or_else(|r| r).status, 411);
+        // A body that ends early leaves no file.
+        let query = format!(
+            "source={}&path=short.bin",
+            percent_encode(&source.to_string_lossy())
+        );
+        let r = server.edit_upload(&query, Some(10), &mut &b"12345"[..]);
+        assert_eq!(r.unwrap_or_else(|r| r).status, 400);
+        assert!(!staging.join("short.bin").exists());
+        // A 255-byte name: the temporary name doesn't grow with it.
+        let long = "n".repeat(251) + ".bin";
+        assert_eq!(upload(&server, &source, &long, b"long").status, 200);
+        assert_eq!(std::fs::read(staging.join(&long)).unwrap(), b"long");
+        // A replacement that fails part way keeps the file uploaded before, and no temp file.
+        let query = format!(
+            "source={}&path=data%2Fa%20b.bin",
+            percent_encode(&source.to_string_lossy())
+        );
+        let r = server.edit_upload(&query, Some(10), &mut &b"12345"[..]);
+        assert_eq!(r.unwrap_or_else(|r| r).status, 400);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+        let names: Vec<_> = std::fs::read_dir(staging.join("data"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+
+        let r = post(&server, "stale_parts", json!({ "dirs": [root] }));
+        assert!(r.text().contains("forge-upload-"), "{}", r.text());
+        let r = post(&server, "edit_discard", json!({ "source": source }));
+        assert_eq!((r.status, r.text()), (200, "null".to_string()));
+        assert!(!staging.exists() && source.exists());
+        assert_eq!(
+            post(&server, "edit_discard", json!({ "source": source })).status,
+            200
+        );
+        assert_eq!(
+            post(&server, "edit_discard", json!({ "source": "rel" })).status,
+            400
+        );
+        assert_eq!(post(&server, "edit_discard", json!({})).status, 400);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -44,15 +44,23 @@ pub(crate) struct GameInfo {
     pub param_json: Option<Value>,
     pub title_id: Option<String>,
     pub content_id: Option<String>,
+    /// No `eboot.bin` at the root but a `param.json` with a title id: a DLC, an update or
+    /// another package (by user decision; not a finding).
+    pub additional_content: bool,
 }
+
+/// The finding for a source without `eboot.bin` that isn't additional content either.
+pub(crate) const NO_EBOOT: &str = "eboot.bin is missing at the game root";
+
+/// The finding for additional content converted to a target that needs a game.
+pub(crate) const ADDITIONAL_CONTENT_TARGET: &str =
+    "additional content (no eboot.bin) can only be packaged as fpkg or written to a folder";
 
 /// Reads `sce_sys/param.json` (when there is one) and checks the game root's layout.
 pub(crate) fn input(tree: &mut dyn SourceTree) -> (GameInfo, Vec<String>) {
     let mut findings = Vec::new();
     let has = |path: &str| tree.files().iter().find(|f| f.path == path).map(|f| f.size);
-    if has("eboot.bin").is_none() {
-        findings.push("eboot.bin is missing at the game root".to_string());
-    }
+    let no_eboot = has("eboot.bin").is_none();
     let param_size = has("sce_sys/param.json");
     let mut info = GameInfo::default();
     match param_size {
@@ -75,6 +83,10 @@ pub(crate) fn input(tree: &mut dyn SourceTree) -> (GameInfo, Vec<String>) {
             );
         }
     }
+    info.additional_content = no_eboot && info.title_id.is_some();
+    if no_eboot && !info.additional_content {
+        findings.insert(0, NO_EBOOT.to_string());
+    }
     (info, findings)
 }
 
@@ -92,6 +104,7 @@ pub(crate) fn parse_param(bytes: &[u8]) -> GameInfo {
         param_json: Some(json),
         title_id,
         content_id,
+        additional_content: false,
     }
 }
 
@@ -173,32 +186,7 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
             ));
         }
     }
-    let name = output.file_name().unwrap_or_default().to_string_lossy();
-    // A file's stem as SMP takes it: up to the last dot; a folder's whole name.
-    let stem = match format {
-        Format::Folder | Format::Lz4 => &*name,
-        _ => name.rsplit_once('.').map_or(&*name, |(stem, _)| stem),
-    };
-    let max = stem_limit(format);
-    if stem.len() > max {
-        findings.push(match extension(format) {
-            Some(ext @ ("exfat" | "ffpkg" | "ffpfs" | "ffpfsc")) => format!(
-                "{name} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
-                 .{ext} whose name is over {max} bytes (UTF-8, extension excluded), as its mount \
-                 point would pass the PS5's 87-byte limit",
-                stem.len()
-            ),
-            Some(ext) => format!(
-                "{name} is {} bytes long without its .{ext}: output names are at most {max} \
-                 bytes (UTF-8, extension excluded)",
-                stem.len()
-            ),
-            None => format!(
-                "{name} is {} bytes long: output names are at most {max} bytes (UTF-8)",
-                stem.len()
-            ),
-        });
-    }
+    findings.extend(stem_finding(output, format));
     if let Ok(source) = source.canonicalize()
         && source.is_dir()
         && inside(output, &source)
@@ -210,6 +198,34 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
         ));
     }
     findings
+}
+
+/// Why `path`'s name is too long for a `format` output ([`stem_limit`]), if it is.
+pub(crate) fn stem_finding(path: &Path, format: Format) -> Option<String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // A file's stem as SMP takes it: up to the last dot; a folder's whole name.
+    let stem = match format {
+        Format::Folder | Format::Lz4 => &*name,
+        _ => name.rsplit_once('.').map_or(&*name, |(stem, _)| stem),
+    };
+    let max = stem_limit(format);
+    (stem.len() > max).then(|| match extension(format) {
+        Some(ext @ ("exfat" | "ffpkg" | "ffpfs" | "ffpfsc")) => format!(
+            "{name} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
+                 .{ext} whose name is over {max} bytes (UTF-8, extension excluded), as its mount \
+                 point would pass the PS5's 87-byte limit",
+            stem.len()
+        ),
+        Some(ext) => format!(
+            "{name} is {} bytes long without its .{ext}: output names are at most {max} \
+                 bytes (UTF-8, extension excluded)",
+            stem.len()
+        ),
+        None => format!(
+            "{name} is {} bytes long: output names are at most {max} bytes (UTF-8)",
+            stem.len()
+        ),
+    })
 }
 
 /// Whether `path` (absolute) lies inside the folder `dir`. Compared by identity, not by
@@ -265,6 +281,8 @@ pub(crate) fn estimate(tree: &dyn SourceTree) -> u64 {
 pub(crate) struct Destination {
     pub findings: Vec<String>,
     pub notes: Vec<String>,
+    /// The folder's free bytes, when they could be read.
+    pub free: Option<u64>,
     /// What the probe saw, for folder findings and publishing; None when it failed (then
     /// `findings` says why).
     #[cfg(target_os = "freebsd")]
@@ -277,8 +295,10 @@ pub(crate) struct Destination {
 pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -> Destination {
     let mut findings = Vec::new();
     let mut notes = Vec::new();
+    let mut room = None;
     match fs_stat(dir) {
         Ok((free, fat)) => {
+            room = Some(free);
             if need > free {
                 findings.push(format!(
                     "not enough space in {}: about {} MiB needed, {} MiB free",
@@ -304,7 +324,11 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -
             dir.display()
         )),
     }
-    Destination { findings, notes }
+    Destination {
+        findings,
+        notes,
+        free: room,
+    }
 }
 
 /// The same checks on what the destination probe saw (U1 in ps5/README.md). A USB drive is
@@ -317,6 +341,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBo
             return Destination {
                 findings: vec![format!("{e:#}")],
                 notes: Vec::new(),
+                free: None,
                 dest: None,
             };
         }
@@ -349,6 +374,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBo
     Destination {
         findings,
         notes,
+        free: Some(dest.free),
         dest: Some(dest),
     }
 }

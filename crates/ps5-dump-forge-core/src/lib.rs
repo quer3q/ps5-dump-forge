@@ -16,11 +16,16 @@ mod delete;
 #[cfg(any(target_os = "freebsd", all(test, target_os = "macos")))]
 mod dest;
 mod dlc;
+mod edit;
+mod edit_folder;
+mod edit_job;
 // Wired into the PS5 (FreeBSD) build only; tested everywhere.
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 mod durable;
 mod extract;
+mod extract_paths;
 mod finalize;
+mod host_tree;
 mod inspect;
 mod jobs;
 mod library;
@@ -43,6 +48,7 @@ pub use delete::DeleteError;
 pub use dlc::Dlc;
 pub use extract::extraction_findings;
 pub use finalize::rename_no_replace;
+pub use host_tree::{HostFile, HostKind, HostTree, host_tree};
 pub use library::{LibraryEntry, LibraryScan};
 pub use ps5_dump_forge_archive::{
     ARCHIVE_PASSWORD_REQUIRED, ARCHIVE_PASSWORD_WRONG, ArchiveFormat,
@@ -194,9 +200,59 @@ pub struct ConvertRequest {
     /// [`lz4_patch`], the explicit exceptions to "never touch the source".
     #[serde(default)]
     pub lz4_in_place: bool,
+    /// File changes applied in place, in order (an edit job when not empty).
+    #[serde(default)]
+    pub edits: Vec<Edit>,
+    /// With [`Self::edits`] on an image: rebuild it instead of editing it in place. A new image
+    /// of the source's own format is written from the source plus the edits beside it (its
+    /// `.part`), verified, then renamed over the source once the source is seen unchanged, as
+    /// [`Self::lz4_in_place`] does; on any failure the source stays as it was. `format` and
+    /// `output` are ignored. Ignored for a folder, which is always changed directly.
+    #[serde(default)]
+    pub edit_rebuild: bool,
+    /// Game paths (`/`-separated, relative) of files or folders to copy out of the source into
+    /// `output`, an existing folder, each under its own last component; nothing there is
+    /// replaced (an extract job when not empty; `format` must be `Folder`).
+    #[serde(default)]
+    pub extract: Vec<String>,
     /// For an archive source that needs one. Never serialized.
     #[serde(default, skip_serializing)]
     pub archive_password: Option<ArchivePassword>,
+}
+
+/// One change of an in-place edit ([`ConvertRequest::edits`]), applied in order. Game paths are
+/// relative, `/`-separated, with no empty, `.` or `..` component and no `\`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum Edit {
+    /// Copy `from` (a file on this computer, or a folder and everything in it) to game path `to`,
+    /// replacing a file there; a folder onto an existing folder merges (same-named files replaced).
+    Add { from: PathBuf, to: String },
+    /// Delete a file, or a folder with everything in it.
+    Delete { path: String },
+    /// Move or rename a file or folder; `to` must not exist.
+    Rename { from: String, to: String },
+    /// A new empty folder (parents created too).
+    Mkdir { path: String },
+}
+
+/// Which way an edit request ([`ConvertRequest::edits`]) can be applied, as [`Jobs::edit_check`]
+/// finds it before Apply: the scan and preflight of both modes, nothing written. A check that
+/// passes means that mode's job passes its preflight on the same files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditCheck {
+    /// Why it can't be applied in place (empty = it can): no room, format, unsupported op.
+    pub in_place: Vec<String>,
+    /// Why it can't be rebuilt (empty = it can; a folder is never rebuilt).
+    pub rebuild: Vec<String>,
+    /// Bytes the changes need inside the image, as its editor plans them (file data, new and
+    /// grown folders, indirect blocks), and what it has free: `.exfat` and `.ffpkg` once the
+    /// edits apply to the game.
+    pub needed_inside: Option<u64>,
+    pub free_inside: Option<u64>,
+    /// Free bytes a rebuild needs beside the source, and what the folder has.
+    pub rebuild_needs: Option<u64>,
+    pub free_beside: Option<u64>,
 }
 
 /// The trace space a request without one gets, in MiB.
@@ -245,7 +301,8 @@ pub enum Event {
     },
     Done {
         job: JobId,
-        /// `Ok` carries the report; `Err` a message for the user (`"cancelled"` when cancelled).
+        /// `Ok` carries the report; `Err` a message for the user (`"cancelled"` when cancelled,
+        /// or an edit's `"cancelled; "` + what stays changed).
         result: Result<JobReport, String>,
     },
 }
@@ -315,6 +372,22 @@ impl Jobs {
         self.inner.delete_path(path, protected)
     }
 
+    /// Whether an unfinished job reads or writes `path`, or anything inside or around it
+    /// (its source, output, `.part`s, profile, traces; an edit's undo journal and added
+    /// files), compared by identity as [`Jobs::delete_path`] compares them. A snapshot: a
+    /// job may start right after.
+    pub fn uses(&self, path: &Path) -> bool {
+        self.inner.uses(path)
+    }
+
+    /// Which way `request`'s edits can be applied, in place or by a rebuild ([`EditCheck`]),
+    /// reading the image and the added files only. A journal an interrupted edit left beside
+    /// the image is settled first, as every edit does, unless a job is using the image; then
+    /// both modes say so.
+    pub fn edit_check(&self, request: &ConvertRequest) -> EditCheck {
+        self.inner.edit_check(request)
+    }
+
     /// Cancel everything and wait until every job has cleaned up (app close).
     pub fn cancel_all_and_wait(&self) {
         self.inner.cancel_all_and_wait();
@@ -330,6 +403,9 @@ pub struct Inspection {
     pub describe: String,
     pub title_id: Option<String>,
     pub content_id: Option<String>,
+    /// No `eboot.bin` at the root but a `param.json` with a title id: a DLC, an update or
+    /// another package. Not a finding; it converts only to fpkg or a folder.
+    pub additional_content: bool,
     /// From `param.json`: the title in its default language.
     pub title_name: Option<String>,
     /// From `param.json`: every `localizedParameters` title by language tag (`en-US`, ...).
@@ -375,6 +451,9 @@ pub struct Inspection {
     /// An archive source: the archive's own facts (`files` and `total_bytes` are the game's,
     /// unpacked). `None` for anything else.
     pub archive: Option<ArchiveFacts>,
+    /// An image whose last in-place edit was interrupted: its undo journal
+    /// (`<image>.forge-undo`) is beside it, and the next edit restores the image first.
+    pub interrupted_edit: bool,
 }
 
 /// What an archive source is.

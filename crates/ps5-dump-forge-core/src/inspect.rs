@@ -254,6 +254,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         describe: tree.describe(),
         title_id: info.title_id,
         content_id: info.content_id,
+        additional_content: info.additional_content,
         title_name,
         title_names,
         version,
@@ -274,6 +275,10 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         findings,
         lz4,
         archive,
+        interrupted_edit: kind != Kind::Folder
+            && ps5_dump_forge_patch::journal_path(path)
+                .symlink_metadata()
+                .is_ok(),
     })
 }
 

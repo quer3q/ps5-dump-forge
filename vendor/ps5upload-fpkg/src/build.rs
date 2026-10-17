@@ -781,9 +781,8 @@ fn prepare_with(
     if let Some(entry) = files.iter_mut().find(|f| f.path == PARAM_JSON) {
         entry.size = param_json.len() as u64;
     }
-    if !files.iter().any(|f| f.path == "eboot.bin") {
-        return format_err("the source has no eboot.bin");
-    }
+    // Forge patch 0023: no eboot.bin is additional content or an update; `content_class`
+    // already gives it that class, so it is packaged rather than refused.
     let content_version = source::content_version_word(&param_json).unwrap_or(0);
     check_cancel(control)?;
     // The container's payloads, read once: the streaming arm hands them to the writer,

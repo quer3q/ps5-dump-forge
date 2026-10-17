@@ -237,6 +237,9 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         lz4_traces: None,
         lz4_trace_space_mib: 256,
         lz4_in_place: false,
+        edits: Vec::new(),
+        extract: Vec::new(),
+        edit_rebuild: false,
         archive_password: None,
     }
 }

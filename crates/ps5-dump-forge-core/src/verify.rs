@@ -576,6 +576,75 @@ fn shown(bytes: u64) -> String {
     }
 }
 
+/// What `mode` reads of `files`: full mode every file whole, fast mode its sample; both
+/// compare slice hashes.
+fn samples(files: &[SourceFile], mode: Mode) -> Vec<Sample> {
+    match mode {
+        Mode::Full => (0..files.len())
+            .map(|file| Sample {
+                file,
+                slice: None,
+                offset: 0,
+                len: files[file].size,
+            })
+            .collect(),
+        Mode::Fast { seed, seam } => plan(files, seed, seam),
+    }
+}
+
+/// The expected manifest of `tree` holding only what [`compare`] reads with the same `mode`:
+/// every slice in full mode, the sampled ones in fast mode (the rest a placeholder it never
+/// looks at). For a source that changes once read: an in-place edit hashes what the image
+/// must hold before it writes the image. Its progress is `stage`'s.
+pub(crate) fn expected_sampled(
+    tree: &mut dyn SourceTree,
+    ctx: &Ctx,
+    mode: Mode,
+    stage: &str,
+) -> anyhow::Result<Expected> {
+    let files = tree.files().to_vec();
+    let empty_dirs = tree.empty_dirs().to_vec();
+    let unread = blake3::Hash::from([0u8; 32]);
+    let mut digests: Vec<Digest> = (files.iter())
+        .map(|f| Digest {
+            slices: vec![unread; f.size.div_ceil(SLICE) as usize],
+        })
+        .collect();
+    let total = summary(&files, mode).checked_bytes;
+    let mut done = 0u64;
+    for s in samples(&files, mode) {
+        let mut digester = Digester::new();
+        read_each(
+            tree,
+            &files[s.file].path,
+            s.offset,
+            s.len,
+            ctx,
+            &mut |bytes| {
+                digester.update(bytes);
+                done += bytes.len() as u64;
+                ctx.progress(stage, done, total);
+            },
+        )?;
+        let got = digester.finish();
+        match s.slice {
+            None => digests[s.file] = got,
+            Some(i) => {
+                if let (Some(want), Some(hash)) =
+                    (digests[s.file].slices.get_mut(i), got.slices.first())
+                {
+                    *want = *hash;
+                }
+            }
+        }
+    }
+    Ok(Expected {
+        files,
+        digests,
+        empty_dirs,
+    })
+}
+
 /// Compares `output` with `expected`; returns one line per check that passed, or fails
 /// listing every difference. Every reader reports its empty directories. The structural
 /// checks run in both modes; `mode` picks how much content is read back.
@@ -653,18 +722,7 @@ pub(crate) fn compare(
         ctx.progress("verify", done, read);
     };
     let mut wrong = Vec::new();
-    // Full mode reads every file whole, fast mode its sample; both compare slice hashes.
-    let samples = match mode {
-        Mode::Full => (0..expected.files.len())
-            .map(|file| Sample {
-                file,
-                slice: None,
-                offset: 0,
-                len: expected.files[file].size,
-            })
-            .collect(),
-        Mode::Fast { seed, seam } => plan(&expected.files, seed, seam),
-    };
+    let samples = samples(&expected.files, mode);
     // Each sample hashes on the pool while the next is read; compared in order, at most
     // `MAX_SEALED` behind. A slice sample is whole slices from a slice boundary, so its
     // digester's slices are the file's.
@@ -860,6 +918,38 @@ mod tests {
             expected.digests,
             [reference(&a), reference(&b), reference(&[])]
         );
+    }
+
+    #[test]
+    fn a_sampled_manifest_checks_what_its_mode_reads() {
+        let data = bytes(5 * SLICE + 3, 5);
+        let small = bytes(1000, 6);
+        let fast = Mode::Fast {
+            seed: 7,
+            seam: false,
+        };
+        let sampled: Vec<usize> = (plan(&Mem::new(&[("big", data.clone())]).files, 7, false))
+            .iter()
+            .filter_map(|s| s.slice)
+            .collect();
+        let unsampled = (0..6).find(|s| !sampled.contains(s)).unwrap();
+        for mode in [fast, Mode::Full] {
+            let mut source = Mem::new(&[("big", data.clone()), ("small", small.clone())]);
+            let expected =
+                with_ctx(|ctx| expected_sampled(&mut source, ctx, mode, "write")).unwrap();
+            let check = |at: Option<(usize, &str)>| {
+                let mut out = Mem::new(&[("big", data.clone()), ("small", small.clone())]);
+                if let Some((at, path)) = at {
+                    out.bytes(path)[at] ^= 1;
+                }
+                with_ctx(|ctx| compare(&expected, &mut out, ctx, mode))
+            };
+            check(None).unwrap();
+            assert!(check(Some((999, "small"))).is_err());
+            assert!(check(Some((sampled[1] * SLICE as usize + 2, "big"))).is_err());
+            let far = check(Some((unsampled * SLICE as usize + 2, "big")));
+            assert_eq!(far.is_err(), matches!(mode, Mode::Full), "{mode:?}");
+        }
     }
 
     #[test]

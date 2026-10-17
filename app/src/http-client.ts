@@ -117,6 +117,58 @@ export async function call<T>(cmd: string, args?: Record<string, unknown>): Prom
   return res.data as T;
 }
 
+/** The upload route for `source` and `gamePath`. Each value is percent-encoded with
+ * `encodeURIComponent` (a space is `%20`, `+` is `%2B`): the server decodes `%XX` only and keeps
+ * `+` as it is, so `URLSearchParams`'s `+` for a space would name another path. */
+export function uploadUrl(source: string, gamePath: string): string {
+  return `/api/edit_upload?source=${encodeURIComponent(source)}&path=${encodeURIComponent(gamePath)}`;
+}
+
+/** `POST /api/edit_upload?source=&path=` with `file` as the raw body (XHR, for upload progress).
+ * Resolves with the staged file's path; rejects as `call` does, or with "aborted" on `signal`. */
+export function upload(
+  source: string,
+  gamePath: string,
+  file: File,
+  onProgress?: (sent: number, total: number) => void,
+  signal?: AbortSignal,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject("aborted");
+    const x = new XMLHttpRequest();
+    x.open("POST", uploadUrl(source, gamePath));
+    x.setRequestHeader("Content-Type", "application/octet-stream");
+    if (onProgress) x.upload.onprogress = (e) => onProgress(e.loaded, e.lengthComputable ? e.total : file.size);
+    const onAbort = () => x.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const end = () => signal?.removeEventListener("abort", onAbort);
+    x.onload = () => {
+      end();
+      setOffline(false);
+      let data: unknown = null;
+      try {
+        data = JSON.parse(x.responseText);
+      } catch {
+        data = { error: `${x.status} ${x.statusText}`.trim() };
+      }
+      const path = (data as { path?: unknown } | null)?.path;
+      if (x.status === 200 && typeof path === "string") resolve(path);
+      else reject(errorOf(data, x.status));
+    };
+    x.onerror = () => {
+      end();
+      setOffline(true);
+      kick();
+      reject(text("unreachable"));
+    };
+    x.onabort = () => {
+      end();
+      reject("aborted");
+    };
+    x.send(file);
+  });
+}
+
 let address: string | null = null;
 let platform: "host" | "ps5" | null = null;
 let version: string | null = null;

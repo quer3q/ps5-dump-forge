@@ -34,13 +34,13 @@ pub(crate) fn is_junk(name: &str) -> bool {
 /// What a file looked like when it was scanned. Checked again on every read, so a file
 /// that changes mid-conversion fails the job instead of landing half old, half new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     size: u64,
     mtime: Option<SystemTime>,
 }
 
 impl Stamp {
-    fn of(meta: &Metadata) -> Self {
+    pub(crate) fn of(meta: &Metadata) -> Self {
         Self {
             size: meta.len(),
             mtime: meta.modified().ok(),
@@ -111,6 +111,11 @@ impl ScannedFolder {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Each file's size and modification time as scanned, in [`SourceTree::files`] order.
+    pub(crate) fn stamps(&self) -> &[Stamp] {
+        &self.stamps
     }
 
     fn index(&self, path: &str) -> ps5upload_fpkg::Result<usize> {
@@ -368,7 +373,7 @@ fn has_junk(path: &str) -> bool {
 }
 
 /// Every proper ancestor of `path` (`a`, `a/b` for `a/b/c`).
-fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(i, _)| &path[..i])
 }
 

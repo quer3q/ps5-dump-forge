@@ -13,14 +13,14 @@ import { Formats, openConnect } from "./Formats";
 import { useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
 import { Icon } from "./icons";
-import { Inspect } from "./Inspect";
+import { Edit } from "./Edit";
 import { Library } from "./Library";
 import { Lz4 } from "./Lz4";
 import { UpdateToast } from "./UpdateToast";
 import { jobsReducer, type Job } from "./jobs";
 
-// Tabs: [Convert Inspect] | LZ4 | Library | About (ids unchanged; the dividers are drawn only).
-type Tab = "convert" | "library" | "lz4" | "inspect" | "formats";
+// Tabs: [Convert Edit] | LZ4 | Library | About (the dividers are drawn only).
+type Tab = "convert" | "library" | "lz4" | "edit" | "formats";
 
 export function App() {
   const t = useMessages().app;
@@ -29,12 +29,12 @@ export function App() {
   const [closing, setClosing] = useState<"ask" | "stopping" | "stopped" | "failed" | null>(null);
   const offline = useOffline();
   // Library handoffs: a new id per action, so the same path is read again.
-  const [inspectSel, setInspectSel] = useState<SourceSelection | null>(null);
+  const [editSel, setEditSel] = useState<SourceSelection | null>(null);
   const [convertSel, setConvertSel] = useState<SourceSelection | null>(null);
   const selId = useRef(0);
-  const handOff = (to: "inspect" | "convert", e: { path: string; kind: SourceSelection["kind"] }) => {
+  const handOff = (to: "edit" | "convert", e: { path: string; kind: SourceSelection["kind"] }) => {
     const sel = { id: ++selId.current, path: e.path, kind: e.kind };
-    (to === "inspect" ? setInspectSel : setConvertSel)(sel);
+    (to === "edit" ? setEditSel : setConvertSel)(sel);
     setTab(to);
     document.getElementById(tabId("screen", to))?.focus();
   };
@@ -152,7 +152,7 @@ export function App() {
                     </>
                   ),
                 },
-                { id: "inspect", label: t.inspect },
+                { id: "edit", label: t.edit },
                 { id: "lz4", label: "LZ4", className: "tab-lz4", sep: true },
                 {
                   id: "library",
@@ -210,7 +210,7 @@ export function App() {
           >
             <Library
               visible={tab === "library"}
-              onInspect={(e) => handOff("inspect", e)}
+              onEdit={(e) => handOff("edit", e)}
               onConvert={(e) => handOff("convert", e)}
             />
           </div>
@@ -223,12 +223,12 @@ export function App() {
             <Lz4 jobs={jobs} dispatch={dispatch} />
           </div>
           <div
-            id={panelId("screen", "inspect")}
+            id={panelId("screen", "edit")}
             role="tabpanel"
-            aria-labelledby={tabId("screen", "inspect")}
-            hidden={tab !== "inspect"}
+            aria-labelledby={tabId("screen", "edit")}
+            hidden={tab !== "edit"}
           >
-            <Inspect outputDirs={outputDirs} visible={tab === "inspect"} selection={inspectSel} />
+            <Edit outputDirs={outputDirs} visible={tab === "edit"} selection={editSel} jobs={jobs} dispatch={dispatch} />
           </div>
           <div
             id={panelId("screen", "formats")}

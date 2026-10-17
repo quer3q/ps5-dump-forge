@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 ps5upload-fpkg.workspace = true
+ps5-dump-forge-patch.workspace = true
 flate2 = "1"
 
 [dev-dependencies]

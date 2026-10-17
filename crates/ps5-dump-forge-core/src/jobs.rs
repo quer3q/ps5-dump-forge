@@ -69,6 +69,45 @@ impl Inner {
         crate::delete::delete(path, protected, state.paths.values().flatten())
     }
 
+    /// Whether an unfinished job reads or writes `path`, or something inside or around it.
+    pub(crate) fn uses(&self, path: &Path) -> bool {
+        crate::delete::in_use(path, self.state().paths.values().flatten())
+    }
+
+    /// [`crate::Jobs::edit_check`]: with the table locked, no job is admitted between the
+    /// check that none uses the image and the recovery of its leftover journal; the rest reads
+    /// only, unlocked.
+    pub(crate) fn edit_check(&self, req: &crate::ConvertRequest) -> crate::EditCheck {
+        // A game folder is changed directly: never rebuilt, so only `in_place` speaks.
+        let folder = matches!(
+            crate::convert::Kind::of(&req.source),
+            Ok(crate::convert::Kind::Folder)
+        );
+        let settled = {
+            let state = self.state();
+            if crate::delete::in_use(&req.source, state.paths.values().flatten()) {
+                let busy = format!(
+                    "a job is using {}; check again once it ends",
+                    req.source.display()
+                );
+                return crate::EditCheck {
+                    in_place: vec![busy.clone()],
+                    rebuild: if folder { Vec::new() } else { vec![busy] },
+                    ..crate::EditCheck::default()
+                };
+            }
+            if folder {
+                None
+            } else {
+                crate::edit_job::settle(req)
+            }
+        };
+        if folder {
+            return crate::edit_folder::check(req);
+        }
+        crate::edit_job::check(req, settled)
+    }
+
     pub(crate) fn cancel_all_and_wait(&self) {
         let threads = {
             let mut state = self.state();
@@ -114,9 +153,10 @@ pub(crate) fn start(inner: &Arc<Inner>, request: ConvertRequest) -> JobId {
 
 /// The paths a job reads or writes: source, output (the source, in place), its `.part`s
 /// (`finalize::part_path`, and `Part::replace`'s `.orig.part`), an archive's later parts,
-/// profile and traces (with a lone journal's index).
+/// profile and traces (with a lone journal's index); in place, the undo journal; for an edit,
+/// every file or folder it adds.
 fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
-    let out = if req.lz4_in_place {
+    let out = if req.lz4_in_place || !req.edits.is_empty() {
         &req.source
     } else {
         &req.output
@@ -135,6 +175,16 @@ fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
         }
     }
     paths.extend(req.lz4_profile.iter().chain(&req.lz4_traces).cloned());
+    // An in-place job's undo journal (an edit's own; one an LZ4 in-place job refuses).
+    if req.lz4_in_place || !req.edits.is_empty() {
+        paths.push(ps5_dump_forge_patch::journal_path(&req.source));
+    }
+    if !req.edits.is_empty() {
+        paths.extend(req.edits.iter().filter_map(|e| match e {
+            crate::Edit::Add { from, .. } => Some(from.clone()),
+            _ => None,
+        }));
+    }
     // A journal named on its own is read with the index beside it.
     if let Some(traces) = &req.lz4_traces
         && !traces
@@ -169,10 +219,13 @@ impl Inner {
                 }
             }
         });
-        let result = match result {
+        let result = match result.map_err(|e| format!("{e:#}")) {
             Ok(report) => Ok(report),
-            Err(_) if cancel.load(Ordering::Relaxed) => Err("cancelled".to_string()),
-            Err(e) => Err(format!("{e:#}")),
+            // An edit's "cancelled; …" says what stays changed (a folder edit has no rollback).
+            Err(e) if cancel.load(Ordering::Relaxed) && !e.starts_with("cancelled; ") => {
+                Err("cancelled".to_string())
+            }
+            Err(e) => Err(e),
         };
         // Its files are settled (published or cleaned up): they may be deleted from now on.
         self.state().paths.remove(&job);
@@ -396,5 +449,67 @@ impl<'a> Ctx<'a> {
             done: job_done,
             total: job_total,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_edit_check_waits_for_a_job_using_the_folder() {
+        let dir = crate::test_dir("jobs-folder-check");
+        std::fs::create_dir_all(dir.join("game")).unwrap();
+        let mut req: ConvertRequest = serde_json::from_value(serde_json::json!({
+            "source": dir.join("game"), "format": "exfat", "output": dir.join("out")
+        }))
+        .unwrap();
+        req.edits = vec![crate::Edit::Mkdir { path: "x".into() }];
+        let inner = Inner::new(Box::new(|_| {}));
+        inner.state().paths.insert(1, vec![dir.join("game")]);
+        let check = inner.edit_check(&req);
+        assert_eq!(check.in_place.len(), 1, "{check:?}");
+        assert!(check.in_place[0].starts_with("a job is using"), "{check:?}");
+        // A folder is never rebuilt: no rebuild findings, no sizes.
+        assert!(check.rebuild.is_empty() && check.rebuild_needs.is_none());
+    }
+
+    #[test]
+    fn uses_is_the_delete_guard() {
+        let dir = crate::test_dir("jobs-uses");
+        let host = dir.join("host");
+        std::fs::create_dir_all(host.join("pack")).unwrap();
+        std::fs::write(dir.join("game.exfat"), b"img").unwrap();
+        std::fs::write(dir.join("other.exfat"), b"img").unwrap();
+        let mut req: ConvertRequest = serde_json::from_value(serde_json::json!({
+            "source": dir.join("game.exfat"), "format": "exfat", "output": dir.join("out")
+        }))
+        .unwrap();
+        req.edits = vec![crate::Edit::Add {
+            from: host.join("pack"),
+            to: "pack".into(),
+        }];
+        let inner = Inner::new(Box::new(|_| {}));
+        inner.state().paths.insert(1, used_paths(1, &req));
+        // The image, its journal (not there yet), an added folder, inside it and above it.
+        for used in [
+            dir.join("game.exfat"),
+            dir.join("game.exfat.forge-undo"),
+            host.join("pack"),
+            host.join("pack/../pack"),
+            host.clone(),
+            dir.clone(),
+        ] {
+            assert!(inner.uses(&used), "{}", used.display());
+        }
+        for free in [
+            dir.join("other.exfat"),
+            dir.join("missing"),
+            dir.join("out"),
+        ] {
+            assert!(!inner.uses(&free), "{}", free.display());
+        }
+        inner.state().paths.clear();
+        assert!(!inner.uses(&dir.join("game.exfat")));
     }
 }

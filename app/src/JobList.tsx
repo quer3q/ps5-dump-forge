@@ -88,6 +88,13 @@ function lz4Job(r: ConvertRequest | undefined): { id: keyof T["lz4"]; tab: boole
   return null;
 }
 
+/** An Edit tab job: an extract, or its changes applied to the source (in place, or rebuilt beside it). */
+function editTag(t: T, r: ConvertRequest | undefined): string | null {
+  if (r?.extract?.length) return t.extract;
+  if (!r?.edits?.length) return null;
+  return r.edit_rebuild && r.format !== "folder" ? t.editRebuild : t.edit;
+}
+
 /** The target as its pill shows it: a pack into a folder writes an LZ4 packed folder. */
 function targetKind(r: ConvertRequest): string {
   return r.lz4 === "pack" && r.format === "folder" ? "lz4" : r.format;
@@ -150,8 +157,10 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
   let status: string;
   let tone: string;
   if (result) {
-    status = "Ok" in result ? t.done : result.Err === "cancelled" ? t.cancelled : t.failed;
-    tone = "Ok" in result ? "green" : result.Err === "cancelled" ? "" : "red";
+    // An edit's "cancelled; …" says what stays changed.
+    const cancelled = "Err" in result && (result.Err === "cancelled" || result.Err.startsWith("cancelled; "));
+    status = "Ok" in result ? t.done : cancelled ? t.cancelled : t.failed;
+    tone = "Ok" in result ? "green" : cancelled ? "" : "red";
   } else if (cancelling) [status, tone] = [t.cancelling, ""];
   else if (job.stage === undefined) [status, tone] = [t.queued, ""];
   else [status, tone] = [(t.stages as Record<string, string | undefined>)[job.stage] ?? job.stage, "blue"];
@@ -170,6 +179,7 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
   const stepMs = Math.max(0, now - job.stageAt);
   const step = running && stepMs >= STEP_MS ? clock(stepMs) : null;
   const lz4 = lz4Job(job.request);
+  const edit = editTag(t, job.request);
   // Every step the job will run, once core said; gone when the job ends (its result says it).
   const steps = !result && job.stages?.length ? <Steps job={job} /> : null;
   // Packing straight into an image: its write pass packs too.
@@ -188,6 +198,7 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
       <header className="job-head">
         {job.request && <FormatPill kind={targetKind(job.request)} />}
         {lz4 && <span className={lz4.tab ? "tag lz4" : "tag"}>{t.lz4[lz4.id]}</span>}
+        {edit && <span className="tag">{edit}</span>}
         <div className="job-name">
           <strong title={job.request?.output}>{name}</strong>
           {job.request && <PathLine path={job.request.source} prefix={t.from} />}
@@ -280,7 +291,12 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
         </details>
       )}
       {result && "Err" in result && result.Err !== "cancelled" && (
-        <FailureText err={result.Err} format={job.request?.format} />
+        <FailureText
+          err={result.Err}
+          format={job.request?.format}
+          edit={edit !== null}
+          extract={!!job.request?.extract?.length}
+        />
       )}
       {job.log.length > 0 && <Log lines={job.log} />}
     </article>
@@ -359,13 +375,14 @@ function clock(ms: number): string {
 }
 
 /** A failed job's error: core's text verbatim, under a plain title for a preflight failure. */
-function FailureText({ err, format }: { err: string; format?: Format }) {
+function FailureText(props: { err: string; format?: Format; edit?: boolean; extract?: boolean }) {
+  const { err, format, edit, extract } = props;
   const t = useMessages().jobs;
   const pre = /^preflight failed:\n?/.exec(err);
   if (!pre) return <p className="error-box backend">{err}</p>;
   return (
     <div className="error-box">
-      <strong className="error-title">{format ? t.cantBuildAs(kindLabel(format)) : t.cantBuild}</strong>
+      <strong className="error-title">{extract ? t.cantExtract : edit ? t.cantEdit : format ? t.cantBuildAs(kindLabel(format)) : t.cantBuild}</strong>
       <span className="backend">{err.slice(pre[0].length)}</span>
     </div>
   );

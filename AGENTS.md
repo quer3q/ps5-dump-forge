@@ -2,7 +2,8 @@
 
 ps5-dump-forge: converts a PS5 game between a folder and every image format ShadowMountPlus 1.7
 mounts (`.exfat`, `.ffpkg` UFS2, `.ffpfs` PFS, `.ffpfsc` compressed PFS container; read and write), plus
-debug FPKG `.pkg` (create and extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`), a
+debug FPKG `.pkg` (create and extract), and edits a game's files in a folder or image (the Edit tab:
+in place or rebuilt) or copies some out (Extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`), a
 CLI (`ps5-dump-forge`), and a PS5 ELF payload (the CLI's `serve`: the same UI as a web page on port 8095).
 Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, the PS5 `.elf`.
 `ps5/README.md` holds the payload's details (harness, HTTP routes, tile/self copy/launch on open, U1–U10
@@ -15,18 +16,33 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   rename (`finalize.rs`; macOS exFAT has none: check, then rename; FreeBSD: hard link where the folder has
   them, U3), BLAKE3 verification (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads, fast sample
   or full), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
-  generated output names), `prefetch.rs` (read-ahead thread), `delete.rs` (Inspect's and Library's delete),
-  `library_roots.rs` (PS5 filesystem classifier, the chosen-folder refusal list) and `library.rs`
-  (`scan_library`, `library_cover`). FreeBSD/PS5 only: `dest.rs` (destination probe, U1), `durable.rs`
+  generated output names), `prefetch.rs` (read-ahead thread), `delete.rs` (Edit's and Library's delete;
+  `in_use`, the job-path guard), `library_roots.rs` (PS5 filesystem classifier, the chosen-folder refusal
+  list) and `library.rs` (`scan_library`, `library_cover`). Edits: `edit.rs` (`Edited`: the `Edit`s folded
+  over a source tree, every refusal listed, host files stamped and re-checked on each read; records the
+  format editor's `patch::Op`s), `edit_job.rs` (an image edit job in place: scan, preflight, apply through
+  the undo journal, verify, commit or roll back; the rebuild dispatch and `edit_check`'s two halves),
+  `edit_folder.rs` (a folder edit job, applied directly), `host_tree.rs` (`host_tree`: a host file or
+  folder as `Edited` will scan it, for the UI's preview), `extract_paths.rs` (an Extract job: chosen
+  files and folders of any source copied out). FreeBSD/PS5 only: `dest.rs` (destination probe, U1), `durable.rs`
   (`sync_retry`, `SyncEvery`, drive-removal check; U4/U5/U7). `lib.rs` is the public API the CLI, the app
   and the server build against.
 - `crates/ps5-dump-forge-exfat`: forward-only exFAT writer (512 B sectors, 64 KiB clusters), ported
   from MkPFS. `crates/ps5-dump-forge-ufs2`: write-once UFS2 writer for the one SMP geometry
   (`newfs -O 2 -b 65536 -f 65536 -m 0 -S 4096`). Both: `plan` (validates names, sizes the image)
-  then `write` (strict offset order into a caller-owned file).
+  then `write` (strict offset order into a caller-owned file). Each also has `edit.rs`, its in-place
+  editor: `Volume::open` (checks the volume, metadata within 128 MiB `MEMORY_LIMIT`), `edit::plan(image,
+  ops) -> Result<Vec<Write>, Vec<String>>` (reads only) and `plan_sized` (+ `Space {needed, free}`, the
+  numbers behind its "the changes need N MB" finding).
 - `crates/ps5-dump-forge-pfs`: PFS writer for `.ffpfs` (MkPFS's unsigned PS5 layout, same `plan`/`write`
   shape), the streaming `.ffpfsc` container writer (`wrap`: the inner image's writer → `Stream` → zlib
-  workers → `.part`), and the PFS/PFSC readers (`PfsSource`, `open_ffpfsc`).
+  workers → `.part`), and the PFS/PFSC readers (`PfsSource`, `open_ffpfsc`). `edit.rs`: the `.ffpfs`
+  in-place editor (same `plan` shape; what it can do: Format rules).
+- `crates/ps5-dump-forge-patch`: std-only (+ `crc32fast`) in-place write engine the format editors plan
+  for: `Op` (`Delete`/`Rename`/`Mkdir`/`Put`), `Data` (`Bytes`/`Zero`/`Source`), `Write {offset, data,
+  live}`; `apply` (undo journal, then free-space writes, then live ones), `Applied::commit`/`rollback`,
+  `recover`, `journal_path`; `Syncs` hooks (core passes FreeBSD's `sync_retry`). The format crates depend
+  on it for types, so they never depend on core.
 - `crates/ps5-dump-forge-fpkg`: streaming `.pkg` reader (`FpkgSource`), CNT entries merged with the
   inner filesystem.
 - `crates/ps5-dump-forge-lz4`: ampr_emu asset packs: AMPRPAK4 manifest + AMPRDAT3 volume writer and
@@ -47,7 +63,8 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
 - `crates/ps5-dump-forge-server`: `serve`, std-only HTTP/1.1 (`http.rs`), routes mirroring the Tauri commands
   (`api.rs`), job table for polling (`table.rs`), roots (`paths.rs`), PS5 tile (`tile.rs`), self copy
   (`self_copy.rs`), `debug.rs` (PS5 only, with `FORGE_DEBUG_API`). `build.rs` embeds `app/dist-http` and the
-  self copy.
+  self copy. `POST /api/edit_upload` is the one route whose body is streamed (no 1 MiB cap; `BodyReader`
+  in `http.rs`).
 - `ps5/`: the payload's Docker harness: `Dockerfile`, `build.sh`, `linker.sh`, `entry.c` (launch modes,
   logs, `ps5_notify`), `compat.c` (statfs symvers; `cpuset_getaffinity` answered per thread, so std sees the 5 CPUs
   a payload may use, not 16), `launcher.c` (tile registration), `icon0.png`,
@@ -58,7 +75,12 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   `npm run build:http` (Vite mode `http`) builds the web UI into `app/dist-http`: `transport-http.tsx`
   replaces `transport-tauri.tsx`, `Picker.tsx` the native dialogs, `main-http.tsx` runs `launcher.ts`
   (start the payload via elfldr) and `appcache.ts` first.
-  `app/scripts/*.mjs`: plain-node checks (`check-paths`, `check-poller`, `check-launcher`, `check-update`, `smoke`).
+  Edit tab: `Edit.tsx` (card, explorer, row actions, drops), `EditChanges.tsx` (pending bar, conflict
+  question), `EditApply.tsx` (mode, `edit_check`, confirm, uploads), `explorer.ts` (pure: the tree, the
+  pending changes' fold, a port of core's `Edited` rules, `toEdits`, `checkable`).
+  `app/scripts/*.mjs`: plain-node checks (`check-paths`, `check-poller`, `check-launcher`, `check-update`,
+  `check-upload` (the upload URL's encoding against the server's decoder, `upload` over a mocked XHR),
+  `check-explorer` (`explorer.ts`: the fold mirrors core's `edit.rs` tests), `smoke`).
 - `vendor/ps5upload-{fpkg,pkg}`: ps5upload v7.0.22 crates (readers, FPKG builder, verify) plus a
   local patch series in `vendor/patches/`; see `vendor/README.md`. Edition 2021 on purpose.
   `vendor/lzma-rust2`: crates.io 0.22.0 + patch 0021 (bounded multithreaded LZMA2 decode, which
@@ -80,11 +102,11 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   that never recorded it) starts a new session from the archive's start: cheap when non-solid (header skips),
   a re-decode of everything before it when solid (by user decision: no temporary files, even for solid
   archives). Verification hashes as written, so nothing re-reads the archive. The source stamp covers every
-  part. Every part of a multi-part source is guarded from delete while its job is unfinished; trace/in-place/patch refuse an archive; the Library lists none. Inspect reads only the entries it needs (no
+  part. Every part of a multi-part source is guarded from delete while its job is unfinished; trace/in-place/patch/edit refuse an archive (Edit browses and extracts from it only); the Library lists none. `inspect` reads only the entries it needs (no
   extraction). Passwords for 7z and rar only (encrypted zip refused), `ArchivePassword` redacted in `Debug`, never
   serialized or logged; with none given, `archive::password` tries `KNOWN_PASSWORDS` (by user decision: six
   release-site passwords, in order; one fits when the game folder's `param.json` reads, and when that
-  file is in the clear, the game's smallest encrypted file too; `Entry::encrypted`) for Inspect, naming and
+  file is in the clear, the game's smallest encrypted file too; `Entry::encrypted`) for inspection, naming and
   jobs alike, and only when none fits is the error "needs a password" (the UI's prompt); CLI `--password-stdin` / `FORGE_ARCHIVE_PASSWORD`. Multi-part: `.partN.rar`, `.rar`+`.rNN`,
   `.7z.NNN`/`.zip.NNN`, split `.z01`…`.zip`; first part only, missing parts named. 7z Deflate is refused: its
   `deflate` feature would switch the workspace's `flate2` to zlib-rs, replacing `.ffpfsc`'s miniz_oxide.
@@ -127,14 +149,15 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   Convert always sends `lz4: null` (by user decision: no Update AMPR switch, nothing to choose); under Build, for an
   AMPR game only, muted `info` notes say what the conversion does by itself: the runtime action
   (`Lz4Facts.runtime_action`: install, replace, keep with the version; `convert.amprRuntime`) and the index (a
-  non-ok one written afresh, `amprIndex`, an ok one counted stale while Remove backport is on; for an fpkg target always `amprPkgIndex`: the builder writes it). Inspect's
-  LZ4 tile names install/replace (keep only for an `other` build with a version) and a non-ok index, and shows for
+  non-ok one written afresh, `amprIndex`, an ok one counted stale while Remove backport is on; for an fpkg target always `amprPkgIndex`: the builder writes it). The Edit tab's
+  LZ4 tile (its Game facts fold) names install/replace (keep only for an `other` build with a version) and a non-ok index, and shows for
   an AMPR game a conversion installs the runtime into. Job rows: an LZ4 tab job has a yellow edge and an
   `LZ4 pack|unpack|trace|unpatch` tag; an `unpatch` without `lz4_in_place` (a server API request; Convert sends
   none) is tagged `AMPR runtime`.
 - Every conversion repairs an AMPR title (`eboot.bin` imports libSceAmpr; by user decision): any target, Convert,
   CLI, server and LZ4 jobs alike (`lz4::plain` for a request without LZ4 options, `prepare`'s full path otherwise).
-  Runtime: one rule, `lz4::runtime_of(tree).action(ampr, packs)` → `RuntimeAction`, shared by the jobs and Inspect:
+  Edit jobs are the exception (their own index rule, runtime never swapped; see the Edit tab below).
+  Runtime: one rule, `lz4::runtime_of(tree).action(ampr, packs)` → `RuntimeAction`, shared by the jobs and `inspect`:
   `Install` where there is none; `Replace` an ampr_emu older than the bundled one (`runtime::version_of` +
   `not_older`), one naming no version or unreadable, and Forge's trace runtime (on any title); `Keep` Forge's
   release runtime and another ampr_emu at the bundled version or newer (by user decision), except into an output
@@ -143,7 +166,7 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   one whatever is there. `Lz4Facts.runtime_action` (plain convert) and `pack_runtime_action` (Pack/Unpack) name it
   (`install`/`replace`/`keep`, `None` for a non-AMPR title); the CLI's LZ4 line says it too.
   Index (any action but `Untouched`): an unpacked source keeps `ampr_emu.index` only when it lists exactly the
-  output's (path, size) set (`lz4::index_state`, the one comparison, Inspect's too; a replaced or installed
+  output's (path, size) set (`lz4::index_state`, the one comparison, `inspect`'s too; a replaced or installed
   runtime counted at the release size, `plain_listing`), else a fresh one is written (stale, damaged or missing alike); with a rebuild the journal
   and logs are left out (the journal's file ids follow the old index's record order), with a kept index they stay
   (LZ4 jobs always leave them out). `index_state` reads no index bigger than `index_bound` (4 × a fresh index for
@@ -154,7 +177,7 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   gets the runtime action and keeps its index, manifest, journal and logs byte for byte; a replaced runtime then
   differs from the manifest's loose record, which `reader::unpack` lets pass for `RUNTIME` only (ponytail:
   unverified on the console). `Lz4Facts.index` (`ok`/`stale`/`damaged`/`missing`; `None` when packed, when the
-  action is `Untouched`, or for an archive's index over 16 MiB) is that comparison; Inspect, Convert, the LZ4
+  action is `Untouched`, or for an archive's index over 16 MiB) is that comparison; Edit's game facts, Convert, the LZ4
   tab and the CLI say a conversion refreshes it.
 - The recommended trace path is a traced `.ffpkg` mounted `image_rw=`, then **Download traces** (http build
   only; the desktop app points at Pack): `GET /api/lz4_traces?source=` streams one STORED zip
@@ -196,7 +219,7 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   spread block indices, `writer::sample` = the writer's `encode`) and kept loose when it saves < 5% or
   ≥ 90% of the blocks stay RAW; one log line `auto-loose: N large files kept loose (incompressible samples): …`.
 - Never touch the source: junk (`.DS_Store`, `._*`, `.fseventsd`, ...) is filtered, not deleted.
-  Three exceptions, by user decision, all explicit requests:
+  Four exceptions, by user decision, all explicit requests:
   1. The LZ4 folder patch and unpatch (`lz4_patch`/`lz4_unpatch`, CLI `lz4-patch`/`lz4-unpatch`, server
      `POST /api/lz4_patch`/`POST /api/lz4_unpatch` `{source}`, Tauri `lz4_patch`/`lz4_unpatch` `{path}`)
      change a plain game folder of an AMPR title: the trace (unpatch: release) runtime replaces any
@@ -214,7 +237,7 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
      the source's `SourceStamp`, closes the source and renames the part over it (`Part::replace`, one
      atomic rename, folder synced). Any failure leaves the source byte-identical and the `.part` deleted.
      The server's stale-part filter takes an in-place job's `.part` from its source.
-  3. Deleting the inspected source or a Library entry (the trash button of Inspect or of a Library
+  3. Deleting the Edit tab's source or a Library entry (the trash button of the Edit card or of a Library
      card/row, one **No** / **Yes, delete** dialog and one route; core `Jobs::delete_path(path, protected)`
      → `DeleteError` `Refused`/`Missing`/`Busy`/`Failed`, `core/src/delete.rs`; server
      `POST /api/delete_path` `{path}` → `null`, 400/404/409/500, 409 also while stopping; Tauri
@@ -224,9 +247,147 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
      mount point, a folder with another volume mounted inside (unix, by `st_dev`; a same-filesystem Linux
      bind mount is not caught), each `protected` path and folders holding it (server: browse roots,
      configured and current; app: the home folder), and anything at, in or above an unfinished job's
-     source, output, `.part`s, profile or traces (a lone journal's index too), compared by identity after
-     canonicalize, links on the typed path included. Check and removal run with the job table locked, so
-     no job is admitted between them. Leftover `.part`s are not cleaned up here.
+     source, output, `.part`s, profile or traces (a lone journal's index too; an edit job's undo journal
+     and every `Add.from`), compared by identity after canonicalize, links on the typed path included
+     (`delete::in_use`, also `Jobs::uses`). Check and removal run with the job table locked, so no job is
+     admitted between them. Leftover `.part`s are not cleaned up here.
+  4. Edits (the Edit tab, below): a request with non-empty `ConvertRequest.edits` is an edit job, which
+     changes its source (`output` and `format` ignored; `JobReport.output` is the source). A folder is
+     changed directly (no rollback); an image is edited in place by its format's editor behind an undo
+     journal, or rebuilt beside and renamed over it (`edit_rebuild`), as exception 2 replaces an image.
+- Edit tab (after Convert; it replaced Inspect, by user decision; `app/src/Edit.tsx`): left a compact game card
+  (`SourceCard compact`, smaller than the other tabs' by user decision: columns 1fr:2fr from 1100px, 56px
+  cover, title ID and version tiles, findings; folds Game facts, param.json, Details; Leftovers; Delete),
+  right an explorer of the source (`role="grid"`, crumbs, Up, a filter over
+  everything below the folder shown, folders first in natural order, at most 2,000 rows shown; arrows,
+  Home/End, PageUp/PageDown, Enter, Backspace or Alt+Up, F2 rename, Delete), "How this works" before a
+  source. Archives are browsed and extracted from, never edited (by user decision). Changes: rename, delete,
+  Add files / Add folder (the transport's pickers; the web picker browses the server and multi-selects within
+  one folder) and drag and drop onto a folder row or the folder shown (Tauri `onDragDropEvent` gives paths,
+  a browser `File`s); no New folder button (by user decision: a `Mkdir` comes only from a dropped or added
+  empty folder). They stack in the UI and nothing is written until **Apply** (by user decision);
+  **Undo** takes back the last batch (one drop is one batch), **Discard all** clears them (asks above one
+  change); no per-change removal (ruling). The pending list folds as core will (`explorer.ts`, a port of
+  `Edited`'s rules; a host folder listed through `host_tree`, so it folds file by file) with badges New
+  (green), Replaced (orange), Renamed (blue, "Was <path>"); a clash asks once per action (Cancel, Skip,
+  Replace; Replace of the other kind deletes it first; a folder onto a folder merges, as core does).
+  - **Modes** (by user decision, shown in the pending bar): **In place** (written into the source; the
+    default when both work) or **Rebuild** (a new image of the source's format beside it, verified as a
+    conversion, then renamed over it; every image format, `.ffpfsc` and `.pkg` included); a folder is
+    always **Changed directly**. The UI asks `edit_check` 500 ms after the last change (core
+    `Jobs::edit_check(&ConvertRequest) -> EditCheck`, reads only but for settling a leftover undo journal
+    (below) and, on the PS5, the destination probe's file: `in_place`/`rebuild` findings, empty =
+    that mode works; `needed_inside`/`free_inside` from the `.exfat`/`.ffpkg` editor's `plan_sized`;
+    `rebuild_needs` = the image + 64 MiB (`.ffpfsc` its every-block-raw worst case, `.pkg` the builder's
+    estimate + 1% + 64 MiB) and `free_beside`; fields that don't apply `null`; a job using the image gives
+    "a job is using <image>" in both lists). In place refused shows **Rebuild needed** with the reason,
+    both refused **Can't apply** with core's findings, both possible a radio choice (by user decision In
+    place green, Rebuild red, chosen or not; the single-mode tags the same, Can't apply red). Apply confirms (no
+    undo; close the game first) and starts the job; while the Apply or its job runs, the changes, the
+    source pickers, Delete and a Library hand-off are locked; otherwise opening a source (another, the same
+    again, a Library hand-off) drops the pending changes without asking. Done Ok: the source is read again and the
+    changes cleared; a failure keeps them with the error. Job rows: a plain `.tag` **Edit** or **Edit ·
+    rebuild**, the error box led by "Can't apply the changes:"; a cancelled job's error that starts
+    "cancelled; " (what stays changed) is kept and shown as cancelled. No CLI subcommand for edits (ruling).
+  - **Room** (by user decision, as ps5upload): no growing an image and no FAT reserve; what an in-place
+    edit adds must fit the free space inside, else one finding "the changes need N MB, the image has M MB
+    free" (the editor's own count: data, new and grown folders, UFS2 indirect blocks) and Rebuild is
+    offered. A rebuild follows exception 2: `<source>.<job>-<pid>.part` beside it (room for the image +
+    64 MiB), verified, the `SourceStamp` and ShadowMount+ re-checked, `Part::replace`; any failure leaves
+    the source byte-identical and the `.part` deleted (where putting the original back fails, the error
+    names its `*.orig.part` backup). A rebuilt `.ffpfsc` keeps its inner format at the
+    request's `ffpfsc_level`, a `.pkg` takes `kraken_level` (the original's level can't be recovered, so
+    the size may differ).
+  - **Undo journal** (in place; the formats have no journal of their own): `edit_job.rs` hashes the
+    expected tree's verify sample first, re-checks the `SourceStamp` and ShadowMount+, then `patch::apply`
+    writes `<image>.forge-undo` beside the image (`FORGEUNDO1`, image and journal lengths, entries of
+    offset + length + old bytes, `FORGEEND` + CRC-32) with the old bytes of every region the edit
+    overwrites, syncs it and its folder, writes new data into free space, syncs, then the live writes
+    (metadata; a `.ffpfs` replacement's data too, journaled), syncs. Verify reopens the image with its reader against the edited tree (fast or full); a
+    mismatch, cancel, error or panic before the commit rolls back ("the edit did not verify; the image was
+    restored"); the commit deletes the journal (a delete that fails rolls back) and syncs the folder; a sync failure
+    after the delete fails the job saying the image holds the edit (ruling: it can't roll back then). Restored means every byte the
+    filesystem uses is the original's; free space may keep the new, unreferenced data. Every open for
+    editing (job, rebuild scan, `edit_check` under the job-table lock unless a job uses the image) runs
+    `patch::recover` after the ShadowMount+ check: a complete journal is restored then deleted, one cut
+    short is deleted (nothing live was written), a damaged one is kept with an error ("keep both files").
+    `Inspection.interrupted_edit` (a journal beside the image) is noted on the card. Room for the journal
+    beside the image is a preflight finding (`undo journal:`).
+  - **Refused** (preflight findings, nothing written; every offender listed): any LZ4 option,
+    `remove_backport`, an archive, an LZ4-packed game ("unpack it first"), a bad game path (relative,
+    `/`-separated, no empty/`.`/`..` part, no `\`), an op that doesn't apply, an `Add.from` that is missing,
+    a link, not a file or folder, the image itself or inside the source folder (by identity), names the
+    format can't hold (the conversion's checks run on the edited tree: `preflight::input`, depth, the
+    writer's layout), the editor's own findings, and on the PS5 (by user decision, as ps5upload) an image
+    ShadowMount+ has mounted (an entry `<stem>_<8 hex>` of `/mnt/shadowmnt[/pfsc]` that is a mount point
+    by `st_dev`; fails closed; checked in both modes at scan and again before writing or replacing). Host
+    files are stamped when listed (identity, size, mtime) and checked on every read: a change fails the job.
+  - **AMPR** (a title whose `eboot.bin` imports libSceAmpr or that holds `ampr_emu.index`; `edit_job::fold`,
+    shared by folder edits): an edit that touches the index itself, or changes the (path, size) set while the
+    index doesn't already list exactly the edited files (`index_state`), writes a fresh `ampr_emu.index` (a
+    user's own index is overwritten: a stale index crashes the game) and then removes `ampr_commands.bin`
+    and the logs (their file ids follow the old index; one note line); otherwise all three stay. The
+    runtime is never swapped, in either mode (ruling: the user's edit
+    is what they asked for, and both modes give the same result), so a rebuild edit does no plain-convert
+    repair. A `.pkg` rebuild always leaves the journal, logs and old index out (the builder indexes), as a
+    conversion into `.pkg` does.
+  - **Folder** (`edit_folder.rs`): every op resolved and checked first (free space for the added bytes),
+    then applied in order: Delete (links not followed), Rename (no replace), Mkdir, Add (each file to
+    `.<name>.forge-<pid>-<n>.tmp`, synced, renamed over); the AMPR rule above; touched folders synced;
+    verify re-reads the added files and the folder against the planned listing. No rollback (ruling: a
+    copy and swap doubles the space and isn't atomic either): a failure part way leaves the earlier ops
+    applied and says which (and "the failed change is partly applied" when it made parents or began a
+    folder delete). Each path is pushed one plain name at a time (a `C:` part can't replace the root), the
+    game folder's identity is kept from planning and re-checked by every op ("was moved or replaced"), an
+    `Add.from` ending in `/`, `.` or `..` is refused, and a temporary name keeps at most 160 bytes of the
+    file's name. `edit_check`: findings in `in_place` only, `rebuild` empty, sizes `null`.
+    ponytail: no openat walk (a folder inside swapped between check and use is not caught), and a volume
+    mounted inside the game folder is not refused.
+  - **Uploads** (web build; a browser's files are on the viewer's machine, ruling): nothing is sent before
+    Apply, then each file goes one at a time (progress, Cancel) to `POST /api/edit_upload?source=&path=`
+    (`encodeURIComponent`, raw body of any size, `Content-Length` required, 30 s idle per read) and is
+    staged at `<source>.forge-upload-<pid>.part/<tag>-<k>/<game path>` (`stagingNames`: a fresh random tag
+    per Apply, k counts this Apply's uploads, so no two staged paths meet and two Applies on one source
+    never replace each other's files) via `.forge-upload-<pid>-<n>.tmp` + rename (0777 on the PS5); 409 for a target an upload in
+    flight or an unfinished job uses. Apply then checks again with the uploads in and starts the job, or
+    stops. `POST /api/edit_discard {source}` removes the staging folder through `delete_path`'s rules (409
+    while an upload or a job uses it) once the job ends or after a failure before the job (Discard all only clears the UI: nothing is staged
+    before Apply).
+    It costs the files' size of free space beside the source; `stale_parts` lists it once nothing uses it.
+    The check before Apply leaves uploads out (`checkable`), or waits for Apply when a later change builds
+    on one. The desktop app adds host paths directly (`stage` refuses).
+  - **Routes**: Tauri `edit_check {request}`, `host_tree {path}`; server `POST /api/edit_check {request}`
+    and `POST /api/host_tree {path}` (both count against the 2-read cap; `edit_check` runs `readable()` on
+    the source and each `Add.from` first, so a FIFO is 400), `edit_upload`, `edit_discard`; an edit job
+    starts through `start_job`. `host_tree` → `HostTree {kind, size, files, empty_dirs, truncated}`: a
+    link refused, a folder through `ScannedFolder::scan` (junk, links, special files, hard links, names as
+    `Edited` sees them), `truncated` past 200,000 entries or 15 s (ponytail: a truncated listing skips the
+    scanner's hard-link and unreadable-file checks; the job's scan runs them).
+  - **Extract** (user request, MVP; `extract_paths.rs`): a row's Extract (file or folder on disk, not a
+    pending one) and the toolbar's **Extract folder** (the folder shown; at the root every top-level
+    entry, the whole game) ask for a destination folder on this machine and start a job with
+    `ConvertRequest.extract` (game paths), `format` folder, `output` that folder, no edits; any source
+    `open_source` opens (folder, every image, `.pkg`, archives), no game-root checks. Each selection lands
+    under its last component (`data/movies` → `<output>/movies/…`). Refused before a byte is written: a
+    bad or unknown path, two selections with one name, one inside another, a target that exists (never
+    replaced), an output that is missing, not a folder or inside the game folder, names the destination
+    can't hold, no room (+ 1 MiB), an edit, `edit_rebuild`, `lz4` or `lz4_in_place`. Stages `scan`, `preflight`, `write`, `verify`;
+    each file streamed in 8 MiB reads through an exclusive temporary name beside it, synced, renamed
+    without replacing; BLAKE3 while writing; verify checks sizes (full: re-reads and re-hashes). No
+    rollback (ponytail): a failure or cancel deletes this job's temporary files and says "N of M files were
+    extracted before it and stay". It reads the source as it is on disk; with changes pending a muted line
+    says so. Job row tag **Extract**, error box "Can't extract:". Server and Tauri: nothing new (`start_job`).
+  - **Additional content** (by user decision): a source with no `eboot.bin` at its root and a
+    `sce_sys/param.json` that parses to a title ID (a DLC, an update or another package) is a source class,
+    not a finding (`GameInfo`/`Inspection`/`LibraryEntry.additional_content`; without param.json or a
+    title ID it is still `preflight::NO_EBOOT`). Every page labels it with a violet **Additional content**
+    `.tag` beside the kind/DLC/LZ4 labels (Edit's card, Convert's and LZ4's source card, Library cards and
+    rows); the Library lists it (an archive falls back to a param.json-only root when no game root exists).
+    Every edit, in every mode, applies to it, Extract too; a conversion goes only into `pkg` or `folder`
+    (else `preflight::ADDITIONAL_CONTENT_TARGET`; Convert offers only Folder and fpkg, default fpkg), its
+    param.json category not checked; the LZ4 tab shows a note and no actions. The `.pkg` builder no longer
+    refuses it (vendor patch 0023; `content_class` gives 0x21 when param.json has neither
+    `applicationCategoryType` nor `applicationDrmType`, else the game classes 0x20/0x26; package.rs notes "packaged as additional content (DLC) or an update"). Unverified on the console.
 - Library (the tab after LZ4, `app/src/Library.tsx`): the game dumps on this computer or console, scanned
   on demand; no database, no index, no persisted state. Core `scan_library(roots)` (PS5 server roots only;
   elsewhere it errors) / `scan_library_folder(root)` (a chosen folder) / `library_cover(path)`; Tauri
@@ -235,7 +396,7 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   computer answers 400 "choose a folder to scan"; on the PS5 the reply adds `storage` `{free, total}`
   (bytes, `statfs` of `/data`; absent when `statfs` fails), shown in the header as "Free 312 GB of 825 GB"
   (decimal GB, whole numbers, one decimal under 10 GB)) and `POST /api/library_cover` `{path}` (409 while
-  stopping, 429 when the shared cap of 2 concurrent source reads (inspections, naming, covers, scans) stays full for
+  stopping, 429 when the shared cap of 2 concurrent source reads (inspections, naming, covers, scans, `host_tree`, `edit_check`) stays full for
   30 s: a read waits for a slot first, at most 4 waiting; 409 once stopping).
   A chosen folder may be on any filesystem, a network share included; mounts nested inside it are walked,
   a chosen root that is a link is resolved first, links inside the walk are never followed,
@@ -256,23 +417,24 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   - **Limits** (`library.rs`): depth 6 (root 0), 20,000 directories and 200,000 entries per root, 10,000
     entries per directory, 256 image opens, 2,000 games, 15 s budget, 20 warnings; hitting one sets
     `truncated` (the UI says the list may be incomplete).
-  - **Recognition**: a folder with a regular `eboot.bin` and a plain `sce_sys` holding a `param.json`
-    (1 B..4 MiB) that parses to a title ID is a game and is not entered (a rejected folder is searched on);
-    images by extension (`.exfat .ffpkg .ffpfs .ffpfsc .pkg`, any case) are opened with `open_source` and
-    need the same files. Entry = path, kind, title ID, localized title (fallback: title ID, then file
+  - **Recognition**: a folder with a plain `sce_sys` holding a `param.json` (1 B..4 MiB) that parses to a
+    title ID is a game and is not entered (a rejected folder is searched on); without a regular
+    `eboot.bin` it is listed as additional content (by user decision, above); images by extension
+    (`.exfat .ffpkg .ffpfs .ffpfsc .pkg`, any case) are opened with `open_source` and need the same files.
+    Entry = path, kind, title ID, localized title (fallback: title ID, then file
     name), version, `has_cover` (a regular `icon0.png` of 1 B..512 KiB by metadata; discovery reads no
     icon), `lz4_packed` (`reader::detect`'s rule: a root `ampr_assets.index` starting with `AMPRPAK4`; the
-    UI's LZ4 badge). Sorted by title, ID, version, path. `library_cover` reads `sce_sys/icon0.png`
+    UI's LZ4 badge), `additional_content` (its label). Sorted by title, ID, version, path. `library_cover` reads `sce_sys/icon0.png`
     (≤ 512 KiB) lazily, one at a time in list order, only for an entry the page lists.
   - **Semantics**: `runtimePlatform()` (`GET /api/session` `platform`) decides. On a computer (`host`)
     nothing scans until the user chooses a folder (**Choose folder**; **Refresh** rescans it). A refused
     or failed newly chosen folder is an error screen with core's message and drops the previous folder and
     list; a failed Refresh keeps the list. On the PS5 the first open scans the server's roots, **Refresh**
     rescans; no picker. Everything lives in memory until the app closes. Cards and rows show the title ID.
-  - **Actions**: Inspect and Convert hand the entry to `App` as a `SourceSelection {id, path, kind}` (one per
-    tab; the tab switches and loads it); Delete uses the same `confirmDelete` (`app/src/delete.tsx`),
-    `delete_path` and refusals as Inspect, then `notifyDeleted`, which Inspect, Convert, LZ4 and the Library
-    all hear.
+  - **Actions**: Edit and Convert hand the entry to `App` as a `SourceSelection {id, path, kind}` (one per
+    tab; the tab switches and loads it; Edit refuses it while changes are being applied); Delete uses the
+    same `confirmDelete` (`app/src/delete.tsx`), `delete_path` and refusals as Edit, then `notifyDeleted`,
+    which Edit, Convert, LZ4 and the Library all hear.
 - Names are never renamed: bad names (non-NFC, exFAT/PFS case collisions, forbidden chars, non-ASCII
   in PFS) fail preflight with every offender listed.
 - `.pkg` is built with `BuildRequest::production` only (plaintext `PPRPLAIN-NOAUTH!`, Kraken);
@@ -282,10 +444,14 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   own index is kept byte for byte (the runtime checks each record against the pack manifest by file id).
   So a plain `.pkg` of an unpacked AMPR title builds no index of its own first (`lz4::plain`): the old index,
   journal and logs are left out and the builder indexes what survives `sdk_rules::excluded`.
+  A source without `eboot.bin` is built, not refused (vendor patch 0023; its content class: above).
 - The UI names formats without the dot (`ffpkg`, `exfat`, `ffpfs`, `ffpfsc`, `fpkg`; `KIND_LABEL` in
   `common.tsx`), and in running text in bold (`Prose`); paths and file names keep the extension. The debug
   FPKG is labelled `fpkg`; its files, the `Format`/`Kind` id and the CLI flag stay `pkg`. Format copy and
   the About tab's formats table (`app/src/Formats.tsx`) follow ShadowMountPlus 1.7's README and release notes.
+  About's feature list (`formats.features`: bold name + a few words) is the user's text (by user decision):
+  Convert, Edit, Delete, LZ4 "with smart healing", Streamed, Archives, Library, Safe, USB and SD cards, In
+  place or rebuilt; sized so the card matches the QR card's height at 1200px; every language translates it.
 - UI languages: English (the fallback), Russian, Simplified Chinese (`zh`), German, Spanish, French,
   Japanese, Brazilian Portuguese (`pt`), Italian, Korean and Arabic; UI text only (`app/src/i18n.ts`). Backend text
   (errors, findings, job logs, checks, `describe`), the CLI, `entry.c`'s notices, format ids, file names, product
@@ -357,8 +523,9 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   `--cfg libc_unstable_freebsd_version="11"` (the env var is ignored by libc ≥ 0.2.187) and struct-size
   asserts in the CLI. `panic=abort`.
 - The server has **no protections** by user decision: no pairing, token, Host/Origin/CSRF checks or path
-  confinement. Don't re-add them. Its one delete route (`delete_path`, Inspect's and Library's, by user decision)
-  refuses only what exception 3 lists; the page's question is UI, not authentication.
+  confinement. Don't re-add them. Its one delete route (`delete_path`, Edit's and Library's, by user decision)
+  refuses only what exception 3 lists (`edit_discard` removes a staging folder by the same rules); the
+  page's question is UI, not authentication. `edit_upload` writes only under a source's staging folder.
 - The PS5 version is named "Dump Forge" (tile, notices, server texts, the web build's UI: `APP_NAME` in
   `api.ts`, the http page title); the desktop app is "PS5 Dump Forge". The CLI, crates,
   `ps5-dump-forge.elf` and release names keep `ps5-dump-forge`. Home folder `/data/dumpforge`
@@ -414,6 +581,29 @@ write safety); `docs/LZ4.md` the LZ4 user guide.
   `.exfat`/`.ffpkg`/`.ffpfs` and ≤ 58 for `.ffpfsc` (`preflight::stem_limit`); preflight refuses a longer
   typed name. Folders and `.pkg` keep to the same 63 bytes, so every output follows one rule. Generated names
   are `[GAME_TITLE]-[TITLE_ID]` (`-2`, `-3`, ... when taken); the game title is cut first.
+- In-place edits (each format crate's `edit.rs`; every overwritten byte journaled; within 128 MiB of
+  metadata, else "rebuild it instead"; timestamps of renamed entries unchanged; exFAT and UFS2 write new
+  data only into free space and reuse no cluster, block or inode freed within the same plan):
+  - exFAT: any valid exFAT (one FAT, no TexFAT, boot and up-case checksums), not one marked VolumeDirty
+    (refused in place: editing an unclean volume can compound damage); the plan sets VolumeDirty first and
+    clears it last (PercentInUse updated). A new file takes one contiguous run when there is one (NoFatChain),
+    else FAT-chained runs; a replace rewrites its entry set in place (name case, attributes and times kept);
+    folders grow by clusters; an exact fit keeps the end-of-directory entry.
+  - UFS2: only Forge's SMP geometry (the superblock and cylinder groups checked against the writer's layout,
+    density 64..256 KiB); soft updates, SUJ, gjournal, metadata check hashes, an unclean volume (`fs_clean`,
+    `FS_UNCLEAN`, `FS_NEEDSFSCK`) and a delete or replace of a file with nlink > 1 refused; other `fs_flags` bits (TRIM, ...) are
+    accepted. `fs_clean` is cleared first and set last; new inodes 0777 root:root with the writer's times;
+    a folder grows by 512 B chunks the kernel's way, up to single indirect (12 + 8192 blocks); a rename
+    makes no missing parents.
+  - PFS (`.ffpfs`): only the unsigned layout the writer and MkPFS make. It has no free space, so in place
+    takes a replacement that fits the old file's blocks (written live, the old bytes journaled), deletes
+    and renames/moves; a new path or folder is refused ("a .ffpfs keeps every file in one run: convert it
+    to .exfat or .ffpkg to add files") and Rebuild is offered. Changed folders are re-encoded in the
+    writer's order (folders first, then files, by lower-cased name) and the path tables rehashed; an
+    emptied collision resolver is kept at size 0 (uroot keeps its inode; `PfsSource` accepts it); a rename
+    that makes the first hash collision creates the resolver in a freed inode or a spare inode-table slot
+    (ponytail: a layout neither the writer nor MkPFS makes; unverified on the console).
+  - `.ffpfsc` and `.pkg`: rebuild only (read-only on the console; no editor).
 - FPKG: outer PFS plaintext with the `PPRPLAIN-NOAUTH!` marker (native AES-XTS fails the console's auth),
   inner image Kraken-compressed (zlib metadata is rejected by the console, never offer it).
 - LZ4 packs (ampr_emu 0.4.2.1): index at `ampr_assets.index` (AMPRPAK4, little-endian, CRC32, FNV-1a path hashes)

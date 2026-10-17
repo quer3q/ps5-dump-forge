@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 
 pub(crate) const HEAD_MAX: usize = 16 * 1024;
 pub(crate) const BODY_MAX: usize = 1024 * 1024;
+/// The body cap of the two routes that take a whole edit list (`start_job`, `edit_check`): a
+/// dropped folder in the web build is one `add` per file, about 200 bytes each.
+pub(crate) const JOB_BODY_MAX: usize = 8 * 1024 * 1024;
+/// The one route whose body has no size limit: streamed to disk, never held in memory.
+pub(crate) const UPLOAD: &str = "/api/edit_upload";
 
 /// A request line and its headers (names lowercased), with the bytes read past them.
 pub(crate) struct Head {
@@ -298,8 +303,18 @@ pub(crate) fn parse_head(bytes: &[u8]) -> Result<Head, Response> {
             return Err(bad("malformed Content-Length"));
         }
         head.length = length.parse().unwrap_or(usize::MAX);
-        if head.length > BODY_MAX {
-            return Err(Response::error(413, "the request body is over 1 MiB"));
+        let cap = match (head.method.as_str(), head.path.as_str()) {
+            ("POST", UPLOAD) => None,
+            ("POST", "/api/start_job" | "/api/edit_check") => Some((JOB_BODY_MAX, "8 MiB")),
+            _ => Some((BODY_MAX, "1 MiB")),
+        };
+        if let Some((max, text)) = cap
+            && head.length > max
+        {
+            return Err(Response::error(
+                413,
+                format!("the request body is over {text}"),
+            ));
         }
     }
     Ok(head)
@@ -319,6 +334,53 @@ pub(crate) fn read_body(
         body.extend_from_slice(&chunk[..n]);
     }
     Ok(body)
+}
+
+/// An [`UPLOAD`] body as a reader: the bytes read past the head, then the socket, `idle` for
+/// each read and no deadline for the whole (a GiB file takes minutes); it ends after
+/// `Content-Length` bytes. A client that closes early gives `UnexpectedEof`.
+pub(crate) struct BodyReader<'a> {
+    rest: std::io::Cursor<Vec<u8>>,
+    stream: &'a mut TcpStream,
+    left: u64,
+    idle: Duration,
+}
+
+impl<'a> BodyReader<'a> {
+    pub fn new(stream: &'a mut TcpStream, head: &mut Head, idle: Duration) -> Self {
+        let mut rest = std::mem::take(&mut head.rest);
+        rest.truncate(head.length);
+        Self {
+            rest: std::io::Cursor::new(rest),
+            stream,
+            left: head.length as u64,
+            idle,
+        }
+    }
+}
+
+impl Read for BodyReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        if want == 0 {
+            return Ok(0);
+        }
+        let n = match self.rest.read(&mut buf[..want])? {
+            0 => read_some(self.stream, &mut buf[..want], Instant::now() + self.idle).map_err(
+                |_| {
+                    std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "the upload ended early or stalled",
+                    )
+                },
+            )?,
+            n => n,
+        };
+        self.left -= n as u64;
+        Ok(n)
+    }
 }
 
 /// Writes the response within `timeout`, however slowly the client reads, and closes; a
@@ -636,6 +698,18 @@ mod tests {
         assert_eq!(parse(&big).err(), Some(413));
         let huge = "GET / HTTP/1.1\r\nHost: a:1\r\nContent-Length: 99999999999999999999999";
         assert_eq!(parse(huge).err(), Some(413));
+        let post = |path: &str, length: usize| {
+            parse(&format!(
+                "POST {path} HTTP/1.1\r\nHost: a:1\r\nContent-Length: {length}"
+            ))
+            .map(|h| h.length)
+        };
+        for path in ["/api/start_job", "/api/edit_check"] {
+            assert_eq!(post(path, JOB_BODY_MAX), Ok(JOB_BODY_MAX), "{path}");
+            assert_eq!(post(path, JOB_BODY_MAX + 1).err(), Some(413), "{path}");
+        }
+        assert_eq!(post("/api/inspect", BODY_MAX + 1).err(), Some(413));
+        assert_eq!(post(UPLOAD, JOB_BODY_MAX * 4), Ok(JOB_BODY_MAX * 4));
         assert!(parse("GET / HTTP/1.0").is_ok()); // no Host needed
     }
 }

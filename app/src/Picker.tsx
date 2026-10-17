@@ -1,7 +1,7 @@
 // http build: the folder and file browser over `POST /api/list_dir` that stands in for the
 // native dialog. A modal in its own React root; the app behind it is inert. Three modes: a
 // folder, a file, or (`folderToo`) either: a file click picks it, "Choose this folder" the
-// folder shown.
+// folder shown. `pickFiles`: file clicks select (in one folder), "Choose N files" takes them.
 
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { createRoot } from "react-dom/client";
@@ -35,6 +35,15 @@ interface Listing {
 let lastDir: string | null = null;
 
 export function pick(o: PickOptions): Promise<string | null> {
+  return open(o, false).then((p) => p?.[0] ?? null);
+}
+
+/** Several files of one folder (the folder shown when choosing). */
+export function pickFiles(o: PickOptions): Promise<string[] | null> {
+  return open(o, true);
+}
+
+function open(o: PickOptions, multiple: boolean): Promise<string[] | null> {
   return new Promise((resolve) => {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const app = document.getElementById("root");
@@ -44,7 +53,7 @@ export function pick(o: PickOptions): Promise<string | null> {
     document.body.appendChild(host);
     const root = createRoot(host);
     let settled = false;
-    const done = (path: string | null) => {
+    const done = (path: string[] | null) => {
       if (settled) return;
       settled = true;
       app?.removeAttribute("inert");
@@ -57,7 +66,7 @@ export function pick(o: PickOptions): Promise<string | null> {
       }, 0);
       resolve(path);
     };
-    root.render(<Picker o={o} done={done} />);
+    root.render(<Picker o={o} multiple={multiple} done={done} />);
   });
 }
 
@@ -66,7 +75,7 @@ function shows(o: PickOptions, e: Entry): boolean {
   if (o.directory) return false;
   const dot = e.name.lastIndexOf(".");
   const ext = dot > 0 ? e.name.slice(dot + 1).toLowerCase() : "";
-  return (o.extensions ?? []).includes(ext);
+  return o.extensions ? o.extensions.includes(ext) : true;
 }
 
 const IMAGES = ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
@@ -85,7 +94,8 @@ function fileIcon(o: PickOptions, name: string): IconName {
 
 /** A file mode's empty listing names what it lists: PS5 images and archives, or ".zip files". */
 function noFiles(t: Messages["picker"], o: PickOptions): string {
-  const ext = o.extensions ?? [];
+  const ext = o.extensions;
+  if (!ext) return t.nothing;
   return ext.some((e) => IMAGES.includes(e)) ? t.noImages : t.noFiles(ext);
 }
 
@@ -108,8 +118,12 @@ function crumbs(drives: string, path: string | null, roots: string[]): { label: 
 
 const FOCUSABLE = 'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])';
 
-function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => void }) {
+function Picker({ o, multiple, done: give }: { o: PickOptions; multiple: boolean; done: (paths: string[] | null) => void }) {
   const t = useMessages().picker;
+  const done = (path: string | null) => give(path === null ? null : [path]);
+  /** `multiple`: the files selected in the folder shown (a new folder starts with none). */
+  const [chosen, setChosen] = useState<string[]>([]);
+  const toggle = (path: string) => setChosen((c) => (c.includes(path) ? c.filter((p) => p !== path) : [...c, path]));
   const [listing, setListing] = useState<Listing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [roots, setRoots] = useState<string[]>([]);
@@ -128,6 +142,7 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
     const mine = ++seq.current;
     setError(null);
     setPending(true);
+    setChosen([]);
     try {
       const l = await call<Listing>("list_dir", { path });
       if (mine !== seq.current) return;
@@ -255,10 +270,11 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
             <li key={e.name}>
               <button
                 type="button"
-                className="pick-row entry"
-                onClick={() => (e.dir ? go(e.path) : done(e.path))}
+                className={chosen.includes(e.path) ? "pick-row entry chosen" : "pick-row entry"}
+                aria-pressed={multiple && !e.dir ? chosen.includes(e.path) : undefined}
+                onClick={() => (e.dir ? go(e.path) : multiple ? toggle(e.path) : done(e.path))}
               >
-                <Icon name={e.dir ? "folder" : fileIcon(o, e.name)} />
+                <Icon name={e.dir ? "folder" : chosen.includes(e.path) ? "check" : fileIcon(o, e.name)} />
                 <span className={here === null ? "pick-name mono" : "pick-name"}>
                   {here === null ? e.path : e.name}
                 </span>
@@ -293,6 +309,11 @@ function Picker({ o, done }: { o: PickOptions; done: (path: string | null) => vo
           <button type="button" ref={cancel} onClick={() => done(null)}>
             {t.cancel}
           </button>
+          {multiple && (
+            <button type="button" className="primary" disabled={chosen.length === 0 || pending} onClick={() => give(chosen)}>
+              {t.chooseFiles(chosen.length)}
+            </button>
+          )}
           {(o.directory || o.folderToo) && (
             <button
               type="button"

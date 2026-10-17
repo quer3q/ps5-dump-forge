@@ -188,7 +188,6 @@ img.qr { display: block; border-radius: 4px; image-rendering: pixelated; backgro
   min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
   background: #2f5bff; color: #fff; font-size: 11px; font-weight: 600; /* 5.2:1 */
 }
-.sub .count { background: rgba(255, 255, 255, 0.08); color: var(--fg-2); font-weight: 500; }
 /* The LZ4 screen tab: a grey pill with four evenly spaced straps from the top-right to the
    bottom-left ("/", 135deg puts the bands across that diagonal). Static. Selected: brighter
    ground and straps, --fg, a ring; the focus ring is the usual outline. */
@@ -204,7 +203,7 @@ img.qr { display: block; border-radius: 4px; image-rendering: pixelated; backgro
   --strap: var(--strap-hi); color: var(--lz4-ink-hi); background-color: var(--raise-hi); font-weight: 600;
   box-shadow: inset 0 0 0 1px var(--lz4-line), 0 1px 2px rgba(0, 0, 0, 0.4);
 }
-/* [Convert Inspect] | LZ4 | About: dividers drawn between the groups (aria-hidden; the arrow
+/* [Convert Edit] | LZ4 | Library | About: dividers drawn between the groups (aria-hidden; the arrow
    keys still move through every tab). */
 .tab-sep { flex: none; align-self: center; width: 1px; height: 16px; margin: 0 5px; background: var(--line-hi); }
 
@@ -260,8 +259,15 @@ img.qr { display: block; border-radius: 4px; image-rendering: pixelated; backgro
   .cols.one { grid-template-columns: minmax(0, 1fr); }
 }
 @media (min-width: 1100px) {
-  .cols.inspect { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+  .cols.edit { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); }
 }
+/* Edit's game card, smaller than the other tabs' (by user decision): the explorer gets the room. */
+.card.hero.compact-src { padding: 14px 16px; }
+.hero.compact-src .card-head { margin-bottom: 10px; }
+.hero.compact-src .game { gap: 12px; }
+.hero.compact-src .cover { width: 56px; height: 56px; border-radius: 10px; }
+.hero.compact-src .title { font-size: 16px; }
+.hero.compact-src .tiles { gap: 6px; }
 
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .row.nowrap { flex-wrap: nowrap; }
@@ -536,6 +542,7 @@ button.link .icon { width: 15px; height: 15px; }
 /* Four in a row only once a tile holds "01.000.000" at 18px whole (below 680px it broke mid-number). */
 @media (min-width: 680px) and (max-width: 879px) {
   .hero:not(.full) .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .hero.compact-src .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 .tile {
   min-width: 0; padding: 12px 14px; border-radius: 12px;
@@ -714,28 +721,121 @@ pre.log {
   background: #0a0a10; border: 1px solid var(--line);
 }
 
-/* ---------- Inspect ---------- */
-.contents { display: flex; flex-direction: column; padding: 16px; }
-.seg.sub { align-self: flex-start; margin-bottom: 14px; }
-.panel { display: flex; flex-direction: column; min-height: 0; flex: 1; }
-.panel-body {
+/* ---------- Edit ---------- */
+/* The explorer card: beside the game card from 880px it fits the window (48px: the screen's
+   16px top and 32px bottom padding, so the page itself doesn't scroll) and its well scrolls
+   inside it; narrower, the well is capped at 60vh. */
+.explorer { display: flex; flex-direction: column; padding: 16px 18px; }
+.explorer-well {
   flex: 1; min-height: 0; max-height: 60vh; overflow: auto;
   border-radius: 12px; background: var(--inset); border: 1px solid rgba(255, 255, 255, 0.04);
 }
 @media (min-width: 880px) {
-  /* Fits the window beside the summary (48px: the screen's 16px top and 32px bottom padding,
-     so the page itself doesn't scroll); its body scrolls inside the card. */
-  .contents { position: sticky; top: calc(var(--top) + 16px); height: calc(100vh - var(--top) - 48px); min-height: 360px; }
-  .panel-body { max-height: none; }
+  .explorer { position: sticky; top: calc(var(--top) + 16px); height: calc(100vh - var(--top) - 48px); min-height: 360px; }
+  .explorer-well { max-height: none; }
 }
+.explorer-note { margin: 0 0 10px; color: var(--fg-2); }
+.explorer-nav { align-items: flex-start; margin-bottom: 10px; }
+.explorer-nav > button { flex: none; }
+.explorer-nav .crumbs { margin: 5px 0 0; max-height: 64px; }
+.crumb { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .filter { margin-bottom: 10px; }
 .count-text { font-size: 12.5px; white-space: nowrap; padding-inline-end: 4px; }
-table.files { width: 100%; border-collapse: collapse; }
-table.files td { padding: 7px 14px; border-bottom: 1px solid var(--line); font-size: 12px; vertical-align: top; }
-table.files tr:last-child td { border-bottom: 0; }
-table.files td.path { word-break: break-all; }
-table.files td.size { text-align: end; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
-.panel h3 { margin: 14px 14px 4px; font-size: 12.5px; font-weight: 500; color: var(--muted); }
+/* One row per entry: name (wraps anywhere), size, the actions' column (Rename, Delete, open). */
+.xrow {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(30px, auto); align-items: center; gap: 10px;
+  min-height: 38px; padding: 4px 8px; padding-inline-start: 12px; border-bottom: 1px solid var(--line);
+  font-size: 12.5px; cursor: default;
+}
+.xrow:last-child { border-bottom: 0; }
+.xrow.head {
+  position: sticky; top: 0; z-index: 1; min-height: 32px; background: var(--inset);
+  color: var(--muted); font-size: 12px; font-weight: 500;
+}
+.xrow[data-path]:hover { background: rgba(255, 255, 255, 0.03); }
+/* The focused row, also for a mouse click (which shows no focus ring). */
+.xrow[data-path]:focus { background: rgba(255, 255, 255, 0.05); }
+/* An empty folder: the grid itself holds focus (Backspace still goes up). */
+.xgrid:focus { outline: none; }
+.xgrid:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; border-radius: 12px; }
+.xrow[data-path]:focus { outline: none; }
+.xrow[data-path]:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; border-radius: 6px; }
+.xrow.dir { cursor: pointer; }
+.xname { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.xname .icon { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.xrow.dir .xname .icon { color: var(--accent-ink); }
+.xlabel { min-width: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: break-word; overflow-wrap: anywhere; }
+.xsize { text-align: end; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+.xrow.head .xsize { text-align: end; }
+button.xopen { background: transparent; color: var(--muted); }
+button.xopen:hover:not(:disabled) { background: var(--raise); color: var(--fg); }
+button.xopen .icon { transform: rotate(-90deg); }
+.xact { display: flex; justify-content: flex-end; gap: 2px; }
+/* Every row's action column fits its buttons, so sizes line up: Extract and open (an archive),
+   or Rename, Extract, Delete and open. */
+.xgrid.extractable .xrow { grid-template-columns: minmax(0, 1fr) auto 62px; }
+.xgrid.editable .xrow { grid-template-columns: minmax(0, 1fr) auto 126px; }
+button.xbtn, button.xbtn.danger { background: transparent; border-color: transparent; color: var(--muted); }
+button.xbtn:hover:not(:disabled) { background: var(--raise); color: var(--fg); }
+button.xbtn.danger:hover:not(:disabled) { background: rgba(255, 93, 93, 0.15); color: #ff9b9b; }
+/* A change's badge after the name; 20px so a row keeps its height. */
+.tag.xmark { height: 20px; padding: 0 8px; font-size: 11.5px; }
+/* Rename / New folder: the name typed in place, its reason under it. */
+.xedit { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.xinput { height: 30px; padding: 0 12px; font-family: var(--mono); font-size: 12px; width: 100%; }
+.xedit .field-error { margin-inline-start: 12px; }
+/* Where dragged files would land: the folder row, or the whole well for the folder shown. */
+.xrow.drop { background: rgba(61, 107, 255, 0.16); box-shadow: inset 0 0 0 2px var(--focus); border-radius: 6px; }
+.explorer-well.drop { box-shadow: inset 0 0 0 2px var(--focus); }
+.explorer-tools { gap: 8px; margin-bottom: 10px; }
+.extract-note { margin: -2px 0 10px; font-size: 12.5px; }
+.explorer > .note-line.block { margin: 0 0 10px; }
+/* Changes not applied yet: a persistent bar over the explorer (count, Undo, Discard all, the
+   list folded). Blue-tinted inset so it reads as state, not an error. */
+.pending-bar {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 12px;
+  background: rgba(61, 107, 255, 0.10); border: 1px solid rgba(61, 107, 255, 0.35);
+}
+.pending-head { gap: 8px; align-items: center; flex-wrap: wrap; }
+.pending-head > .icon { width: 16px; height: 16px; color: #a3c0ff; flex: none; }
+.pending-head b { font-size: 13px; font-weight: 600; min-width: min(14em, 60%); }
+.pending-bar > .note-line { margin: 8px 0 0; }
+.pending-bar details.fold { margin-top: 6px; }
+ol.changes { margin: 6px 0 0; padding: 6px 10px; padding-inline-start: 30px; max-height: 200px; font-size: 12.5px; }
+ol.changes > li { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+ol.changes .path { font-size: 12px; }
+.change-from { font-size: 12px; }
+/* How the changes go in (core's check): a tag and a line, the choice when both ways work, core's
+   findings; then the uploads' bar and Apply's error. */
+.edit-mode { margin-top: 10px; font-size: 13px; }
+.edit-mode > p { margin: 0; }
+.edit-mode > * + * { margin-top: 6px; }
+.edit-mode-line .tag { margin-inline-end: 4px; }
+.edit-mode-text { font-size: 12.5px; }
+.edit-checking { font-size: 12px; }
+.edit-why { margin: 4px 0 0; padding: 6px 10px; border-radius: 8px; background: var(--inset); font-size: 12px; max-height: 160px; overflow: auto; }
+.mode-hue { --h: var(--accent-ink); --h-bg: rgba(61, 107, 255, 0.2); --h-line: rgba(157, 182, 255, 0.5); }
+/* Both modes offered: In place in the Done green, Rebuild in the Failed red (.tag.green / .tag.red). */
+.mode-hue.mode-green { --h: #6fe3a3; --h-bg: rgba(47, 210, 122, 0.14); --h-line: rgba(111, 227, 163, 0.5); }
+.mode-hue.mode-red { --h: #ff9b9b; --h-bg: rgba(255, 93, 93, 0.15); --h-line: rgba(255, 155, 155, 0.5); }
+/* Unchosen too: each option's text keeps its hue (the user's In place green / Rebuild red). */
+.mode-hue.mode-green .seg-opt, .mode-hue.mode-red .seg-opt { color: var(--h); }
+.upload-line { margin-top: 10px; font-size: 12.5px; }
+.upload-line progress { width: 100%; display: block; margin-bottom: 6px; }
+.upload-line .row { gap: 8px; align-items: center; }
+.pending-bar > .error-box { margin-top: 10px; }
+.pending-bar > .error-box > .muted { display: block; margin-top: 4px; }
+.interrupted-note { margin: 10px 0 0; }
+/* The conflict question: the colliding names in a scrolling box. */
+.modal p.conflict-in { margin: 12px 0 6px; }
+.conflict-names { max-height: 160px; margin: 0; }
+/* The card's folds: long contents scroll in their own box. */
+.game-folds { margin-top: 12px; }
+.fold-box { max-height: 320px; overflow: auto; border-radius: 10px; background: var(--inset); border: 1px solid var(--line); }
+details.fold > .summary { margin-top: 10px; }
+/* How this works: the empty state's right side. */
+.how p { margin: 0 0 10px; color: var(--fg-2); font-size: 13px; line-height: 1.55; max-width: 620px; }
+.how p:last-child { margin-bottom: 0; color: var(--muted); }
 pre.code { padding: 14px 16px; }
 
 /* ---------- Quit prompt ---------- */
@@ -812,7 +912,7 @@ pre.code { padding: 14px 16px; }
   .update-toast, [dir="rtl"] .update-toast { right: 12px; left: 12px; bottom: 12px; width: auto; max-width: none; }
 }
 
-/* Inspect odds and ends. */
+/* Edit odds and ends. */
 .fold-note { padding: 6px 12px 0; font-size: 12px; }
 .cid-label { color: var(--fg-2); font-weight: 600; }
 .empty-note { padding: 14px; font-size: 13px; }
@@ -908,6 +1008,9 @@ button.pick-row {
 button.pick-row:hover:not(:disabled) { background: var(--raise); }
 button.pick-row:focus { outline-offset: -2px; }
 button.pick-row .icon { color: var(--muted); }
+/* A file selected for "Choose N files": tinted, ringed, and a check in place of its icon. */
+button.pick-row.chosen { background: rgba(61, 107, 255, 0.16); box-shadow: inset 0 0 0 1px rgba(61, 107, 255, 0.45); }
+button.pick-row.chosen .icon { color: #a3c0ff; }
 .pick-name { flex: 1; min-width: 0; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .pick-name.mono { font-size: 12px; }
 button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -950,6 +1053,7 @@ button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; 
 .head-actions > .danger.icon-only { margin-inline-start: 8px; }
 .library-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12.5px; }
 .library-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; }
+.library-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .library-actions { display: inline-flex; gap: 6px; }
 .library-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .library-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 8px 12px; border-radius: 12px; background: var(--card); min-width: 0; }
@@ -1005,7 +1109,11 @@ button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; 
    logs and number + unit values ("9.00+", "1.4 MiB") read left to right; values keep the
    column's alignment. */
 [dir="rtl"] .backend { unicode-bidi: plaintext; text-align: start; }
-[dir="rtl"] pre.log { direction: ltr; unicode-bidi: isolate; text-align: left; }
+[dir="rtl"] pre.log, [dir="rtl"] pre.code { direction: ltr; unicode-bidi: isolate; text-align: left; }
+/* The explorer: names and paths, and sizes, read left to right at the row's start / end. */
+[dir="rtl"] .xlabel { direction: ltr; unicode-bidi: isolate; text-align: right; }
+[dir="rtl"] .xinput { direction: ltr; text-align: right; }
+[dir="rtl"] .xrow[data-path]:not(.dir) .xsize { direction: ltr; unicode-bidi: isolate; text-align: left; }
 .error-box > .backend { display: block; }
 [dir="rtl"] .value, [dir="rtl"] td.size { direction: ltr; unicode-bidi: isolate; text-align: right; }
 /* The steps run right to left: their "›" points the same way, and the bar's bright head leads. */
@@ -1019,6 +1127,7 @@ button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; 
 :lang(ko) body { word-break: keep-all; }
 /* A collapsed fold's chevron points at the text that follows it. */
 [dir="rtl"] details.fold:not([open]) > summary::before { transform: rotate(135deg); }
+[dir="rtl"] button.xopen .icon { transform: rotate(90deg); }
 
 /* Touch (a phone or tablet through the QR code): small controls grow to a finger's size and
    the Library's delete moves further from its neighbours. */

@@ -8,11 +8,12 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ps5_dump_forge_core::{
-    ArchivePassword, ConvertRequest, Event, Format, Inspection, JobId, Jobs, LibraryScan, Lz4Patch,
+    ArchivePassword, ConvertRequest, EditCheck, Event, Format, HostTree, Inspection, JobId, Jobs,
+    LibraryScan, Lz4Patch,
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
@@ -128,6 +129,26 @@ async fn library_scan(app: AppHandle, root: PathBuf) -> Result<LibraryScan, Stri
     .await
 }
 
+/// The Edit tab's preview of a host file or folder the user adds or drops.
+#[tauri::command]
+async fn host_tree(app: AppHandle, path: PathBuf) -> Result<HostTree, String> {
+    blocking(app, move |_, _| {
+        ps5_dump_forge_core::host_tree(&path, &AtomicBool::new(false)).map_err(err)
+    })
+    .await
+}
+
+/// Which way the Edit tab's `request` can be applied, in place or by a rebuild (core's
+/// `Jobs::edit_check`: it settles a leftover undo journal unless a job uses the image, then
+/// only reads). Read errors come back as findings.
+#[tauri::command]
+async fn edit_check(app: AppHandle, request: ConvertRequest) -> Result<EditCheck, String> {
+    blocking(app, move |app, state| {
+        Ok(state.jobs(app).edit_check(&request))
+    })
+    .await
+}
+
 /// One Library card's cover: a PNG data URL, or `None`.
 #[tauri::command]
 async fn library_cover(app: AppHandle, path: PathBuf) -> Result<Option<String>, String> {
@@ -171,6 +192,7 @@ async fn generated_output(
     .await
 }
 
+// An edit job's `edits` (and mode) come through as they are; core ignores its `output`.
 #[tauri::command]
 async fn start_job(app: AppHandle, request: ConvertRequest) -> Result<JobId, String> {
     blocking(app, move |app, state| {
@@ -776,6 +798,8 @@ fn main() {
                 outputs: Arc::default(),
             });
 
+            // The drag and drop handler stays on (Tauri 2's default): the Edit tab hears
+            // drops of host files through `onDragDropEvent` (`core:event:allow-listen`).
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 // The web build's page title says the same (vite.config.ts).
                 .title(concat!("PS5 Dump Forge v", env!("CARGO_PKG_VERSION")))
@@ -809,6 +833,8 @@ fn main() {
             inspect,
             library_scan,
             library_cover,
+            host_tree,
+            edit_check,
             default_output,
             generated_output,
             start_job,

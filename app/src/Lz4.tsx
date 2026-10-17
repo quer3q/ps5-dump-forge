@@ -143,10 +143,10 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
   const kind = ins?.kind ?? (sourceIsImage ? "" : "folder");
   const archive = isArchive(kind);
   const why = (s: Scenario) =>
-    !source ? t.chooseFirst : !ins ? t.notRead : scenarioWhy(s, lz4, archive);
+    !source ? t.chooseFirst : !ins ? t.notRead : ins.additional_content ? t.noEboot : scenarioWhy(s, lz4, archive);
   const usable = SCENARIOS.filter((s) => why(s) === null);
   const scenario: Scenario | null =
-    chosen && usable.includes(chosen) ? chosen : ins ? defaultScenario(lz4, archive) : null;
+    chosen && usable.includes(chosen) ? chosen : ins && !ins.additional_content ? defaultScenario(lz4, archive) : null;
   const packed = !!lz4?.packed;
   const traceAct: TraceAct = act ?? (lz4?.runtime === "forge_trace" ? "unpatch" : "patch");
   const writableImage = sourceIsImage && WRITABLE_IMAGES.includes(kind as Format);
@@ -202,7 +202,7 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
     if (again && source !== null) void inspectSource(source, false, password);
   }, [props.jobs, source]);
 
-  // Inspect or the Library deleted this source (or the folder holding it): forget it, and any late answer.
+  // Edit or the Library deleted this source (or the folder holding it): forget it, and any late answer.
   useEffect(
     () =>
       onDeleted((gone) => {
@@ -384,7 +384,8 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
 
   const patchDone = folderTrace && patched?.source === source ? patched : null;
   const sameJobs = props.jobs.filter(
-    (j) => !j.result && !j.request?.lz4_in_place && j.request?.source === source && j.request.format === fmt,
+    (j) =>
+      !j.result && !j.request?.lz4_in_place && !j.request?.edits?.length && j.request?.source === source && j.request.format === fmt,
   );
   const outputJob = scenario === "pack";
   // Any unfinished job writing this path, from any source.
@@ -465,7 +466,7 @@ export function Lz4(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
           ) : ins && usable.length === 0 ? (
             <p className="note-line warn lz4-why">
               <Icon name="warn" />
-              <span>{t.noAmprGame}</span>
+              <span>{ins.additional_content ? t.additionalContent : t.noAmprGame}</span>
             </p>
           ) : (
             ins &&

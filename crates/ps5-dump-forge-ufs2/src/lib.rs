@@ -11,6 +11,7 @@
 //! totals, every pointer — is computed by `plan`, so `write` never goes back.
 
 mod bmap;
+pub mod edit;
 mod geom;
 mod ondisk;
 mod tree;
@@ -462,11 +463,20 @@ impl<W: Write + Seek> Writer<'_, W> {
         let base = c * g.fpg * BSIZE;
         if c == 0 {
             self.put(ondisk::SBLOCK_UFS2 - 20, &ondisk::fsrecovery(&g))?;
-            let sb = ondisk::superblock(&g, &total, layout, ondisk::SBLOCK_UFS2);
+            let sb = ondisk::superblock(
+                &g,
+                &total,
+                layout.fs_id,
+                &layout.volname,
+                ondisk::SBLOCK_UFS2,
+            );
             self.put(ondisk::SBLOCK_UFS2, &sb)?;
         }
         let at = base + SBLKNO * BSIZE;
-        self.put(at, &ondisk::superblock(&g, &total, layout, at))?;
+        self.put(
+            at,
+            &ondisk::superblock(&g, &total, layout.fs_id, &layout.volname, at),
+        )?;
         let u = &self.cs[c as usize];
         let cg = ondisk::cylinder_group(&g, c, u.inodes, u.blocks, &u.cs);
         let used = u.inodes;

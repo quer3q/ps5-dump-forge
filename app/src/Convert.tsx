@@ -47,6 +47,8 @@ import {
 const TARGETS: Format[] = ["folder", "pkg", "exfat", "ffpkg", "ffpfsc", "ffpfs"];
 /** The target a new source starts with: fpkg (the debug .pkg), or exfat for a .pkg source. */
 const DEFAULT_FORMAT: Format = "pkg";
+/** Additional content (no eboot.bin): core takes it into a folder or an fpkg only. */
+const AC_TARGETS: Format[] = ["folder", "pkg"];
 const startFormat = (path: string, isImage: boolean): Format =>
   isImage && path.toLowerCase().endsWith(".pkg") ? "exfat" : DEFAULT_FORMAT;
 
@@ -107,6 +109,11 @@ export function Convert(props: {
       if (seq !== sourceSeq.current) return;
       setIns(opened.ins);
       setPassword(opened.password);
+      if (opened.ins.additional_content && !AC_TARGETS.includes(formatNow.current)) {
+        formatNow.current = "pkg";
+        setFormat("pkg");
+        out.retarget(path, "pkg");
+      }
       // A locked archive could not be named before its password.
       if (opened.password !== null) out.opened(path, formatNow.current, opened.password);
     } catch (e) {
@@ -127,7 +134,7 @@ export function Convert(props: {
     void pickRef.current(sel.path, sel.kind !== "folder");
   }, [props.selection]);
 
-  // Inspect or the Library deleted this source (or the folder holding it): forget it, and any late answer.
+  // Edit or the Library deleted this source (or the folder holding it): forget it, and any late answer.
   useEffect(
     () =>
       onDeleted((gone) => {
@@ -228,7 +235,7 @@ export function Convert(props: {
   };
 
   const sameJobs = props.jobs.filter(
-    (j) => !j.result && j.request?.source === source && j.request.format === format,
+    (j) => !j.result && j.request?.source === source && j.request.format === format && !j.request.edits?.length,
   );
   // A typed name that an unfinished job is writing can't be used twice; a generated one
   // moves on to the next free name, so another Build is a second copy.
@@ -263,7 +270,7 @@ export function Convert(props: {
             label={t.targetFormat}
             value={format}
             onChange={pickFormat}
-            formats={TARGETS}
+            formats={ins?.additional_content ? AC_TARGETS : TARGETS}
             disabled={(f) => f === "folder" && source !== null && !sourceIsImage}
             reason={(f) => (f === "folder" ? t.alreadyFolder : undefined)}
           />

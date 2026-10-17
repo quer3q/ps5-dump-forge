@@ -16,11 +16,11 @@ The interface is in **11 languages**.
 ## Features
 
 - **Any source to any target**, streamed straight through: no temporary copy, not even the image inside a `.ffpfsc` or a game in an archive.
-- **Archives as sources**: a `.zip`, `.7z` or `.rar` holding one game is inspected, converted or packed like a folder.
+- **Archives as sources**: a `.zip`, `.7z` or `.rar` holding one game is browsed, converted or packed like a folder.
 - **LZ4 compression**, new experimental way to pack ampr_emu enabled games.
 - **Library**, to convert and edit dumps.
-- **Never touches your dump** unless you ask (LZ4 Patch/Unpatch, Inspect's Delete): junk (`.DS_Store`, `._*`, ...) is skipped, not deleted; bad file names are reported up front, never renamed.
-- **Inspect** a dump or image: cover, title, required firmware, backport firmware (`fakelib/`), embedded DLC, `param.json`, leftover `.part` files.
+- **Never touches your dump** unless you ask (Edit's Apply, LZ4 Patch/Unpatch, Delete): junk (`.DS_Store`, `._*`, ...) is skipped, not deleted; bad file names are reported up front, never renamed.
+- **Edit** a dump or image: browse its files, rename, delete, add or replace files and folders, then apply the changes in place or by rebuilding the image; extract files and folders from any source. The game card shows the cover, title, required firmware, backport firmware (`fakelib/`), embedded DLC, `param.json` and leftover `.part` files.
 - **Runs on the PS5 itself**: converts on the console's own storage, driven from its browser or any browser on the network.
 - **Writes onto USB sticks and SD cards** formatted exFAT or FAT32.
 - **Fast**: (and furious).
@@ -38,6 +38,40 @@ installed. Every format can be created and read back (an image or `.fpkg` can be
 | `.ffpfs` (PFS, uncompressed) | Full image speed | Equal to the game size | Experimental in ShadowMountPlus. ASCII file names only. |
 | `.ffpfsc` (compressed PFS container) | may stutter | Depends on the compression level, usually 30–60% less | Experimental, always mounted read-only. UFS2 (default), exFAT or PFS inside. zlib level 0–9 (`--level`), default 6. |
 | Folder | Full drive speed | Equal to the game size | Run as it is by ShadowMountPlus. |
+
+## Editing a game
+
+The **Edit** tab lists a game's files. Rename or delete them, and add files or folders with **Add files**,
+**Add folder**, or by dragging them onto the list (onto a folder's row to add them inside it).
+A file of the same name is replaced once you confirm. Nothing changes until **Apply**: **Undo** takes back the
+last change (a drop of several files is one) and **Discard all** drops them all. New, replaced and renamed entries are badged.
+
+Before you press Apply the tab says how the changes will go in:
+
+- **In place**: written straight into the image. `.exfat` and `.ffpkg` take any change that fits the image's
+  free space (an image never grows); `.ffpfs` takes deletes, renames and replacements that fit in the old
+  file's space. The undo file needs room beside the image. An image
+  marked unclean, or a `.ffpkg` not laid out the way Forge writes one, takes Rebuild instead. If the check after writing fails, or the computer or console stops part way, the image is put back
+  from an undo file beside it (`<image>.forge-undo`); one left by a crash is restored on the next edit.
+- **Rebuild**: a new image of the same format is written beside the original from the original plus your
+  changes, verified, then put in its place. It needs about the image's size of free space beside it. It is
+  the only way for `.ffpfsc` and `.pkg`, and the way when the changes don't fit in place.
+
+A folder is changed directly, with no undo: a failure part way leaves the earlier changes in. Archives can be
+browsed and extracted from, not edited; a game with LZ4 packs must be unpacked first. For an AMPR title, a change to its file
+list writes a fresh `ampr_emu.index` and drops the old traces; the ampr_emu runtime is left as it is. On the
+PS5, an image ShadowMountPlus has mounted can't be edited: stop the game and move the image out of
+ShadowMountPlus's folders (or turn it off) first. In a browser on another device, dropped files are uploaded to the console
+when you press Apply, so they need that much free space beside the game until the job ends. Close the game
+before applying; once applied there is no undo.
+
+**Extract** copies a file or folder (a row's Extract button, or **Extract folder** for the folder shown, the
+whole game at the top) out of any source, images, `.pkg` and archives included, into a folder you choose.
+Nothing there is ever replaced: a name that already exists stops it before anything is copied.
+
+A source with a `sce_sys/param.json` naming a title ID but no `eboot.bin` is **additional content** (a DLC, an update or
+another package) and is labelled so everywhere. It can be edited and extracted like a game, and converted
+to a folder or an `.fpkg` (not to an image).
 
 ## LZ4 asset packs
 

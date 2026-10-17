@@ -41,7 +41,15 @@ fn put64(b: &mut [u8], at: usize, v: u64) {
 
 /// The superblock (`fs_sbsize` = 8192 bytes). `actual` is `fs_sblockactualloc`: the byte
 /// offset this copy is written at (newfs stamps each backup with its own location).
-pub fn superblock(g: &Geom, total: &Csum, layout: &crate::Layout, actual: u64) -> Vec<u8> {
+/// `fs_id` is `fs_id[1]`, `volname` the `fs_volname` field. The in-place editor builds one
+/// too, to check an image's geometry fields against the writer's own.
+pub fn superblock(
+    g: &Geom,
+    total: &Csum,
+    fs_id: u32,
+    volname: &[u8; VOLNAME_LEN],
+    actual: u64,
+) -> Vec<u8> {
     let mut b = vec![0u8; SBLOCKSIZE];
     let s32 = |b: &mut [u8], at: usize, v: i64| put32(b, at, v as i32 as u32);
     s32(&mut b, 8, SBLKNO as i64); // fs_sblkno
@@ -66,13 +74,13 @@ pub fn superblock(g: &Geom, total: &Csum, layout: &crate::Layout, actual: u64) -
     s32(&mut b, 120, INOPB as i64); // fs_inopb
     s32(&mut b, 128, FS_OPTSPACE as i64); // fs_optim
     s32(&mut b, 144, crate::ondisk::TIME); // fs_id[0]
-    put32(&mut b, 148, layout.fs_id); // fs_id[1]
+    put32(&mut b, 148, fs_id); // fs_id[1]
     s32(&mut b, 156, (g.csblocks * BSIZE) as i64); // fs_cssize
     s32(&mut b, 160, BSIZE as i64); // fs_cgsize = fragroundup(CGSIZE)
     s32(&mut b, 184, g.ipg as i64); // fs_ipg
     s32(&mut b, 188, g.fpg as i64); // fs_fpg
     b[209] = 1; // fs_clean
-    b[VOLNAME_AT..VOLNAME_AT + VOLNAME_LEN].copy_from_slice(&layout.volname); // fs_volname
+    b[VOLNAME_AT..VOLNAME_AT + VOLNAME_LEN].copy_from_slice(volname); // fs_volname
     b[211] = FS_FLAGS_UPDATED; // fs_old_flags
     s32(&mut b, 860, BSIZE as i64); // fs_maxbsize
     put64(&mut b, 872, g.size); // fs_providersize

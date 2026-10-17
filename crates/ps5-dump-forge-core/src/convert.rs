@@ -89,6 +89,21 @@ impl Kind {
     }
 }
 
+/// Refuses an image whose undo journal (`<image>.forge-undo`) is beside it: an in-place edit
+/// was interrupted, so the image may be half edited. Only an edit settles the journal; a job
+/// that only reads the image (or replaces it, LZ4 in place) must not take it as it is.
+pub(crate) fn refuse_interrupted_edit(path: &Path, kind: Kind) -> anyhow::Result<()> {
+    if !matches!(kind, Kind::Folder | Kind::Archive(_))
+        && std::fs::symlink_metadata(ps5_dump_forge_patch::journal_path(path)).is_ok()
+    {
+        bail!(
+            "{}: an earlier edit of this image was interrupted: open it in Edit to restore it first",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// The source as a tree. Image readers are wrapped in [`JunkFiltered`], so every source
 /// drops the same junk the folder scanner does.
 pub(crate) fn open_source(
@@ -347,6 +362,23 @@ impl Image {
     }
 }
 
+/// The size of a fresh `format` image of `tree` (exFAT, UFS2 or PFS), or the layout's refusal
+/// (bad names, case collisions, ...): the name checks a conversion runs, for an edited tree.
+pub(crate) fn image_size(
+    format: Format,
+    tree: &dyn SourceTree,
+    info: &GameInfo,
+    cancel: &AtomicBool,
+) -> Result<u64, String> {
+    Image::plan(format, tree, info, 0, cancel).map(|image| image.size())
+}
+
+/// Free bytes an image of `size` bytes needs at its destination: 64 MiB more covers what the
+/// destination's own file system spends on the new file.
+pub(crate) fn room(size: u64) -> u64 {
+    size.saturating_add(64 * 1024 * 1024)
+}
+
 /// The writer's layout, fixed in preflight.
 enum Plan {
     Folder,
@@ -444,8 +476,22 @@ pub(crate) fn log_cadence(cadence: &mut crate::durable::Cadence, ctx: &Ctx) {
 /// full verification. `.pkg`'s middle ones are the builder's `Stage` ids (`verify` is both
 /// the builder's read-back and ours).
 pub(crate) fn stages(req: &ConvertRequest) -> Vec<&'static str> {
-    let packing = crate::lz4::packing(req);
-    let middle: &[&str] = match req.format {
+    if !req.extract.is_empty() {
+        return crate::extract_paths::STAGES.to_vec();
+    }
+    if !req.edits.is_empty() {
+        return match crate::edit_job::rebuild_format(req) {
+            // A rebuild is a conversion to the source's own format.
+            Some(format) => conversion_stages(format, false),
+            None => crate::edit_job::STAGES.to_vec(),
+        };
+    }
+    conversion_stages(req.format, crate::lz4::packing(req))
+}
+
+/// A conversion's stages into `format`, `packing` or not.
+fn conversion_stages(format: Format, packing: bool) -> Vec<&'static str> {
+    let middle: &[&str] = match format {
         Format::Pkg => &["check", "plan", "compress", "write"],
         Format::Folder | Format::Lz4 if packing => &["write", "pack"],
         Format::Folder | Format::Lz4 => &["write"],
@@ -459,14 +505,43 @@ pub(crate) fn stages(req: &ConvertRequest) -> Vec<&'static str> {
 }
 
 pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
+    // Files and folders copied out of the source, nothing converted.
+    if !req.extract.is_empty() {
+        return crate::extract_paths::run(req, ctx);
+    }
+    // An edit rebuilds its image (a conversion to the image's own format, replacing it), or is
+    // applied in place by the edit job.
+    let rebuild = crate::edit_job::rebuild_format(req).map(|format| ConvertRequest {
+        format,
+        ..req.clone()
+    });
+    if !req.edits.is_empty() && rebuild.is_none() {
+        return crate::edit_job::run(req, ctx);
+    }
+    let req = rebuild.as_ref().unwrap_or(req);
+    let rebuild = rebuild.is_some();
     ctx.stages(&stages(req));
     ctx.progress("scan", 0, 1);
     let kind = Kind::of(&req.source)?;
-    // Before the open: a change after this point, however early, fails the publish.
-    let stamp = SourceStamp::take(&req.source, kind)?;
-    let (source, stamp) = match kind {
-        Kind::Archive(format) => crate::archive::open(req, ctx, format, stamp)?,
-        _ => (open_source(&req.source, kind, ctx.cancel)?, stamp),
+    // A rebuilt `.ffpfsc` keeps its inner image's format.
+    let mut inner = req.inner;
+    let (source, stamp) = if rebuild {
+        // The edit job's scan: request, kind, name, ShadowMount+, then an interrupted edit
+        // settled before the image is stamped and opened.
+        let scanned = crate::edit_job::scan(req, true, ctx.cancel)?.map_err(preflight_failed)?;
+        crate::edit_job::log_recovery(scanned.recovery, ctx);
+        if kind == Kind::Ffpfsc {
+            inner = Some(crate::edit_job::inner_format(&req.source)?);
+        }
+        (scanned.tree, scanned.stamp)
+    } else {
+        refuse_interrupted_edit(&req.source, kind)?;
+        // Before the open: a change after this point, however early, fails the publish.
+        let stamp = SourceStamp::take(&req.source, kind)?;
+        match kind {
+            Kind::Archive(format) => crate::archive::open(req, ctx, format, stamp)?,
+            _ => (open_source(&req.source, kind, ctx.cancel)?, stamp),
+        }
     };
     ctx.log(format!("source: {}", source.describe()));
     // The job's one timestamp, in whole seconds, for what it generates (an LZ4 manifest and
@@ -475,15 +550,49 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     // LZ4 packs decoded first, when the job asks: the backport's files are manifest records.
-    let (mut source, packs) = crate::lz4::open(req, source, ctx)?;
+    // A rebuild takes no LZ4 option and refuses a packed game (`edit_job::fold`).
+    let (source, packs) = if rebuild {
+        (source, crate::lz4::Packs::default())
+    } else {
+        crate::lz4::open(req, source, ctx)?
+    };
     ctx.progress("scan", 1, 1);
     ctx.check()?;
 
     ctx.progress("preflight", 0, 1);
     // In place the output is the source itself; its `.part` goes beside it.
-    let in_place = req.lz4_in_place;
+    let in_place = req.lz4_in_place || rebuild;
     let out = preflight::output_path(if in_place { &req.source } else { &req.output })?;
+    // A rebuild writes the edited tree; the checks below run on it.
+    let (mut source, edit_findings) = if rebuild {
+        let folded = crate::edit_job::fold(
+            &req.source,
+            source,
+            req,
+            mtime,
+            req.format == Format::Pkg,
+            ctx.cancel,
+        )?
+        .map_err(preflight_failed)?;
+        for note in folded.notes {
+            ctx.log(note);
+        }
+        (folded.tree, folded.findings)
+    } else {
+        (source, Vec::new())
+    };
     let (info, mut findings) = preflight::input(source.as_mut());
+    // Additional content holds no game for an image to boot: fpkg or a folder only. An edit
+    // (a rebuild) keeps whatever it is.
+    if info.additional_content
+        && !rebuild
+        && (!matches!(req.format, Format::Pkg | Format::Folder)
+            || req.lz4.is_some()
+            || req.lz4_in_place)
+    {
+        findings.push(preflight::ADDITIONAL_CONTENT_TARGET.to_string());
+    }
+    findings.extend(edit_findings);
     if let Some(id) = &info.title_id {
         ctx.log(format!("title id: {id}"));
     }
@@ -491,12 +600,27 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     // verification see the tree without it.
     let source = leave_out_backport(req, source, &info, &packs, ctx, &mut findings);
     findings.extend(crate::lz4::in_place_findings(req, kind, packs.packed));
-    // The LZ4 options, before anything sizes or writes the tree (`.pkg` included).
-    let prepared = crate::lz4::prepare(req, source, packs, mtime, ctx)?;
+    // The LZ4 options, before anything sizes or writes the tree (`.pkg` included). A rebuild
+    // keeps the runtime, the journal and logs; `fold` refreshed the index.
+    let prepared = if rebuild {
+        crate::lz4::Prepared {
+            tree: source,
+            findings: Vec::new(),
+            pack: None,
+        }
+    } else {
+        crate::lz4::prepare(req, source, packs, mtime, ctx)?
+    };
     findings.extend(prepared.findings);
     let mut source = prepared.tree;
     let mut pack = prepared.pack;
-    if in_place {
+    if rebuild {
+        ctx.log(format!(
+            "rebuild: writing an edited copy beside {} (about the image's size of free space); \
+             it replaces the source only once it verifies",
+            out.display()
+        ));
+    } else if in_place {
         ctx.log(format!(
             "in place: writing {} copy beside {} (about the image's size of free space); it \
              replaces the source only once it verifies",
@@ -511,7 +635,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         findings.extend(preflight::output(&req.source, &out, req.format));
     }
     if req.format == Format::Pkg {
-        return crate::package::run(req, ctx, source, &info, findings, &out, &stamp);
+        return crate::package::run(req, ctx, source, &info, findings, &out, &stamp, in_place);
     }
     if !matches!(req.format, Format::Folder | Format::Lz4) {
         findings.extend(preflight::too_deep(source.as_ref()));
@@ -606,7 +730,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
             ));
             None
         }
-        Format::Ffpfsc => match req.inner.unwrap_or(Format::Ffpkg) {
+        Format::Ffpfsc => match inner.unwrap_or(Format::Ffpkg) {
             inner @ (Format::Exfat | Format::Ffpkg | Format::Ffpfs) => {
                 planned(inner, &mut findings).map(|image| {
                     // SMP picks the inner image's driver by its extension.
@@ -644,7 +768,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         _ => None,
     };
     if let Some(size) = output_size {
-        need = size.saturating_add(64 * 1024 * 1024);
+        need = room(size);
         largest = size;
     }
     let dir = out.parent().expect("output_path gives a parent");
@@ -943,6 +1067,9 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     // Checked after the progress event, so a cancel sent in reaction to it still lands.
     ctx.check()?;
     stamp.check()?;
+    if rebuild && let Some(why) = crate::edit_job::smp_finding(&out) {
+        bail!("{why}; the source was not replaced");
+    }
     if in_place {
         if let Some(backup) = part.replace(&out)? {
             ctx.log(format!(
@@ -963,6 +1090,11 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         checks,
         verify: summary,
     })
+}
+
+/// A job's preflight failure, every finding listed.
+fn preflight_failed(findings: Vec<String>) -> anyhow::Error {
+    anyhow::anyhow!("preflight failed:\n  {}", findings.join("\n  "))
 }
 
 /// Compression threads: the request's cap, else every core.

@@ -58,6 +58,9 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         lz4_traces: None,
         lz4_trace_space_mib: 256,
         lz4_in_place: false,
+        edits: Vec::new(),
+        extract: Vec::new(),
+        edit_rebuild: false,
         archive_password: None,
     }
 }
@@ -2832,6 +2835,45 @@ fn one_bar(events: &[Event]) -> Vec<(&str, u64, u64)> {
     bar
 }
 
+#[test]
+fn an_interrupted_edit_blocks_other_jobs_and_goes_with_its_image() {
+    let root = dir("interrupted-edit");
+    let src = root.join("src");
+    game(&src);
+    let image = root.join("game.exfat");
+    run(request(&src, Format::Exfat, &image)).1.unwrap();
+    let journal = root.join("game.exfat.forge-undo");
+    std::fs::write(&journal, b"x").unwrap();
+    let interrupted = |req: ConvertRequest| {
+        let err = run(req).1.unwrap_err();
+        assert!(
+            err.contains("an earlier edit of this image was interrupted"),
+            "{err}"
+        );
+    };
+    // Convert, Extract and an LZ4 job in place all refuse it as it is.
+    interrupted(request(&image, Format::Folder, &root.join("out")));
+    let out = root.join("extracted");
+    std::fs::create_dir(&out).unwrap();
+    interrupted(ConvertRequest {
+        extract: vec!["eboot.bin".into()],
+        ..request(&image, Format::Folder, &out)
+    });
+    interrupted(ConvertRequest {
+        lz4: Some(ps5_dump_forge_core::Lz4Mode::Trace),
+        lz4_in_place: true,
+        ..request(&image, Format::Exfat, &root.join("ignored"))
+    });
+    assert!(!root.join("out").exists());
+    assert_eq!(names_in(&out), Vec::<String>::new());
+    assert!(journal.exists());
+    // Deleting the image takes its journal too.
+    let jobs = Jobs::new(|_| {});
+    assert_eq!(deleted(&jobs, &image, &[]), "ok");
+    assert!(!image.exists() && !journal.exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// What `delete_path` refused, or "ok".
 fn deleted(jobs: &Jobs, path: &Path, protected: &[PathBuf]) -> &'static str {
     match jobs.delete_path(path, protected) {
@@ -2969,5 +3011,888 @@ fn delete_leaves_what_unfinished_jobs_use() {
         assert_eq!(deleted(&jobs, free, &[]), "ok", "{}", free.display());
     }
     jobs.cancel_all_and_wait();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A request with `edits` is an edit job: its own stages, the image itself as the subject,
+/// refusals as preflight findings. Applying the plan is not wired yet.
+#[test]
+fn an_edit_request_runs_the_edit_job() {
+    use ps5_dump_forge_core::Edit;
+    for (ext, format) in [("exfat", Format::Exfat), ("ffpkg", Format::Ffpkg)] {
+        let root = dir(&format!("edit-dispatch-{ext}"));
+        let src = root.join("src");
+        game(&src);
+        let image = root.join(format!("game.{ext}"));
+        run(request(&src, format, &image)).1.unwrap();
+        let edit = |edits: Vec<Edit>| ConvertRequest {
+            edits,
+            // Ignored for an edit.
+            ..request(&image, Format::Pkg, &root.join("ignored"))
+        };
+        let (events, result) = run(edit(vec![Edit::Mkdir {
+            path: "more".into(),
+        }]));
+        assert_eq!(
+            announced_stages(&events),
+            ["scan", "preflight", "write", "verify", "finalize"]
+        );
+        assert_eq!(stages(&events).last(), Some(&"finalize"));
+        let report = result.unwrap();
+        assert_eq!(report.output, image);
+        assert_eq!(report.verify.mode, VerifyMode::Fast);
+        let seen = inspect(&image).unwrap();
+        assert!(seen.empty_dirs.contains(&"more".to_string()), "{ext}");
+        assert!(!seen.interrupted_edit);
+
+        // Add, replace, delete and rename; the image then converts to the edited folder.
+        let host = root.join("host");
+        write(&host, "added.bin", &[5u8; 300_000]);
+        write(&host, "zero.bin", b"no longer empty");
+        let mut want = tree_bytes(&src);
+        let mut full = edit(vec![
+            Edit::Add {
+                from: host.join("added.bin"),
+                to: "data/added.bin".into(),
+            },
+            Edit::Add {
+                from: host.join("zero.bin"),
+                to: "data/zero.bin".into(),
+            },
+            Edit::Rename {
+                from: "data/big.bin".into(),
+                to: "big.bin".into(),
+            },
+            Edit::Delete {
+                path: "more".into(),
+            },
+        ]);
+        full.full_verify = true;
+        let report = run(full).1.unwrap();
+        assert_eq!(report.verify.mode, VerifyMode::Full);
+        for (path, bytes) in &mut want {
+            match path.as_str() {
+                "data/big.bin" => *path = "big.bin".into(),
+                "data/zero.bin" => *bytes = b"no longer empty".to_vec(),
+                _ => {}
+            }
+        }
+        want.push(("data/added.bin".into(), vec![5u8; 300_000]));
+        want.sort();
+        let out = root.join("out");
+        run(request(&image, Format::Folder, &out)).1.unwrap();
+        assert_eq!(tree_bytes(&out), want, "{ext}");
+        assert!(!root.join(format!("game.{ext}.forge-undo")).exists());
+
+        // A refused edit writes nothing.
+        let before = std::fs::read(&image).unwrap();
+        let (_, result) = run(edit(vec![Edit::Delete {
+            path: "nope".into(),
+        }]));
+        let err = result.unwrap_err();
+        assert!(
+            err.starts_with("preflight failed:") && err.contains("nope is not in the game"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&image).unwrap(), before, "nothing written");
+        assert!(!root.join("ignored").exists());
+
+        // A journal beside the image is an interrupted edit.
+        let journal = root.join(format!("game.{ext}.forge-undo"));
+        std::fs::write(&journal, b"x").unwrap();
+        assert!(inspect(&image).unwrap().interrupted_edit);
+        std::fs::remove_file(&journal).unwrap();
+    }
+}
+
+#[test]
+fn a_panic_during_an_edit_restores_the_image_before_the_job_ends() {
+    let root = dir("edit-panic");
+    let src = root.join("src");
+    game(&src);
+    let image = root.join("game.exfat");
+    run(request(&src, Format::Exfat, &image)).1.unwrap();
+    let before = inspect(&image).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    let watched = image.clone();
+    let jobs = Jobs::new(move |e| {
+        if let Event::Progress { stage, .. } = &e
+            && stage == "verify"
+        {
+            panic!("simulated panic in an event callback");
+        }
+        if let Event::Done { result, .. } = &e {
+            // Seen as Done goes out: the image is already back.
+            let seen = inspect(&watched).unwrap();
+            let journal = watched.with_extension("exfat.forge-undo");
+            let _ = tx
+                .lock()
+                .unwrap()
+                .send((result.clone(), seen, journal.exists()));
+        }
+    });
+    jobs.start(ConvertRequest {
+        edits: vec![ps5_dump_forge_core::Edit::Delete {
+            path: "data/big.bin".into(),
+        }],
+        ..request(&image, Format::Exfat, &image)
+    });
+    let (result, seen, journal) = rx.recv().unwrap();
+    let err = result.unwrap_err();
+    assert!(err.contains("simulated panic"), "{err}");
+    assert!(!journal);
+    let paths = |i: &ps5_dump_forge_core::Inspection| {
+        (i.files.iter())
+            .map(|f| (f.path.clone(), f.size))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(paths(&seen), paths(&before));
+    assert_eq!(seen.empty_dirs, before.empty_dirs);
+}
+
+#[test]
+fn an_edit_refuses_what_it_cannot_edit_in_place() {
+    let root = dir("edit-refusals");
+    for (name, want) in [
+        ("game.ffpfsc", "a .ffpfsc can only be rebuilt"),
+        ("game.pkg", "a .pkg can only be rebuilt"),
+        ("game.zip", "archives can be browsed but not edited"),
+        ("game.rar", "archives can be browsed but not edited"),
+    ] {
+        let path = root.join(name);
+        std::fs::write(&path, b"never read").unwrap();
+        let req = ConvertRequest {
+            edits: vec![ps5_dump_forge_core::Edit::Mkdir { path: "x".into() }],
+            ..request(&path, Format::Exfat, &path)
+        };
+        let err = run(req).1.unwrap_err();
+        assert!(
+            err.starts_with("preflight failed:") && err.contains(want),
+            "{name}: {err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"never read");
+    }
+}
+
+/// An edit request that rebuilds `image` (its `format` and `output` are ignored).
+fn rebuild(image: &Path, edits: Vec<ps5_dump_forge_core::Edit>) -> ConvertRequest {
+    ConvertRequest {
+        edits,
+        edit_rebuild: true,
+        ..request(image, Format::Pkg, &image.with_file_name("ignored"))
+    }
+}
+
+/// The images a rebuild is tested on: a name, the format, a `.ffpfsc`'s inner format.
+const REBUILT: [(&str, Format, Option<Format>); 7] = [
+    ("exfat", Format::Exfat, None),
+    ("ffpkg", Format::Ffpkg, None),
+    ("ffpfs", Format::Ffpfs, None),
+    ("ffpfsc-exfat", Format::Ffpfsc, Some(Format::Exfat)),
+    ("ffpfsc-ffpkg", Format::Ffpfsc, Some(Format::Ffpkg)),
+    ("ffpfsc-ffpfs", Format::Ffpfsc, Some(Format::Ffpfs)),
+    ("pkg", Format::Pkg, None),
+];
+
+/// `src` written as `name`'s image `game.<ext>` in `root`, as [`REBUILT`] names it.
+fn rebuilt_image(
+    root: &Path,
+    src: &Path,
+    (name, format, inner): (&str, Format, Option<Format>),
+) -> PathBuf {
+    let ext = name.split('-').next().unwrap();
+    let image = root.join(format!("game.{ext}"));
+    let mut req = request(src, format, &image);
+    req.inner = inner;
+    run(req).1.unwrap();
+    image
+}
+
+/// The `.ffpfsc` container's inner image name.
+fn inner_name(image: &Path) -> String {
+    let file = std::fs::File::open(image).unwrap();
+    let label = image.display().to_string();
+    (ps5_dump_forge_pfs::open_ffpfsc(Box::new(file), &label)
+        .unwrap()
+        .1)
+        .inner_name
+}
+
+#[test]
+fn a_rebuild_replaces_the_image_with_its_edited_copy() {
+    use ps5_dump_forge_core::Edit;
+    for case in REBUILT {
+        let (ext, format, inner) = case;
+        let root = dir(&format!("edit-rebuild-{ext}"));
+        let src = root.join("src");
+        game(&src);
+        let image = rebuilt_image(&root, &src, case);
+        let name = image.file_name().unwrap().to_string_lossy().into_owned();
+        // What the image holds before (a package adds files of its own).
+        let held = root.join("held");
+        run(request(&image, Format::Folder, &held)).1.unwrap();
+        let host = root.join("host");
+        write(&host, "added.bin", &[5u8; 300_000]);
+        write(&host, "zero.bin", b"no longer empty");
+        write(&host, "tree/a.txt", b"a");
+        std::fs::create_dir_all(host.join("tree/hollow")).unwrap();
+        let edits = vec![
+            // A new path: a .ffpfs takes it only rebuilt.
+            Edit::Add {
+                from: host.join("added.bin"),
+                to: "data/added.bin".into(),
+            },
+            Edit::Add {
+                from: host.join("zero.bin"),
+                to: "data/zero.bin".into(),
+            },
+            Edit::Add {
+                from: host.join("tree"),
+                to: "tree".into(),
+            },
+            Edit::Rename {
+                from: "data/big.bin".into(),
+                to: "big.bin".into(),
+            },
+            Edit::Delete {
+                path: "data/empty".into(),
+            },
+            Edit::Mkdir {
+                path: "more/deep".into(),
+            },
+        ];
+        if format == Format::Ffpfs {
+            // In place a .ffpfs takes no new path.
+            let before = std::fs::read(&image).unwrap();
+            let in_place = ConvertRequest {
+                edit_rebuild: false,
+                ..rebuild(&image, edits.clone())
+            };
+            assert!(run(in_place).1.is_err(), "{ext}");
+            assert_eq!(std::fs::read(&image).unwrap(), before);
+        }
+        let mut req = rebuild(&image, edits);
+        req.full_verify = true;
+        // The source's own inner format and the request's level, whatever `inner` says.
+        req.inner = Some(Format::Exfat);
+        req.ffpfsc_level = 1;
+        let (events, result) = run(req);
+        // A conversion's stages into the image's own format.
+        let middle: &[&str] = match format {
+            Format::Pkg => &["check", "plan", "compress", "write"],
+            _ => &["write"],
+        };
+        let want: Vec<&str> = (["scan", "preflight"].iter())
+            .chain(middle)
+            .chain(&["verify", "finalize"])
+            .copied()
+            .collect();
+        assert_eq!(announced_stages(&events), want, "{ext}");
+        let report = result.unwrap();
+        assert_eq!(report.output, image);
+        assert_eq!(report.verify.mode, VerifyMode::Full);
+        assert!(
+            report.checks.iter().any(|c| c.starts_with("replaced ")),
+            "{:?}",
+            report.checks
+        );
+        assert!(logged(&events, "rebuild: writing an edited copy beside"));
+        assert_eq!(stale_parts(&root), Vec::<PathBuf>::new(), "{ext}");
+        assert!(!root.join("ignored").exists());
+        assert!(!root.join(format!("{name}.forge-undo")).exists());
+        if let Some(inner) = inner {
+            let ext = format!("{inner:?}").to_ascii_lowercase();
+            assert_eq!(inner_name(&image), format!("PPSA01234.{ext}"));
+        }
+
+        let mut want = tree_bytes(&held);
+        want.retain(|(p, _)| p != "data/big.bin");
+        for (path, bytes) in &mut want {
+            if path == "data/zero.bin" {
+                *bytes = b"no longer empty".to_vec();
+            }
+        }
+        let big: Vec<u8> = (0..9 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        want.push(("big.bin".into(), big));
+        want.push(("data/added.bin".into(), vec![5u8; 300_000]));
+        want.push(("tree/a.txt".into(), b"a".to_vec()));
+        want.sort();
+        let out = root.join("out");
+        run(request(&image, Format::Folder, &out)).1.unwrap();
+        let got = tree_bytes(&out);
+        let names = |t: &[(String, Vec<u8>)]| t.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&got), names(&want), "{ext}");
+        assert!(got == want, "{ext}");
+        let seen = inspect(&image).unwrap();
+        let mut dirs = seen.empty_dirs.clone();
+        dirs.sort();
+        assert_eq!(dirs, ["more/deep", "tree/hollow"], "{ext}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Runs `req`, calling `hook` on the job's first progress of `at` (at `verify` its `.part` is
+/// written).
+fn run_hooked(
+    req: ConvertRequest,
+    at: &'static str,
+    hook: impl Fn(&Jobs, u64) + Send + Sync + 'static,
+) -> Result<JobReport, String> {
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(Mutex::new((Some(hook), tx, None::<std::sync::Weak<Jobs>>)));
+    let hook = state.clone();
+    let jobs = Arc::new(Jobs::new(move |e| {
+        let mut s = hook.lock().unwrap();
+        match e {
+            Event::Progress { ref stage, job, .. } if stage == at => {
+                if let (Some(f), Some(jobs)) = (s.0.take(), s.2.as_ref().and_then(|j| j.upgrade()))
+                {
+                    f(&jobs, job);
+                }
+            }
+            Event::Done { result, .. } => s.1.send(result).unwrap(),
+            _ => {}
+        }
+    }));
+    state.lock().unwrap().2 = Some(Arc::downgrade(&jobs));
+    jobs.start(req);
+    let result = rx.recv().unwrap();
+    jobs.cancel_all_and_wait();
+    result
+}
+
+#[test]
+fn a_refused_rebuild_leaves_the_image_as_it_was() {
+    use ps5_dump_forge_core::Edit;
+    for case in REBUILT {
+        let (ext, format, _) = case;
+        let root = dir(&format!("edit-rebuild-refused-{ext}"));
+        let src = root.join("src");
+        game(&src);
+        let image = rebuilt_image(&root, &src, case);
+        let before = std::fs::read(&image).unwrap();
+        let unchanged = |what: &str| {
+            assert_eq!(std::fs::read(&image).unwrap(), before, "{ext}: {what}");
+            assert_eq!(stale_parts(&root), Vec::<PathBuf>::new(), "{ext}: {what}");
+            assert!(!root.join("ignored").exists());
+        };
+        let delete = || {
+            vec![Edit::Delete {
+                path: "data/big.bin".into(),
+            }]
+        };
+
+        // Preflight: an edit that does not apply, an LZ4 option, no game left.
+        let err = run(rebuild(
+            &image,
+            vec![Edit::Delete {
+                path: "nope".into(),
+            }],
+        ))
+        .1
+        .unwrap_err();
+        assert!(err.contains("nope is not in the game"), "{err}");
+        unchanged("missing path");
+        let mut lz4 = rebuild(&image, delete());
+        lz4.lz4_in_place = true;
+        let err = run(lz4).1.unwrap_err();
+        assert!(err.contains("an edit takes no LZ4 option"), "{err}");
+        unchanged("lz4");
+
+        // Cancelled once the copy is written.
+        let err = run_hooked(rebuild(&image, delete()), "verify", |jobs, job| {
+            jobs.cancel(job)
+        });
+        assert_eq!(err.unwrap_err(), "cancelled");
+        unchanged("cancel");
+
+        // The image changed after it was read: its stamp fails at finalize.
+        let touched = image.clone();
+        let err = run_hooked(rebuild(&image, delete()), "verify", move |_, _| {
+            let file = std::fs::File::options().write(true).open(&touched).unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 20);
+            file.set_modified(t).unwrap();
+        })
+        .unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+        unchanged("stamp");
+
+        // A host file changed before the copy read it fails it too.
+        let host = root.join("host.bin");
+        std::fs::write(&host, [7u8; 1000]).unwrap();
+        let add = vec![Edit::Add {
+            from: host.clone(),
+            to: "data/host.bin".into(),
+        }];
+        // A package's builder reads the files from its first stage on.
+        let first = if format == Format::Pkg {
+            "check"
+        } else {
+            "write"
+        };
+        let err = run_hooked(rebuild(&image, add), first, move |_, _| {
+            std::fs::write(&host, [8u8; 1000]).unwrap();
+            let file = std::fs::File::options().write(true).open(&host).unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 20);
+            file.set_modified(t).unwrap();
+        })
+        .unwrap_err();
+        assert!(err.contains("changed after it was added"), "{err}");
+        unchanged("host file");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn an_ampr_edit_refreshes_the_index_and_drops_the_journal_and_logs() {
+    use ps5_dump_forge_core::Edit;
+    let root = dir("edit-ampr");
+    let src = root.join("src");
+    ampr_game(&src);
+    let fixed = root.join("fixed");
+    run(request(&src, Format::Folder, &fixed)).1.unwrap();
+    write(&fixed, "ampr_commands.bin", b"a session's journal");
+    write(&fixed, "ampr_emu.log", b"a log");
+    let host = root.join("host");
+    write(&host, "added.bin", b"new");
+    write(&host, "trace.sprx", TRACE);
+    let edits = || {
+        vec![
+            Edit::Add {
+                from: host.join("added.bin"),
+                to: "data/added.bin".into(),
+            },
+            // The user's own runtime stays: an edit never swaps it.
+            Edit::Add {
+                from: host.join("trace.sprx"),
+                to: "fakelib/libSceAmpr.sprx".into(),
+            },
+        ]
+    };
+    let read = |image: &Path| {
+        let file = std::fs::File::open(image).unwrap();
+        ps5upload_fpkg::ufs2_source::Ufs2Source::from_reader(Box::new(file), "ffpkg".into())
+            .unwrap()
+    };
+    let traces = ["ampr_commands.bin", "ampr_emu.log"];
+    for rebuilt in [true, false] {
+        let image = root.join(format!("game-{rebuilt}.ffpkg"));
+        run(request(&fixed, Format::Ffpkg, &image)).1.unwrap();
+        assert!(traces.iter().all(|t| read(&image).read(t).is_ok()));
+        let req = |edits| ConvertRequest {
+            edit_rebuild: rebuilt,
+            ..rebuild(&image, edits)
+        };
+        if rebuilt {
+            // An undo journal beside the image is settled before anything reads the image;
+            // one that can't be refuses the rebuild.
+            let undo = image.with_file_name(format!("game-{rebuilt}.ffpkg.forge-undo"));
+            std::fs::write(&undo, b"x").unwrap();
+            let before = std::fs::read(&image).unwrap();
+            let err = run(req(edits())).1.unwrap_err();
+            assert!(err.contains("undo journal could not be settled"), "{err}");
+            assert_eq!(std::fs::read(&image).unwrap(), before);
+            std::fs::remove_file(&undo).unwrap();
+        }
+        // A new folder changes no file: the index stays, and so do the journal and logs.
+        run(req(vec![Edit::Mkdir { path: "x".into() }])).1.unwrap();
+        assert!(
+            traces.iter().all(|t| read(&image).read(t).is_ok()),
+            "{rebuilt}"
+        );
+
+        let (events, result) = run(req(edits()));
+        result.unwrap();
+        assert!(
+            logged(&events, "writing a new ampr_emu.index"),
+            "{events:?}"
+        );
+        assert!(
+            logged(&events, "removing ampr_commands.bin, ampr_emu.log"),
+            "{events:?}"
+        );
+        assert!(!logged(&events, "runtime"), "{events:?}");
+        // Read back by the image's own reader: a conversion would swap the trace runtime.
+        let mut tree = read(&image);
+        assert!(tree.read("fakelib/libSceAmpr.sprx").unwrap() == TRACE);
+        assert_eq!(tree.read("data/added.bin").unwrap(), b"new");
+        for t in traces {
+            assert!(tree.files().iter().all(|f| f.path != t), "{rebuilt}: {t}");
+        }
+        let index = ps5_dump_forge_lz4::index::read_index(&tree.read("ampr_emu.index").unwrap())
+            .unwrap()
+            .records;
+        let mut got: Vec<(String, u64)> = index;
+        let mut want: Vec<(String, u64)> = (tree.files().iter())
+            .filter(|f| f.path != "ampr_emu.index")
+            .map(|f| (f.path.clone(), f.size))
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "{rebuilt}");
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// [`Jobs::edit_check`] on a table with no job.
+fn edit_check(req: &ConvertRequest) -> ps5_dump_forge_core::EditCheck {
+    Jobs::new(|_| {}).edit_check(req)
+}
+
+#[test]
+fn a_ffpfs_is_edited_in_place_within_its_runs() {
+    use ps5_dump_forge_core::Edit;
+    let root = dir("edit-ffpfs");
+    let src = root.join("src");
+    game(&src);
+    let image = rebuilt_image(&root, &src, ("ffpfs", Format::Ffpfs, None));
+    let size = std::fs::metadata(&image).unwrap().len();
+    let host = root.join("host");
+    // As big as data/big.bin (served from the host file), and a shorter eboot.
+    let big: Vec<u8> = (0..9 * 1024 * 1024 + 7).map(|i| (i % 241) as u8).collect();
+    write(&host, "big.bin", &big);
+    write(&host, "eboot.bin", b"\x7fELF eboot");
+    let put = |from: &str, to: &str| Edit::Add {
+        from: host.join(from),
+        to: to.into(),
+    };
+    let rename = |from: &str, to: &str| Edit::Rename {
+        from: from.into(),
+        to: to.into(),
+    };
+    let in_place = |edits| ConvertRequest {
+        edit_rebuild: false,
+        ..rebuild(&image, edits)
+    };
+    let edits = vec![
+        put("big.bin", "data/big.bin"),
+        put("eboot.bin", "eboot.bin"),
+        Edit::Delete {
+            path: "data/empty".into(),
+        },
+        rename("data/zero.bin", "zero.bin"),
+        rename("data", "assets"),
+    ];
+    let check = edit_check(&in_place(edits.clone()));
+    assert_eq!(check.in_place, Vec::<String>::new());
+    // PFS keeps no free count: no sizes inside.
+    assert_eq!((check.needed_inside, check.free_inside), (None, None));
+    let report = run(in_place(edits)).1.unwrap();
+    assert_eq!(report.output, image);
+    assert!(
+        report.checks.iter().any(|c| c.starts_with("blake3:")),
+        "{report:?}"
+    );
+    // A second edit, fully verified: a file moved into a renamed folder and back out.
+    let mut req = in_place(vec![
+        rename("zero.bin", "sce_sys/zero.bin"),
+        rename("sce_sys/zero.bin", "zero.bin"),
+    ]);
+    req.full_verify = true;
+    run(req).1.unwrap();
+    assert_eq!(std::fs::metadata(&image).unwrap().len(), size);
+    assert!(!ps5_dump_forge_patch::journal_path(&image).exists());
+    let mut tree = ps5_dump_forge_pfs::PfsSource::open(&image).unwrap();
+    let mut paths: Vec<String> = tree.files().iter().map(|f| f.path.clone()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "assets/big.bin",
+            "eboot.bin",
+            "sce_sys/param.json",
+            "zero.bin"
+        ]
+    );
+    assert!(tree.read("assets/big.bin").unwrap() == big);
+    assert_eq!(tree.read("eboot.bin").unwrap(), b"\x7fELF eboot");
+    assert_eq!(tree.read("zero.bin").unwrap(), b"");
+    assert!(tree.empty_dirs().is_empty(), "{:?}", tree.empty_dirs());
+    drop(tree);
+
+    // A new file, a folder, a file past its run (eboot.bin holds one 64 KiB block), each on
+    // its own and all together: refused in place (said once), a rebuild offered.
+    write(&host, "run.bin", &[1u8; 65_536]);
+    write(&host, "past.bin", &[1u8; 65_537]);
+    let refusals = [
+        vec![put("eboot.bin", "assets/new.bin")],
+        vec![Edit::Mkdir {
+            path: "more".into(),
+        }],
+        vec![put("past.bin", "eboot.bin")],
+    ];
+    let all = refusals.concat();
+    for edits in refusals.into_iter().chain([all]) {
+        let check = edit_check(&in_place(edits.clone()));
+        assert_eq!(
+            check.in_place,
+            [ps5_dump_forge_pfs::edit::NO_ROOM],
+            "{edits:?}"
+        );
+        assert_eq!(check.rebuild, Vec::<String>::new(), "{edits:?}");
+        assert!(check.rebuild_needs.is_some(), "{edits:?}");
+    }
+    // The whole run still fits.
+    let check = edit_check(&in_place(vec![put("run.bin", "eboot.bin")]));
+    assert_eq!(check.in_place, Vec::<String>::new());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+// ponytail: one smoke test for folder edits (the MVP cut stopped Task 8 before its own tests).
+#[test]
+fn a_game_folder_is_edited_directly() {
+    use ps5_dump_forge_core::Edit;
+    let root = dir("edit-folder");
+    let src = root.join("src");
+    game(&src);
+    let host = root.join("host");
+    write(&host, "new.bin", b"new file");
+    write(&host, "eboot.bin", b"\x7fELF new eboot");
+    let req = |edits| ConvertRequest {
+        edits,
+        edit_rebuild: false,
+        ..request(&src, Format::Folder, &root.join("ignored"))
+    };
+    let edits = vec![
+        Edit::Add {
+            from: host.join("new.bin"),
+            to: "data/sub/new.bin".into(),
+        },
+        Edit::Add {
+            from: host.join("eboot.bin"),
+            to: "eboot.bin".into(),
+        },
+        Edit::Delete {
+            path: "data/zero.bin".into(),
+        },
+        Edit::Rename {
+            from: "data/empty".into(),
+            to: "data/renamed".into(),
+        },
+        Edit::Mkdir {
+            path: "extra".into(),
+        },
+    ];
+    let check = edit_check(&req(edits.clone()));
+    assert_eq!(check.in_place, Vec::<String>::new());
+    run(req(edits)).1.unwrap();
+    assert_eq!(
+        std::fs::read(src.join("data/sub/new.bin")).unwrap(),
+        b"new file"
+    );
+    assert_eq!(
+        std::fs::read(src.join("eboot.bin")).unwrap(),
+        b"\x7fELF new eboot"
+    );
+    assert!(!src.join("data/zero.bin").exists());
+    assert!(!src.join("data/empty").exists());
+    assert!(src.join("data/renamed").is_dir());
+    assert!(src.join("extra").is_dir());
+    assert_eq!(
+        std::fs::read(src.join("data/big.bin")).unwrap().len(),
+        9 * 1024 * 1024 + 7
+    );
+    // A refused edit changes nothing.
+    let bad = vec![Edit::Delete {
+        path: "missing.bin".into(),
+    }];
+    assert!(run(req(bad)).1.is_err());
+    assert!(src.join("extra").is_dir());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn extract_copies_files_and_folders_out_of_a_folder_or_an_image() {
+    let root = dir("extract");
+    let src = root.join("src");
+    game(&src);
+    write(&src, "data/sub/deep.bin", b"deep");
+    let image = rebuilt_image(&root, &src, ("exfat", Format::Exfat, None));
+    let extract = |source: &Path, out: &Path, paths: &[&str], full: bool| {
+        let mut req = request(source, Format::Folder, out);
+        req.extract = paths.iter().map(|p| p.to_string()).collect();
+        req.full_verify = full;
+        run(req).1
+    };
+    for (label, source, full) in [("folder", &src, false), ("exfat", &image, true)] {
+        let out = root.join(format!("out-{label}"));
+        std::fs::create_dir(&out).unwrap();
+        let report = extract(source, &out, &["eboot.bin", "data"], full)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(report.output, out.canonicalize().unwrap(), "{label}");
+        assert_eq!(report.files, 4, "{label}: eboot + big, zero, deep");
+        let mode = if full {
+            VerifyMode::Full
+        } else {
+            VerifyMode::Fast
+        };
+        assert_eq!(report.verify.mode, mode, "{label}");
+        assert_eq!(
+            std::fs::read(out.join("eboot.bin")).unwrap(),
+            std::fs::read(src.join("eboot.bin")).unwrap(),
+            "{label}"
+        );
+        assert_eq!(
+            tree_bytes(&out.join("data")),
+            tree_bytes(&src.join("data")),
+            "{label}"
+        );
+        assert!(
+            out.join("data/empty").is_dir(),
+            "{label}: empty folder kept"
+        );
+        assert!(!out.join("data/._big.bin").exists(), "{label}: no junk");
+        // Only the two selections and no temporary file are left in the destination.
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["data", "eboot.bin"], "{label}");
+
+        // A target that exists is never replaced.
+        let before = snapshot(&out);
+        let err = extract(source, &out, &["data/big.bin", "eboot.bin"], false).unwrap_err();
+        assert!(err.contains("preflight failed"), "{label}: {err}");
+        assert!(err.contains("eboot.bin already exists"), "{label}: {err}");
+        assert_eq!(snapshot(&out), before, "{label}: nothing written");
+    }
+    let out = root.join("out-refused");
+    std::fs::create_dir(&out).unwrap();
+    let cases: [(&[&str], &str); 5] = [
+        (&["data/nope.bin"], "data/nope.bin is not in the game"),
+        (
+            &["data/big.bin", "data/big.bin"],
+            "would both be named big.bin",
+        ),
+        (&["data", "data/sub"], "data/sub is inside data"),
+        (&["data/../eboot.bin"], "'..' component"),
+        (&[""], "an empty path"),
+    ];
+    for (paths, want) in cases {
+        let err = extract(&src, &out, paths, false).unwrap_err();
+        assert!(err.contains(want), "{paths:?}: {err}");
+    }
+    // Into a missing folder, or into the game folder itself.
+    let err = extract(&src, &root.join("missing"), &["eboot.bin"], false).unwrap_err();
+    assert!(err.contains("missing"), "{err}");
+    let err = extract(&src, &src.join("data"), &["eboot.bin"], false).unwrap_err();
+    assert!(err.contains("inside the game folder"), "{err}");
+    assert_eq!(
+        std::fs::read_dir(&out).unwrap().count(),
+        0,
+        "nothing written"
+    );
+}
+
+/// Every name in `dir`, recursively, relative to it, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
+        if p.is_dir() {
+            out.extend(names_in(&p).into_iter().map(|n| format!("{rel}/{n}")));
+        }
+        out.push(rel);
+    }
+    out.sort();
+    out
+}
+
+// No eboot.bin but a param.json with a title id is additional content (a DLC, an update), by
+// user decision: no finding, fpkg or a folder only, every edit allowed, listed by the Library.
+#[test]
+fn additional_content_converts_to_fpkg_or_a_folder_and_takes_edits() {
+    use ps5_dump_forge_core::Edit;
+    let root = dir("no-eboot");
+    let src = root.join("src");
+    game(&src);
+    std::fs::remove_file(src.join("eboot.bin")).unwrap();
+    let seen = inspect(&src).unwrap();
+    assert!(seen.additional_content);
+    assert!(
+        !seen.findings.iter().any(|f| f.contains("eboot.bin")),
+        "{:?}",
+        seen.findings
+    );
+    run(request(&src, Format::Pkg, &root.join("dlc.pkg")))
+        .1
+        .unwrap();
+    assert!(inspect(&root.join("dlc.pkg")).unwrap().additional_content);
+    run(request(&src, Format::Folder, &root.join("copy")))
+        .1
+        .unwrap();
+    for format in [Format::Exfat, Format::Ffpkg, Format::Lz4] {
+        let err = run(request(&src, format, &root.join("refused")))
+            .1
+            .unwrap_err();
+        assert!(
+            err.contains("additional content (no eboot.bin) can only be packaged as fpkg"),
+            "{format:?}: {err}"
+        );
+    }
+
+    // An image of a game whose eboot.bin an edit deletes, then a second edit on it.
+    let full = root.join("full");
+    game(&full);
+    let image = root.join("game.exfat");
+    run(request(&full, Format::Exfat, &image)).1.unwrap();
+    assert!(!inspect(&image).unwrap().additional_content);
+    let edit = |edits| ConvertRequest {
+        edits,
+        ..request(&image, Format::Pkg, &root.join("ignored"))
+    };
+    let delete = edit(vec![Edit::Delete {
+        path: "eboot.bin".into(),
+    }]);
+    let check = edit_check(&delete);
+    assert!(
+        check.in_place.is_empty() && check.rebuild.is_empty(),
+        "{check:?}"
+    );
+    run(delete).1.unwrap();
+    assert!(inspect(&image).unwrap().additional_content);
+    let mkdir = edit(vec![Edit::Mkdir {
+        path: "more".into(),
+    }]);
+    let check = edit_check(&mkdir);
+    assert!(
+        check.in_place.is_empty() && check.rebuild.is_empty(),
+        "{check:?}"
+    );
+    run(mkdir).1.unwrap();
+    run(rebuild(
+        &image,
+        vec![Edit::Delete {
+            path: "more".into(),
+        }],
+    ))
+    .1
+    .unwrap();
+    let seen = inspect(&image).unwrap();
+    assert!(
+        seen.additional_content && !seen.findings.iter().any(|f| f.contains("eboot.bin")),
+        "{:?}",
+        seen.findings
+    );
+
+    // The Library lists the folder and the image, flagged.
+    std::fs::remove_dir_all(&full).unwrap();
+    std::fs::remove_dir_all(root.join("copy")).unwrap();
+    let scan = ps5_dump_forge_core::scan_library_folder(&root).unwrap();
+    let mut listed: Vec<(String, bool)> = scan
+        .entries
+        .iter()
+        .map(|e| {
+            let name = e.path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, e.additional_content)
+        })
+        .collect();
+    listed.sort();
+    let want = [("dlc.pkg", true), ("game.exfat", true), ("src", true)];
+    let want: Vec<(String, bool)> = want.iter().map(|(n, f)| (n.to_string(), *f)).collect();
+    assert_eq!(listed, want, "{:?}", scan.warnings);
     let _ = std::fs::remove_dir_all(root);
 }

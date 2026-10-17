@@ -149,27 +149,62 @@ pub(crate) fn patch(folder: &Path, runtime: Runtime) -> anyhow::Result<Lz4Patch>
 /// Writes `bytes` to `dir/name` durably: a temporary name of this attempt in `dir`, created
 /// exclusively, synced, renamed over the target, then `dir` synced.
 fn replace(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    write_temp(dir, name, &mut |file| file.write_all(bytes))?;
+    fsync_dir(dir).with_context(|| format!("syncing {}", dir.display()))
+}
+
+/// Writes `dir/name` through an exclusive temporary name of this attempt in `dir`
+/// (`.<name>.forge-<pid>-<n>.tmp`): `fill` writes it, it is synced and renamed over the
+/// target (a file there is replaced, a link there itself, never followed). On any failure the
+/// temporary file is deleted and the target is as it was. `dir` is left to the caller to sync.
+pub(crate) fn write_temp(
+    dir: &Path,
+    name: &str,
+    fill: &mut dyn FnMut(&mut File) -> io::Result<()>,
+) -> anyhow::Result<()> {
+    write_temp_as(dir, name, fill, &|tmp, target| std::fs::rename(tmp, target))
+}
+
+/// [`write_temp`] that never replaces: the rename fails with `AlreadyExists` when the target
+/// exists ([`crate::finalize::rename_no_replace`]), and the temporary file is deleted.
+pub(crate) fn write_temp_new(
+    dir: &Path,
+    name: &str,
+    fill: &mut dyn FnMut(&mut File) -> io::Result<()>,
+) -> anyhow::Result<()> {
+    write_temp_as(dir, name, fill, &crate::finalize::rename_no_replace)
+}
+
+fn write_temp_as(
+    dir: &Path,
+    name: &str,
+    fill: &mut dyn FnMut(&mut File) -> io::Result<()>,
+    rename: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> anyhow::Result<()> {
     let target = dir.join(name);
     let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    // A long name cut to 160 bytes, so the temporary one stays within 255.
+    let cut = (0..=name.len().min(160))
+        .rev()
+        .find(|&i| name.is_char_boundary(i))
+        .unwrap_or(0);
+    let short = &name[..cut];
     let tmp = dir.join(format!(
-        ".{name}.forge-{}-{attempt}.tmp",
+        ".{short}.forge-{}-{attempt}.tmp",
         std::process::id()
     ));
     debug_assert!(is_temp(&tmp.to_string_lossy()));
     let mut file = create_new(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| sync(&file))
-        .and_then(|()| {
-            drop(file);
-            std::fs::rename(&tmp, &target)
-        });
+    let written = fill(&mut file).and_then(|()| sync(&file)).and_then(|()| {
+        drop(file);
+        rename(&tmp, &target)
+    });
     if let Err(e) = written {
         // Ours: created above, never renamed.
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("writing {}", target.display()));
     }
-    fsync_dir(dir).with_context(|| format!("syncing {}", dir.display()))
+    Ok(())
 }
 
 /// U4 on FreeBSD: ps5upload's retries, and a sync that only succeeded on a retry fails.

@@ -44,7 +44,7 @@ gradient notice bar) and the app icon (near-black navy with a blue edge and an o
 | `--library-ink` / `-ink-hi` / `-line` | `#a8ed8b` / `#c4f6aa` / green 50% | Library green: its header icon and the selected view button only |
 | `--neon-*` | lime, magenta, cyan 12%; ring lime 38%; ink `#d6e875` | A traced source's `LZ4 (AMPR)` tile |
 | `--pk-*` | green 14%, cyan 12%; ring 42%; ink `#86f5b4` | A packed source's tile |
-| count badge (`.count`) | `#2f5bff` + white | Active jobs on the Convert tab, the Library's count (5.2:1); grey in Inspect's sub-tabs |
+| count badge (`.count`) | `#2f5bff` + white | Active jobs on the Convert tab, the Library's count (5.2:1) |
 | primary button | `#fff` + `#0e0e15` | The one main action per card |
 
 **Format hues.** `.fmt-*` sets `--h` (text), `--h-bg` (tint) and `--h-line` (ring); text on tint ≥ 4.5:1.
@@ -60,7 +60,8 @@ gradient notice bar) and the app icon (near-black navy with a blue edge and an o
 | LZ4 packed folder | `fmt-lz4` | lime `#d6e875` (only the LZ4 tab's Pack target picker offers it) |
 
 **Semantic tags.** Tinted pills for states: `.tag.blue` Writing, `.tag.green` Done, `.tag.red` Failed,
-`.tag.orange` Backport, `.tag.violet` DLC. A plain `.tag` is neutral (Emulators, AMPR runtime).
+`.tag.orange` Backport, `.tag.violet` DLC and Additional content (a source without `eboot.bin`, beside
+the other labels on every tab, Library cards and rows too). A plain `.tag` is neutral (Emulators, AMPR runtime).
 
 **Type.** System font (SF Pro on macOS), 14px/1.45 body.
 
@@ -78,7 +79,7 @@ gradient notice bar) and the app icon (near-black navy with a blue edge and an o
 
 **Spacing.** Page gutters 28px, content max 1200px, 16px between
 cards, card padding 20–22px, 14px from card head to body, 12px between groups in a card, 8px between
-tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
+tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game card is the narrow one).
 
 ## Components (class names in `styles.css`)
 
@@ -89,9 +90,9 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
   Forge v…" in the app, "Dump Forge v…" in the web build; `APP_NAME` in `api.ts`).
   Under 900px: two rows, logo and actions over the full-width tabs (`--top` 98px); the tab bar scrolls
   inside itself. At ≤ 420px the tab padding tightens so all five tabs fit at 360px.
-- **Segmented control** (`.seg`, `.seg-opt`, `.on`): the screen tabs (Convert, Inspect | LZ4 | Library |
-  About: one tablist, `.tab-sep` dividers drawn only, arrow keys move through every tab), Inspect's
-  sub-tabs, the format picker (`.seg.formats`) and the LZ4 tab's scenario and action pickers. Native
+- **Segmented control** (`.seg`, `.seg-opt`, `.on`): the screen tabs (Convert, Edit | LZ4 | Library |
+  About: one tablist, `.tab-sep` dividers drawn only, arrow keys move through every tab), the format
+  picker (`.seg.formats`), Edit's mode choice and the LZ4 tab's scenario and action pickers. Native
   radios or `role="tab"` sit underneath for the keyboard.
   - The LZ4 screen tab (`.seg-opt.tab-lz4`): a `--tab-lz4` pill with four static yellow straps from top
     right to bottom left and `--lz4-ink` text; selected, `--raise-hi`, `--strap-hi`, `--lz4-ink-hi`, bold
@@ -110,7 +111,7 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
 
   | Kind | Class | Use |
   |---|---|---|
-  | Primary | `.primary` | White. One per card (Build, Pack, Choose folder on an empty Library). |
+  | Primary | `.primary` | White. One per card (Build, Pack, Edit's Apply, Choose folder on an empty Library). |
   | Secondary | default | Dark. Choose, Change, Show in Finder (Explorer, folder), download links (`a.button`). |
   | Danger | `.danger` | Red tint. Stop job, Stop jobs and quit, the trash buttons, Yes, delete. |
   | Small | `.small` | Job rows; `.small.icon-only` is a 30px round icon button. |
@@ -130,8 +131,9 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
   positions (switch knob, menus, the LZ4 badge, the LZ4 job edge, the select's chevron) have
   `[dir="rtl"]` overrides at the end of styles.css. Paths, file names, the output name, job names,
   the backend's English (`.backend`: errors and core's checks; job logs) and number + unit values
-  (`.value`, sizes) stay left-to-right, isolated from the text around them; the steps' "›" and the
-  progress bar's bright head mirror.
+  (`.value`, sizes) stay left-to-right, isolated from the text around them (in Edit: the names, file
+  sizes, rename input and param.json); the steps' "›", the progress bar's bright head and the
+  explorer's open chevron mirror.
 - **Language select** (`select.lang-select`, right in the About card's header after a muted
   "Language" label, `.head-lang`): the one dropdown. A native `<select>` drawn as a small pill
   (`button.small`'s 30px and 12.5px, `--inset`, `--line-hi` border, `--focus` ring), `appearance: none`
@@ -168,6 +170,48 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
     Folder | ffpkg (default) | exfat | ffpfs.
   - Pack and Unpack end like Convert (Full verification, Output, Generate name; shared in
     `target.tsx`).
+- **Edit tab** (`Edit.tsx`, `EditChanges.tsx`, `EditApply.tsx`; `.cols.edit`, 1fr:2fr from 1100px). Before a
+  source: the empty Source card left, "How this works" (`.how`: short paragraphs, the last muted) right.
+  - **Compact game card** (`SourceCard compact`, `.hero.compact-src`; smaller than the other tabs' by user
+    decision, so the explorer gets the room): padding 14px 16px, the hero glow, a 56px cover (radius 10px),
+    a 16px title, the title ID and version tiles (6px gap) (two per row at every width) and the findings; under it, folds (`.game-folds`)
+    Game facts, param.json and Details, long contents in a scrolling `.fold-box`; then leftovers. An
+    interrupted edit (`<image>.forge-undo` beside it) adds a `.note-line.warn` (`.interrupted-note`).
+  - **Explorer** (`.explorer` card), top to bottom: "Game files" with the file count as a `.tag` (an
+    archive adds a note-line that it can be browsed, not edited); the pending bar (below); Up and the
+    crumbs (`.explorer-nav`, "Game" / …, the current folder `aria-current`); the toolbar
+    (`.explorer-tools`, `.small`: Add files, Add folder, then **Extract folder**, the folder shown or at
+    the root the whole game; no New folder button, by user decision; an archive gets Extract folder only;
+    with changes pending a muted `.extract-note` says Extract copies the files as they are now); the filter and a live count ("N folders, M files", "N matches", "first 2000 of N"). The well (`.explorer-well`: `--inset`,
+    scrolls inside; from 880px the card is sticky and window-high, narrower the well stops at 60vh) is a
+    `role="grid"` of rows (`.xrow`: icon, mono name that wraps anywhere, tabular muted size, actions): folders
+    first with the `--accent-ink` icon, then files; a sticky header row. Rows take a roving `tabIndex`; the
+    focused row tints, `:focus-visible` adds the ring. Row actions (`button.xbtn`: Rename (pencil), Extract
+    (download; rows on disk only), Delete in danger hover, and a folder's open chevron) are quiet icon
+    buttons with no fill until hover, in a fixed column (`.xgrid.editable` 126px; `.xgrid.extractable`, an
+    archive: Extract and open, 62px) so sizes line up. Rename edits inline (`.xinput`, mono pill; the reason under it
+    as a `.field-error`). Where dragged files would land rings in `--focus`: the folder row (`.xrow.drop`,
+    blue tint) or the whole well (`.explorer-well.drop`), and the count line says "Drop to add to …".
+  - **Badges** (`.tag.xmark`, 20px so a row keeps its height): **New** green, **Replaced** orange,
+    **Renamed** blue with "Was <path>" as its tooltip. A size read only on Apply shows "—" with a tooltip.
+  - **Pending bar** (`.pending-bar`, under the explorer's head while changes are pending): a blue-tinted inset (state, not an error) with
+    "N changes not applied yet", **Undo**, **Discard all** (`.danger`) and **Apply** (`.small.primary`) in
+    its head; a warn line when some changes won't apply; a "Changes, in order" fold (`ol.changes`, each
+    change, its source path, its findings).
+  - **Mode box** (`.edit-mode`, in the bar): one tag and a line: `.tag.blue` **Changed directly** (a
+    folder), `.tag.green` **In place** ("needs N of its M free"), `.tag.red` **Rebuild needed** with the
+    reason, or `.tag.red` **Can't apply** with core's findings (`.edit-why`, a scrolling `.backend` list).
+    When both ways work, a `.seg.formats.inner` radiogroup (`.mode-hue`, by user decision): **In place** in
+    the Done green (`.mode-green`), **Rebuild** in the Failed red (`.mode-red`); an unchosen option's text
+    keeps its hue, the chosen one takes the tint and ring; one muted line on what the choice does. A muted "Checking" while an answer is due; a failed check a
+    `.note-line.block` and **Check again**. While locked it says the changes are being applied.
+  - **Uploads** (web build, `.upload-line`): a full-width `<progress>`, "Uploading file i of n: sent of
+    total" and **Cancel**. Apply's error sits in the bar as an `.error-box`.
+  - **Dialogs** (`role="alertdialog"`, warn icon, Cancel or No focused): the conflict question ("N items
+    already exist here", the folder, the names in a scrolling `.conflict-names` box, the replace warning;
+    Cancel, Skip, Replace `.danger`), Discard all (above one change; No, Discard all), and Apply's
+    confirm (In place: written straight into the path, no undo; Rebuild: a new image beside, put in its
+    place; close the game first; Cancel and a primary Apply).
 - **Lead word** (`Lead` in `target.tsx`): a note starting with "Recommended" shows that word in
   `--good` (`.lead-good`), one starting with "Experimental" in `--warn` (`.lead-warn`). Text colour only
   (≥ 9:1 on `--card` and `--inset`); the word itself carries the meaning.
@@ -180,7 +224,7 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
     accepted kinds and an archive source's head, never a target picker.
 - **Stat tiles** (`.tiles`, `.tile`, `.value`, `.note`): two per row, four from 680 to 879px;
   an archive source adds an "in a .7z archive · <size>" `.tag` to the Size tile everywhere and, in
-  Inspect, a `.tile.wide` **Archive** tile: the part count as the value, then "game in <folder>" (or
+  Edit's Game facts, a `.tile.wide` **Archive** tile: the part count as the value, then "game in <folder>" (or
   "at the archive's root") · solid · password-protected as its note, and the part names as a `.path`
   note when there are several.
   `.tile.wide` spans the row (the `LZ4 (AMPR)` tile: Packed, Damaged packs, Traced or Plain; its note
@@ -199,7 +243,7 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
   expect.
 - **Folds** (`details.fold`): DLC, backport files, emulators in fakelib, job logs, verified checks,
   folders checked. Collapsed by default; a list inside that can grow is a scrollable, focusable box.
-- **Job list** (`JobList.tsx`, `.card.jobs`): one card under the other cards on Convert and LZ4, newest
+- **Job list** (`JobList.tsx`, `.card.jobs`): one card under the other cards on Convert, Edit and LZ4, newest
   first; it fills the rest of the window when short and grows with its rows (the page scrolls, never
   a box inside it). A row (`.job`): format tag, name,
   `from` path, progress bar (`progress` in a `.bar` wrapper, blue gradient; it never goes back and stays
@@ -213,11 +257,13 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
   readers hear "done" / "not started yet" (visually hidden). No row until the stages are known, none once
   the job has ended; no motion of its own. An LZ4 tab job (`.job.lz4`) has a
   yellow left edge and a `.tag.lz4` (LZ4 pack, unpack, trace, unpatch); an unpatch conversion sent to the
-  server's API (not the LZ4 tab's in-place one) a plain `.tag` "AMPR runtime". Finished: Show in Finder (Explorer on Windows, folder on Linux), the error box,
+  server's API (not the LZ4 tab's in-place one) a plain `.tag` "AMPR runtime"; an edit job a plain `.tag` **Edit** or **Edit · rebuild**, its error box led
+  by "Can't apply the changes:"; an extract job a plain `.tag` **Extract** ("Can't extract:"). Finished: Show in Finder (Explorer on Windows, folder on Linux), the error box,
   or "Fast (Full) verification passed: N checks".
 - **Rating chip** (`.chip.good` / `.ok` / `.bad`): the About tab's formats table (Console speed and
   Size on disk). Tint, icon and text together, every text ≥ 8.9:1. About holds an introduction card
-  (one line, then the features as a bold name plus a few words), in the web build beside a 300px
+  (one line, then the features as a bold name plus a few words: ten rows, Convert … In place or rebuilt, as
+  many as fill the QR card's height at 1200px with the content flush), in the web build beside a 300px
   **How to connect on any device** card (`.about-row`, `.about-connect`: a 200px QR code over the
   address; stacked under 880px), then the table and a `.credits` block (plain selectable text, no
   links).
@@ -242,7 +288,7 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
     primary **Unlock** ("Checking…" while it runs). Cancel leaves the source locked: the Source card
     shows the red reason and a `.small` **Enter password** (lock icon) in `.row.locked`. The password
     stays in memory with that source (inspect, naming and its jobs), never stored or shown.
-  - **Delete** (`confirmDelete` in `delete.tsx`, `role="alertdialog"`, shared by Inspect and the
+  - **Delete** (`confirmDelete` in `delete.tsx`, `role="alertdialog"`, shared by Edit and the
     Library): the warn icon, "Delete this folder?" / "Delete this image?", the whole path in an
     `.out-box`, a muted line (for good, no Trash or undo), and two buttons: **No** (focused first) and
     **Yes, delete** (`.danger`). Afterwards a muted "Deleted <path>".
@@ -268,8 +314,8 @@ tiles and tags. Two columns from 880px; Inspect splits 5:7 from 1100px.
     tint with a backdrop `blur(14px) saturate(160%) brightness(0.55)` (`-webkit-` prefixed for the PS5
     browser), so it stays readable on any cover; in a row it follows the title ID (20px, ≥ 7:1 on
     `--card`). It reads "LZ4 packed" to a screen reader; the format pill stays the entry's own.
-  - **Actions**: icon-only buttons with `aria-label` and `title` ("Inspect <name>", "Convert <name>",
-    "Delete <name>", the last `.danger`). Inspect and Convert switch to that tab with the game loaded;
+  - **Actions**: icon-only buttons with `aria-label` and `title` ("Edit <name>" with the pencil icon,
+    "Convert <name>", "Delete <name>", the last `.danger`). Edit and Convert switch to that tab with the game loaded;
     Delete opens the shared Delete dialog, then focus moves to the next entry (or Refresh); a failure
     shows an orange "Can’t delete:" tag + the reason.
   - **States**: scanning, a centred spinner and "Scanning <folder name>…" in the well (`role="status"`,
@@ -305,7 +351,9 @@ The web build names the product "Dump Forge" (the PS5 tile's name); the desktop 
   clipped, and scroll inside the crumbs once they would push the buttons off screen), then an
   inset list (`ul.rows.pick-list`, scrolls inside, max 420px): Parent folder (or All
   drives), folders, files with their size (tabular, muted). File mode lists only the accepted
-  extensions; zip-or-folder mode (LZ4 Pack Traces) lists folders and `.zip` files. Footer: Cancel and,
+  extensions (Edit's Add file pickers: every file; Add files toggles a selection within the folder
+  shown: the row tinted and ringed, its icon a check, `aria-pressed`, then a primary "Choose N files");
+  zip-or-folder mode (LZ4 Pack Traces) lists folders and `.zip` files. Footer: Cancel and,
   in folder modes, "Choose this folder" (`.primary`). The next browse opens where the last one ended.
 - **Show path** (instead of Show in Finder on a finished job): the output path in an `.out-box`
   (`.path-shown`), focused and selected, to copy by hand (plain HTTP has no clipboard API).
@@ -327,7 +375,7 @@ spots). Add a path there rather than importing an icon set.
 ## Motion
 
 Only short fades and transforms: the hero glow (0.5s), the switch and fold chevrons (0.15s), the
-spinners, the dots after a waiting text (`Dots`, `.dots`: ".", "..", "..." in turn over 1.2s; Inspect's
+spinners, the dots after a waiting text (`Dots`, `.dots`: ".", "..", "..." in turn over 1.2s; Edit's
 "Reading the source", the Library's "Scanning", the picker's "Loading"), and a job bar's sheen (`.bar
 .sheen`: the whole time a job runs, since many stages move the bar little or in steps and a
 stall-only sheen flickered, a soft

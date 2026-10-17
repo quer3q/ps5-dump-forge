@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use ps5_dump_forge_core::{ConvertRequest, Event, JobId};
+use ps5_dump_forge_core::{ConvertRequest, Edit, Event, JobId};
 use serde_json::{Value, json};
 
 const FINISHED: usize = 32;
@@ -66,17 +66,29 @@ impl Table {
     }
 
     /// The unfinished jobs' ids and outputs (an in-place job's is its source, whose `.part`
-    /// it writes beside it).
+    /// it writes beside it; so is an edit job's, whose `output` is ignored).
     pub fn unfinished(&self) -> Vec<(JobId, PathBuf)> {
-        self.jobs
-            .iter()
-            .filter(|(_, e)| e.done.is_none())
-            .filter_map(|(id, e)| {
-                let r = e.request.as_ref()?;
-                let out = if r.lz4_in_place { &r.source } else { &r.output };
-                Some((*id, out.clone()))
+        self.requests()
+            .map(|(id, r)| {
+                let in_place = r.lz4_in_place || !r.edits.is_empty();
+                (id, if in_place { &r.source } else { &r.output }.clone())
             })
             .collect()
+    }
+
+    /// What the unfinished edit jobs add (`Edit::Add.from`): staged uploads among them.
+    pub fn adds(&self) -> Vec<PathBuf> {
+        (self.requests().flat_map(|(_, r)| &r.edits))
+            .filter_map(|e| match e {
+                Edit::Add { from, .. } => Some(from.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn requests(&self) -> impl Iterator<Item = (JobId, &ConvertRequest)> {
+        (self.jobs.iter().filter(|(_, e)| e.done.is_none()))
+            .filter_map(|(id, e)| Some((*id, e.request.as_ref()?)))
     }
 
     #[cfg(test)]
@@ -141,6 +153,9 @@ mod tests {
             lz4_traces: None,
             lz4_trace_space_mib: 256,
             lz4_in_place: false,
+            edits: Vec::new(),
+            extract: Vec::new(),
+            edit_rebuild: false,
             archive_password: None,
         }
     }
@@ -181,10 +196,30 @@ mod tests {
             },
         );
         assert_eq!(t.unfinished()[1], (2, PathBuf::from("/i/game.ffpkg")));
-        t.record(&Event::Done {
-            job: 2,
-            result: Err("cancelled".into()),
-        });
+        // An edit job's `output` is ignored: it edits the source (or rebuilds beside it).
+        t.admit(
+            3,
+            ConvertRequest {
+                source: "/i/edit.exfat".into(),
+                edits: vec![
+                    Edit::Delete { path: "a".into() },
+                    Edit::Add {
+                        from: "/s/x.bin".into(),
+                        to: "x.bin".into(),
+                    },
+                ],
+                ..request("/o/ignored")
+            },
+        );
+        assert_eq!(t.unfinished()[2], (3, PathBuf::from("/i/edit.exfat")));
+        assert_eq!(t.adds(), [PathBuf::from("/s/x.bin")]);
+        for job in [2, 3] {
+            t.record(&Event::Done {
+                job,
+                result: Err("cancelled".into()),
+            });
+        }
+        assert!(t.adds().is_empty());
         for job in 1..=40 {
             t.admit(job, request("/o/x"));
             t.record(&Event::Done {
@@ -201,6 +236,7 @@ mod tests {
         t.admit(
             41,
             ConvertRequest {
+                edits: Vec::new(),
                 archive_password: Some(ps5_dump_forge_core::ArchivePassword::new("Secret1")),
                 ..request("/o/y")
             },

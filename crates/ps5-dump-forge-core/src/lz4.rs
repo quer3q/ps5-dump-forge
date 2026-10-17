@@ -492,6 +492,22 @@ fn keep_log(rt: &Runtime, ctx: &Ctx) {
     }
 }
 
+/// What a `.pkg` of an AMPR title leaves out of `all`, since the builder writes the index from
+/// exactly what it packages: the journal and logs (their file ids follow the old index's
+/// order), and when `ampr` (`eboot.bin` imports libSceAmpr) the old index too. The paths left
+/// out come back, the index not among them.
+pub(crate) fn leave_out_for_pkg(all: &mut Vec<SourceFile>, ampr: bool) -> Vec<String> {
+    let mut gone = Vec::new();
+    all.retain(|f| {
+        let trace = f.path == JOURNAL || LOGS.contains(&f.path.as_str());
+        if trace {
+            gone.push(f.path.clone());
+        }
+        !(trace || (ampr && f.path == INDEX))
+    });
+    gone
+}
+
 /// A conversion without LZ4 options (by user decision). An AMPR title (`eboot.bin` imports
 /// libSceAmpr) gets the release runtime per [`Runtime::action`] (installed where there is none,
 /// replacing an older or unknown one, another as new as ours kept) and keeps its
@@ -551,13 +567,9 @@ fn plain(
         // Built only after the builder leaves out SDK leftovers, from exactly what it packages
         // (an AMPR title's always; another's only when it has one, so that one stays).
         let before = all.len();
-        all.retain(|f| {
-            let out = traces(f) || (ampr && f.path == INDEX);
-            if out && f.path != INDEX {
-                ctx.log(format!("LZ4: leaving out {}", f.path));
-            }
-            !out
-        });
+        for path in leave_out_for_pkg(&mut all, ampr) {
+            ctx.log(format!("LZ4: leaving out {path}"));
+        }
         if all.len() == before && !release {
             return untouched(tree);
         }
@@ -613,7 +625,7 @@ pub(crate) fn plain_listing(listing: &[SourceFile], action: RuntimeAction) -> Ve
 /// `inner` as `files`, the `generated` ones served from memory; its empty folders that now
 /// hold a file are left out. `files` keeps the source's order (no sort): a solid archive is read
 /// front to back, and an entry it already went past starts its decode again.
-fn overlay(
+pub(crate) fn overlay(
     inner: Box<dyn SourceTree>,
     files: Vec<SourceFile>,
     generated: HashMap<String, Cow<'static, [u8]>>,

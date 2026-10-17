@@ -24,7 +24,7 @@ const gb = (bytes: number) => {
 
 export function Library(props: {
   visible: boolean;
-  onInspect: (entry: LibraryEntry) => void;
+  onEdit: (entry: LibraryEntry) => void;
   onConvert: (entry: LibraryEntry) => void;
 }) {
   const t = useMessages().library;
@@ -176,7 +176,7 @@ export function Library(props: {
     if (result && !busy && props.visible) void pump();
   }, [result, busy, props.visible]);
 
-  // Deleted anywhere (here or Inspect): drop what is gone.
+  // Deleted anywhere (here or Edit): drop what is gone.
   useEffect(
     () =>
       onDeleted((path) => {
@@ -292,7 +292,7 @@ export function Library(props: {
       {entries.length > 0 && (
         <ul className={view === "cards" ? "library-cards" : "library-rows"}>
           {entries.map((e) => (
-            <Item key={e.path} entry={e} cover={covers.current.get(e.path)} list={view === "list"} onInspect={props.onInspect} onConvert={props.onConvert} remove={remove} />
+            <Item key={e.path} entry={e} cover={covers.current.get(e.path)} list={view === "list"} onEdit={props.onEdit} onConvert={props.onConvert} remove={remove} />
           ))}
         </ul>
       )}
@@ -365,11 +365,12 @@ function Item(props: {
   entry: LibraryEntry;
   cover: string | undefined;
   list: boolean;
-  onInspect: (e: LibraryEntry) => void;
+  onEdit: (e: LibraryEntry) => void;
   onConvert: (e: LibraryEntry) => void;
   remove: (e: LibraryEntry) => void;
 }) {
   const t = useMessages().library;
+  const c = useMessages().common;
   const { entry: e } = props;
   const n = name(e);
   const cover = props.cover ? (
@@ -381,8 +382,8 @@ function Item(props: {
   );
   const actions = (
     <span className="library-actions">
-      <button type="button" className="small icon-only" aria-label={t.inspect(n)} title={t.inspect(n)} onClick={() => props.onInspect(e)}>
-        <Icon name="search" />
+      <button type="button" className="small icon-only" aria-label={t.edit(n)} title={t.edit(n)} onClick={() => props.onEdit(e)}>
+        <Icon name="pencil" />
       </button>
       <button type="button" className="small icon-only" aria-label={t.convert(n)} title={t.convert(n)} onClick={() => props.onConvert(e)}>
         <Icon name="convert" />
@@ -393,6 +394,7 @@ function Item(props: {
     </span>
   );
   const packed = e.lz4_packed === true;
+  const ac = e.additional_content === true && <span className="tag violet">{c.additionalContent}</span>;
   const box = (
     <div className="library-cover-box">
       {cover}
@@ -411,6 +413,7 @@ function Item(props: {
         </div>
       </div>
       <FormatPill kind={e.kind} />
+      {ac}
       <div className="library-path">
         <PathLine path={e.path} />
       </div>
@@ -429,7 +432,10 @@ function Item(props: {
         <PathLine path={e.path} />
       </div>
       <div className="library-foot">
-        <FormatPill kind={e.kind} />
+        <span className="library-tags">
+          <FormatPill kind={e.kind} />
+          {ac}
+        </span>
         {actions}
       </div>
     </li>

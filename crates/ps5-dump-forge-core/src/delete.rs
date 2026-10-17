@@ -121,6 +121,17 @@ pub(crate) fn delete<'a>(
         }
     } else {
         std::fs::remove_file(&real).map_err(|e| failed("deleting", e))?;
+        // An interrupted edit's undo journal goes with its image: left behind, it would be
+        // replayed into a later image of the same name.
+        let journal = ps5_dump_forge_patch::journal_path(&real);
+        if std::fs::symlink_metadata(&journal).is_ok_and(|m| !m.is_dir()) {
+            std::fs::remove_file(&journal).map_err(|e| {
+                DeleteError::Failed(format!(
+                    "deleted {shown}, but not its undo journal {}: {e}",
+                    journal.display()
+                ))
+            })?;
+        }
     }
     if let Some(parent) = real.parent() {
         fsync_dir(parent).map_err(|e| {
@@ -131,6 +142,19 @@ pub(crate) fn delete<'a>(
         })?;
     }
     Ok(())
+}
+
+/// Whether `path` is at, in or above one of `guarded`, compared as [`delete`] compares them
+/// (by identity, links on the typed path included). A path that doesn't exist matches only
+/// a guarded path spelled the same.
+pub(crate) fn in_use<'a>(path: &Path, guarded: impl IntoIterator<Item = &'a PathBuf>) -> bool {
+    let path = &path.components().collect::<PathBuf>();
+    let mut guarded = guarded.into_iter();
+    let Ok((id, _)) = path_id(path) else {
+        return guarded.any(|g| g.components().eq(path.components()));
+    };
+    let chain = (path.canonicalize().and_then(|real| ids_up(&real))).unwrap_or_default();
+    guarded.any(|used| followed_id(used).is_ok_and(|g| chain.contains(&g)) || holds(id, used))
 }
 
 /// The identities of `real` (canonical) and every folder above it.

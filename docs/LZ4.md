@@ -113,7 +113,7 @@ an `ampr_emu.index` that lists exactly the restored files, so the folder keeps w
 ## Every conversion of an AMPR game
 
 Any conversion of an AMPR title (Convert, the CLI, the console web UI and the LZ4 tab's jobs; every target)
-fixes two things in the output by itself, with nothing to choose; Inspect, Convert and the **LZ4** tab say
+fixes two things in the output by itself, with nothing to choose; Edit, Convert and the **LZ4** tab say
 which. The source is left as it is.
 
 - **The runtime** (`fakelib/libSceAmpr.sprx`). Installed: a game without its own ampr_emu gets the bundled
@@ -144,7 +144,7 @@ which. The source is left as it is.
 - **Only AMPR titles.** A game whose `eboot.bin` does not import `libSceAmpr` is refused (the **LZ4**
   tab says "This game doesn't use AMPR, so LZ4 can't be used here"; Convert shows no AMPR notes for it).
   A game without its own ampr_emu is fine: Pack, Unpack, Patch and Unpatch install the bundled one.
-- **Patch and Unpatch are the only LZ4 operations that change your source** (Delete, in Inspect or the
+- **Patch and Unpatch are the only LZ4 operations that change your source** (Delete, in Edit or the
   Library, removes it). Keep the original dump to pack from. Only a folder, `.exfat` or `.ffpkg` can be
   patched (`.ffpfs`, `.ffpfsc` and `.pkg` are read-only on the console), and a packed source must be
   unpacked first.

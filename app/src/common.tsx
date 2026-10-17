@@ -364,13 +364,13 @@ export function Modal(props: {
 
 const deletedSubs = new Set<(path: string) => void>();
 
-/** Calls `f` with every path Inspect or the Library deletes; returns the unsubscribe. */
+/** Calls `f` with every path Edit or the Library deletes; returns the unsubscribe. */
 export function onDeleted(f: (path: string) => void): () => void {
   deletedSubs.add(f);
   return () => void deletedSubs.delete(f);
 }
 
-/** A game Library handed to Inspect or Convert; a new `id` is a new request, even for the same
+/** A game Library handed to Edit or Convert; a new `id` is a new request, even for the same
  * path (the screen reads it again). */
 export interface SourceSelection {
   id: number;
@@ -409,17 +409,17 @@ export async function pickSource(
 }
 
 /** "Folder" / "Image/Archive": a game folder, or an image or archive file. */
-function PickButtons(props: { onPick: (path: string, isImage: boolean) => void; big?: boolean }) {
+function PickButtons(props: { onPick: (path: string, isImage: boolean) => void; big?: boolean; disabled?: boolean }) {
   const t = useMessages().common;
   const pickFolder = () => pickSource("folder", props.onPick);
   const pickImage = () => pickSource("image", props.onPick);
   return (
     <>
-      <button className={props.big ? "primary" : "small"} onClick={pickFolder}>
+      <button className={props.big ? "primary" : "small"} onClick={pickFolder} disabled={props.disabled}>
         <Icon name="folder" />
         {t.pickFolderButton}
       </button>
-      <button className={props.big ? undefined : "small"} onClick={pickImage}>
+      <button className={props.big ? undefined : "small"} onClick={pickImage} disabled={props.disabled}>
         <Icon name="archive" />
         {t.pickImageButton}
       </button>
@@ -434,7 +434,9 @@ export function isPasswordRequired(error: string | null): boolean {
 
 /**
  * The Source card: an empty state with the pickers until a source is chosen, then the game
- * it holds (or why it can't be read). `full` adds what only Inspect shows.
+ * it holds (or why it can't be read). `full` adds what only Edit shows; `compact` (Edit) keeps the
+ * card to the cover, title, kind, title ID, version and findings, with `children` (Edit's folds)
+ * at its foot.
  */
 export function SourceCard(props: {
   path: string | null;
@@ -443,14 +445,20 @@ export function SourceCard(props: {
   error: string | null;
   ins: Inspection | null;
   full?: boolean;
+  /** Edit's small card: the facts beyond title ID and version go into `children`'s folds. */
+  compact?: boolean;
+  /** At the card's foot once a source is chosen (Edit's folds). */
+  children?: ReactNode;
   /** Keeps element ids apart per screen; default "i" with `full`, else "c". */
   prefix?: string;
   /** Stands in for the default empty state (the LZ4 tab's). */
   empty?: ReactNode;
-  /** More buttons in the title row once a source is chosen (Inspect's Delete). */
+  /** More buttons in the title row once a source is chosen (Edit's Delete). */
   actions?: ReactNode;
   /** An archive that needs a password was left locked (Cancel): ask again. */
   onUnlock?: () => void;
+  /** The source can't change now (Edit, while changes are applied): the pick buttons are off. */
+  locked?: boolean;
 }) {
   const t = useMessages().common;
   const { path, ins } = props;
@@ -470,12 +478,12 @@ export function SourceCard(props: {
 
   return (
     <section
-      className={`card hero${props.full ? " full" : ""}${glow.ready ? " lit" : ""}`}
+      className={`card hero${props.full ? " full" : ""}${props.compact ? " compact-src" : ""}${glow.ready ? " lit" : ""}`}
       style={glow.style}
       aria-labelledby={headId}
     >
       <CardHead icon="disc" title={t.source} id={headId} focusable>
-        {path && <PickButtons onPick={props.onPick} />}
+        {path && <PickButtons onPick={props.onPick} disabled={props.locked} />}
         {/* Last, like the Library's: a destructive button away from the pickers. */}
         {path && props.actions}
       </CardHead>
@@ -513,7 +521,8 @@ export function SourceCard(props: {
           ) : (
             props.error && <p className="bad backend">{props.error}</p>
           )}
-          {ins && <InspectSummary ins={ins} full={props.full} />}
+          {ins && (props.compact ? <CompactSummary ins={ins} /> : <InspectSummary ins={ins} full={props.full} />)}
+          {props.children}
         </>
       )}
     </section>
@@ -556,6 +565,7 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
           {ins && ins.backport.length > 0 && <span className="tag orange">{t.backport}</span>}
           {ins && ins.emulators.length > 0 && <span className="tag">{t.emulators}</span>}
           {ins && ins.dlcs.length > 0 && <span className="tag violet">DLC</span>}
+          {ins?.additional_content && <span className="tag violet">{t.additionalContent}</span>}
         </div>
         <PathLine path={props.path} />
       </div>
@@ -564,7 +574,7 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
 }
 
 /** The game's facts as inset tiles. */
-function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
+function Facts({ ins, full, rest }: { ins: Inspection; full: boolean; rest?: boolean }) {
   const t = useMessages().common;
   const bp = ins.backport.length > 0;
   const emus = emulatorNames(ins);
@@ -580,14 +590,7 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
   if (full && ins.sdk) fwNote.push(t.sdk(ins.sdk));
   return (
     <dl className="tiles">
-      <div className="tile">
-        <dt>{t.titleId}</dt>
-        <dd className={ins.title_id ? "value mono" : "value"}>{ins.title_id ?? "—"}</dd>
-      </div>
-      <div className="tile">
-        <dt>{t.version}</dt>
-        <dd className="value">{ins.version ?? "—"}</dd>
-      </div>
+      {!rest && <IdTiles ins={ins} />}
       <div className="tile">
         <dt>{t.firmware}</dt>
         <dd>
@@ -628,7 +631,7 @@ function Facts({ ins, full }: { ins: Inspection; full: boolean }) {
   );
 }
 
-/** An archive source, in Inspect: its parts and how it is packed, and where the game sits. */
+/** An archive source, in Edit: its parts and how it is packed, and where the game sits. */
 function ArchiveTile({ facts }: { facts: NonNullable<Inspection["archive"]> }) {
   const t = useMessages().common;
   const notes = [facts.root ? t.archiveRoot(facts.root) : t.archiveAtRoot];
@@ -806,13 +809,43 @@ function dlcNote(d: Inspection["dlcs"][number]): string {
   return t.dlcMerged;
 }
 
+/** The title ID and version tiles. */
+function IdTiles({ ins }: { ins: Inspection }) {
+  const t = useMessages().common;
+  return (
+    <>
+      <div className="tile">
+        <dt>{t.titleId}</dt>
+        <dd className={ins.title_id ? "value mono" : "value"}>{ins.title_id ?? "—"}</dd>
+      </div>
+      <div className="tile">
+        <dt>{t.version}</dt>
+        <dd className="value">{ins.version ?? "—"}</dd>
+      </div>
+    </>
+  );
+}
+
+/** Edit's compact card: title ID and version, then the findings. */
+function CompactSummary({ ins }: { ins: Inspection }) {
+  return (
+    <div className="summary">
+      <dl className="tiles">
+        <IdTiles ins={ins} />
+      </dl>
+      <Findings lines={ins.findings} />
+    </div>
+  );
+}
+
 /** The game's facts, its embedded DLC (and backport and emulator files, `full`), then the
- * findings. */
-export function InspectSummary({ ins, full = false }: { ins: Inspection; full?: boolean }) {
+ * findings. `rest`: Edit's facts fold, without what its compact card already shows (title ID,
+ * version, findings). */
+export function InspectSummary({ ins, full = false, rest = false }: { ins: Inspection; full?: boolean; rest?: boolean }) {
   const t = useMessages().common;
   return (
     <div className="summary">
-      <Facts ins={ins} full={full} />
+      <Facts ins={ins} full={full} rest={rest} />
       {(ins.dlcs.length > 0 ||
         (full && (ins.backport.length > 0 || ins.emulators.length > 0))) && (
         <div className="folds">
@@ -848,7 +881,7 @@ export function InspectSummary({ ins, full = false }: { ins: Inspection; full?: 
           )}
         </div>
       )}
-      <Findings lines={ins.findings} />
+      {!rest && <Findings lines={ins.findings} />}
     </div>
   );
 }

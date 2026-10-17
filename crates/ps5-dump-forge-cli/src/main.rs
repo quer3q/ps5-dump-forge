@@ -351,6 +351,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     lz4_trace_space_mib: lz4_space
                         .unwrap_or(ps5_dump_forge_core::DEFAULT_LZ4_TRACE_SPACE_MIB),
                     lz4_in_place,
+                    edits: Vec::new(),
+                    extract: Vec::new(),
+                    edit_rebuild: false,
                     archive_password: None,
                 },
                 password_stdin,

@@ -5,6 +5,7 @@ members = [
   "crates/ps5-dump-forge-exfat",
   "crates/ps5-dump-forge-ufs2",
   "crates/ps5-dump-forge-pfs",
+  "crates/ps5-dump-forge-patch",
   "crates/ps5-dump-forge-core",
   "crates/ps5-dump-forge-archive",
   "crates/ps5-dump-forge-cli",
@@ -38,6 +39,7 @@ ps5upload-pkg = { path = "vendor/ps5upload-pkg" }
 ps5-dump-forge-exfat = { path = "crates/ps5-dump-forge-exfat" }
 ps5-dump-forge-ufs2 = { path = "crates/ps5-dump-forge-ufs2" }
 ps5-dump-forge-pfs = { path = "crates/ps5-dump-forge-pfs" }
+ps5-dump-forge-patch = { path = "crates/ps5-dump-forge-patch" }
 ps5-dump-forge-core = { path = "crates/ps5-dump-forge-core" }
 ps5-dump-forge-ps5 = { path = "crates/ps5-dump-forge-ps5" }
 ps5-dump-forge-archive = { path = "crates/ps5-dump-forge-archive" }

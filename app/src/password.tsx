@@ -1,5 +1,5 @@
 // Reading a source, and the one password question for an archive that needs one (built like
-// the delete question). Inspect, Convert and LZ4 read their source through `inspectSource`; the
+// the delete question). Edit, Convert and LZ4 read their source through `inspectSource`; the
 // password it returns stays with that source in memory (never stored) and goes with its jobs.
 
 import { useRef, useState } from "react";

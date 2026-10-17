@@ -55,7 +55,11 @@ pub(crate) fn source_findings(
 
     // ponytail: the category is read from applicationCategoryType alone; a patch that keeps
     // its game's category passes. Tell patches apart once a dumped patch's param.json is in hand.
-    if let Some(json) = &info.param_json {
+    // Additional content (no eboot.bin) is packaged whatever its category (by user decision);
+    // the no-eboot note below says so.
+    if let Some(json) = &info.param_json
+        && !info.additional_content
+    {
         match json.get("applicationCategoryType").map(|v| v.as_u64()) {
             None | Some(Some(GAME)) => notes.push("category: base game".to_string()),
             Some(Some(APP)) => notes.push("category: app".to_string()),
@@ -75,11 +79,8 @@ pub(crate) fn source_findings(
         }
     }
     if !files.iter().any(|p| p == "eboot.bin") {
-        findings.push(
-            "no eboot.bin: additional content (DLC) and patches cannot be packaged yet, \
-             only base games and apps"
-                .to_string(),
-        );
+        // By user decision: packaged as additional content (the builder's content class).
+        notes.push("no eboot.bin: packaged as additional content (DLC) or an update".into());
     }
     if let (Some(title), Some(cid)) = (&info.title_id, &info.content_id)
         && let Some(from_cid) = preflight::title_from_content_id(cid)
@@ -270,6 +271,60 @@ fn synced_build<T>(built: ps5upload_fpkg::Result<T>, synced: io::Result<()>) -> 
     })
 }
 
+/// The builder's request for `req`: a production package, its threads and Kraken level.
+fn build_request(req: &ConvertRequest, dir: &Path, imports_ampr: bool) -> BuildRequest {
+    // `source`/`output_dir` are not read by `prepare`/`write_package`; the `.part` is ours.
+    let mut request = BuildRequest::production(&req.source, dir);
+    request.threads = req.compression_threads;
+    request.imports_ampr = Some(imports_ampr);
+    request.level = match req.kraken_level {
+        KrakenLevel::Fast => Level::Fast,
+        KrakenLevel::Balanced => Level::Balanced,
+        KrakenLevel::Smallest => Level::Smallest,
+        KrakenLevel::Stored => Level::Stored,
+    };
+    request
+}
+
+/// Free bytes a package of about `size` bytes needs at its destination: the size, 1% more and
+/// 64 MiB for what the destination's own file system spends on the new file.
+pub(crate) fn room(size: u64) -> u64 {
+    size.saturating_add(size / 100).saturating_add(64 * MIB)
+}
+
+/// The package `tree` would build into, sized as [`run`]'s preflight sizes it (its findings,
+/// then the builder's `prepare`, reading per-file headers only), for an edit's check: the
+/// package's estimated size, or every finding.
+pub(crate) fn size(
+    req: &ConvertRequest,
+    tree: &mut dyn SourceTree,
+    info: &GameInfo,
+    dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<u64, Vec<String>> {
+    let (findings, _, imports_ampr) = source_findings(tree, info);
+    if !findings.is_empty() {
+        return Err(findings);
+    }
+    let mut control = BuildControl {
+        cancel: Some(cancel),
+        ..BuildControl::default()
+    };
+    let request = build_request(req, dir, imports_ampr);
+    match build::prepare(tree, &request, &mut control) {
+        Ok(prepared) => Ok(prepared.estimated_size()),
+        Err(e) => Err(vec![
+            format!("{:#}", prepare_error(e))
+                .trim_start_matches("preflight failed:\n  ")
+                .to_string(),
+        ]),
+    }
+}
+
+/// Builds the package of `tree` into `out`'s `.part`, verifies it and publishes it, or, when
+/// `in_place` (an edit's rebuild: `out` is the source), renames it over the source once the
+/// source's `stamp` still holds and ShadowMount+ hasn't mounted it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     req: &ConvertRequest,
     ctx: &Ctx,
@@ -278,6 +333,7 @@ pub(crate) fn run(
     mut findings: Vec<String>,
     out: &Path,
     stamp: &SourceStamp,
+    in_place: bool,
 ) -> anyhow::Result<JobReport> {
     ctx.log(CONSOLE);
     let (more, notes, imports_ampr) = source_findings(tree.as_mut(), info);
@@ -292,16 +348,7 @@ pub(crate) fn run(
     ctx.progress("preflight", 1, 1);
 
     let dir = out.parent().expect("output_path gives a parent");
-    // `source`/`output_dir` are not read by `prepare`/`write_package`; the `.part` is ours.
-    let mut request = BuildRequest::production(&req.source, dir);
-    request.threads = req.compression_threads;
-    request.imports_ampr = Some(imports_ampr);
-    request.level = match req.kraken_level {
-        KrakenLevel::Fast => Level::Fast,
-        KrakenLevel::Balanced => Level::Balanced,
-        KrakenLevel::Smallest => Level::Smallest,
-        KrakenLevel::Stored => Level::Stored,
-    };
+    let request = build_request(req, dir, imports_ampr);
     let stage = Cell::new(Stage::Check.id());
     let sized = Cell::new(false);
     let mut on_stage = |s: Stage| {
@@ -383,7 +430,7 @@ pub(crate) fn run(
     // read no spool dir), so the package is the only thing written.
     let size = prepared.estimated_size();
     estimate.set(size);
-    let need = size.saturating_add(size / 100).saturating_add(64 * MIB);
+    let need = room(size);
     // U7: so a probe that fails because the drive went away says so.
     #[cfg(target_os = "freebsd")]
     ctx.watch(dir);
@@ -485,6 +532,10 @@ pub(crate) fn run(
         .collect();
     let expected = verify::expected_from(&mut packaged, &known, ctx, mode)?;
     checks.push(source_summary(&prepared));
+    // The source is read no more: its handles close before the package may replace it
+    // (Windows refuses to rename over an open file).
+    drop(packaged);
+    drop(ahead);
     ctx.check()?;
 
     // Through the handle the package was written with, whatever its name now names.
@@ -508,9 +559,22 @@ pub(crate) fn run(
     ctx.progress("finalize", 0, 1);
     ctx.check()?;
     stamp.check()?;
-    part.publish(out)?;
+    if in_place {
+        if let Some(why) = crate::edit_job::smp_finding(out) {
+            bail!("{why}; the source was not replaced");
+        }
+        if let Some(backup) = part.replace(out)? {
+            ctx.log(format!(
+                "in place: the original package is still at {}; delete it once the new one works",
+                backup.display()
+            ));
+        }
+        checks.push(format!("replaced {} with the verified copy", out.display()));
+    } else {
+        part.publish(out)?;
+        checks.push(format!("published {}", out.display()));
+    }
     ctx.progress("finalize", 1, 1);
-    checks.push(format!("published {}", out.display()));
     Ok(JobReport {
         output: out.to_path_buf(),
         bytes: report.size,
@@ -819,5 +883,21 @@ mod tests {
             assert!(text.contains(want), "{want:?} not in:\n{text}");
         }
         assert_eq!(findings.len(), 4, "{text}");
+    }
+
+    // Additional content (no eboot.bin) is packaged whatever its category, by user decision.
+    #[test]
+    fn additional_content_is_packaged_whatever_its_category() {
+        let param = r#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST","applicationCategoryType":33554432}"#;
+        let mut tree = Mem::new(&[
+            ("sce_sys/param.json", param.as_bytes().to_vec()),
+            ("data/dlc.bin", vec![1]),
+        ]);
+        let (findings, notes, _) = findings_of(&mut tree);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("additional content")),
+            "{notes:?}"
+        );
     }
 }

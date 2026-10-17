@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ps5upload_fpkg::source::SourceTree;
 use ps5upload_fpkg::{Error, Result};
 
+pub mod edit;
 mod names;
 mod upcase_table;
 
@@ -49,12 +50,12 @@ const SECTORS_PER_CLUSTER: u64 = 1 << CLUSTER_SHIFT;
 const FAT_OFFSET: u64 = SECTORS_PER_CLUSTER;
 const BOOT_REGION: usize = 12 * SECTOR as usize;
 /// The first heap cluster; clusters 0 and 1 exist only as FAT slots.
-const FIRST_CLUSTER: u64 = 2;
+pub(crate) const FIRST_CLUSTER: u64 = 2;
 /// ClusterCount may not exceed 2^32 − 11.
-const MAX_CLUSTERS: u64 = (1 << 32) - 11;
+pub(crate) const MAX_CLUSTERS: u64 = (1 << 32) - 11;
 /// A directory's DataLength may not exceed 256 MiB.
-const MAX_DIR_BYTES: u64 = 256 << 20;
-const ENTRY: usize = 32;
+pub(crate) const MAX_DIR_BYTES: u64 = 256 << 20;
+pub(crate) const ENTRY: usize = 32;
 /// The OEM Parameters record (spec §3.3) a maker's mark goes in: GUID
 /// {182B1321-1B2D-441D-BECA-28B704837CA0}, ours, in the on-disk order (first three fields
 /// little-endian), then 32 bytes of ASCII.
@@ -68,13 +69,13 @@ const NAME_UNITS_PER_ENTRY: usize = 15;
 /// Read size per `read_range`: bounded memory however large the file.
 const CHUNK: u64 = 8 << 20;
 /// Every timestamp is 2024-01-01 00:00:00, so the image depends on the tree alone.
-const TIMESTAMP: u32 = ((2024 - 1980) << 25) | (1 << 21) | (1 << 16);
+pub(crate) const TIMESTAMP: u32 = ((2024 - 1980) << 25) | (1 << 21) | (1 << 16);
 const FAT_MEDIA: u32 = 0xFFFF_FFF8;
-const FAT_EOC: u32 = 0xFFFF_FFFF;
-const ATTR_DIRECTORY: u16 = 0x10;
-const ATTR_ARCHIVE: u16 = 0x20;
-const ALLOCATION_POSSIBLE: u8 = 0x01;
-const NO_FAT_CHAIN: u8 = 0x02;
+pub(crate) const FAT_EOC: u32 = 0xFFFF_FFFF;
+pub(crate) const ATTR_DIRECTORY: u16 = 0x10;
+pub(crate) const ATTR_ARCHIVE: u16 = 0x20;
+pub(crate) const ALLOCATION_POSSIBLE: u8 = 0x01;
+pub(crate) const NO_FAT_CHAIN: u8 = 0x02;
 
 /// Knobs a caller may set. `Default` is the SMP-recommended layout.
 #[derive(Debug, Clone, Default)]
@@ -120,6 +121,13 @@ struct Geometry {
     upcase_cluster: u32,
     root_cluster: u32,
     serial: u32,
+}
+
+impl Layout {
+    /// Bytes of the clusters the image leaves free.
+    pub fn free_bytes(&self) -> u64 {
+        u64::from(self.geo.cluster_count - self.geo.used_clusters) * CLUSTER
+    }
 }
 
 /// A file or directory of the image.
@@ -673,7 +681,7 @@ fn boot_region(layout: &Layout) -> Vec<u8> {
 
 /// BootChecksum (spec §3.4): sectors 0..11, skipping VolumeFlags and PercentInUse, which
 /// change without the region being rewritten.
-fn boot_checksum(bytes: &[u8]) -> u32 {
+pub(crate) fn boot_checksum(bytes: &[u8]) -> u32 {
     bytes
         .iter()
         .enumerate()
@@ -813,7 +821,7 @@ fn entry_set(node: &Node) -> Vec<u8> {
 }
 
 /// SetChecksum (spec §6.3.3): every byte of the set but the checksum field itself.
-fn set_checksum(set: &[u8]) -> u16 {
+pub(crate) fn set_checksum(set: &[u8]) -> u16 {
     set.iter()
         .enumerate()
         .filter(|(i, _)| !matches!(i, 2 | 3))

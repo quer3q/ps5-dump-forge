@@ -91,22 +91,26 @@ pub(crate) fn table_checksum(bytes: &[u8]) -> u32 {
 /// of U+FFFF, which is how the recommended table ends.
 fn table() -> &'static [u16] {
     static TABLE: OnceLock<Vec<u16>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut out: Vec<u16> = (0..=u16::MAX).collect();
-        let mut at = 0usize;
-        let mut i = 0usize;
-        while i < COMPRESSED.len() && at < out.len() {
-            if COMPRESSED[i] == 0xFFFF && i + 1 < COMPRESSED.len() {
-                at += usize::from(COMPRESSED[i + 1]);
-                i += 2;
-            } else {
-                out[at] = COMPRESSED[i];
-                at += 1;
-                i += 1;
-            }
+    TABLE.get_or_init(|| expand(&COMPRESSED))
+}
+
+/// An up-case table as stored (compressed or not) expanded to one entry per BMP code unit;
+/// units past its end map to themselves.
+pub(crate) fn expand(stored: &[u16]) -> Vec<u16> {
+    let mut out: Vec<u16> = (0..=u16::MAX).collect();
+    let mut at = 0usize;
+    let mut i = 0usize;
+    while i < stored.len() && at < out.len() {
+        if stored[i] == 0xFFFF && i + 1 < stored.len() {
+            at += usize::from(stored[i + 1]);
+            i += 2;
+        } else {
+            out[at] = stored[i];
+            at += 1;
+            i += 1;
         }
-        out
-    })
+    }
+    out
 }
 
 #[cfg(test)]

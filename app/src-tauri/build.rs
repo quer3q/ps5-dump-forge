@@ -6,6 +6,8 @@ const COMMANDS: &[&str] = &[
     "inspect",
     "library_scan",
     "library_cover",
+    "host_tree",
+    "edit_check",
     "default_output",
     "generated_output",
     "start_job",
