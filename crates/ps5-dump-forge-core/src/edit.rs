@@ -660,6 +660,7 @@ mod tests {
         let file = put(&dir, "f.bin", b"f");
         let folder = dir.join("folder");
         put(&folder, "a.bin", b"a");
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut edits = vec![
             delete(""),
             delete("/data"),
@@ -721,6 +722,8 @@ mod tests {
         let a = put(&host, "a.bin", b"a");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&a, host.join("l.bin")).unwrap();
+        #[cfg(not(unix))]
+        drop(a);
         let result = edited(&[add(&host, "data")], None);
         #[cfg(unix)]
         {

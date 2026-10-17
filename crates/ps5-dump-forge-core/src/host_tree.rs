@@ -275,6 +275,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn folder(name: &str) -> PathBuf {
         let dir = temp(name);
         fs::create_dir_all(dir.join("a/b")).unwrap();
