@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-archive"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "cc",
  "crc32fast",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-cli"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-core"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-exfat"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "ps5-dump-forge-patch",
  "ps5upload-fpkg",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-flink"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -2634,18 +2634,18 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-fpkg"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "ps5upload-fpkg",
 ]
 
 [[package]]
 name = "ps5-dump-forge-ftp"
-version = "0.4.2"
+version = "0.5.0"
 
 [[package]]
 name = "ps5-dump-forge-gui"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dunce",
@@ -2660,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-lz4"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -2671,21 +2671,21 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-nfs"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ps5-dump-forge-patch"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "ps5-dump-forge-pfs"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "ps5-dump-forge-exfat",
@@ -2696,11 +2696,11 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-ps5"
-version = "0.4.2"
+version = "0.5.0"
 
 [[package]]
 name = "ps5-dump-forge-server"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "dunce",
@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-smb"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "getrandom 0.4.3",
  "hmac",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-ufs2"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "ps5-dump-forge-patch",
  "ps5upload-fpkg",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-updater"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "libc",
  "ureq",
@@ -2749,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-zstd"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "crc32fast",
  "getrandom 0.4.3",
