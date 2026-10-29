@@ -1,5 +1,5 @@
 //! Byte-level pieces of the AMPR pack formats: magics, sizes, flag bits, checked little-endian
-//! access, the two path hashes and the journal's payload hash, the CRC ranges, logical path
+//! access, the two path hashes, the CRC ranges, logical path
 //! rules and the chunk `location`/`descriptor` words. Nothing here maps a struct onto bytes.
 
 use ps5upload_fpkg::{Error, Result};
@@ -9,14 +9,12 @@ pub const DAT_MAGIC: &[u8; 8] = b"AMPRDAT3";
 pub const CFG_MAGIC: &[u8; 8] = b"AMPRCFG1";
 pub const CRC_MAGIC: &[u8; 8] = b"AMPRCRC1";
 pub const IDX_MAGIC: &[u8; 8] = b"AMPRIDX3";
-pub const CMD_MAGIC: &[u8; 8] = b"AMPRCMD1";
 
 pub const PAK_VERSION: u32 = 4;
 pub const DAT_VERSION: u32 = 3;
 pub const CFG_VERSION: u32 = 1;
 pub const CRC_VERSION: u32 = 1;
 pub const IDX_VERSION: u32 = 3;
-pub const CMD_VERSION: u16 = 1;
 pub const ENDIAN_MARKER: u32 = 0x0102_0304;
 
 pub const PAK_HEADER: usize = 128;
@@ -29,7 +27,6 @@ pub const CRC_HEADER: usize = 48;
 pub const IDX_HEADER: usize = 48;
 pub const IDX_RECORD: usize = 24;
 pub const IDX_SLOT: usize = 16;
-pub const CMD_HEADER: usize = 96;
 
 /// Offsets of the CRC fields inside their headers.
 pub const PAK_PAYLOAD_CRC_AT: usize = 112;
@@ -138,7 +135,7 @@ pub fn check_magic(b: &[u8], magic: &[u8; 8], what: &str) -> Result<()> {
 const FNV_PRIME: u64 = 1099511628211;
 /// AMPRPAK4 path hash: standard FNV-1a 64.
 const PAK_BASIS: u64 = 14695981039346656037;
-/// AMPRIDX3 slot hash and AMPRCMD1 payload hash: the same basis with its last digit dropped.
+/// AMPRIDX3 slot hash: the same basis with its last digit dropped.
 const IDX_BASIS: u64 = 1469598103934665603;
 
 fn fold(b: u8) -> u8 {
@@ -162,11 +159,6 @@ pub fn pak_hash(path: &[u8]) -> u64 {
 /// Path index slot hash of a complete `/app0/...` path, folded as `pak_hash` does.
 pub fn idx_hash(path: &[u8]) -> u64 {
     fnv(IDX_BASIS, path.iter().copied().map(fold))
-}
-
-/// Journal payload hash: the index basis over the raw bytes, no folding.
-pub fn cmd_hash(payload: &[u8]) -> u64 {
-    fnv(IDX_BASIS, payload.iter().copied())
 }
 
 /// CRC-32/ISO-HDLC of `bytes`.
@@ -356,15 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn hashes_fold_paths_but_cmd_hash_does_not() {
+    fn hashes_fold_paths() {
         assert_eq!(pak_hash(b"/APP0\\Dir\\X.Bin"), pak_hash(b"/app0/dir/x.bin"));
         assert_eq!(idx_hash(b"/APP0\\Dir\\X.Bin"), idx_hash(b"/app0/dir/x.bin"));
         // Only ASCII A-Z fold.
         assert_ne!(pak_hash("É".as_bytes()), pak_hash("é".as_bytes()));
-        assert_ne!(cmd_hash(b"A"), cmd_hash(b"a"));
-        assert_ne!(cmd_hash(b"\\"), cmd_hash(b"/"));
-        assert_eq!(cmd_hash(b""), 1469598103934665603);
-        assert_eq!(cmd_hash(b"a"), idx_hash(b"a"));
     }
 
     fn sample(len: usize) -> Vec<u8> {

@@ -4,7 +4,7 @@
 //! absolute path (`nfs://nas/srv/games/My Game` is `/srv/games/My Game`); `nfs://host` alone
 //! lists what is above the exports (NFSv3: the exports' first parts, NFSv4.1: what `/` lists).
 //! No login: the client calls as AUTH_SYS uid 0. A game on a server is never changed in place:
-//! edits, LZ4 in place and patch, delete and move refuse an `nfs://` path, as an `smb://` one.
+//! edits, delete and move refuse an `nfs://` path, as an `smb://` one.
 
 use std::collections::HashMap;
 use std::io;

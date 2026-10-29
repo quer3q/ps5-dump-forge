@@ -56,7 +56,7 @@ pub const FORGE_DIR: &str = "/data/dumpforge";
 /// Where the PS5's file browser starts: `/data`, and each drive while a filesystem is mounted
 /// on it (re-checked each time, for hot-plugged drives). By user request they are all it
 /// reaches: a listing, and a paired device, refuses any other path (`paths::Roots::confine`);
-/// not `/mnt/shadowmnt` either (a mounted image's traces are downloaded from the image file).
+/// not `/mnt/shadowmnt` either.
 pub const PS5_ROOTS: [&str; 11] = [
     "/data",
     "/mnt/usb0",
@@ -175,8 +175,7 @@ fn bind(port: u16) -> io::Result<TcpListener> {
     TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
 }
 
-/// Another copy (any version) holds the port: asks it to quit if idle (no job queued or running, no trace
-/// download), then binds once its port is free (every 200 ms, up to 30 s) and serves. A busy
+/// Another copy (any version) holds the port: asks it to quit if idle (no job queued or running), then binds once its port is free (every 200 ms, up to 30 s) and serves. A busy
 /// one keeps serving; the notice says how to update.
 fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
     // A start that can't serve (no usable root) must not stop the one that does.
@@ -191,7 +190,7 @@ fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
     // A copy without `handover` (v0.1.1 and older) ignores `if_idle` and cancels its jobs on
     // quit: asked only when its job list shows none unfinished.
     // ponytail: a job admitted between the two requests isn't listed yet and gets cancelled,
-    // and a trace download it is streaming is cut; both need someone acting in that instant.
+    // which needs someone acting in that instant.
     let body = match peer.handover {
         true => r#"{"if_idle":true}"#,
         false if idle_by_jobs(port) => "{}",
@@ -252,6 +251,7 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
     let local = listener.local_addr()?;
     let interrupt = opts.interrupt;
     let server = Arc::new(api::Server::new(opts, local)?);
+    server.wire_install();
     (server.opts.notify)(&started(&server.url, cfg!(target_env = "ps5")));
     #[cfg(target_env = "ps5")]
     eprintln!("ps5-dump-forge serve: listening on {}", server.url);

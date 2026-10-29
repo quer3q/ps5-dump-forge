@@ -458,10 +458,6 @@ mod tests {
             crate::edit_job::request_findings(&req),
             Vec::<String>::new()
         );
-        let mut req = request(&url, "exfat", &dir);
-        req.lz4_in_place = true;
-        let findings = crate::lz4::in_place_findings(&req, Kind::Folder, false);
-        assert!(findings[0].contains("read only here"), "{findings:?}");
         let jobs = crate::Jobs::new(|_| {});
         let refused = |r: Result<(), crate::DeleteError>| {
             assert!(

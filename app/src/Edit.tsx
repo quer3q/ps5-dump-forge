@@ -414,13 +414,12 @@ export function Edit(props: {
     if (folder) void reread(path, false);
   }, [props.jobs]);
 
-  // An edit job of this source not started here (restored after a reload, or another viewer's),
-  // or an LZ4 Patch or Unpatch replacing it: when it ends the source is read again; the changes
-  // listed here stay.
+  // An edit job of this source not started here (restored after a reload, or another viewer's):
+  // when it ends the source is read again; the changes listed here stay.
   const others = useRef(new Map<JobId, string>());
   useEffect(() => {
     for (const j of props.jobs) {
-      if (!(j.request?.edits?.length || j.request?.lz4_in_place) || j.id === job.current?.id) continue;
+      if (!j.request?.edits?.length || j.id === job.current?.id) continue;
       if (!j.result) {
         if (j.request.source === picked.current) others.current.set(j.id, j.request.source);
       } else if (others.current.has(j.id)) {

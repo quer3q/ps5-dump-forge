@@ -156,7 +156,9 @@ pub(crate) fn delete<'a>(
     protected: &[PathBuf],
     guarded: impl IntoIterator<Item = &'a PathBuf>,
 ) -> Result<(), DeleteError> {
-    net_refusal(path)?;
+    if crate::remote::is_remote(path) {
+        return delete_remote(path, guarded);
+    }
     let Checked {
         path,
         real,
@@ -229,21 +231,85 @@ pub(crate) fn delete<'a>(
     Ok(())
 }
 
-/// A NAS share or a peer is read only here: nothing on it is deleted or moved.
-fn net_refusal(path: &Path) -> Result<(), DeleteError> {
-    if crate::remote::is_nas(path) {
-        return Err(DeleteError::Refused(format!(
+/// What [`crate::remote::Remote::delete_path`] and `move_path` answer by default: a NAS share
+/// or a server is read only here.
+pub(crate) fn not_here(at: &crate::remote::FlinkPath) -> DeleteError {
+    use crate::remote::Scheme;
+    DeleteError::Refused(match at.scheme {
+        Scheme::Smb | Scheme::Nfs => format!(
             "{}: a NAS share is read only here; delete or move it on the NAS itself",
-            path.display()
-        )));
-    }
-    if crate::remote::is_remote(path) {
-        return Err(DeleteError::Refused(format!(
+            at.shown()
+        ),
+        _ => format!(
             "{}: a file on another device is deleted or moved on that device itself",
+            at.shown()
+        ),
+    })
+}
+
+/// A path on another device: refused while one of this device's unfinished jobs uses it, then
+/// handed to that device ([`crate::remote::Remote::delete_path`]: a paired Forge deletes it
+/// under its own rules, a NAS refuses).
+// ponytail: called with the job table locked, so a slow device holds off this device's jobs
+// until it answers (as a large local folder does).
+fn delete_remote<'a>(
+    path: &Path,
+    guarded: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<(), DeleteError> {
+    let at = remote_at(path)?;
+    if in_use(path, guarded) {
+        return Err(busy(path));
+    }
+    remote_of(&at)?.delete_path(&at)
+}
+
+/// [`delete_remote`] for a move: `from` and `to` on one device, neither used by an unfinished
+/// job of this device; the device moves it.
+fn move_remote<'a>(
+    from: &Path,
+    to: &Path,
+    replace: bool,
+    guarded: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<(), DeleteError> {
+    let (a, b) = (remote_at(from)?, remote_at(to)?);
+    if a.scheme != b.scheme || a.key_id != b.key_id {
+        return Err(DeleteError::Refused(format!(
+            "{} and {} are on different devices: a move stays on one device",
+            from.display(),
+            to.display()
+        )));
+    }
+    let guarded: Vec<&PathBuf> = guarded.into_iter().collect();
+    if let Some(p) = [from, to]
+        .into_iter()
+        .find(|p| in_use(p, guarded.iter().copied()))
+    {
+        return Err(busy(p));
+    }
+    remote_of(&a)?.move_path(&a, &b, replace)
+}
+
+fn remote_at(path: &Path) -> Result<crate::remote::FlinkPath, DeleteError> {
+    if !crate::remote::is_remote(path) {
+        return Err(DeleteError::Refused(format!(
+            "{}: a move from or to another device is a transfer, not a move",
             path.display()
         )));
     }
-    Ok(())
+    crate::remote::FlinkPath::parse(path).map_err(|e| DeleteError::Refused(e.to_string()))
+}
+
+fn remote_of(
+    at: &crate::remote::FlinkPath,
+) -> Result<std::sync::Arc<dyn crate::remote::Remote>, DeleteError> {
+    crate::remote::get_for(at).map_err(|e| DeleteError::Failed(format!("{}: {e}", at.shown())))
+}
+
+fn busy(path: &Path) -> DeleteError {
+    DeleteError::Busy(format!(
+        "{} is in use by an unfinished job; wait for it or stop it first",
+        path.display()
+    ))
 }
 
 /// Why a job must not replace `path` with a file of its own (an extract's or transfer's
@@ -270,10 +336,7 @@ pub(crate) fn replace_refusal<'a>(
             }
         }
         if in_use(path, guarded) {
-            return Err(DeleteError::Busy(format!(
-                "{} is in use by an unfinished job; wait for it or stop it first",
-                path.display()
-            )));
+            return Err(busy(path));
         }
         return Ok(());
     }
@@ -308,8 +371,9 @@ pub(crate) fn move_<'a>(
     protected: &[PathBuf],
     guarded: impl IntoIterator<Item = &'a PathBuf>,
 ) -> Result<(), DeleteError> {
-    net_refusal(from)?;
-    net_refusal(to)?;
+    if crate::remote::is_remote(from) || crate::remote::is_remote(to) {
+        return move_remote(from, to, replace, guarded);
+    }
     let guarded: Vec<&PathBuf> = guarded.into_iter().collect();
     let Checked {
         path,

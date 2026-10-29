@@ -352,7 +352,7 @@ impl SourceTree for MemTree {
 }
 
 /// Each folder takes a whole cluster, which the size budgets at 256 B: the room asked for
-/// (an LZ4 trace's) must still be free.
+/// must still be free.
 #[test]
 fn free_bytes_stay_free_with_many_folders() {
     let names: Vec<String> = (0..4000).map(|i| format!("d{i:04}/f")).collect();

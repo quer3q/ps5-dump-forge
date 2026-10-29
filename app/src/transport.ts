@@ -2,6 +2,8 @@
 // alias (vite.config.ts): transport-tauri.tsx (the app, `npm run build`) and
 // transport-http.tsx (the PS5 web UI, `npm run build:http`). Types only here.
 
+import type { JobId, PackageScan } from "./api";
+
 export type Unlisten = () => void;
 
 /** The events api.ts listens to. `jobs://restore` comes from the http poller only. */
@@ -19,11 +21,7 @@ export interface PickOptions {
   title: string;
   /** File mode: the extensions offered (without the dot); missing: every file. */
   extensions?: string[];
-  /** File mode: what the extensions are, for the dialog's filter menu. */
-  filterName?: string;
-  /** File mode, http build only: the current folder can be chosen too ("Choose this folder").
-   * The native dialog can't pick both kinds at once (rfd: files or folders), so the app asks
-   * which kind first. */
+  /** File mode: the current folder can be chosen too ("Choose this folder"). */
   folderToo?: boolean;
   /** The folder to open at (else where the last browse ended). */
   start?: string;
@@ -98,11 +96,6 @@ export interface Transport {
   notifications(): Promise<boolean | null>;
   /** Save that choice; null in the app. */
   setNotifications(on: boolean): Promise<boolean | null>;
-  /** Patch a game folder in place for LZ4 tracing (api.ts `Lz4Patch`). Its own function: the
-   * Tauri command takes `path`, the route `source`. */
-  lz4Patch<T>(source: string): Promise<T>;
-  /** Put Forge's release runtime back in a game folder (same argument names as lz4Patch). */
-  lz4Unpatch<T>(source: string): Promise<T>;
   /** The running version and its release file's suffix (after `ps5-dump-forge-<v>-`), or null
    * when this build gets no updates (the http build on a computer). */
   updateTarget(): Promise<{ version: string; asset: string } | null>;
@@ -143,4 +136,9 @@ export interface Transport {
   ): Promise<string>;
   /** http build: the URL that downloads the server's file `path`; the app: null. */
   connectDownloadUrl(path: string): string | null;
+  /** http build on the PS5: `POST /api/package_scan {}`. The app rejects (no PS5 here). */
+  packageScan(): Promise<PackageScan>;
+  /** Asks the paired PS5 `keyId` to install this device's `.pkg` at `path`: Tauri
+   * `connect_install {keyId, path}`, `POST /api/connect/install {key_id, path}`; its job id there. */
+  connectInstall(keyId: string, path: string): Promise<JobId>;
 }

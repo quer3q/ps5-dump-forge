@@ -80,7 +80,7 @@ fn instance() -> &'static str {
 }
 
 /// The path strings a job names, as `f` may rewrite them: `request`'s source, output,
-/// transfer, added files (`edits[].from`, op `add`), LZ4 profile and traces, and the done
+/// transfer, added files (`edits[].from`, op `add`), and the done
 /// report's output.
 fn map_paths(job: &mut Value, f: &mut dyn FnMut(&str) -> Option<String>) {
     let mut each = |v: &mut Value| {
@@ -90,7 +90,7 @@ fn map_paths(job: &mut Value, f: &mut dyn FnMut(&str) -> Option<String>) {
     };
     let r = &mut job["request"];
     if r.is_object() {
-        for key in ["source", "output", "lz4_profile", "lz4_traces"] {
+        for key in ["source", "output", "install"] {
             if let Some(v) = r.get_mut(key) {
                 each(v);
             }
@@ -132,6 +132,16 @@ fn peers_of(request: &Value) -> HashSet<String> {
 // ponytail: a path outside the share root (Windows: another drive) goes as it is, shown on the
 // peer as a plain path of this device's (display only: the peer never opens it).
 fn to_flink(me: &str, root: &Path, s: &str) -> Option<String> {
+    let rel = relative(root, s)?;
+    Some(match rel.is_empty() {
+        true => format!("flink://{me}"),
+        false => format!("flink://{me}/{rel}"),
+    })
+}
+
+/// A local absolute path inside `root` as `/`-joined names relative to it (`""` for `root`
+/// itself); `None` outside it or for a name that isn't UTF-8.
+pub(crate) fn relative(root: &Path, s: &str) -> Option<String> {
     let p = Path::new(s);
     if !p.is_absolute() {
         return None;
@@ -146,10 +156,7 @@ fn to_flink(me: &str, root: &Path, s: &str) -> Option<String> {
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(match parts.is_empty() {
-        true => format!("flink://{me}"),
-        false => format!("flink://{me}/{}", parts.join("/")),
-    })
+    Some(parts.join("/"))
 }
 
 /// `p` resolved, or its folder resolved when `p` isn't there (yet).
@@ -373,6 +380,13 @@ mod tests {
             "source": source, "format": "folder", "output": output,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn an_install_of_a_peer_package_is_shown_on_that_peer() {
+        let key = "ab".repeat(16);
+        let request = json!({ "install": format!("flink://{key}/Users/me/game.pkg") });
+        assert_eq!(peers_of(&request), HashSet::from([key]));
     }
 
     #[test]

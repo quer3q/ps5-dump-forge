@@ -1,5 +1,5 @@
 // A tab's job list under its cards: one row per job of that tab's type, newest first (Convert,
-// Edit, LZ4 and Connect each list their own).
+// Edit, Pack and Connect each list their own).
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 
@@ -15,10 +15,11 @@ import {
   type VerifyReport,
 } from "./api";
 import { basename, CardHead, FormatPill, isNetwork, kindLabel, PathLine, usePeerPath } from "./common";
-import { useMessages } from "./i18n";
+import { msg, useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
-import { jobType, lz4Job, type Action, type Job } from "./jobs";
+import { DEFAULT_ZSTD_LEVEL, jobType, packJob, type Action, type Job } from "./jobs";
+import { LEVEL_OF, type PackLevel } from "./Pack";
 import { readable } from "./peers";
 import { askReplace } from "./replace";
 import { refreshConnect, useConnectState } from "./useConnectState";
@@ -79,6 +80,15 @@ function editTag(t: T, r: ConvertRequest | undefined): string | null {
   return r.edit_rebuild && r.format !== "folder" ? t.editRebuild : t.edit;
 }
 
+/** A Pack tab job's tag: LZ4 or zstd, pack with its level (Fast, Medium, Max, else "level N") or unpack. */
+function packTag(t: T, p: { kind: "lz4" | "zstd"; id: "pack" | "unpack" }, r: ConvertRequest): string {
+  if (p.id === "unpack") return p.kind === "lz4" ? t.packTag.lz4Unpack : t.packTag.zstdUnpack;
+  const n = p.kind === "lz4" ? (r.lz4_level ?? 0) : (r.zstd_level ?? DEFAULT_ZSTD_LEVEL);
+  const preset = (Object.keys(LEVEL_OF[p.kind]) as PackLevel[]).find((l) => LEVEL_OF[p.kind][l] === n);
+  const level = preset ? msg().pack.levels[preset] : t.packTag.level(n);
+  return p.kind === "lz4" ? t.packTag.lz4Pack(level) : t.packTag.zstdPack(level);
+}
+
 /** The target as its pill shows it: a pack into a folder writes an LZ4 packed folder. */
 function targetKind(r: ConvertRequest): string {
   return r.lz4 === "pack" && r.format === "folder" ? "lz4" : r.format;
@@ -87,6 +97,8 @@ function targetKind(r: ConvertRequest): string {
 /** A job's title: its output's name; a peer's share root (`flink://<key_id>`) by the device's
  * name, not its key id; before its request arrives, "Job N". */
 export function jobName(job: Job, shown: (path: string) => string, fallback: (id: number) => string): string {
+  // An install has no output: the package names it.
+  if (job.request?.install) return basename(job.request.install);
   const out = job.request?.output;
   if (out === undefined) return fallback(job.id);
   return /^flink:\/\/[^/\\]+[/\\]*$/i.test(out) ? shown(out).replace(/: \/$/, "") : basename(out);
@@ -95,6 +107,7 @@ export function jobName(job: Job, shown: (path: string) => string, fallback: (id
 function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => void }) {
   const { job, fresh, dispatch } = props;
   const t = useMessages().jobs;
+  const installTag = useMessages().install.tag;
   const [cancelling, setCancelling] = useState(false);
   /** Retry is starting the job again (asking about names already there first). */
   const [retrying, setRetrying] = useState(false);
@@ -217,14 +230,16 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
   const alive = running && !stopping;
   const stepMs = Math.max(0, now - job.stageAt);
   const step = running && stepMs >= STEP_MS ? clock(stepMs) : null;
-  const lz4 = lz4Job(job.request);
+  const pack = packJob(job.request);
   const edit = editTag(t, job.request);
   // A transfer (Connect's copy job): its first source shown as "from", no target format.
   const transfer = job.request?.transfer?.length ? job.request.transfer : null;
+  // A package install: the package shown as "from", no target format.
+  const install = job.request?.install ?? null;
   // Every step the job will run, once core said; gone when the job ends (its result says it).
   const steps = !result && job.stages?.length ? <Steps job={job} /> : null;
   // Packing straight into an image: its write pass packs too.
-  if (running && job.stage === "write" && lz4?.id === "pack" && targetKind(job.request!) !== "lz4")
+  if (running && job.stage === "write" && pack?.kind === "lz4" && pack.id === "pack" && targetKind(job.request!) !== "lz4")
     status = t.packingWriting;
 
   // A job just started here scrolls the page to itself; restored ones (a reload) leave the
@@ -250,10 +265,11 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
       ref={ref}
     >
       <header className="job-head">
-        {job.request && !transfer && <FormatPill kind={targetKind(job.request)} />}
-        {lz4 && <span className={lz4.tab ? "tag lz4" : "tag"}>{t.lz4[lz4.id]}</span>}
+        {job.request && !transfer && !install && <FormatPill kind={targetKind(job.request)} />}
+        {pack && job.request && <span className="tag lz4">{packTag(t, pack, job.request)}</span>}
         {edit && <span className="tag edit">{edit}</span>}
         {transfer && <span className="tag transfer">{t.transfer}</span>}
+        {install && <span className="tag install">{installTag}</span>}
         {remote && (
           <span className="tag green" title={t.remoteTitle(remote.name)}>
             {remote.name}
@@ -261,7 +277,7 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
         )}
         <div className="job-name">
           <strong title={job.request && shown(job.request.output)}>{name}</strong>
-          {job.request && <PathLine path={transfer ? transfer[0] : job.request.source} prefix={t.from} />}
+          {job.request && <PathLine path={install ?? (transfer ? transfer[0] : job.request.source)} prefix={t.from} />}
         </div>
         {/* An output on a peer (`flink://`) or a NAS has no local folder for the file manager to show. */}
         {!remote && result && "Ok" in result && (web || !isNetwork(job.request?.output)) && (
@@ -385,6 +401,7 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
           edit={edit !== null}
           extract={!!job.request?.extract?.length}
           transfer={!!transfer}
+          install={!!install}
         />
       )}
       {job.log.length > 0 && <Log lines={job.log} name={name} />}
@@ -464,16 +481,17 @@ function clock(ms: number): string {
 }
 
 /** A failed job's error: a plain title, then core's text verbatim (without its "preflight failed:"). */
-function FailureText(props: { err: string; format?: string; edit?: boolean; extract?: boolean; transfer?: boolean }) {
-  const { format, edit, extract, transfer } = props;
+function FailureText(props: { err: string; format?: string; edit?: boolean; extract?: boolean; transfer?: boolean; install?: boolean }) {
+  const { format, edit, extract, transfer, install } = props;
   const t = useMessages().jobs;
+  const cantInstall = useMessages().install.cantInstall;
   // A paired device's `flink://` address by its name (again once Connect's state arrives).
   useConnectState();
   const err = readable(props.err);
   const pre = /^preflight failed:\n?/.exec(err);
   return (
     <div className="error-box">
-      <strong className="error-title">{transfer ? t.cantTransfer : extract ? t.cantExtract : edit ? t.cantEdit : format ? t.cantBuildAs(kindLabel(format)) : t.cantBuild}</strong>
+      <strong className="error-title">{install ? cantInstall : transfer ? t.cantTransfer : extract ? t.cantExtract : edit ? t.cantEdit : format ? t.cantBuildAs(kindLabel(format)) : t.cantBuild}</strong>
       <span className="backend">{pre ? err.slice(pre[0].length) : err}</span>
     </div>
   );

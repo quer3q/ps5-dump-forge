@@ -24,9 +24,9 @@ use ps5upload_fpkg::source::{SourceFile, SourceTree};
 use crate::convert::{Kind, SourceStamp, open_source};
 use crate::finalize::{fsync_dir, make_dir_open};
 use crate::jobs::Ctx;
-use crate::lz4_patch::{write_temp, write_temp_new};
 use crate::preflight;
 use crate::remote::RemoteDir;
+use crate::temp_file::{write_temp, write_temp_new};
 use crate::{ConvertRequest, Format, JobReport, VerifyMode, VerifySummary};
 
 /// The stages an extract reports, in order.
@@ -168,8 +168,14 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     if req.format != Format::Folder {
         findings.push("extract: the target format must be folder".to_string());
     }
-    if !req.edits.is_empty() || req.edit_rebuild || req.lz4.is_some() || req.lz4_in_place {
-        findings.push("extract: a request to extract takes no edit or LZ4 options".to_string());
+    if !req.edits.is_empty()
+        || req.edit_rebuild
+        || req.lz4.is_some()
+        || req.zstd_pack
+        || req.zstd_unpack
+    {
+        findings
+            .push("extract: a request to extract takes no edit, LZ4 or zstd options".to_string());
     }
     // Into a mounted game, written through the mount while the game may run.
     #[cfg(target_os = "freebsd")]

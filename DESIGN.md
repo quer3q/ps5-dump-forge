@@ -41,8 +41,7 @@ gradient notice bar) and the app icon (a blue portal-and-anvil emblem with an or
 | `--sans` | `-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif` | Body text; placeholders and the Naming text inside mono boxes |
 | `--mono` | `ui-monospace, SFMono-Regular, Menlo, monospace` | Paths, file names, IDs, param.json, logs |
 | `--top` | `57px`; `98px` under 900px | The sticky header's height: what sits under it and focus scrolling clear of it |
-| `--tab-lz4`, `--strap` / `--strap-hi` | `#1c1c26`, yellow 12% / 20% | The LZ4 screen tab's ground and straps |
-| `--lz4-ink` / `-ink-hi` / `-soft` | `#ffd84d` / `#ffe27a` / `#e3c766` | LZ4 yellow text: the tab, its pickers, Choose source, LZ4 job tags, the Library's LZ4 badge |
+| `--lz4-ink` / `-soft` | `#ffd84d` / `#e3c766` | Pack yellow text: the Pack tab's zstd \| LZ4 picker, its Choose source and How pack works icon, Pack job tags, the Library's LZ4 and zstd chips and badges |
 | `--lz4-tint` / `-tint-hi` / `-line` | yellow 14% / 22%, ring 50% | Their tint, hover and ring (`--lz4-ink` on tint ≥ 9.3:1, `--lz4-soft` 11.4:1) |
 | `--edit-ink` / `-tint` | `#a3c0ff` / blue 18% | Edit blue (the `.tag.blue` hue): an edit or extract job's `.tag.edit` |
 | `--rate-good-*` / `--rate-ok-*` / `--rate-bad-*` | ink `#86e8b0` / `#ffd28f` / `#ffaaaa` on green 12% / amber 12% / red 13% | About's rating chips (`.chip.good` / `.ok` / `.bad`), every text ≥ 8.9:1 |
@@ -53,9 +52,8 @@ gradient notice bar) and the app icon (a blue portal-and-anvil emblem with an or
 | `--bar-track` / `--bar-lo` / `--bar-hi` | `#262633` / `#232c8f` / `#a8bfff` | The progress bar's track; its fill runs `--bar-lo`, `--accent` at 70%, `--bar-hi` (the bright head) |
 | `--library-ink-hi` / `--library-line` | `#c4f6aa` / green 50% | Library green: the chosen **All** chip, the selected Cards/List button and the view switch's Library option only |
 | `--view-lib-tint`, `--view-files-ink` / `-tint` / `-line` | green 14%; `#c3d3ff` / blue 18% / ring 50% | The Storage view switch's selected option: Library (`--library-ink-hi` on its tint 11.9:1), File explorer (10.6:1; also the folder tree's current folder, a picker's chosen file and File Transfer's chosen device) |
-| `--neon-*` | lime, magenta, cyan 12%; ring lime 38%; glow 16%; ink `#d6e875` | A traced source's `LZ4 (AMPR)` tile (`.tile.neon`) |
 | `--pk-*` | green 14%, cyan 12%; ring 42%; glow 16%; ink `#86f5b4` | A packed source's tile (`.tile.neon.packed`) |
-| count badge (`.count`) | white + `--page` | Unfinished jobs in the Convert, Edit, LZ4 and Connect tabs: one look on every tab (19:1) |
+| count badge (`.count`) | white + `--page` | Unfinished jobs in the Convert, Edit, Pack and Connect tabs: one look on every tab (19:1) |
 | primary button | `#fff` + `--page` | The one main action per card (the update toast's is `--done-ink`) |
 
 **Format hues.** `.fmt-*` sets `--h` (text), `--h-bg` (tint) and `--h-line` (ring); text on tint ≥ 4.5:1.
@@ -68,13 +66,14 @@ gradient notice bar) and the app icon (a blue portal-and-anvil emblem with an or
 | ffpfs | `fmt-ffpfs` | teal `#7ee0e0` |
 | ffpfsc | `fmt-ffpfsc` | amber `#ffc580` |
 | fpkg | `fmt-pkg` | green `#8fe0ab` (Convert's default target) |
-| LZ4 packed folder | `fmt-lz4` | lime `#d6e875` (a job row's pill for a Pack into a folder; the Pack target picker shows that target as Folder) |
+| zstd packed folder | `fmt-zstd` | teal `#7fe3d8` (About's Compare formats row) |
+| LZ4 packed folder | `fmt-lz4` | lime `#d6e875` (a job row's pill for an LZ4 Pack into a folder; the Pack target picker shows that target as Folder) |
 | Archive (zip, 7z, rar) | `fmt-archive` | sand `#e8c9a6` (sources only; one hue for the three, the label tells them apart) |
 
 **Semantic tags.** Tinted pills for states: `.tag.blue` a running job's stage (Writing), `.tag.green` Done
 (also Connected and another device's name), `.tag.red` Failed, `.tag.orange` Backport and warnings (Offline,
 Can't scan, Can't delete, Leftovers' "N found"), `.tag.violet` DLC and Additional content (a source without `eboot.bin`, beside
-the other labels on every tab, Library cards and rows too). A plain `.tag` is neutral (Emulators, AMPR runtime,
+the other labels on every tab, Library cards and rows too). A plain `.tag` is neutral (Emulators,
 Queued, Disconnected, a device's kind).
 
 **Type.** System font (SF Pro on macOS), 14px/1.45 body.
@@ -100,7 +99,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
 
 ## Components (class names in `styles.css`)
 
-- **Header** (`.topbar`, sticky, no bottom border): the 30px logo left (a transparent emblem: no ring, its orange glow a `drop-shadow` that follows its shape), the screen tabs centred
+- **Header** (`.topbar`, sticky, no bottom border): the 30px logo left (a transparent emblem by Xxcco: a blue ring with the four button symbols around an orange gear, no tile; its orange glow a `drop-shadow` that follows its shape), the screen tabs centred
   (`.seg.nav`: 14px labels, a 1% white fill over a 28px backdrop blur), the GitHub mark (`.gh-link`,
   32px round, `--muted`) rightmost; the app opens it in the default browser through the fixed-URL
   `open_repo` command. Right of the logo the Connect indicator (`.conn-btn`, every platform, a bare button
@@ -116,15 +115,13 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   on hover) on either side of the bar, outside its pill (`.seg-wrap`), out of the Tab order; a click
   steps to the previous / next tab, as the triggers do. With them (`.nav.shoulders`) the
   ≤ 420px tab padding is 5px, so the bar still fits at 360px.
-- **Segmented control** (`.seg`, `.seg-opt`, `.on`): the screen tabs (Convert, Edit | LZ4 | Storage |
+- **Segmented control** (`.seg`, `.seg-opt`, `.on`): the screen tabs (Convert, Edit | Pack | Storage |
   Connect | About: one tablist, `.tab-sep` dividers drawn only, arrow keys move through every tab), the format
-  picker (`.seg.formats`), Edit's mode choice, the LZ4 tab's scenario and action pickers, the
+  picker (`.seg.formats`), Edit's mode choice, the Pack tab's zstd | LZ4, level and runtime pickers, the
   pickers' device tabs and the small pill switches (`ViewSwitch`: Storage's views, Connect's filter,
   File Transfer's devices). Native radios, `role="tab"` or `role="radio"` buttons sit underneath for
   the keyboard. Options are 29px, 13px/500 `--muted`; chosen `--raise-hi`, `--fg`.
-  - The LZ4 screen tab (`.seg-opt.tab-lz4`): a `--tab-lz4` pill with four static yellow straps from top
-    right to bottom left and `--lz4-ink` text; selected, `--raise-hi`, `--strap-hi`, `--lz4-ink-hi`, bold
-    and a `--lz4-line` ring. The Storage tab is plain text, like Convert and Edit.
+  - Every screen tab is plain text, the Pack tab too.
   - The Storage view switch (`.seg.view-switch`, `Storage.tsx`): first in the view's card head
     (`.storage-head`; left, right in RTL), the view's actions after it; smaller than the screen tabs so it never reads
     as a second navbar (26px pills, 12.5px labels, 15px icons). **[disc] Library** | **[folder] File
@@ -139,8 +136,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     that target) and the fpkg Compression picker (Fast / Balanced / Smallest / Stored, 15px bolt, scale,
     compress and file icons, the fpkg tint), each with one line under it on what the choice costs.
   - The ffpfsc Compression level is a native range (`.range`, `accent-color`, 0–9, default 6) with its
-    value in the label row (`.range-value`, tabular) and a line under it on what the level costs; the
-    LZ4 trace's room is the same range.
+    value in the label row (`.range-value`, tabular) and a line under it on what the level costs.
 - **Connect** (`Connect.tsx`, a device hub): two columns from 980px (`.connect-cols`: 340px, then the
   rest; one column below).
   - Left (`.connect-side`): **This device** (`.connect-me`: lock icon, a plain `.small` **How to
@@ -202,8 +198,8 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   | Secondary | default | Dark. Choose, Change, Show in Finder (Explorer, folder), download links (`a.button`). |
   | Danger | `.danger` | Red tint. Stop job (a running job's Cancel, second click), Stop jobs and quit, the trash buttons, Yes, delete, Forget, Discard all, Replace. |
   | Small | `.small` | Job rows; `.small.icon-only` is a 30px round icon button. |
-  | LZ4 | `.lz4-btn` | Yellow tint, ring and ink: the LZ4 tab's Choose source. |
-  | Link | `.link` | Quiet text action (Use the source's traces, the crumbs). |
+  | Pack | `.lz4-btn` | Yellow tint, ring and ink: the Pack tab's Choose source. |
+  | Link | `.link` | Quiet text action (the crumbs). |
 
   Touch (`pointer: coarse`, a phone or tablet): every button, menu item, input, fold summary,
   switch row and explorer row is at least 40px tall, and fields take 16px text (iOS zooms the
@@ -244,31 +240,35 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   Convert says under Build what the conversion does by itself, each a muted `.note-line` with the
   `info` icon, from core's `runtime_action`: the bundled ampr_emu (its version) is installed (none
   there) or replaces the game's runtime (older or unknown), or the game's own one is kept (the bundled
-  version or newer, named); and a stale, damaged or missing `ampr_emu.index` is written afresh (the old
-  traces left out; for fpkg, the package always gets a fresh one). A game that doesn't use AMPR gets none.
-- **LZ4 tab** (`Lz4.tsx`): a Source card, then an "LZ4 asset packs" card whose head holds a plain
-  `.small` **How LZ4 works** (info icon, as Convert's Compare formats). The empty Source is `.empty.lz4` (yellow icon and glow): "Choose a
-  game that uses AMPR", an experimental lead and one `.lz4-btn` **Choose source** with a Folder /
-  Image/Archive menu.
-  - The scenario picker is a full-width `.seg.formats` in LZ4 yellow (`.lz4-y`: unselected `--lz4-soft`,
-    chosen tint and ring, disabled plain `--muted`, no icons): **Pack/Unpack** (first, the default
-    whenever it applies) and **Trace**. Before a source one muted line asks for one. A disabled scenario
-    carries its reason in its tooltip and in one muted "Not for this source: …" line under the picker; a
-    title that neither uses AMPR nor is packed (or additional content) gets one `.note-line.warn` instead.
-  - Settings sit in `.field.lz4` inset boxes. **Trace**: when the source has a journal, a
-    `.field.lz4.recorded` box "Recorded traces" (both builds; the web build adds one wrapping download
-    link, `a.button`, `.downloads`, except in the PS5's own browser; without the index a `.note-line.warn`
-    instead); then a `.seg.formats.inner` **Patch** / **Unpatch** picker and a box with what it
-    changes, for an image Patch the "Room for the trace" range, and the fakelib warning (Patch's; Unpatch
-    shows it in Recorded traces). A read-only
-    image gets one `.note-line.warn` and nothing else. **Pack**: Traces (a zip or a folder; the app's
-    Choose opens a Zip / Folder `.menu`), locked to the source's own traces when they load by
-    themselves (`.lock-box`: dashed `--line-hi` border, a round lock button; unlocked, a `button.link`
-    "Use the source's traces" locks it again), a collapsed `details.fold.rules` "Use a rules profile
-    instead", a muted line saying where the rules come from, then the Target picker: Folder (the LZ4 packed folder, shown as Folder) | ffpkg (default) | exfat | ffpfs. **Unpack**:
-    Folder | ffpkg (default) | exfat | ffpfs.
-  - Pack and Unpack end like Convert (Full verification, Output, Generate name; shared in
-    `target.tsx`).
+  version or newer, named); a game's ampr-emu-ng is said only when it is replaced ("Replaces this game's
+  ampr-emu-ng with ampr_emu <version>"), and a zstd packed game's only when it goes in; and a stale,
+  damaged or missing `ampr_emu.index` is written afresh (for fpkg, the package always gets a fresh one). A
+  game that doesn't use AMPR gets none.
+- **Pack tab** (`Pack.tsx`): a Source card, then a "Pack" card whose head holds a plain `.small` **How pack
+  works** (info icon, as Convert's Compare formats; `PackHelp.tsx`). The empty Source is `.empty.lz4`
+  (yellow icon and glow): "Choose a game that uses AMPR", an experimental lead and one `.lz4-btn` **Choose
+  source** with a Folder / Image/Archive menu.
+  - The kind picker is a full-width `.seg.formats` in Pack yellow (`.lz4-y`: unselected `--lz4-soft`, chosen
+    tint and ring, no icons): **zstd** (the default) | **LZ4**, with one line under it on what the job does
+    (LZ4's an amber experimental lead). Before a source one muted line asks for one; a game the kind can't
+    take (a patch package, additional content, a title that doesn't use AMPR) gets one `.note-line.warn`
+    (`p.lz4-why`) instead of the settings. A game already packed by the kind chosen gets **Unpack**.
+  - Then the Target picker (`.target-label`): **Pack** Folder (the default, the LZ4 packed folder shown as
+    Folder) | exfat | ffpkg | ffpfs, the folder's line a green "Recommended" lead, an image's its
+    format's line and a muted "Packs straight into the image" hint; zstd **Unpack** adds fpkg, LZ4 Unpack doesn't. Unpack
+    shows one `.field.lz4` inset box saying what it writes back.
+  - Pack's level: a `.seg.formats.inner` **Fast** / **Medium** / **Max** picker in the fpkg tint (`fmt-pkg`,
+    bolt, scale and compress icons, as Convert's fpkg Compression), one line under it on what it costs
+    (Fast green "Recommended"). LZ4 Pack adds the **Runtime** picker of the same look: **ampr-emu-ng**
+    (default, green "Recommended") | **ampr_emu** with the bundled version. A Pack that installs ampr-emu-ng
+    (zstd, or LZ4 with it) gets an amber line: turn off ShadowMount+'s fakelib update, or it replaces the
+    runtime.
+  - Pack and Unpack end like Convert (Full verification, Output, Generate name; shared in `target.tsx`),
+    then the action button. Under it (`.build-notes`), muted `info` lines: for LZ4 with ampr_emu, what the job
+    does to the runtime (core's `pack_runtime_action`; a game's ampr-emu-ng that it replaces is said so,
+    one it keeps isn't), and a stale, damaged or missing `ampr_emu.index` LZ4 Pack writes afresh.
+  - **How pack works** (`.modal.help`, `PackHelp.tsx`): the info icon in yellow (`.head-icon.lz4`), then
+    zstd, LZ4 and ampr-emu-ng as short numbered lists; the body scrolls (focusable), title and Close stay.
 - **Edit tab** (`Edit.tsx`, `EditChanges.tsx`, `EditApply.tsx`; `.cols.edit`, 1fr:2fr from 1100px). Before a
   source: the empty Source card left, "How this works" (`.how`: short paragraphs across the card's width, the last muted) right.
   - **Compact game card** (`SourceCard compact`, `.hero.compact-src`; smaller than the other tabs' by user
@@ -334,15 +334,14 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   "at the archive's root") · solid · password-protected as its note, and the part names as a `.path`
   note when there are several.
   `.tile.wide` spans the row (Edit's Game facts also add Content ID and the Forge version that made
-  the image, both mono; the `LZ4 (AMPR)` tile: Packed, Damaged packs, Traced or Plain; its note
+  the image, both mono; the `LZ4 (AMPR)` tile: Packed, Damaged packs or Plain (with the runtime); its note
   says when the game doesn't use AMPR and adds what a conversion does to the runtime (installs or replaces with the bundled ampr_emu, or keeps
   another build's named version) and a stale, damaged or missing `ampr_emu.index`; an index to refresh
-  or a runtime to install also makes the tile show). A traced
-  source's tile is `.tile.neon` wherever it shows: static muted lime, magenta and cyan straps over
-  `--inset`, a `--neon-line` ring with a faint `--neon-glow`, the state in `--neon-ink` (on the
-  brightest strap `--fg` 12.8:1, `--muted` 5.2:1, `--neon-ink` 10.7:1). A packed source takes green
-  straps instead (`.tile.neon.packed`, `--pk-*`: `--pk-ink` 10.4:1, `--muted` 5.0:1); damaged packs
-  (`.tile.damaged`) get no straps and the state in `--warn`.
+  or a runtime to install also makes the tile show; a zstd packed source shows a `zstd` tile in its
+  place, Packed with the runtime). A packed source's tile (LZ4 or zstd) is `.tile.neon.packed` wherever it
+  shows: static green and cyan straps over `--inset`, a `--pk-line` ring with a faint `--pk-glow`, the
+  state in `--pk-ink` (`--pk-ink` 10.4:1, `--fg` 12.5:1, `--muted` 5.0:1 on the brightest strap); damaged
+  packs (`.tile.damaged`) get no straps and the state in `--warn`.
 - **Alert bar** (`.alert-bar`): one line of notice on a blue-to-orange gradient kept dark under the
   text, orange only as a glow at the right edge. `.alert-bar.warn` is amber: the fpkg firmware limit
   (`PkgWarning`), today the bar's only use.
@@ -350,9 +349,9 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   good news (blue). Under Build, `.note-line` (`.warn`, `.block`, `.good`, `.muted` with an info icon)
   says why it is off or what to expect.
 - **Folds** (`details.fold`): DLC, backport files, emulators in fakelib, job logs, verified checks,
-  folders checked, Edit's Game facts / param.json / Details and "Changes, in order", the LZ4 rules
-  profile, the Library's skipped folders. Collapsed by default; a list inside that can grow is a scrollable, focusable box.
-- **Job list** (`JobList.tsx`, `.card.jobs`): under Convert, Edit, LZ4 and Connect (`.screen.jobs-screen`;
+  folders checked, Edit's Game facts / param.json / Details and "Changes, in order", the Library's
+  skipped folders. Collapsed by default; a list inside that can grow is a scrollable, focusable box.
+- **Job list** (`JobList.tsx`, `.card.jobs`): under Convert, Edit, Pack and Connect (`.screen.jobs-screen`;
   none on Storage and About) each tab's own jobs, the type its count counts (Connect: transfers), one list
   per tab kept mounted by `App`, only while that type has jobs, newest first; the head says "N running
   or queued" or "all finished"; min-height 240px, it grows
@@ -368,9 +367,8 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   Checking), "›" between them (mirrored in RTL), wrapping, 12.5px. Done steps: a small green check and
   `--fg-2`; the current one: `--accent-ink`, 600, `aria-current="step"`; later ones `--muted`. Screen
   readers hear "done" / "not started yet" (visually hidden). No row until the stages are known, none once
-  the job has ended; no motion of its own. An LZ4 tab job (`.job.lz4`) has a
-  `.tag.lz4` (LZ4 pack, unpack, trace, unpatch); an unpatch conversion sent to the
-  server's API (not the LZ4 tab's in-place one) a plain `.tag` "AMPR runtime". An edit or extract job
+  the job has ended; no motion of its own. A Pack tab job (`.job.pack`) has a `.tag.lz4` in Pack yellow
+  (zstd or LZ4 pack with its level, or unpack). An edit or extract job
   (`.job.edit`) has a `.tag.edit` **Edit**, **Edit · rebuild** (error box led by
   "Can't apply the changes:") or **Extract** ("Can't extract:"); a transfer (`.job.transfer`) a
   `.tag.transfer` **Transfer**, no format pill, "from" its first source, "Can't transfer:".
@@ -391,7 +389,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   language select at its end; no introduction line): the nine features as one grid of small inset tiles
   (`.feat-tiles` / `.feat-tile`: `--inset`, `--line` border; a round icon, the bold name, its text), no
   group headings, in three sets of three (Convert, Transfer, Edit / Streamed, Archives, USB and SD cards /
-  LZ4, Storage, Safe). From 1000px each set is a column, the three sharing the card's width at equal
+  Pack, Storage, Safe). From 1000px each set is a column, the three sharing the card's width at equal
   heights; 600–999px each set a row of three; a phone one tile a row; a slightly wider gap between sets
   is the only grouping cue. **Compare formats** (`.fmt-table`): one row per format (`.fmt-row`), an
   inset tile edged at its start in the format's hue (`.fmt-*` `--h-line`): the format and its tagline,
@@ -413,8 +411,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   Transfer) makes that one inert behind it and gives focus back to it. The pairing prompt
   (`.pair-layer`, Connect) is the one layer above every dialog: one opening, loading or closing under
   it leaves focus in the prompt, and a quit request unmounts it instead of answering it.
-  - **How LZ4 works** (`.modal.help`, 560px, `Lz4Help.tsx`): the info icon in yellow, a warn line, then
-    Pack/Unpack and Trace as short numbered steps; the body scrolls (focusable), title and Close stay.
+  - **How pack works** (`.modal.help`, 560px, `PackHelp.tsx`): above, under the Pack tab.
   - **How to connect** (`.modal.help`, `ConnectHelp.tsx`): the same frame, a few short paragraphs and
     no section headings (pairing and the check number, a NAS, File Transfer, phones in the web build
     only, what the network can see); Close.
@@ -459,7 +456,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   count, by user request). Then the
   kind chips (`.kind-chips`, `role="group"` "Show kind"; 28px pills (40px on touch) with a count, quiet until chosen,
   `aria-pressed`): **All**, then only the kinds present (Folder, ffpkg, exfat, ffpfs, ffpfsc, fpkg, an
-  archive), **LZ4 packed** and **Additional content**; chosen, a kind takes its `.fmt-*` hue, LZ4 yellow,
+  archive), **LZ4** and **zstd** (packed) and **Additional content**; chosen, a kind takes its `.fmt-*` hue, LZ4 and zstd yellow,
   Additional content `--raise-hi`, All the Library green. A chosen kind that is gone shows All.
   Then the scrolling well (`.library-well`: `--inset`, 14px padding, height to the viewport; at least
   160px and, in Cards, one whole card row plus 56px of the second when there is one (`--fit`, measured,
@@ -470,16 +467,16 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     WebKit), the name (600, wraps anywhere), the title ID and version muted, the path line (copies
     of one game differ only there), and a foot with the format pill (and a violet Additional content tag)
     and the actions. **List** (`.library-rows`): compact grid rows
-    (`.library-row`, 8px 12px padding): 48px cover, name over the title ID, version and LZ4 / Additional
+    (`.library-row`, 8px 12px padding): 48px cover, name over the title ID, version and LZ4 / zstd / Additional
     content tags (`.library-sub`), the format pill (104px column), path line, actions; under 720px three
     rows (cover beside the name, then the pill and actions, then the path whole). Covers load lazily, one at a time; a
     placeholder with the disc icon stands in at the same size.
-  - **LZ4 badge** (`.lz4-badge`, an entry with ampr_emu packs): "LZ4" in bold `--lz4-ink` on a
+  - **Pack badge** (`.lz4-badge`, an entry with LZ4 or zstd packs): "LZ4" or "zstd" in bold `--lz4-ink` on a
     liquid-glass pill: a faint white gradient, a light rim brighter on top, a soft dark text shadow,
     no colour of its own. On a card it sits on the cover's top-right corner (24px) over a light dark
     tint with a backdrop `blur(14px) saturate(160%) brightness(0.55)` (`-webkit-` prefixed for the PS5
     browser), so it stays readable on any cover; in a row it follows the title ID (20px, ≥ 7:1 on
-    `--card`). It reads "LZ4 packed: ampr_emu asset packs" to a screen reader; the format pill stays the entry's own.
+    `--card`). It reads "LZ4 asset packs" or "zstd asset packs" (its tooltip too) to a screen reader; the format pill stays the entry's own.
   - **Actions**: icon-only buttons with `aria-label` and `title` ("Edit <name>" with the pencil icon,
     "Convert <name>", "Delete <name>", the last `.danger`). Edit and Convert switch to that tab with the game loaded;
     Delete opens the shared Delete dialog; while the delete runs that entry's Edit and Convert and
@@ -556,7 +553,7 @@ The web build names the product "Dump Forge" (the PS5 tile's name); the desktop 
   drives), folders, files with their size (tabular, muted). File mode lists only the accepted
   extensions (Edit's Add file pickers: every file; Add files toggles a selection within the folder
   shown: the row tinted and ringed, its icon a check, `aria-pressed`, then a primary "Choose N files");
-  zip-or-folder mode (LZ4 Pack Traces) lists folders and `.zip` files. Footer: Cancel and,
+  Footer: Cancel and,
   in folder modes, "Choose this folder" (`.primary`; off at a NAS's shares or exports, an FTP
   server's root excepted). The next browse opens where the last one ended. A failed listing shows
   `.bad.pick-error` (`role="alert"`) with the reason, and its last crumb stays a button that tries
@@ -593,7 +590,7 @@ spots). Add a path there rather than importing an icon set.
 Only short fades and transforms: the hero glow (0.5s), the switch and fold chevrons (0.15s), the
 spinners, the dots after a waiting text (`Dots`, `.dots`: ".", "..", "..." in turn over 1.2s, each dot
 in its place; e.g. "Reading the source", the Library's "Scanning", the pickers' and explorers'
-"Loading", Connect's searching, probing and pairing waits, the LZ4 action button while it starts;
+"Loading", Connect's searching, probing and pairing waits, the Pack action button while it starts;
 a static "..." with reduced motion), and a job bar's sheen (`.bar
 .sheen`: the whole time a job runs, since many stages move the bar little or in steps and a
 stall-only sheen flickered, a soft

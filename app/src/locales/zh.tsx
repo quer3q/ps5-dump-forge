@@ -16,6 +16,7 @@ const zh: Messages = {
     convert: "转换",
     active: (n) => `，${num(n)} 个进行中`,
     edit: "编辑",
+    pack: "打包",
     storage: "存储",
     connect: "连接",
     disconnected: "未连接",
@@ -53,16 +54,20 @@ const zh: Messages = {
     targetFormat: "目标格式",
     alreadyFolder: "源已经是文件夹",
     lz4Backport:
-      "此游戏的资源已用 LZ4 打包，且其 LZ4 清单包含向下移植文件：请先在“LZ4”选项卡中解包，再在此处移除向下移植。",
+      "此游戏的资源已用 LZ4 打包，且其 LZ4 清单包含向下移植文件：请先在“打包”选项卡中解包，再在此处移除向下移植。",
+    zstdBackport:
+      "此游戏的资源已用 zstd 打包，且其 zstd 索引包含向下移植文件：请先在“打包”选项卡中解包，再在此处移除向下移植。",
     unreadable: "无法构建：无法读取此源（见“源”）。",
     patchBlocked: "无法构建：这是补丁包，只包含更新改动的内容。请在“编辑”中打开它以提取其中的文件。",
     openInEdit: "在“编辑”中打开",
     noContentId: "无法构建为 fpkg：此游戏的 param.json 没有软件包所需的 Content ID。",
     blocked: (first, more) =>
       `无法构建：${first}${more > 0 ? `（另有 ${num(more)} 项，见“源”）` : ""}。`,
+    amprZstdRuntime: "此次转换会在 fakelib/libSceAmpr.sprx 安装 ampr-emu-ng，这些包需要它。",
+    amprNgReplaced: (version) => `将此游戏的 ampr-emu-ng 替换为 ampr_emu ${version}。`,
     amprRuntime: (a, own, version) => {
       if (a === "install") return `此游戏使用 AMPR 但没有 ampr_emu：转换时会安装内置的 ampr_emu ${version}。`;
-      if (a === "trace") return `转换时会用内置的正式版 ampr_emu ${version} 替换 LZ4 追踪运行时。`;
+      if (a === "trace") return `转换时会用内置的 ampr_emu ${version} 替换此游戏的 ampr_emu。`;
       if (a === "replace")
         return own
           ? `转换时会用内置的 ampr_emu ${version} 替换此游戏的 ampr_emu ${own}。`
@@ -71,10 +76,9 @@ const zh: Messages = {
         ? `此游戏的 ampr_emu ${own} 不低于内置的 ${version}：转换时会保留它。`
         : `此游戏已带有内置的 ampr_emu ${version}：转换时会保留它。`;
     },
-    amprIndex: (state, traces) =>
-      `${state === "stale" ? "ampr_emu.index 与此游戏的文件不符" : state === "damaged" ? "无法读取 ampr_emu.index" : "此游戏没有 ampr_emu.index"}：转换时会写入新的索引${traces ? "，并略去旧的追踪数据" : ""}。`,
-    amprPkgIndex: (traces) =>
-      `软件包会获得根据其中文件新建的 ampr_emu.index${traces ? "，并略去旧的追踪数据" : ""}。`,
+    amprIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "ampr_emu.index 与此游戏的文件不符" : state === "damaged" ? "无法读取 ampr_emu.index" : "此游戏没有 ampr_emu.index"}：转换时会写入新的索引。`,
+    amprPkgIndex: "软件包会获得根据其中文件新建的 ampr_emu.index。",
     removeBackport: "移除向下移植",
     removeHint: (libs, emulators, other) =>
       `从 fakelib/ 中排除 ${num(libs)} 个向下移植库` +
@@ -107,6 +111,7 @@ const zh: Messages = {
         tagline: "最佳，前提是固件允许",
         cells: ["原生，全速", "减少 30–60%，视游戏而定"],
       },
+      zstd: { tagline: "适用于使用 AMPR 的游戏，需 ampr-emu-ng", cells: ["加载速度最多快 80%", "最多可缩小到游戏的一半"] },
       lz4: {
         tagline: "实验性，适用于使用 AMPR 的游戏",
         cells: ["加载快 30–40%（上游数据）", "约为游戏大小的一半（上游数据）"],
@@ -127,7 +132,7 @@ const zh: Messages = {
       ["流式", "可从任意来源到任意目标：无需临时副本，即使是 ffpfsc 内的镜像或压缩包中的游戏。"],
       ["压缩包", "包含一款游戏的 .zip、.7z 或 .rar 可像文件夹一样浏览、转换或打包。"],
       ["USB 和 SD 卡", "可写入 exFAT 或 FAT32 格式的 U 盘和存储卡。"],
-      ["LZ4", "追踪 AMPR 游戏，再以智能修复方式打包其资源（实验性）。"],
+      ["打包", "以智能修复方式生成 zstd 或 LZ4（实验性）资源包。"],
       ["存储", "您的游戏库，以及可重命名、移动和删除的文件浏览器。"],
       ["安全", "除非您要求，否则绝不修改您的游戏；会跳过垃圾文件，并提前报告不合规的文件名。"],
     ],
@@ -139,13 +144,15 @@ const zh: Messages = {
     upstream: (app) =>
       `上游数据：来自 ampr_emu 和 Lazy_AMPR 作者的报告，并非 ${app} 实测；具体因游戏而异。ampr_emu 0.4.2.1 是上游的测试版本；已知问题：部分游戏在存档时崩溃。`,
     bundled: "LZ4 打包后的游戏使用 drakmor 的 ampr_emu 0.4.2.1（GPL-3.0）运行；该运行时原样内置，未作修改。源代码：",
-    lazy: "“先追踪、后打包”的流程沿用 Nazky 的 Lazy_AMPR：",
+    lazy: "LZ4 打包基于 Nazky 的 Lazy_AMPR：",
+    ng: "zstd 和 LZ4 包运行于 ampr-emu-ng。源代码：",
+    logo: "标志由 Xxcco 设计：",
     unrar:
       ".rar 压缩包由内置的 UnRAR 库（作者 Alexander Roshal）读取（仅解压，遵循 UnRAR 许可）。",
     language: "语言",
     system: "跟随系统",
     notifications: "任务完成时通知我",
-    notificationsHint: "转换、LZ4 和传输任务的通知会显示在主机上。",
+    notificationsHint: "转换、打包和传输任务的通知会显示在主机上。",
     notificationsFailed: "无法更改通知设置。",
   },
   // Edit.tsx
@@ -313,6 +320,7 @@ const zh: Messages = {
       pack: "正在打包",
       verify: "正在校验",
       finalize: "正在收尾",
+      install: "正在安装",
     },
     steps: {
       scan: "读取",
@@ -325,6 +333,7 @@ const zh: Messages = {
       pack: "打包",
       verify: "校验",
       finalize: "收尾",
+      install: "安装",
     },
     stepsLabel: "步骤",
     stepDone: (s) => `${s}（已完成）`,
@@ -335,12 +344,12 @@ const zh: Messages = {
     showFinder: "在访达中显示",
     showExplorer: "在资源管理器中显示",
     showFolder: "在文件夹中显示",
-    lz4: {
-      pack: "LZ4 打包",
-      unpack: "LZ4 解包",
-      trace: "LZ4 追踪",
-      unpatch: "LZ4 移除补丁",
-      runtime: "AMPR 运行时",
+    packTag: {
+      lz4Pack: (level: string) => `LZ4 打包 · ${level}`,
+      lz4Unpack: "LZ4 解包",
+      zstdPack: (level: string) => `zstd 打包 · ${level}`,
+      level: (n: number) => `级别 ${num(n)}`,
+      zstdUnpack: "zstd 解包",
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "编辑",
@@ -415,11 +424,13 @@ const zh: Messages = {
     convert: (n) => `转换 ${n}`,
     remove: (n) => `删除 ${n}`,
     deleting: (n) => `正在删除 ${n}`,
-    lz4Tip: "已用 LZ4 打包：ampr_emu 资源包",
+    lz4Tip: "LZ4 资源包",
+    zstdTip: "zstd 资源包",
     showAs: "显示方式",
     kinds: "按类型显示",
     all: "全部",
-    lz4Chip: "已用 LZ4 打包",
+    lz4Chip: "LZ4",
+    zstdChip: "zstd",
     countIn: (n, path) => (
       <>
         <b>{num(n)}</b> 个游戏，位于 {path}
@@ -475,84 +486,65 @@ const zh: Messages = {
     deleted: (path) => `已删除 ${path}`,
     renamed: (path) => `已重命名为 ${path}`,
     moved: (path) => `已移动到 ${path}`,
+    devices: "设备",
+    thisDevice: "本设备",
+    otherDevice: "“移动”只在同一台设备内进行：要复制到其他设备，请拖到该设备的标签页上。",
+    dropCopy: (folder) => `松开即可复制到 ${folder}`,
+    dropMove: (folder) => `松开即可移动到 ${folder}`,
+    cantCopy: "无法复制：",
+    copyNoFolder: "请先在那台设备上打开一个文件夹。",
+    copyOne: (name, to) => `正在将 ${name} 复制到 ${to}。传输任务显示在“连接”中。`,
+    copyMany: (n, to) => `正在将 ${num(n)} 项复制到 ${to}。传输任务显示在“连接”中。`,
+    openConnect: "打开“连接”",
   },
-  // Lz4.tsx
-  lz4: {
-    title: "LZ4 资源包",
-    help: "LZ4 使用说明",
-    scenario: "LZ4 场景",
-    scenarios: { trace: "追踪", pack: "打包/解包" },
-    actions: { patch: "打补丁", unpatch: "移除补丁", pack: "打包", unpack: "解包" },
-    scenarioInfo: (s, packed) => s === "trace"
-      ? "记录游戏在您游玩时读取的资源，供打包使用。"
-      : packed
-        ? "将游戏的 LZ4 包还原为普通文件。"
-        : "将游戏的资源打包为 LZ4 卷，由 ampr_emu 在游戏运行时读取。",
-    traceInfo: (a, image) => a === "patch"
-      ? image
-        ? "用追踪运行时重新构建此镜像，然后替换原镜像。"
-        : "在此文件夹中安装追踪运行时。"
-      : image
-        ? "用正式版运行时重新构建此镜像，然后替换原镜像。"
-        : "在此文件夹中恢复正式版运行时。",
-    noAmpr: "该游戏未使用 AMPR",
-    isPatch: "这是补丁包",
-    noEboot: "没有 eboot.bin",
-    packedFirst: "源已用 LZ4 打包：请先解包",
-    damaged: "其 LZ4 包已损坏",
-    archive: "压缩包无法追踪：请先转换",
-    nas: "NAS 上的游戏无法追踪：请先转换",
-    peer: "其他设备上的游戏无法追踪：请先转换",
-    chooseFirst: "请先选择源",
-    notRead: "尚未读取源",
-    pickProfile: "LZ4 配置文件",
-    profileFilter: "LZ4 配置文件（TOML）",
-    pickTracesFolder: "LZ4 追踪数据（包含 ampr_commands.bin 和 ampr_emu.index 的文件夹）",
-    pickTracesEither: "LZ4 追踪数据：zip 文件，或包含这两个文件的文件夹",
-    pickTracesZip: "LZ4 追踪数据（zip）",
-    unreadable: "无法开始：无法读取此源（见“源”）。",
-    pending: (a) => a === "patch"
-      ? "有任务正在运行或排队时无法打补丁。"
-      : "有任务正在运行或排队时无法移除补丁。",
-    replacing: "已有任务正在重新构建此镜像：请等待其完成。",
+  // Pack.tsx
+  pack: {
+    title: "打包",
+    help: "打包使用说明",
+    engine: "包的类型",
+    engines: { zstd: "zstd", lz4: "LZ4" },
+    actions: { pack: "打包", unpack: "解包" },
+    info: (e, packed) =>
+      e === "zstd"
+        ? packed
+          ? "将 zstd 包还原为普通文件。"
+          : "将游戏资源打包为 zstd 卷。"
+        : packed
+          ? "实验性。将 LZ4 包还原为普通文件。"
+          : "实验性：部分游戏可能无法启动。将游戏资源打包为 LZ4 卷。",
+    chooseGame: "请先选择游戏。",
+    noAmprGame: (e) => `该游戏未使用 AMPR，因此无法使用 ${e === "zstd" ? "zstd" : "LZ4"} 包。`,
+    patch: "补丁包无法打包。",
+    additionalContent: "附加内容（没有 eboot.bin）无法打包。",
+    unreadable: "无法开始：无法读取源（见“源”）。",
     blocked: (a, first, more) =>
-      `无法${a === "patch" ? "打补丁" : a === "unpatch" ? "移除补丁" : a === "pack" ? "打包" : "解包"}：${first}${more > 0 ? `（另有 ${num(more)} 项，见“源”）` : ""}。`,
-    chooseGame: "请先选择游戏文件夹、镜像或压缩包。",
-    noAmprGame: "该游戏未使用 AMPR，因此这里无法使用 LZ4。",
-    patch: "这是补丁包，因此这里无法使用 LZ4。",
-    additionalContent: "这是附加内容（没有 eboot.bin），因此这里无法使用 LZ4。",
-    installsRuntime: (a, version) =>
-      a === "pack"
-        ? `该游戏没有 ampr_emu：打包时会安装内置的 ampr_emu ${version}。`
-        : a === "patch"
-          ? `该游戏没有 ampr_emu：打补丁时会安装内置的追踪运行时（ampr_emu ${version}）。`
-          : `该游戏没有 ampr_emu：移除补丁时会安装内置的正式版运行时（ampr_emu ${version}）。`,
-    freshIndex: (state, a) =>
-      `${state === "stale" ? "ampr_emu.index 与此游戏的文件不符" : state === "damaged" ? "无法读取 ampr_emu.index" : "此游戏没有 ampr_emu.index"}：${a === "pack" ? "打包" : a === "patch" ? "打补丁" : "移除补丁"}时会写入新的索引。`,
-    unavailable: (items) => `不适用于此源：${items.join("；")}。`,
-    unavailableItem: (name, why) => `${name}（${why}）`,
-    optionWhy: (why) => `，${why}`,
-    readOnly: (kind) => <>
-      <b>{kind}</b> 在主机上是只读的，因此无法追踪。请先将其转换为 <b>ffpkg</b> 或 <b>exfat</b>。
-    </>,
-    action: "操作",
-    changes: (a, image) => a === "patch"
-      ? `将修改此${image ? "镜像" : "文件夹"}：追踪运行时替换 fakelib/libSceAmpr.sprx，不保留备份。`
-      : `将修改此${image ? "镜像" : "文件夹"}：恢复正式版运行时并删除追踪数据，不保留备份。`,
-    replay: (web) => `游玩后再次选择此源，即可使用其追踪数据。${web ? "“追踪”还可将其打包为 zip 提供下载。" : ""}`,
-    room: "追踪数据空间",
-    roomHint: "供游戏写入追踪数据的可用空间。请用 image_rw= 挂载镜像，否则不会记录任何内容。",
-    alreadyRelease: "已是正式版运行时：只会重新写入索引。",
-    spaceHint: "需要与镜像大小相当的可用空间；副本校验通过后才会替换镜像。",
-    deletesTraces: (a, bytes, web) =>
-      `${a === "patch" ? "打补丁" : "移除补丁"}会删除此源的追踪数据（${bytes}）：${web ? "请先下载。" : "请先复制一份。"}`,
-    useProfile: "改用规则配置文件",
-    profile: "配置文件",
-    choose: "选择",
-    profileHint: "包含打包规则的 TOML 文件，用于代替追踪数据。",
+      `无法${a === "pack" ? "打包" : "解包"}：${first}${more > 0 ? `（另有 ${num(more)} 项，见“源”）` : ""}。`,
     target: "目标",
-    direct: "直接打包到镜像中；游戏文件会读取两次。",
-    unpackFolder: "新的游戏文件夹，其中的包已还原为普通文件。",
+    packFolder: (e) => `推荐。最快、延迟最低：新的游戏文件夹，其资源位于 ${e === "zstd" ? "zstd" : "LZ4"} 包中。`,
+    levels: { fast: "快速", medium: "中等", max: "最大" },
+    levelNotes: {
+      zstd: {
+        fast: { tone: "good", text: "推荐。zstd 5：快速，体积适中。" },
+        medium: { text: "zstd 9：更小，更慢。" },
+        max: { text: "zstd 19：最小；慢得多，占用更多内存。" },
+      },
+      lz4: {
+        fast: { tone: "good", text: "推荐。LZ4 默认：最快。" },
+        medium: { text: "LZ4 HC 9：更小，更慢。" },
+        max: { text: "LZ4 HC 12：最小，最慢。" },
+      },
+    },
+    runtime: "运行时",
+    runtimeNotes: {
+      ng: { tone: "good", text: "推荐。可读取 zstd 和 LZ4 包。" },
+      ampr_emu: { text: "上游 ampr_emu。" },
+    },
+    ngNote: "需要 ampr-emu-ng：打包时会将其安装到 fakelib/。请关闭 ShadowMount+ 的 fakelib 更新，否则它会替换运行时。",
+    installsRuntime: (version) => `这里没有 ampr_emu：打包时会安装 ampr_emu ${version}。`,
+    freshIndex: (state) =>
+      `${state === "stale" ? "ampr_emu.index 已过期" : state === "damaged" ? "ampr_emu.index 已损坏" : "没有 ampr_emu.index"}：打包时会写入新的。`,
+    direct: "直接打包到镜像中；游戏会读取两次。",
+    unpackFolder: "由普通文件组成的新游戏文件夹。",
     unpackHint: (n) =>
       n === null ? "将已打包的文件还原为普通文件。" : `将 ${num(n)} 个已打包的文件还原为普通文件。`,
     likelyFail: (fmt) => <>
@@ -563,68 +555,35 @@ const zh: Messages = {
     already: (a, fmt) => <>
       已有任务正在将此游戏输出为 <b>{fmt}</b>；再次{a === "pack" ? "打包" : "解包"}会生成第二份副本。
     </>,
-    profileRules: "按配置文件的规则打包；引擎直接打开的文件保持不打包。",
-    chosenRules: "打包游戏在这些追踪数据中读取过的文件；引擎直接打开的文件保持不打包。",
-    ownRules: "打包游戏在上一次追踪会话中读取过的文件；引擎直接打开的文件保持不打包。",
-    guessRules: "没有追踪数据：将按可靠性较低的内置推测打包。请先追踪，或选择追踪数据或配置文件。",
-    recorded: "已记录的追踪数据",
-    recordedHint: (bytes) => `ampr_commands.bin（${bytes}）：“打包”会使用这些追踪数据。`,
-    downloadHint: "关闭游戏并等待约一分钟，然后在电脑浏览器中下载。再在电脑上的“打包/解包”→“追踪数据”中选择该 zip。",
-    download: (bytes, zip) => `下载追踪数据（${bytes}），保存为 ${zip}`,
-    missingIndex: "此源中没有 ampr_emu.index：打包需要它与 ampr_commands.bin 放在一起。",
-    truncatedJournal: "末尾被截断的记录仍可打包，处理到最后一条完整记录为止。",
-    fakelibWarning: (recorded) => recorded
-      ? "追踪数据很少或没有？请关闭 fakelib 更新程序，重新打补丁后再玩一次。"
-      : "追踪期间请关闭 fakelib 更新程序，否则不会记录任何内容。",
     emptyTitle: "请选择使用 AMPR 的游戏",
     experimental: "实验性：请保留原始游戏的副本。",
-    chooseSource: "选择源",
     source: "源",
-    traces: "追踪数据",
-    optionalTraces: "追踪数据（可选）",
-    unlock: "解锁以选择其他追踪数据",
-    loaded: "已从此源加载追踪数据",
-    lockedHint: (bytes) => `ampr_commands.bin（${bytes}）。如需改选其他追踪数据，请使用锁形图标。`,
-    clear: "清除",
-    zip: "Zip",
-    folder: "文件夹",
-    tracesHint: "选择通过“下载追踪数据”得到的 amprtrace zip，或包含两个追踪文件的文件夹。",
-    useOwn: "使用源自带的追踪数据",
-    patchResult: (a, n) =>
-      `${a === "patch" ? "已打补丁：追踪运行时已安装" : "已移除补丁：正式版运行时已恢复"}；索引列出了 ${num(n)} 个文件。`,
-    removed: (files) => `已删除旧的追踪文件：${files.join("、")}。`,
   },
-  // Lz4Help.tsx
-  lz4Help: {
-    title: "LZ4 使用说明",
+  // PackHelp.tsx
+  packHelp: {
+    title: "打包使用说明",
     close: "关闭",
-    warning: "实验性，仅适用于 AMPR 游戏。请保留原始游戏的副本。",
     body: () => (
       <>
-        <h3>1. 打包/解包</h3>
+        <h3>zstd</h3>
         <ol>
-          <li>
-            选择原始游戏、<b>打包/解包</b>，以及追踪数据（或配置文件）。
-          </li>
-          <li>输出已打包的文件夹或普通镜像；文件夹可在 <b>转换</b> 中转换为任意格式。</li>
-          <li>
-            对于已打包的源，这里显示的是 <b>解包</b>：文件会还原为普通文件。
-          </li>
-          <li>如果游戏自带的 ampr_emu 不低于内置版本且能读取 LZ4 包，打包会保留它；否则安装内置的正式版 ampr_emu；LZ4 追踪运行时也会被替换，没有 ampr_emu 的游戏也一样。</li>
+          <li>将游戏资源打包为 zstd 卷，输出到文件夹或镜像。仅适用于使用 AMPR 的游戏。</li>
+          <li><b>快速</b>（zstd 5）速度快；<b>中等</b>（9）和<b>最大</b>（19）体积更小，速度更慢。</li>
+          <li>已打包的游戏会显示<b>解包</b>：还原为普通文件。</li>
         </ol>
 
-        <h3>2. 追踪</h3>
+        <h3>LZ4</h3>
         <ol>
-          <li>
-            选择游戏的 <b>ffpkg</b> 或 <b>exfat</b>，然后依次选择 <b>追踪</b> → <b>打补丁</b>。
-          </li>
-          <li>关闭 fakelib 更新程序：它会覆盖追踪运行时。</li>
-          <li>
-            用 <span className="path">image_rw=</span> 挂载镜像，玩一次，然后关闭游戏。
-          </li>
-          <li>
-            在 PS5 页面上点击 <b>下载追踪数据</b>，或复制 ampr_commands.bin 和 ampr_emu.index。
-          </li>
+          <li><b>实验性</b>：部分游戏可能无法启动。请保留副本。</li>
+          <li>打包为 LZ4 卷，输出到文件夹或镜像：<b>快速</b>（LZ4）、<b>中等</b>（HC 9）、<b>最大</b>（HC 12）。</li>
+          <li>运行时：<b>ampr-emu-ng</b>（默认）或上游 <b>ampr_emu</b>。</li>
+          <li>已打包的游戏会显示<b>解包</b>。</li>
+        </ol>
+
+        <h3>ampr-emu-ng</h3>
+        <ol>
+          <li>可读取 zstd 和 LZ4 包；打包时会将其安装到 fakelib/。</li>
+          <li>请关闭 ShadowMount+ 的 fakelib 更新，否则它会替换运行时，游戏将无法读取它的包。</li>
         </ol>
       </>
     ),
@@ -633,7 +592,6 @@ const zh: Messages = {
   picker: {
     devices: "设备",
     thisDevice: "本设备",
-    systemDialog: "系统对话框",
     drives: "驱动器",
     location: "位置",
     parent: "上级文件夹",
@@ -653,14 +611,10 @@ const zh: Messages = {
   // common.tsx
   common: {
     folder: "文件夹",
-    pickFolder: "游戏文件夹",
-    pickImage: "游戏镜像或压缩包",
-    pickImageFilter: "镜像和压缩包",
-    pickFolderButton: "文件夹",
-    pickImageButton: "镜像/压缩包",
+    pickButton: "选择",
+    pickAny: "游戏文件夹、镜像或压缩包",
     source: "源",
     emptyTitle: "请选择游戏文件夹、镜像或压缩包",
-    emptyText: "PS5 游戏文件夹，或其镜像、安装包或压缩包。",
     accepted: "支持的源",
     unknownTitle: "未知游戏",
     patch: "补丁",
@@ -686,18 +640,17 @@ const zh: Messages = {
     noAmpr: "eboot.bin 未导入 libSceAmpr",
     runtime: {
       forge_release: "Forge 正式版",
-      forge_trace: "Forge 追踪版",
+      forge_trace: "旧版 LZ4 追踪运行时",
+      zstd: "ampr-emu-ng",
       other: "其他",
       none: "无",
     },
     packed: "已打包",
+    zstdKept: "zstd 资源包：转换时会保留",
     damaged: "包已损坏",
-    traced: "已追踪",
     plain: "未打包",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} 个文件，位于 ${num(volumes)} 个卷中` + (percent === null ? "" : `，为原大小的 ${num(percent)}%`),
-    journal: (size) => `记录 ${size}`,
-    noJournal: "尚无记录",
     runtimeIs: (label) => `运行时：${label}`,
     index: {
       stale: "ampr_emu.index 已过期：转换时会更新",
@@ -797,24 +750,20 @@ const zh: Messages = {
       exfat: {
         text: "适用于以 ffpkg 运行异常、只能像外置硬盘内容那样运行的游戏。也可在 Mac 或 PC 上打开。",
       },
-      ffpkg: { tone: "good", text: "推荐。PS5 自身的文件系统（UFS2）。可以以可写方式挂载。" },
+      ffpkg: { text: "PS5 自身的文件系统（UFS2）。可以以可写方式挂载。" },
       ffpfs: {
-        tone: "warn",
-        text: "实验性。PS5 的 PFS 文件系统，不压缩。文件名只能使用纯 ASCII 字符。",
+        text: "PS5 的 PFS 文件系统，不压缩。文件名只能使用纯 ASCII 字符。",
       },
       ffpfsc: {
-        tone: "warn",
-        text: "实验性。体积最小：包裹一个镜像的压缩容器，始终以只读方式挂载。",
+        text: "体积最小：包裹一个镜像的压缩容器，始终以只读方式挂载。",
       },
-      pkg: {
-        text: "像商店游戏一样安装，以原生速度运行。需要 kstuff、fpkg-enable 和 ppr-patch。",
-      },
+      pkg: { tone: "good", text: "推荐。像原生游戏一样运行，但前提是你的固件允许。" },
       lz4: {
         tone: "warn",
         text: "实验性。资源被打包为 LZ4 卷的游戏文件夹，由内置的 AMPR 模拟器（ampr_emu）在游戏运行时解包。仅适用于使用 AMPR 的游戏。",
       },
     },
-    innerFfpkg: { tone: "good", text: "推荐。PS5 自身的文件系统（UFS2）。" },
+    innerFfpkg: { text: "PS5 自身的文件系统（UFS2）。" },
     level0: { text: "不压缩：每个块按原样存储。文件与镜像一样大。" },
     levelDefault: {
       tone: "good",
@@ -847,7 +796,6 @@ const zh: Messages = {
         },
       },
     },
-    pkgFirmware: "仅适用于 11.60 及以下固件。",
     imageInside: "内部镜像",
     imageInsideLabel: "ffpfsc 内部的镜像",
     compressionLevel: "压缩级别",
@@ -1026,6 +974,39 @@ const zh: Messages = {
     sentPayload: (name, size, host) => `已将 ${name}（${size}）发送到 ${host}。`,
     helpInstallTitle: "一键在 PS5 上安装 Dump Forge",
     helpInstallText: "使用安装 Dump Forge 卡片将载荷发送到主机。它会从 GitHub 下载对应版本（或最新版本）并启动。",
+  },
+  // Packages.tsx (Storage's Package installer), InstallDialog.tsx, Files.tsx and Connect.tsx's Install pkg
+  install: {
+    view: "安装包安装器",
+    packages: "安装包",
+    refresh: "刷新",
+    scanning: "正在查找安装包",
+    none: "这台主机上没有找到安装包。",
+    noneHint: "将 .pkg 文件复制到主机存储或 USB 驱动器，然后点击“刷新”。",
+    truncated: "列表可能不完整",
+    limits: "搜索达到了某项上限而停止：可能缺少部分安装包。",
+    cantScan: "无法搜索：",
+    cantInstall: "无法安装：",
+    content: { game: "游戏", patch: "补丁", additional_content: "附加内容", unknown: "未知" },
+    install: "安装",
+    installName: (name) => `安装 ${name}`,
+    started: (name) => `正在安装 ${name}。任务显示在下方。`,
+    tag: "安装",
+    title: "安装此安装包？",
+    titleOn: (device) => `在 ${device} 上安装此安装包？`,
+    file: "文件",
+    game: "游戏",
+    titleId: "游戏 ID",
+    version: "版本",
+    size: "大小",
+    text: "PS5 会从 Dump Forge 获取安装包并安装。任务结束前请保持 Dump Forge 运行。",
+    reinstall: "如果此游戏已安装，PS5 会先删除已安装的副本，再安装这一个。",
+    cancel: "取消",
+    confirm: "安装",
+    installPkg: "安装 pkg",
+    installPkgOn: (device) => `在 ${device} 上安装安装包`,
+    pickTitle: "选择要安装的安装包",
+    sent: (device) => `${device} 正在安装安装包。任务显示在下方。`,
   },
   duration: { s: (s) => `${s}秒`, ms: (m, s) => `${m}分${s}秒`, hm: (h, m) => `${h}小时${m}分钟` },
 };

@@ -3,11 +3,13 @@
 //! ```sh
 //! cargo run --release -p ps5-dump-forge-lz4 --example lz4_bench -- survey <game_dir>
 //! cargo run --release -p ps5-dump-forge-lz4 --example lz4_bench -- bench <threads> <file[@offset+len]>...
+//! cargo run --release -p ps5-dump-forge-lz4 --example lz4_bench -- levels <threads> <file[@offset+len]>...
 //! ```
 //! `survey` lists what the built-in fallback packs (sizes only, nothing is read). `bench` loads the
 //! slices into RAM, then for every block shift 14..=20 runs the real `writer::pack` into memory
 //! (1 thread and `<threads>`), reads the result back through `reader::unpack`, and times plain
-//! `lz4_flex` block decompression. Each time is the median of 3 runs after one warm-up.
+//! C liblz4 block decompression. Each time is the median of 3 runs after one warm-up. `levels`
+//! packs the slices at 64 KiB blocks at LZ4 levels 0 (fast), 9 and 12 (HC).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -19,7 +21,7 @@ use std::time::Instant;
 use ps5_dump_forge_lz4::format::Codec;
 use ps5_dump_forge_lz4::reader::{open_manifest, unpack};
 use ps5_dump_forge_lz4::writer::{PackFile, PackOutput, pack};
-use ps5_dump_forge_lz4::{MANIFEST, PackSpec, Selection, select};
+use ps5_dump_forge_lz4::{MANIFEST, PackSpec, block, select};
 use ps5upload_fpkg::source::{FolderSource, SourceFile, SourceTree};
 use ps5upload_fpkg::{Error, Result};
 
@@ -97,7 +99,7 @@ fn survey(dir: &str) -> Result<()> {
             .rsplit_once('.')
             .map_or("", |x| x.1)
             .to_ascii_lowercase();
-        let m = if select(&f.path, f.size, &Selection::Fallback).is_some() {
+        let m = if select(&f.path, f.size).is_some() {
             &mut packed
         } else {
             &mut loose
@@ -105,7 +107,7 @@ fn survey(dir: &str) -> Result<()> {
         let e: &mut (u64, u64) = m.entry(ext).or_default();
         e.0 += 1;
         e.1 += f.size;
-        if select(&f.path, f.size, &Selection::Fallback).is_some() {
+        if select(&f.path, f.size).is_some() {
             println!("PACK {:>14} {}", f.size, f.path);
         }
     }
@@ -152,7 +154,13 @@ fn keep_lz4(raw: usize, compressed: usize) -> bool {
     }
 }
 
-fn run_pack(mem: &mut Mem, files: &[PackFile], shift: u8, threads: usize) -> (f64, MemOut) {
+fn run_pack(
+    mem: &mut Mem,
+    files: &[PackFile],
+    shift: u8,
+    threads: usize,
+    level: u8,
+) -> (f64, MemOut) {
     let files: Vec<PackFile> = files
         .iter()
         .map(|f| PackFile {
@@ -171,6 +179,7 @@ fn run_pack(mem: &mut Mem, files: &[PackFile], shift: u8, threads: usize) -> (f6
         0,
         None,
         threads,
+        level,
         &mut out,
         &mut |_| {},
         &AtomicBool::new(false),
@@ -179,7 +188,38 @@ fn run_pack(mem: &mut Mem, files: &[PackFile], shift: u8, threads: usize) -> (f6
     (t.elapsed().as_secs_f64(), out)
 }
 
-fn bench(threads: usize, args: &[&str]) -> Result<()> {
+fn levels(threads: usize, args: &[&str]) -> Result<()> {
+    let (mut mem, files) = sample(args)?;
+    let total: u64 = mem.files.iter().map(|f| f.size).sum();
+    println!("level  stored/raw  disk MB  c{threads} MB/s");
+    for level in [block::LEVEL_FAST, block::LEVEL_MEDIUM, block::LEVEL_MAX] {
+        run_pack(&mut mem, &files, 16, threads, level); // warm-up
+        let mut t = vec![];
+        let mut last = None;
+        for _ in 0..3 {
+            let (s, out) = run_pack(&mut mem, &files, 16, threads, level);
+            t.push(s);
+            last = Some(out);
+        }
+        let out = last.unwrap();
+        let stored: u64 = open_manifest(&out.done[MANIFEST])?
+            .chunks
+            .iter()
+            .map(|c| u64::from(c.stored))
+            .sum();
+        let disk: usize = out.done.values().map(Vec::len).sum();
+        println!(
+            "{level:5}  {:10.4}  {:7.1}  {:8.0}",
+            stored as f64 / total as f64,
+            disk as f64 / 1e6,
+            total as f64 / 1e6 / median(t)
+        );
+    }
+    Ok(())
+}
+
+/// The slices in memory, each listed packed at 64 KiB blocks.
+fn sample(args: &[&str]) -> Result<(Mem, Vec<PackFile>)> {
     let mut mem = Mem::default();
     let t = Instant::now();
     for a in args {
@@ -193,7 +233,7 @@ fn bench(threads: usize, args: &[&str]) -> Result<()> {
         t.elapsed().as_secs_f64(),
         total as f64 / 1e6 / t.elapsed().as_secs_f64()
     );
-    let files: Vec<PackFile> = mem
+    let files = mem
         .files
         .iter()
         .map(|f| PackFile {
@@ -207,17 +247,23 @@ fn bench(threads: usize, args: &[&str]) -> Result<()> {
             }),
         })
         .collect();
+    Ok((mem, files))
+}
+
+fn bench(threads: usize, args: &[&str]) -> Result<()> {
+    let (mut mem, files) = sample(args)?;
+    let total: u64 = mem.files.iter().map(|f| f.size).sum();
     println!(
         "shift block  stored/raw  disk/raw  lz4%blk  lz4%bytes  c1 MB/s  c{threads} MB/s  d_block MB/s  d_unpack MB/s"
     );
     for shift in 14..=20u8 {
-        run_pack(&mut mem, &files, shift, threads); // warm-up
+        run_pack(&mut mem, &files, shift, threads, 0); // warm-up
         let mut t1 = vec![];
         let mut tn = vec![];
         let mut last = None;
         for _ in 0..3 {
-            t1.push(run_pack(&mut mem, &files, shift, 1).0);
-            let (t, out) = run_pack(&mut mem, &files, shift, threads);
+            t1.push(run_pack(&mut mem, &files, shift, 1, 0).0);
+            let (t, out) = run_pack(&mut mem, &files, shift, threads, 0);
             tn.push(t);
             last = Some(out);
         }
@@ -232,7 +278,7 @@ fn bench(threads: usize, args: &[&str]) -> Result<()> {
         let mut lz4_raw = 0u64;
         for d in mem.data.values() {
             for b in d.chunks(bs) {
-                let c = lz4_flex::block::compress(b);
+                let c = block::compress(b, block::LEVEL_FAST).unwrap();
                 if keep_lz4(b.len(), c.len()) {
                     lz4_raw += b.len() as u64;
                     kept.push((c, b.len()));
@@ -244,7 +290,8 @@ fn bench(threads: usize, args: &[&str]) -> Result<()> {
             let t = Instant::now();
             let mut sink = 0usize;
             for (c, n) in &kept {
-                sink += lz4_flex::block::decompress(c, *n).unwrap().len();
+                let mut out = vec![0; *n];
+                sink += block::decompress_into(c, &mut out).unwrap();
             }
             assert_eq!(sink as u64, lz4_raw);
             dt.push(t.elapsed().as_secs_f64());
@@ -291,8 +338,11 @@ fn main() -> Result<()> {
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["survey", dir] => survey(dir),
         ["bench", threads, ref files @ ..] => bench(threads.parse().expect("threads"), files),
+        ["levels", threads, ref files @ ..] => levels(threads.parse().expect("threads"), files),
         _ => {
-            eprintln!("usage: lz4_bench survey <dir> | bench <threads> <file[@offset+len]>...");
+            eprintln!(
+                "usage: lz4_bench survey <dir> | bench|levels <threads> <file[@offset+len]>..."
+            );
             std::process::exit(2);
         }
     }

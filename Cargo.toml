@@ -12,6 +12,7 @@ members = [
   "crates/ps5-dump-forge-fpkg",
   "crates/ps5-dump-forge-flink",
   "crates/ps5-dump-forge-lz4",
+  "crates/ps5-dump-forge-zstd",
   "crates/ps5-dump-forge-server",
   "crates/ps5-dump-forge-smb",
   "crates/ps5-dump-forge-ftp",
@@ -51,6 +52,7 @@ ps5-dump-forge-archive = { path = "crates/ps5-dump-forge-archive" }
 ps5-dump-forge-fpkg = { path = "crates/ps5-dump-forge-fpkg" }
 ps5-dump-forge-flink = { path = "crates/ps5-dump-forge-flink" }
 ps5-dump-forge-lz4 = { path = "crates/ps5-dump-forge-lz4" }
+ps5-dump-forge-zstd = { path = "crates/ps5-dump-forge-zstd" }
 ps5-dump-forge-server = { path = "crates/ps5-dump-forge-server" }
 ps5-dump-forge-smb = { path = "crates/ps5-dump-forge-smb" }
 ps5-dump-forge-ftp = { path = "crates/ps5-dump-forge-ftp" }

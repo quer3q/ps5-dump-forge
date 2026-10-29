@@ -12,6 +12,7 @@ import { AddressQr, basename, CardHead, Dots, Head, Modal, openOverlay, ViewSwit
 import { openConnectHelp } from "./ConnectHelp";
 import { getLang, msg, num, useMessages } from "./i18n";
 import { Icon } from "./icons";
+import { confirmInstall } from "./InstallDialog";
 import type { Action } from "./jobs";
 import { NAS_PORT, type NasProtocol } from "./peers";
 import { nasRoot } from "./Picker";
@@ -150,6 +151,27 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
     setAsked(true);
   };
   const send = (start: string) => openTransfer(props.dispatch, start);
+  // An online paired PS5's Install pkg: a package on this device, asked, then the PS5's install
+  // job (it reads the file over FLINK; mirrored here under Connect).
+  const inst = useMessages().install;
+  const [installed, setInstalled] = useState<{ ok: string } | { err: string } | null>(null);
+  const installing = useRef(false);
+  const installOn = async (d: ConnectDevice) => {
+    if (installing.current) return;
+    installing.current = true;
+    try {
+      const path = await pick({ directory: false, title: inst.pickTitle, extensions: ["pkg"] });
+      if (!path || !(await confirmInstall({ path, device: d.name }))) return;
+      setInstalled(null);
+      await connect.install(d.key_id, path);
+      setInstalled({ ok: inst.sent(d.name) });
+      void refreshConnect();
+    } catch (e) {
+      setInstalled({ err: connectError(e) });
+    } finally {
+      installing.current = false;
+    }
+  };
   const rows: ReactNode[] = [];
   // Online devices first; within that, Forge peers, then NAS devices.
   for (const on of [true, false]) {
@@ -164,6 +186,7 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
             facts={[platformName(d.platform), d.address && <span className="mono" dir="ltr">{d.address}</span>, seen(d.online, d.last_seen)]}
             live={!!state}
             onSend={() => send(`flink://${d.key_id}`)}
+            onInstall={d.platform === "ps5" ? () => void installOn(d) : undefined}
             onDetails={() => openDevice(d.key_id, props.dispatch)}
           />,
         );
@@ -263,6 +286,13 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
                 <span className="muted connect-online">{t.onlineOf(online, total)}</span>
               </div>
               <ul className="dev-list">{rows}</ul>
+              {installed && "err" in installed && <ErrorLine lead={inst.cantInstall} text={installed.err} />}
+              {installed && "ok" in installed && (
+                <p className="note-line muted" role="status">
+                  <Icon name="info" />
+                  <span>{installed.ok}</span>
+                </p>
+              )}
             </>
           ) : !shown ? (
             !error && <Loading />
@@ -314,8 +344,19 @@ function Counted({ label, n }: { label: string; n: number }) {
 /** A saved device in the list: online dot, name and kind, its facts, Send (online only) and
  * Details. */
 /** `live`: false while a failed poll shows the last good state; Send waits for the service. */
-function DeviceRow(props: { name: string; kind: string; online: boolean; live: boolean; facts: ReactNode[]; onSend: () => void; onDetails: () => void }) {
+function DeviceRow(props: {
+  name: string;
+  kind: string;
+  online: boolean;
+  live: boolean;
+  facts: ReactNode[];
+  onSend: () => void;
+  onDetails: () => void;
+  /** A paired PS5: Install pkg (online only). */
+  onInstall?: () => void;
+}) {
   const t = useMessages().connect;
+  const inst = useMessages().install;
   return (
     <li className="dev-row">
       <OnlineDot online={props.online} />
@@ -330,6 +371,12 @@ function DeviceRow(props: { name: string; kind: string; online: boolean; live: b
         </p>
       </div>
       <div className="dev-actions">
+        {props.online && props.onInstall && (
+          <button type="button" className="small install" aria-haspopup="dialog" aria-label={inst.installPkgOn(props.name)} disabled={!props.live} onClick={props.onInstall}>
+            <Icon name="package" />
+            {inst.installPkg}
+          </button>
+        )}
         {props.online && (
           <button type="button" className="small" aria-haspopup="dialog" aria-label={t.sendFilesTo(props.name)} disabled={!props.live} onClick={props.onSend}>
             <Icon name="move" />

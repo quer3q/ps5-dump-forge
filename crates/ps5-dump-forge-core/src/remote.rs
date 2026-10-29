@@ -98,6 +98,23 @@ pub trait Remote: Send + Sync {
     fn remove(&self, path: &FlinkPath) -> io::Result<()>;
     /// Bytes free on the volume holding the folder `dir`.
     fn free_space(&self, dir: &FlinkPath) -> io::Result<u64>;
+    /// Deletes the file or folder `path` for good, as the device's own Delete would (a paired
+    /// Forge: its `Jobs::delete_path` and its protected paths). Refused unless the device
+    /// does it: a NAS share is read only here.
+    fn delete_path(&self, path: &FlinkPath) -> Result<(), crate::DeleteError> {
+        Err(crate::delete::not_here(path))
+    }
+    /// Moves or renames `from` to `to` on the same device, as its own Move to would
+    /// (`replace`: the user confirmed taking over a `to` there). Refused unless the device
+    /// does it, as [`Remote::delete_path`].
+    fn move_path(
+        &self,
+        from: &FlinkPath,
+        _to: &FlinkPath,
+        _replace: bool,
+    ) -> Result<(), crate::DeleteError> {
+        Err(crate::delete::not_here(from))
+    }
 }
 
 /// [`Remote::put_new`] in calls: `tmp` created, written, synced and closed, then renamed to
@@ -673,6 +690,8 @@ pub struct RemoteReader {
     /// The last window's length, and where a read that continues the last one starts.
     want: usize,
     next: u64,
+    /// The largest window read ahead (`WINDOW_MAX` unless [`Self::window_max`] lowers it).
+    max: usize,
 }
 
 const WINDOW_MIN: usize = 1 << 20;
@@ -698,7 +717,14 @@ impl RemoteReader {
             window_at: 0,
             want: WINDOW_MIN,
             next: 0,
+            max: WINDOW_MAX,
         })
+    }
+
+    /// Reads ahead at most `max` bytes (at least `WINDOW_MIN`), for many readers at once.
+    pub(crate) fn window_max(mut self, max: usize) -> Self {
+        self.max = max.clamp(WINDOW_MIN, WINDOW_MAX);
+        self
     }
 
     pub fn len(&self) -> u64 {
@@ -730,13 +756,13 @@ impl Read for RemoteReader {
         let end = self.window_at + self.window.len() as u64;
         if self.pos < self.window_at || self.pos >= end {
             self.want = if self.pos == self.next && self.next > 0 {
-                (self.want * 2).min(WINDOW_MAX)
+                (self.want * 2).min(self.max)
             } else {
                 WINDOW_MIN
             };
             // A read at least a window long skips the window.
             if buf.len() >= self.want {
-                let data = self.fetch(buf.len().min(WINDOW_MAX))?;
+                let data = self.fetch(buf.len().min(self.max))?;
                 buf[..data.len()].copy_from_slice(&data);
                 self.pos += data.len() as u64;
                 return Ok(data.len());
@@ -1208,7 +1234,7 @@ impl ps5upload_fpkg::PkgOut for RemotePkgOut {
     }
 }
 
-/// `dir/name` on its peer as [`crate::lz4_patch::write_temp_new`] writes a local file: an
+/// `dir/name` on its peer as [`crate::temp_file::write_temp_new`] writes a local file: an
 /// exclusive temporary name beside it that `fill` writes, sent, synced and closed, then renamed
 /// without replacing (over a file there when `replace`; the peer syncs the folder). On any
 /// failure the temporary file is removed. What `fill` writes is held up to [`PUT_MAX`] bytes:
@@ -1222,7 +1248,7 @@ fn write_temp_new(
     fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>,
 ) -> anyhow::Result<()> {
     let target = dir.join(name);
-    let tmp = dir.join(&crate::lz4_patch::temp_name(name));
+    let tmp = dir.join(&crate::temp_file::temp_name(name));
     let mut out = Spill {
         remote,
         tmp: &tmp,
@@ -1415,7 +1441,7 @@ impl ps5_dump_forge_lz4::writer::PackOutput for RemotePacks<'_> {
     type W = RemoteFile;
 
     fn create(&mut self, name: &str) -> ps5upload_fpkg::Result<RemoteFile> {
-        let tmp = self.dir.root.join(&crate::lz4_patch::temp_name(name));
+        let tmp = self.dir.root.join(&crate::temp_file::temp_name(name));
         let (part, file) = RemotePart::create(self.dir.remote.clone(), tmp)
             .map_err(|e| io::Error::other(format!("{e:#}")))?;
         self.parts.push((name.to_string(), part));
@@ -1430,6 +1456,23 @@ impl ps5_dump_forge_lz4::writer::PackOutput for RemotePacks<'_> {
 
     fn finish(&mut self, _: &str, mut w: RemoteFile) -> ps5upload_fpkg::Result<()> {
         Ok(w.sync_open()?)
+    }
+}
+
+/// The zstd packer writes through the same files as the LZ4 one.
+impl ps5_dump_forge_zstd::writer::PackOutput for RemotePacks<'_> {
+    type W = RemoteFile;
+
+    fn create(&mut self, name: &str) -> ps5upload_fpkg::Result<RemoteFile> {
+        ps5_dump_forge_lz4::writer::PackOutput::create(self, name)
+    }
+
+    fn reopen(&mut self, name: &str) -> ps5upload_fpkg::Result<RemoteFile> {
+        ps5_dump_forge_lz4::writer::PackOutput::reopen(self, name)
+    }
+
+    fn finish(&mut self, name: &str, w: RemoteFile) -> ps5upload_fpkg::Result<()> {
+        ps5_dump_forge_lz4::writer::PackOutput::finish(self, name, w)
     }
 }
 

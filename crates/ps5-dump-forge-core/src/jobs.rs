@@ -232,7 +232,7 @@ impl Inner {
 pub(crate) fn start(inner: &Arc<Inner>, request: ConvertRequest) -> JobId {
     let job = inner.next.fetch_add(1, Ordering::Relaxed);
     let cancel = Arc::new(AtomicBool::new(false));
-    let transfer = !request.transfer.is_empty();
+    let transfer = transfer_slot(&request);
     let paths = used_paths(job, &request);
     // Asked unlocked: the hook may take locks of its own (Connect's).
     // ponytail: check, then admit; a remote write that starts between the two isn't caught
@@ -278,6 +278,12 @@ pub(crate) fn start(inner: &Arc<Inner>, request: ConvertRequest) -> JobId {
     job
 }
 
+/// Whether `req` runs in the transfer slot: a transfer, or an install (ponytail: an install
+/// waits behind a transfer and a transfer behind an install).
+fn transfer_slot(req: &ConvertRequest) -> bool {
+    !req.transfer.is_empty() || req.install.is_some()
+}
+
 /// Why a job (a transfer or not) using `paths` can't start: one of them is at, in or above
 /// what an unfinished job of the other kind uses (jobs of one kind run one after another).
 fn conflict(state: &State, transfer: bool, paths: &[PathBuf]) -> Option<String> {
@@ -299,7 +305,7 @@ fn conflict(state: &State, transfer: bool, paths: &[PathBuf]) -> Option<String> 
 
 /// The paths a job reads or writes: source, output (the source, in place), its `.part`s
 /// (`finalize::part_path`, and `Part::replace`'s `.orig.part`), an archive's later parts,
-/// profile and traces (with a lone journal's index); in place, the undo journal; for an edit,
+/// for an edit, the undo journal and
 /// every file or folder it adds.
 /// An archive's later parts, found by name beside it (`source` is the first part).
 fn later_parts(source: &Path) -> Vec<PathBuf> {
@@ -318,11 +324,27 @@ fn later_parts(source: &Path) -> Vec<PathBuf> {
 /// What an Extract or a transfer reads (a transfer's sources, else the source and an
 /// archive's later parts): never what it replaces.
 fn read_paths(req: &ConvertRequest) -> Vec<PathBuf> {
+    if let Some(package) = &req.install {
+        return install_paths(package);
+    }
     if !req.transfer.is_empty() {
         return req.transfer.clone();
     }
     let mut paths = vec![req.source.clone()];
     paths.extend(later_parts(&req.source));
+    paths
+}
+
+/// An install's package and its `.crc` sidecar: here only when it exists. These run under the
+/// job table's lock (start, delete, quit), so another device is never asked: its sidecar is
+/// guarded whether or not it is there.
+// ponytail: a remote package's missing sidecar name is guarded too (refused to other jobs).
+fn install_paths(package: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![package.to_path_buf()];
+    let sidecar = package.with_extension("crc");
+    if crate::remote::is_remote(package) || sidecar.symlink_metadata().is_ok() {
+        paths.push(sidecar);
+    }
     paths
 }
 
@@ -342,13 +364,17 @@ fn at_or_in(path: &Path, read: &Path) -> bool {
 }
 
 fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
+    // An install: the package and its existing sidecar, nothing written.
+    if let Some(package) = &req.install {
+        return install_paths(package);
+    }
     // A transfer: its sources and where each lands (its temporary files are inside those).
     if !req.transfer.is_empty() {
         let mut paths = req.transfer.clone();
         paths.extend(crate::transfer::targets(req));
         return paths;
     }
-    let out = if req.lz4_in_place || !req.edits.is_empty() {
+    let out = if !req.edits.is_empty() {
         &req.source
     } else {
         &req.output
@@ -365,24 +391,13 @@ fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
         paths.extend(req.extract.iter().map(|p| req.output.join(name(p))));
     }
     paths.extend(later_parts(&req.source));
-    paths.extend(req.lz4_profile.iter().chain(&req.lz4_traces).cloned());
-    // An in-place job's undo journal (an edit's own; one an LZ4 in-place job refuses).
-    if req.lz4_in_place || !req.edits.is_empty() {
-        paths.push(ps5_dump_forge_patch::journal_path(&req.source));
-    }
+    // An edit job's undo journal and added files.
     if !req.edits.is_empty() {
+        paths.push(ps5_dump_forge_patch::journal_path(&req.source));
         paths.extend(req.edits.iter().filter_map(|e| match e {
             crate::Edit::Add { from, .. } => Some(from.clone()),
             _ => None,
         }));
-    }
-    // A journal named on its own is read with the index beside it.
-    if let Some(traces) = &req.lz4_traces
-        && !traces
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
-    {
-        paths.push(traces.with_file_name(crate::LZ4_TRACE_FILES[1]));
     }
     paths
 }
@@ -399,7 +414,7 @@ impl Inner {
         // Dropped last: Done goes out before the next job is woken, so no event of the next
         // job can arrive before this job's Done. A panicking `emit` still dequeues.
         let _leave = Leave(self, job);
-        let transfer = !request.transfer.is_empty();
+        let transfer = transfer_slot(request);
         let admitted = match refusal {
             Some(why) => Err(anyhow::anyhow!("preflight failed:\n  {why}")),
             None => self.wait_turn(job, transfer, cancel),
@@ -718,5 +733,30 @@ mod tests {
             assert!(inner.uses(&used), "{}", used.display());
         }
         assert!(!inner.uses(&dir.join("out/other")));
+    }
+
+    #[test]
+    fn install_guards_existing_sidecar_from_delete_and_move() {
+        let dir = crate::test_dir("jobs-install-sidecar");
+        let package = dir.join("game.pkg");
+        let sidecar = package.with_extension("crc");
+        std::fs::write(&package, b"package").unwrap();
+        std::fs::write(&sidecar, b"crc").unwrap();
+        let req: ConvertRequest = serde_json::from_value(serde_json::json!({
+            "source": "", "format": "folder", "output": "", "install": package
+        }))
+        .unwrap();
+        assert_eq!(read_paths(&req), vec![package.clone(), sidecar.clone()]);
+        let inner = Inner::new(Box::new(|_| {}));
+        inner.state().paths.insert(1, used_paths(1, &req));
+        assert!(inner.uses(&sidecar));
+        assert!(!inner.uses(&dir.join("other.crc")));
+        // Another device's sidecar is guarded without asking it.
+        let remote = Path::new("flink://0123456789abcdef/games/game.pkg");
+        let paths = install_paths(remote);
+        assert_eq!(
+            paths[1],
+            Path::new("flink://0123456789abcdef/games/game.crc")
+        );
     }
 }

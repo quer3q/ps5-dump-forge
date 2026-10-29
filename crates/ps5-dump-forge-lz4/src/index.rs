@@ -1,5 +1,5 @@
 //! Checked AMPRIDX3 path-index reader. Stricter than the runtime's own parser: a forged index
-//! must not be able to attach trace ids to the wrong files.
+//! must not be able to attach file ids to the wrong files.
 
 use std::collections::HashSet;
 

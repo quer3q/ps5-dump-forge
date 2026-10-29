@@ -1,4 +1,4 @@
-//! LZ4 asset packs in a conversion: unpacking a packed source, tracing, and the logical tree
+//! LZ4 asset packs in a conversion: unpacking a packed source, and the logical tree
 //! the `Lz4` target packs (`ps5-dump-forge-lz4` does the bytes; this is the job's glue).
 //!
 //! Without an LZ4 option packs travel as plain files, and an AMPR title gets the release
@@ -11,26 +11,22 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, Read};
+#[cfg(target_os = "freebsd")]
+use std::io;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
 use ps5_dump_forge_lz4::runtime::{self, RuntimeKind};
 use ps5_dump_forge_lz4::writer::{PackFile, PackOutput};
-use ps5_dump_forge_lz4::{
-    AutoLoose, CRC_SIDECAR, INDEX, JOURNAL, LOGS, MANIFEST, PROFILE, Profile, RUNTIME,
-    RuntimeProfile, Selection,
-};
+use ps5_dump_forge_lz4::{CRC_SIDECAR, INDEX, JOURNAL, LOGS, MANIFEST, PROFILE, RUNTIME};
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
 use crate::jobs::Ctx;
 use crate::preflight::listing;
-use crate::{ConvertRequest, Format, Lz4Mode};
+use crate::{ConvertRequest, Format, Lz4Mode, Lz4Runtime};
 
 /// A runtime is a few hundred KiB; a bigger file is not read to be recognized.
 const MAX_RUNTIME: u64 = 64 << 20;
-/// The largest `ampr_emu.index` read for traces (2 M records and their paths fit).
-const MAX_INDEX: u64 = 512 << 20;
 /// The largest `ampr_emu.index` read whole to be compared with the files written.
 // ponytail: 64 MiB is about 600,000 records; a bigger index is taken as damaged and rebuilt
 // (its journal and logs left out) rather than read whole into a job's 512 MiB.
@@ -71,8 +67,32 @@ impl Runtime {
             _ if !ampr => RuntimeAction::Untouched,
             RuntimeKind::None => RuntimeAction::Install,
             RuntimeKind::ForgeRelease => RuntimeAction::Keep,
+            // ampr-emu-ng reads LZ4 packs too.
+            RuntimeKind::Zstd => RuntimeAction::Keep,
             RuntimeKind::Other if current && (self.packs || !packs) => RuntimeAction::Keep,
             RuntimeKind::Other => RuntimeAction::Replace,
+        }
+    }
+
+    /// The action for LZ4 Pack with the runtime the request chose: ampr-emu-ng goes in unless
+    /// it is there; ampr_emu follows [`Self::action`] into packs, replacing ampr-emu-ng too.
+    pub(crate) fn pack_action(&self, choice: Lz4Runtime) -> RuntimeAction {
+        match (choice, self.kind) {
+            (Lz4Runtime::Ng, RuntimeKind::Zstd) => RuntimeAction::Keep,
+            (Lz4Runtime::Ng, RuntimeKind::None) => RuntimeAction::Install,
+            (Lz4Runtime::Ng, _) => RuntimeAction::Replace,
+            (Lz4Runtime::AmprEmu, RuntimeKind::Zstd) => RuntimeAction::Replace,
+            (Lz4Runtime::AmprEmu, _) => self.action(true, true),
+        }
+    }
+
+    /// The action for a zstd-packed source converted as it is: its packs need the zstd
+    /// runtime, whatever `eboot.bin` says, so any other one is replaced and none installed.
+    pub(crate) fn zstd_action(&self) -> RuntimeAction {
+        match self.kind {
+            RuntimeKind::Zstd => RuntimeAction::Keep,
+            RuntimeKind::None => RuntimeAction::Install,
+            _ => RuntimeAction::Replace,
         }
     }
 }
@@ -119,12 +139,10 @@ pub(crate) struct Packs {
     pub packed: bool,
     /// ... and the tree [`open`] returned has them decoded.
     pub unpacked: bool,
-    /// For the `Lz4` target without a profile: the files the traces saw, resolved against the
-    /// source's whole tree (before the backport is left out: the index the game ran with lists
-    /// it). `None`: no usable traces.
-    pub observed: Option<BTreeSet<String>>,
-    /// What reading the traces refused.
-    pub findings: Vec<String>,
+    /// For zstd packing of an LZ4-packed source: the paths its LZ4 packs held.
+    pub lz4_packed: Option<BTreeSet<String>>,
+    /// The tree [`open`] returned has the source's zstd packs decoded.
+    pub zstd_unpacked: bool,
 }
 
 /// Whether the job packs: the `Lz4` target (a packed folder), or [`Lz4Mode::Pack`] into any
@@ -133,86 +151,13 @@ pub(crate) fn packing(req: &ConvertRequest) -> bool {
     req.format == Format::Lz4 || req.lz4 == Some(Lz4Mode::Pack)
 }
 
-/// Whether the job decodes packs: unpack, trace (not in place), or repack. Unpatch and an
-/// in-place job refuse a packed source instead.
+/// Whether the job decodes packs: unpack, or repack (LZ4 or zstd).
 fn wants_unpack(req: &ConvertRequest) -> bool {
-    let in_place = req.lz4_in_place || req.lz4 == Some(Lz4Mode::Unpatch);
-    (req.lz4.is_some() && !in_place) || packing(req)
+    req.lz4.is_some() || packing(req) || req.zstd_pack
 }
 
-/// The findings of [`ConvertRequest::lz4_in_place`]: an `.exfat`/`.ffpkg` source (`kind`)
-/// converted to its own format, patched (`Trace`) or unpatched, not packed. Empty when the
-/// request is not in place.
-pub(crate) fn in_place_findings(
-    req: &ConvertRequest,
-    kind: crate::convert::Kind,
-    packed: bool,
-) -> Vec<String> {
-    use crate::convert::Kind;
-    let mut findings = Vec::new();
-    if !req.lz4_in_place {
-        return findings;
-    }
-    if crate::net::is_network(&req.source) {
-        findings.push(
-            "a game on a NAS or another device is read only here: it can't be patched in place"
-                .into(),
-        );
-    }
-    let own = match kind {
-        Kind::Exfat => Some(Format::Exfat),
-        Kind::Ffpkg => Some(Format::Ffpkg),
-        _ => None,
-    };
-    match kind {
-        Kind::Folder => findings.push(
-            "a game folder is patched in place directly (lz4_patch, lz4_unpatch), not by a \
-             conversion in place"
-                .into(),
-        ),
-        Kind::Exfat | Kind::Ffpkg => {}
-        other => findings.push(format!(
-            "a .{} can't be patched in place: the game's /app0 is read-only in it; only an \
-             .exfat or .ffpkg image is replaced by a patched copy",
-            other.name()
-        )),
-    }
-    if let Some(own) = own
-        && req.format != own
-    {
-        findings.push(format!(
-            "patching in place keeps the image's format: the target must be .{}, not {}",
-            kind.name(),
-            target_name(req.format)
-        ));
-    }
-    let verb = match req.lz4 {
-        Some(Lz4Mode::Trace) => "patch",
-        Some(Lz4Mode::Unpatch) => "unpatch",
-        _ => {
-            findings.push(
-                "in place goes only with an LZ4 patch (lz4: trace) or unpatch (lz4: unpatch)"
-                    .into(),
-            );
-            return findings;
-        }
-    };
-    if packed && own.is_some() {
-        findings.push(format!(
-            "this image holds LZ4 packs ({MANIFEST}): unpack it first (Unpack LZ4), then {verb} \
-             the unpacked image"
-        ));
-    }
-    // Replaced under a running game otherwise; checked again before the replace.
-    if own.is_some() {
-        findings.extend(crate::edit_job::smp_finding(&req.source));
-    }
-    findings
-}
-
-/// The source with its packs decoded when the job asks for that, and its traces when the
-/// `Lz4` target picks by them. Before the backport is left out: its files are records of the
-/// manifest and of the traced index. Packs that fail any check fail the job.
+/// The source with its packs decoded when the job asks for that. Before the backport is left
+/// out: its files are records of the manifest. Packs that fail any check fail the job.
 pub(crate) fn open(
     req: &ConvertRequest,
     mut source: Box<dyn SourceTree>,
@@ -226,16 +171,20 @@ pub(crate) fn open(
     if packs.packed && wants_unpack(req) {
         let tree = ps5_dump_forge_lz4::reader::unpack(source).context("opening the LZ4 packs")?;
         ctx.log(format!("LZ4: {}", tree.describe()));
+        if req.zstd_pack {
+            packs.lz4_packed = Some(tree.packed_paths().map(str::to_owned).collect());
+        }
         source = Box::new(tree);
         packs.unpacked = true;
     }
-    if packing(req) && req.lz4_profile.is_none() {
-        packs.observed = traces(
-            source.as_mut(),
-            req.lz4_traces.as_deref(),
-            ctx,
-            &mut packs.findings,
-        )?;
+    // zstd packs are decoded to be unpacked, or packed again (zstd or LZ4).
+    if (req.zstd_pack || req.zstd_unpack || packing(req))
+        && ps5_dump_forge_zstd::reader::detect(source.as_ref())
+    {
+        let tree = ps5_dump_forge_zstd::reader::unpack(source).context("opening the zstd packs")?;
+        ctx.log(format!("zstd: {}", tree.describe()));
+        source = Box::new(tree);
+        packs.zstd_unpacked = true;
     }
     Ok((source, packs))
 }
@@ -244,9 +193,8 @@ pub(crate) fn open(
 pub(crate) struct PackPlan {
     /// Every logical file in final `ampr_emu.index` record order; `spec` `None` stays loose.
     pub files: Vec<PackFile>,
-    pub runtime: Option<RuntimeProfile>,
-    /// Where the rules came from, for the job log.
-    pub rules: String,
+    /// The LZ4 level every pass compresses at (`ConvertRequest::lz4_level`).
+    pub level: u8,
 }
 
 /// What [`prepare`] made of the tree.
@@ -260,14 +208,6 @@ pub(crate) struct Prepared {
 /// The findings the request's LZ4 options make on their own (ruling 3 of the design).
 fn combinations(req: &ConvertRequest) -> Vec<String> {
     let mut findings = Vec::new();
-    let trace = req.lz4 == Some(Lz4Mode::Trace);
-    if trace && !matches!(req.format, Format::Folder | Format::Exfat | Format::Ffpkg) {
-        findings.push(format!(
-            "LZ4 traces are recorded only in a folder, .exfat or .ffpkg (the game writes them \
-             into its own /app0, which is read-only from a {})",
-            target_name(req.format)
-        ));
-    }
     if req.lz4 == Some(Lz4Mode::Unpack) && req.format == Format::Lz4 {
         findings.push("unpacking LZ4 is redundant: the LZ4 target always unpacks first".into());
     }
@@ -278,34 +218,19 @@ fn combinations(req: &ConvertRequest) -> Vec<String> {
                 .into(),
         );
     }
-    if req.lz4 == Some(Lz4Mode::Unpatch) && req.format == Format::Lz4 {
-        findings.push(
-            "unpatching LZ4 is redundant: the LZ4 target always installs the release runtime"
-                .into(),
-        );
-    }
-    if req.lz4_profile.is_some() && !packing(req) {
-        findings.push("an LZ4 profile only goes with packing (LZ4 Pack)".into());
-    }
-    if req.lz4_traces.is_some() && !packing(req) {
-        findings.push("LZ4 traces only go with packing (LZ4 Pack)".into());
-    }
-    if req.lz4_traces.is_some() && req.lz4_profile.is_some() {
-        findings.push("choose a profile or traces, not both".into());
-    }
-    if trace
-        && (!(64..=1024).contains(&req.lz4_trace_space_mib)
-            || !req.lz4_trace_space_mib.is_multiple_of(64))
-    {
+    if !ps5_dump_forge_lz4::block::valid_level(req.lz4_level) {
         findings.push(format!(
-            "the LZ4 trace space is 64 MiB to 1 GiB, in 64 MiB steps, not {} MiB",
-            req.lz4_trace_space_mib
+            "LZ4 level {} is not 0 (fast) or 3 through 12 (HC)",
+            req.lz4_level
         ));
+    }
+    if req.zstd_unpack && (req.lz4.is_some() || packing(req)) {
+        findings.push("zstd unpack takes no LZ4 option: unpack it, then pack it".into());
     }
     findings
 }
 
-fn target_name(format: Format) -> String {
+pub(crate) fn target_name(format: Format) -> String {
     match format {
         Format::Lz4 => "LZ4 packed folder".into(),
         other => crate::preflight::extension(other).map_or("folder".into(), |e| format!(".{e}")),
@@ -319,32 +244,25 @@ fn target_name(format: Format) -> String {
 pub(crate) fn prepare(
     req: &ConvertRequest,
     mut tree: Box<dyn SourceTree>,
-    mut packs: Packs,
+    packs: Packs,
     mtime: i64,
     ctx: &Ctx,
 ) -> anyhow::Result<Prepared> {
     let mut findings = combinations(req);
-    findings.append(&mut packs.findings);
     let target = packing(req);
-    let trace = req.lz4 == Some(Lz4Mode::Trace);
-    let unpatch = req.lz4 == Some(Lz4Mode::Unpatch);
     let rt = runtime_of(tree.as_mut());
     let kind = rt.kind;
     let ampr = imports_ampr(tree.as_mut());
-    // In place, `in_place_findings` says it once.
-    if unpatch && packs.packed && !req.lz4_in_place {
-        findings.push(format!(
-            "this dump holds LZ4 packs ({MANIFEST}): unpack it first (Unpack LZ4), then unpatch \
-             the unpacked copy"
-        ));
-    }
     if req.lz4 == Some(Lz4Mode::Unpack) && !packs.packed {
         ctx.log("unpack LZ4: nothing to unpack, the source holds no LZ4 packs");
     }
-    if (trace || target || unpatch) && size_of(tree.as_ref(), "eboot.bin").is_some() && !ampr {
+    if req.zstd_unpack && !packs.zstd_unpacked {
+        findings.push("zstd unpack: the source holds no zstd packs (ampr_zstd.index)".into());
+    }
+    if target && size_of(tree.as_ref(), "eboot.bin").is_some() && !ampr {
         findings.push(
-            "eboot.bin does not import libSceAmpr: LZ4 traces and packs only work for a title \
-             that uses AMPR"
+            "eboot.bin does not import libSceAmpr: LZ4 packs only work for a title that uses \
+             AMPR"
                 .into(),
         );
     }
@@ -355,61 +273,35 @@ pub(crate) fn prepare(
             pack: None,
         });
     }
-    if !(trace || target || unpatch || packs.unpacked) {
+    if !(target || packs.unpacked || packs.zstd_unpacked) {
         return plain(req, tree, packs.packed, &rt, ampr, mtime, ctx);
     }
-    if trace || target || unpatch {
+    let ng = target && req.lz4_runtime == Lz4Runtime::Ng;
+    if target && !ng {
         ctx.log(runtime::WARNING);
     }
-    let profile = match (&req.lz4_profile, target) {
-        (Some(path), true) => match ps5_dump_forge_lz4::load_profile(path) {
-            Ok(p) => Some(p),
-            Err(found) => {
-                findings.extend(found);
-                None
-            }
-        },
-        _ => None,
+    // Pack installs the chosen runtime whatever `eboot.bin` says (the check above refuses a
+    // non-AMPR one). Unpacked, the zstd runtime has nothing left to read: the release one
+    // replaces it.
+    let action = match kind {
+        _ if target => rt.pack_action(req.lz4_runtime),
+        RuntimeKind::Zstd if packs.zstd_unpacked => RuntimeAction::Replace,
+        _ => rt.action(ampr, false),
     };
-    let observed = packs.observed.take();
-
-    let installed: Option<&'static [u8]> = if trace {
-        ctx.log(format!(
-            "LZ4 trace: installing the tracing runtime at {RUNTIME}"
-        ));
-        Some(runtime::TRACE)
-    } else if unpatch {
-        ctx.log(match kind {
-            RuntimeKind::ForgeTrace => {
-                format!(
-                    "LZ4 unpatch: replacing the tracing runtime at {RUNTIME} with the release one"
-                )
-            }
-            RuntimeKind::ForgeRelease => {
-                format!("LZ4 unpatch: the release runtime at {RUNTIME} is written again")
-            }
-            RuntimeKind::Other => {
-                format!("LZ4 unpatch: replacing another runtime at {RUNTIME} with the release one")
-            }
-            RuntimeKind::None => {
-                format!("LZ4 unpatch: installing the release runtime at {RUNTIME}")
-            }
-        });
-        Some(runtime::RELEASE)
-    } else {
-        // Pack installs a runtime whatever `eboot.bin` says (the check above refuses a
-        // non-AMPR one).
-        match rt.action(ampr || target, target) {
-            RuntimeAction::Install | RuntimeAction::Replace => {
-                ctx.log(release_log(kind));
-                Some(runtime::RELEASE)
-            }
-            RuntimeAction::Keep => {
-                keep_log(&rt, ctx);
-                None
-            }
-            RuntimeAction::Untouched => None,
+    let installed: Option<&'static [u8]> = match action {
+        RuntimeAction::Install | RuntimeAction::Replace if ng => {
+            ctx.log(format!("LZ4: installing ampr-emu-ng at {RUNTIME}"));
+            Some(runtime::ZSTD)
         }
+        RuntimeAction::Install | RuntimeAction::Replace => {
+            ctx.log(release_log(kind));
+            Some(runtime::RELEASE)
+        }
+        RuntimeAction::Keep => {
+            keep_log(&rt, ctx);
+            None
+        }
+        RuntimeAction::Untouched => None,
     };
     // Into a `.pkg` the builder writes the index from exactly what it packages (as in
     // [`plain`]); a non-AMPR title's own stays listed so that the builder rebuilds it too.
@@ -435,9 +327,9 @@ pub(crate) fn prepare(
             pack: None,
         });
     }
-    // The `Lz4` target always writes a new one: the space bound counts exactly that. Unpatch
-    // promises a fresh one.
-    let keep = !(target || unpatch);
+    // The `Lz4` target always writes a new one: the space bound counts exactly that. So does
+    // zstd unpack: the zstd runtime's index listed its size.
+    let keep = !target && !packs.zstd_unpacked;
     let Some(index) = final_index(tree.as_mut(), &files, keep, mtime, ctx, &mut findings)? else {
         return Ok(Prepared {
             tree,
@@ -451,27 +343,10 @@ pub(crate) fn prepare(
     put(&mut files, INDEX, index.len() as u64);
     generated.insert(INDEX.into(), Cow::Owned(index));
     let pack = if target {
-        Some(plan(
-            tree.as_mut(),
-            &records,
-            profile.as_ref(),
-            observed.as_ref(),
-            req,
-            ctx,
-            &mut findings,
-        )?)
+        Some(plan(tree.as_mut(), &records, req, ctx, &mut findings)?)
     } else {
         None
     };
-    if trace && req.format == Format::Folder {
-        // ponytail: the growth figure is the design's workload assumption (1,000 submits/s at
-        // 96-byte headers and ~24 bytes per read), not a measurement; recalibrate after a real
-        // play session.
-        ctx.log(
-            "LZ4 trace: the journal and logs grow while the game runs (about 1 GB per hour, an \
-             estimate) and nothing caps them; keep free space where the folder will be played",
-        );
-    }
     Ok(Prepared {
         tree: overlay(tree, files, generated),
         findings,
@@ -489,6 +364,9 @@ fn release_log(kind: RuntimeKind) -> String {
             "LZ4: replacing the game's runtime at {RUNTIME} with the bundled ampr_emu {}",
             runtime::VERSION
         ),
+        RuntimeKind::Zstd => {
+            format!("LZ4: swapping ampr-emu-ng at {RUNTIME} for the release one")
+        }
         _ => format!("LZ4: installing the release runtime at {RUNTIME}"),
     }
 }
@@ -544,25 +422,48 @@ fn plain(
             pack: None,
         })
     };
-    let action = rt.action(ampr, packed);
+    // zstd packs travel as plain files too, read by the zstd runtime only. By the magic, as
+    // Inspect labels it: a stray file of that name gets the plain repair.
+    let zstd = !packed && crate::zstd_pack::packed(tree.as_mut());
+    let action = if zstd {
+        rt.zstd_action()
+    } else {
+        rt.action(ampr, packed)
+    };
     let release = match action {
         RuntimeAction::Untouched => return untouched(tree),
         RuntimeAction::Keep => {
             keep_log(rt, ctx);
             false
         }
+        RuntimeAction::Install if zstd => {
+            ctx.log(format!("zstd: installing the zstd runtime at {RUNTIME}"));
+            true
+        }
+        RuntimeAction::Replace if zstd => {
+            ctx.log(format!(
+                "zstd: replacing the runtime at {RUNTIME} with the zstd runtime"
+            ));
+            true
+        }
         RuntimeAction::Install | RuntimeAction::Replace => {
             ctx.log(release_log(rt.kind));
             true
         }
     };
+    let bytes = if zstd {
+        runtime::ZSTD
+    } else {
+        runtime::RELEASE
+    };
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
     let mut all = tree.files().to_vec();
     if release {
-        generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::RELEASE));
-        put(&mut all, RUNTIME, runtime::RELEASE.len() as u64);
+        generated.insert(RUNTIME.into(), Cow::Borrowed(bytes));
+        put(&mut all, RUNTIME, bytes.len() as u64);
     }
-    if packed {
+    // The zstd index lists the packed files, which the folder does not hold as such.
+    if packed || zstd {
         // The pack manifest's file ids are the index's records: never rebuilt.
         ctx.log(format!(
             "LZ4: keeping {INDEX} as it is: it must match the packs"
@@ -630,14 +531,6 @@ pub(crate) fn plain_listing(listing: &[SourceFile], action: RuntimeAction) -> Ve
     if matches!(action, RuntimeAction::Install | RuntimeAction::Replace) {
         put(&mut files, RUNTIME, runtime::RELEASE.len() as u64);
     }
-    files
-}
-
-/// The files Patch writes beside its index, with the tracing runtime installed.
-pub(crate) fn trace_listing(mut files: Vec<SourceFile>) -> Vec<SourceFile> {
-    // A folder patch's leftover temporary files are never indexed (`lz4_patch`).
-    files.retain(|f| !crate::lz4_patch::is_temp(&f.path));
-    put(&mut files, RUNTIME, runtime::TRACE.len() as u64);
     files
 }
 
@@ -814,78 +707,24 @@ fn read_all(tree: &mut dyn SourceTree, path: &str, size: u64) -> anyhow::Result<
     Ok(bytes)
 }
 
-/// The pack list, in `records` (final index) order: the rules pick from the profile, else the
-/// files the traces saw, else the built-in guess; the keep-loose list applies to all three, then
-/// auto-loose samples the large files left to pack (from `tree`).
+/// The pack list, in `records` (final index) order: the built-in guess (the keep-loose list and
+/// root files stay loose), then auto-loose samples the large files left to pack (from `tree`).
 fn plan(
     tree: &mut dyn SourceTree,
     records: &[(String, u64)],
-    profile: Option<&Profile>,
-    observed: Option<&BTreeSet<String>>,
     req: &ConvertRequest,
     ctx: &Ctx,
     findings: &mut Vec<String>,
 ) -> anyhow::Result<PackPlan> {
-    let (selection, rules) = match (profile, observed) {
-        (Some(p), _) => {
-            for key in &p.ignored {
-                ctx.log(format!("LZ4 profile: {key} is not used"));
-            }
-            let path = req
-                .lz4_profile
-                .as_deref()
-                .unwrap_or(std::path::Path::new(""));
-            (
-                Selection::Profile(p),
-                format!("the profile {}", path.display()),
-            )
-        }
-        (None, Some(o)) => (
-            Selection::Observed(o),
-            match &req.lz4_traces {
-                Some(path) => format!(
-                    "the traces copied to {} ({} files the game read)",
-                    path.display(),
-                    o.len()
-                ),
-                None => format!("this dump's traces ({} files the game read)", o.len()),
-            },
-        ),
-        (None, None) => (
-            Selection::Fallback,
-            "a built-in guess (no traces; less reliable)".to_string(),
-        ),
-    };
     let mut files: Vec<PackFile> = records
         .iter()
         .map(|(path, size)| PackFile {
             path: path.clone(),
             size: *size,
-            spec: ps5_dump_forge_lz4::select(path, *size, &selection),
+            spec: ps5_dump_forge_lz4::select(path, *size),
         })
         .collect();
-    if let Some(p) = profile {
-        let kept: Vec<String> = files
-            .iter()
-            .filter(|f| {
-                f.spec.is_none()
-                    && f.size > 0
-                    && !ps5_dump_forge_lz4::always_loose(&f.path)
-                    && ps5_dump_forge_lz4::profile_spec(&f.path, p).is_some()
-            })
-            .map(|f| f.path.clone())
-            .collect();
-        if !kept.is_empty() {
-            ctx.log(format!(
-                "LZ4 profile: {} files the profile packs stay loose (the keep-loose list: the \
-                 game may read them before AMPR starts): {}",
-                kept.len(),
-                first_ten(&kept)
-            ));
-        }
-    }
-    let auto = profile.map_or_else(AutoLoose::default, |p| p.auto_loose);
-    auto_loose(tree, &mut files, &auto, ctx)?;
+    auto_loose(tree, &mut files, req.lz4_level, ctx)?;
     // Names the runtime cannot take, and names the pack files will take.
     let bad: Vec<String> = files
         .iter()
@@ -907,13 +746,13 @@ fn plan(
     ));
     let packed = files.iter().filter(|f| f.spec.is_some()).count();
     ctx.log(format!(
-        "LZ4 rules: {rules}; {packed} files to pack, {} loose",
-        files.len() - packed
+        "LZ4 rules: the built-in guess; {packed} files to pack, {} loose; level {}",
+        files.len() - packed,
+        req.lz4_level
     ));
     Ok(PackPlan {
         files,
-        runtime: profile.and_then(|p| p.runtime),
-        rules,
+        level: req.lz4_level,
     })
 }
 
@@ -926,21 +765,26 @@ fn first_ten(paths: &[String]) -> String {
     s
 }
 
-/// Upstream's auto-loose over the pack list: every file `auto` applies to is sampled (a few
+/// Upstream's auto-loose over the pack list: every file it applies to is sampled (a few
 /// blocks spread over it, encoded as the writer would) and kept loose when the sample barely
 /// shrinks. Counted as preflight progress.
 fn auto_loose(
     tree: &mut dyn SourceTree,
     files: &mut [PackFile],
-    auto: &AutoLoose,
+    level: u8,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let picks: Vec<(usize, Vec<u64>)> = files
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
-            let spec = f.spec.filter(|s| auto.applies(f.size, s))?;
-            Some((i, auto.sample_indices(f.size, spec.block_shift)))
+            let spec = f
+                .spec
+                .filter(|s| ps5_dump_forge_lz4::auto_loose_applies(f.size, s))?;
+            Some((
+                i,
+                ps5_dump_forge_lz4::sample_indices(f.size, spec.block_shift),
+            ))
         })
         .collect();
     if picks.is_empty() {
@@ -974,6 +818,7 @@ fn auto_loose(
             f.size,
             shift,
             ks,
+            level,
             &mut |n| ctx.progress("preflight", base + n, total),
             ctx.cancel,
         )
@@ -985,7 +830,7 @@ fn auto_loose(
             s.savings() * 100.0,
             s.raw_ratio() * 100.0
         );
-        if auto.keeps_loose(&s) {
+        if s.keeps_loose() {
             loose.push(line);
             files[*i].spec = None;
         } else {
@@ -1019,199 +864,6 @@ fn is_pack_name(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     [MANIFEST, CRC_SIDECAR, PROFILE].contains(&p.as_str())
         || (p.starts_with("ampr_assets-") && p.ends_with(".pak") && !p.contains('/'))
-}
-
-/// Paths a trace session adds or replaces in the game folder (the PS5 patch, a traced copy),
-/// and a killed patch's temporary files: left out of both sides of the membership check
-/// (every other indexed file must be in the dump; the dump may hold more).
-fn trace_artifact(path: &str) -> bool {
-    path == JOURNAL
-        || path == INDEX
-        || path == RUNTIME
-        || LOGS.contains(&path)
-        || crate::lz4_patch::is_temp(path)
-}
-
-/// The files the game read in its last traced session, by path: the journal's file ids
-/// through the path index it ran with. From `copied` (a journal with its index beside it)
-/// when given, else from the dump's own. `None` (the built-in guess) without usable traces;
-/// copied traces that cannot be used are a finding instead.
-fn traces(
-    tree: &mut dyn SourceTree,
-    copied: Option<&std::path::Path>,
-    ctx: &Ctx,
-    findings: &mut Vec<String>,
-) -> anyhow::Result<Option<BTreeSet<String>>> {
-    let mut copied_journal = None;
-    // A usable index lists only files the dump has (the membership check below), so one past
-    // what they could take is refused before it is read.
-    let bound = index_bound(tree.files()).min(MAX_INDEX);
-    let index = match copied {
-        Some(path) => match crate::lz4_traces::open_copied(path, bound) {
-            Ok((index, journal)) => {
-                copied_journal = Some(journal);
-                index
-            }
-            Err(e) => {
-                findings.push(e);
-                return Ok(None);
-            }
-        },
-        None => {
-            if size_of(tree, JOURNAL).is_none() {
-                ctx.log(format!("LZ4 rules: no traces ({JOURNAL}) in this dump"));
-                return Ok(None);
-            }
-            let Some(size) = size_of(tree, INDEX) else {
-                ctx.log(format!(
-                    "LZ4 rules: {JOURNAL} without {INDEX}, whose file ids it names; not using it"
-                ));
-                return Ok(None);
-            };
-            if size > bound {
-                findings.push(format!(
-                    "{INDEX} is {size} bytes, too big to be one for this dump's files"
-                ));
-                return Ok(None);
-            }
-            read_all(tree, INDEX, size)?
-        }
-    };
-    let index = match ps5_dump_forge_lz4::index::read_index(&index) {
-        Ok(index) => index,
-        Err(e) => {
-            findings.push(format!("{INDEX}, which names the traced files: {e}"));
-            return Ok(None);
-        }
-    };
-    let listed: BTreeSet<&str> = index
-        .records
-        .iter()
-        .map(|(p, _)| p.as_str())
-        .filter(|p| !trace_artifact(p))
-        .collect();
-    let dump: BTreeSet<&str> = tree
-        .files()
-        .iter()
-        .map(|f| f.path.as_str())
-        .filter(|p| !trace_artifact(p))
-        .collect();
-    // Every indexed file must be in the dump: an index of files the dump lacks is another dump
-    // (or version), and the journal's ids would name the wrong files. Files only in the dump
-    // (a scene `.nfo` the traced copy lacked) were never seen by the game: unobserved, loose.
-    let missing: Vec<String> = listed.difference(&dump).map(|p| p.to_string()).collect();
-    if !missing.is_empty() {
-        findings.push(format!(
-            "the LZ4 traces do not belong to this dump: {INDEX}, through which {JOURNAL} names \
-             the files the game read, lists files this dump does not have"
-        ));
-        findings.extend(listing("only in the index", &missing));
-        return Ok(None);
-    }
-    let extra: Vec<&str> = dump.difference(&listed).copied().collect();
-    if !extra.is_empty() {
-        const SHOWN: usize = 10;
-        let mut line = extra[..extra.len().min(SHOWN)].join(", ");
-        if extra.len() > SHOWN {
-            line += &format!(" and {} more", extra.len() - SHOWN);
-        }
-        ctx.log(format!(
-            "LZ4 traces: {} files of this dump are not in {INDEX}, so the game can't have read \
-             them; they stay loose: {line}",
-            extra.len()
-        ));
-    }
-    let count = u32::try_from(index.records.len()).unwrap_or(u32::MAX);
-    let journal: Box<dyn Read + '_> = match copied_journal {
-        Some(journal) => journal,
-        None => {
-            let size = size_of(tree, JOURNAL).unwrap_or(0);
-            Box::new(TreeReader::new(tree, JOURNAL, size))
-        }
-    };
-    let reader = io::BufReader::with_capacity(1 << 20, journal);
-    let stats = ps5_dump_forge_lz4::journal::scan(reader, count, ctx.cancel)
-        .with_context(|| format!("reading {JOURNAL}"))?;
-    let observed: BTreeSet<String> = stats
-        .observed
-        .iter()
-        .filter_map(|&id| index.records.get((id as usize).checked_sub(1)?))
-        .map(|(p, _)| p.clone())
-        .collect();
-    ctx.log(format!(
-        "LZ4 traces: {} records read, {} skipped (bad hash), {} sequence gaps, {} ended on an \
-         unknown packet; {} files read by the game, {} bytes requested (requests, not bytes \
-         delivered)",
-        stats.records,
-        stats.bad_hash,
-        stats.gaps,
-        stats.unknown,
-        observed.len(),
-        stats.requested_bytes
-    ));
-    if stats.unparsed_tail > 0 || stats.truncated_tail > 0 {
-        ctx.log(format!(
-            "LZ4 traces: the last {} bytes of {JOURNAL} could not be read as records",
-            stats.unparsed_tail.saturating_add(stats.truncated_tail)
-        ));
-    }
-    if observed.is_empty() {
-        if let Some(path) = copied {
-            findings.push(format!(
-                "the LZ4 traces {} name no file the game read: play the traced copy (or patched \
-                 folder) first",
-                path.display()
-            ));
-            return Ok(None);
-        }
-        ctx.log("LZ4 rules: the traces name no file the game read; using the built-in guess");
-        return Ok(None);
-    }
-    Ok(Some(observed))
-}
-
-/// One file of a tree as a stream.
-struct TreeReader<'a> {
-    tree: &'a mut dyn SourceTree,
-    path: &'a str,
-    pos: u64,
-    size: u64,
-}
-
-impl<'a> TreeReader<'a> {
-    fn new(tree: &'a mut dyn SourceTree, path: &'a str, size: u64) -> Self {
-        Self {
-            tree,
-            path,
-            pos: 0,
-            size,
-        }
-    }
-}
-
-impl Read for TreeReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let want = (self.size - self.pos).min(buf.len() as u64) as usize;
-        if want == 0 {
-            return Ok(0);
-        }
-        let bytes = self
-            .tree
-            .read_range(self.path, self.pos, want)
-            .map_err(io::Error::other)?;
-        if bytes.is_empty() || bytes.len() > want {
-            return Err(io::Error::other(format!(
-                "{}: read {} bytes at {} of {}",
-                self.path,
-                bytes.len(),
-                self.pos,
-                self.size
-            )));
-        }
-        buf[..bytes.len()].copy_from_slice(&bytes);
-        self.pos += bytes.len() as u64;
-        Ok(bytes.len())
-    }
 }
 
 /// The prepared tree: the inner tree's files less the diagnostics, plus the generated runtime
@@ -1384,11 +1036,28 @@ impl<'a> PackOutput for PartOutput<'a> {
     }
 }
 
+/// The zstd packer writes through the same files as the LZ4 one.
+impl ps5_dump_forge_zstd::writer::PackOutput for PartOutput<'_> {
+    type W = <Self as PackOutput>::W;
+
+    fn create(&mut self, name: &str) -> ps5upload_fpkg::Result<Self::W> {
+        PackOutput::create(self, name)
+    }
+
+    fn reopen(&mut self, name: &str) -> ps5upload_fpkg::Result<Self::W> {
+        PackOutput::reopen(self, name)
+    }
+
+    fn finish(&mut self, name: &str, w: Self::W) -> ps5upload_fpkg::Result<()> {
+        PackOutput::finish(self, name, w)
+    }
+}
+
 /// The biggest single file the `Lz4` target writes, for the destination's file size limit
 /// (FAT32's 4 GiB): a loose file, the path index (`index` bytes), the manifest or a sidecar,
 /// or a volume, which never passes `VOLUME_CAP`. Packed files' own sizes do not count: their
 /// chunks are spread over volumes.
-pub(crate) fn largest_file(files: &[PackFile], profile: bool, index: u64) -> u64 {
+pub(crate) fn largest_file(files: &[PackFile], index: u64) -> u64 {
     use ps5_dump_forge_lz4::writer::{VOLUME_CAP, worst_case_bytes};
     let loose = files
         .iter()
@@ -1412,7 +1081,7 @@ pub(crate) fn largest_file(files: &[PackFile], profile: bool, index: u64) -> u64
         .saturating_add(12u64.saturating_mul(chunks))
         .saturating_add(strings);
     let crc = 48u64.saturating_add(4u64.saturating_mul(chunks));
-    let volume = worst_case_bytes(&packed, profile).min(VOLUME_CAP);
+    let volume = worst_case_bytes(&packed, false).min(VOLUME_CAP);
     loose.max(manifest).max(crc).max(volume)
 }
 
@@ -1564,7 +1233,7 @@ mod tests {
             file("eboot.bin", 100, None),
             file("data/huge.bin", 5 * GIB, spec),
         ];
-        let largest = largest_file(&files, false, 4096);
+        let largest = largest_file(&files, 4096);
         assert!(
             largest <= ps5_dump_forge_lz4::writer::VOLUME_CAP,
             "{largest}"
@@ -1575,13 +1244,13 @@ mod tests {
             file("eboot.bin", 100, None),
             file("data/huge.bin", 5 * GIB, None),
         ];
-        assert_eq!(largest_file(&files, false, 4096), 5 * GIB);
-        assert_eq!(largest_file(&files[..1], false, 4096), 4096);
+        assert_eq!(largest_file(&files, 4096), 5 * GIB);
+        assert_eq!(largest_file(&files[..1], 4096), 4096);
         // Small packs: the volume is about the data, not the cap.
         let files = [
             file("eboot.bin", 100, None),
             file("data/a.bin", 300_000, spec),
         ];
-        assert!(largest_file(&files, false, 4096) < 1 << 20);
+        assert!(largest_file(&files, 4096) < 1 << 20);
     }
 }

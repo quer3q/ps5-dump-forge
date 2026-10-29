@@ -19,7 +19,7 @@ import { askReplace, confirmReplace } from "./replace";
 import { useConnectState } from "./useConnectState";
 
 /** A transfer job: `paths` (on any device) copied into the folder `output`. */
-function transferRequest(paths: string[], output: string): ConvertRequest {
+export function transferRequest(paths: string[], output: string): ConvertRequest {
   return {
     source: "",
     format: "folder",

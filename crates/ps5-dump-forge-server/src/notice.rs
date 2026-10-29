@@ -118,7 +118,7 @@ pub(crate) fn stopped(lang: Lang) -> &'static str {
     }
 }
 
-/// A newer copy was started while an older one has a job (or a trace download): the older one
+/// A newer copy was started while an older one has a job: the older one
 /// keeps serving, and the newer one's self copy is what the tile starts next time.
 pub(crate) fn update_busy(lang: Lang) -> &'static str {
     match lang {
@@ -160,7 +160,11 @@ pub(crate) fn not_taken_over(lang: Lang, old: &str, new: &str) -> String {
 pub(crate) enum JobKind {
     Convert,
     Lz4,
+    /// A zstd pack or unpack job (`zstd_pack`, `zstd_unpack`).
+    Zstd,
     Transfer,
+    /// A package install (`install`).
+    Install,
 }
 
 /// A job of this device that finished or failed, as the console is told ([`job_ended`]).
@@ -172,7 +176,7 @@ pub(crate) struct Ended {
 }
 
 /// What a notice says about `request`'s job, given its result (`Ok`: the report's output):
-/// a conversion, an LZ4 tab job or a transfer (named by what it sent) that finished or failed. Nothing for an edit,
+/// a conversion, an LZ4 tab job, a zstd pack or a transfer (named by what it sent) that finished or failed. Nothing for an edit,
 /// an extract or a cancel.
 pub(crate) fn ended(request: &ConvertRequest, result: &Result<PathBuf, String>) -> Option<Ended> {
     if let Err(e) = result
@@ -181,17 +185,20 @@ pub(crate) fn ended(request: &ConvertRequest, result: &Result<PathBuf, String>) 
         return None;
     }
     let lz4 = match request.lz4 {
-        Some(Lz4Mode::Pack | Lz4Mode::Unpack | Lz4Mode::Trace) => true,
-        // Without `lz4_in_place` an unpatch is a runtime swap the UI counts as a conversion.
-        Some(Lz4Mode::Unpatch) => request.lz4_in_place,
+        Some(Lz4Mode::Pack | Lz4Mode::Unpack) => true,
         None => request.format == Format::Lz4,
     };
-    let kind = if !request.transfer.is_empty() {
+    let zstd = request.zstd_pack || request.zstd_unpack;
+    let kind = if request.install.is_some() {
+        JobKind::Install
+    } else if !request.transfer.is_empty() {
         JobKind::Transfer
     } else if !request.edits.is_empty() || !request.extract.is_empty() {
         return None;
     } else if lz4 {
         JobKind::Lz4
+    } else if zstd {
+        JobKind::Zstd
     } else {
         JobKind::Convert
     };
@@ -201,10 +208,11 @@ pub(crate) fn ended(request: &ConvertRequest, result: &Result<PathBuf, String>) 
             0 => file_name(first),
             n => format!("{} +{n}", file_name(first)),
         }
+    } else if let Some(pkg) = &request.install {
+        file_name(pkg)
     } else {
         file_name(match result {
             Ok(output) => output,
-            Err(_) if request.lz4_in_place => &request.source,
             Err(_) => &request.output,
         })
     };
@@ -222,14 +230,14 @@ fn file_name(path: &Path) -> String {
     }
 }
 
-/// A conversion, LZ4 job or transfer finished or failed: "Dump Forge: conversion finished:
-/// <name>" and its five siblings (the plain notice, when the system toast can't be sent).
+/// A conversion, LZ4 job, zstd job or transfer finished or failed: "Dump Forge: conversion
+/// finished: <name>" and its seven siblings (the plain notice, when the system toast can't be sent).
 pub(crate) fn job_ended(lang: Lang, e: &Ended) -> String {
     let (what, colon, name) = job_parts(lang, e);
     format!("Dump Forge{colon}{what}{colon}{name}")
 }
 
-/// The system toast's headline: "Conversion finished" and its five siblings.
+/// The system toast's headline: "Conversion finished" and its seven siblings.
 fn job_headline(lang: Lang, e: &Ended) -> String {
     let what = job_parts(lang, e).0;
     let mut chars = what.chars();
@@ -240,101 +248,147 @@ fn job_headline(lang: Lang, e: &Ended) -> String {
 
 /// What happened, the language's colon and the name (kept whole in right-to-left text).
 fn job_parts(lang: Lang, e: &Ended) -> (&'static str, &'static str, String) {
-    // Finished, failed: a conversion, an LZ4 job, a transfer.
-    let words: [&str; 6] = match lang {
+    // Finished, failed: a conversion, an LZ4 job, a zstd job, a transfer, a package install.
+    let words: [&str; 10] = match lang {
         Lang::En => [
             "conversion finished",
             "conversion failed",
             "LZ4 job finished",
             "LZ4 job failed",
+            "zstd job finished",
+            "zstd job failed",
             "transfer finished",
             "transfer failed",
+            "install finished",
+            "install failed",
         ],
         Lang::Ru => [
             "конвертация завершена",
             "конвертация не удалась",
             "задача LZ4 завершена",
             "задача LZ4 не удалась",
+            "задача zstd завершена",
+            "задача zstd не удалась",
             "передача завершена",
             "передача не удалась",
+            "установка завершена",
+            "установка не удалась",
         ],
         Lang::Zh => [
             "转换完成",
             "转换失败",
             "LZ4 任务完成",
             "LZ4 任务失败",
+            "zstd 任务完成",
+            "zstd 任务失败",
             "传输完成",
             "传输失败",
+            "安装完成",
+            "安装失败",
         ],
         Lang::De => [
             "Konvertierung abgeschlossen",
             "Konvertierung fehlgeschlagen",
             "LZ4-Auftrag abgeschlossen",
             "LZ4-Auftrag fehlgeschlagen",
+            "zstd-Auftrag abgeschlossen",
+            "zstd-Auftrag fehlgeschlagen",
             "Übertragung abgeschlossen",
             "Übertragung fehlgeschlagen",
+            "Installation abgeschlossen",
+            "Installation fehlgeschlagen",
         ],
         Lang::Es => [
             "conversión terminada",
             "conversión fallida",
             "tarea LZ4 terminada",
             "tarea LZ4 fallida",
+            "tarea zstd terminada",
+            "tarea zstd fallida",
             "transferencia terminada",
             "transferencia fallida",
+            "instalación terminada",
+            "instalación fallida",
         ],
         Lang::Fr => [
             "conversion terminée",
             "échec de la conversion",
             "tâche LZ4 terminée",
             "échec de la tâche LZ4",
+            "tâche zstd terminée",
+            "échec de la tâche zstd",
             "transfert terminé",
             "échec du transfert",
+            "installation terminée",
+            "échec de l’installation",
         ],
         Lang::Ja => [
             "変換が完了しました",
             "変換に失敗しました",
             "LZ4 ジョブが完了しました",
             "LZ4 ジョブに失敗しました",
+            "zstd ジョブが完了しました",
+            "zstd ジョブに失敗しました",
             "転送が完了しました",
             "転送に失敗しました",
+            "インストール完了",
+            "インストール失敗",
         ],
         Lang::Pt => [
             "conversão concluída",
             "falha na conversão",
             "tarefa LZ4 concluída",
             "falha na tarefa LZ4",
+            "tarefa zstd concluída",
+            "falha na tarefa zstd",
             "transferência concluída",
             "falha na transferência",
+            "instalação concluída",
+            "falha na instalação",
         ],
         Lang::It => [
             "conversione completata",
             "conversione non riuscita",
             "processo LZ4 completato",
             "processo LZ4 non riuscito",
+            "processo zstd completato",
+            "processo zstd non riuscito",
             "trasferimento completato",
             "trasferimento non riuscito",
+            "installazione completata",
+            "installazione non riuscita",
         ],
         Lang::Ko => [
             "변환 완료",
             "변환 실패",
             "LZ4 작업 완료",
             "LZ4 작업 실패",
+            "zstd 작업 완료",
+            "zstd 작업 실패",
             "전송 완료",
             "전송 실패",
+            "설치 완료",
+            "설치 실패",
         ],
         Lang::Ar => [
             "اكتمل التحويل",
             "فشل التحويل",
             "اكتملت مهمة LZ4",
             "فشلت مهمة LZ4",
+            "اكتملت مهمة zstd",
+            "فشلت مهمة zstd",
             "اكتمل النقل",
             "فشل النقل",
+            "اكتمل التثبيت",
+            "فشل التثبيت",
         ],
     };
     let kind = match e.kind {
         JobKind::Convert => 0,
         JobKind::Lz4 => 2,
-        JobKind::Transfer => 4,
+        JobKind::Zstd => 4,
+        JobKind::Transfer => 6,
+        JobKind::Install => 8,
     };
     let what = words[kind + usize::from(!e.ok)];
     let colon = match lang {
@@ -567,7 +621,7 @@ mod tests {
     }
 
     /// As the UI's `jobType`: a transfer, then edits and extracts (no notice), then an LZ4
-    /// tab job, else a conversion.
+    /// tab job, then a zstd pack, else a conversion.
     #[test]
     fn which_jobs_get_a_notice() {
         let plain = request("/o/a.exfat");
@@ -578,36 +632,33 @@ mod tests {
             kind(&r)
         };
         assert_eq!(with(&|r| r.format = Format::Lz4), Some(JobKind::Lz4));
-        for mode in [Lz4Mode::Pack, Lz4Mode::Unpack, Lz4Mode::Trace] {
+        for mode in [Lz4Mode::Pack, Lz4Mode::Unpack] {
             assert_eq!(with(&|r| r.lz4 = Some(mode)), Some(JobKind::Lz4));
         }
-        assert_eq!(
-            with(&|r| r.lz4 = Some(Lz4Mode::Unpatch)),
-            Some(JobKind::Convert)
-        );
-        let in_place = |r: &mut ConvertRequest| {
-            r.lz4 = Some(Lz4Mode::Unpatch);
-            r.lz4_in_place = true;
+        let zstd = |r: &mut ConvertRequest| {
+            r.format = Format::Folder;
+            r.zstd_pack = true;
         };
-        assert_eq!(with(&in_place), Some(JobKind::Lz4));
+        assert_eq!(with(&zstd), Some(JobKind::Zstd));
         assert_eq!(
             with(&|r| r.transfer = vec!["/s/a".into()]),
             Some(JobKind::Transfer)
+        );
+        assert_eq!(
+            with(&|r| r.install = Some("/data/a.pkg".into())),
+            Some(JobKind::Install)
         );
         assert_eq!(with(&|r| r.extract = vec!["a".into()]), None);
         let edit = |r: &mut ConvertRequest| {
             r.edits = vec![ps5_dump_forge_core::Edit::Delete { path: "a".into() }];
         };
         assert_eq!(with(&edit), None);
-        // A cancel says nothing; a failure names the output, an in-place job's source.
+        // A cancel says nothing; a failure names the output.
         for cancel in ["cancelled", "cancelled; the image was restored"] {
             assert_eq!(ended(&plain, &Err(cancel.into())), None);
         }
         let failed = ended(&plain, &Err("no room".into())).unwrap();
         assert_eq!((failed.ok, failed.name.as_str()), (false, "a.exfat"));
-        let mut r = request("");
-        in_place(&mut r);
-        assert_eq!(ended(&r, &Err("x".into())).unwrap().name, "game");
         // A transfer names what it sent: the first item, "+N" for the rest.
         let mut t = request("/data/games");
         t.transfer = vec!["/s/game-1k".into(), "/s/b".into(), "/s/c".into()];
@@ -641,6 +692,14 @@ mod tests {
         assert_eq!(
             job_ended(Lang::Ja, &e(JobKind::Convert, false)),
             "Dump Forge：変換に失敗しました：Game-PPSA01234.ffpkg"
+        );
+        assert_eq!(
+            job_ended(Lang::En, &e(JobKind::Zstd, true)),
+            "Dump Forge: zstd job finished: Game-PPSA01234.ffpkg"
+        );
+        assert_eq!(
+            job_ended(Lang::De, &e(JobKind::Zstd, false)),
+            "Dump Forge: zstd-Auftrag fehlgeschlagen: Game-PPSA01234.ffpkg"
         );
         assert!(job_ended(Lang::Ar, &e(JobKind::Convert, true)).ends_with("\u{2069}"));
     }

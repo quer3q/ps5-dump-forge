@@ -1,19 +1,16 @@
 //! LZ4 asset packs in the AMPRPAK4 layout read by the `ampr_emu` runtime: byte formats, the
 //! embedded runtimes, the pack writer and the unpacking reader.
 
+pub mod block;
 pub mod format;
 pub mod index;
-pub mod journal;
 pub mod reader;
 pub mod rules;
 pub mod runtime;
 pub mod tree;
 pub mod writer;
 
-pub use rules::{
-    AutoLoose, Profile, Sample, Selection, always_loose, keep_loose, load_profile, profile_spec,
-    select,
-};
+pub use rules::{Sample, always_loose, auto_loose_applies, keep_loose, sample_indices, select};
 
 /// What the rules decide for one packed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +22,8 @@ pub struct PackSpec {
     pub random: bool,
 }
 
-/// The optional AMPRCFG1 runtime profile (`ampr_assets.index.runtime`), from a TOML `[runtime]`
-/// table. `rules` parses and validates it; `writer` encodes it.
+/// The optional AMPRCFG1 runtime profile (`ampr_assets.index.runtime`): `reader` reads it from
+/// other tools' packs; `writer` can encode it (Forge's own packs carry none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeProfile {
     pub decoded_cache_bytes: u64,

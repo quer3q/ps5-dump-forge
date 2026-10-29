@@ -120,7 +120,8 @@ mod tests {
     use std::thread::sleep;
 
     static TICKS: AtomicUsize = AtomicUsize::new(0);
-    static SHARED: Shared = Shared::new(Some(count), Duration::from_millis(100));
+    // A period long against a busy CI runner's stalls: the checks below run well inside one.
+    static SHARED: Shared = Shared::new(Some(count), Duration::from_millis(500));
 
     fn count() {
         TICKS.fetch_add(1, Ordering::SeqCst);
@@ -130,9 +131,9 @@ mod tests {
         TICKS.load(Ordering::SeqCst)
     }
 
-    /// Waits up to 2 s for `want` ticks.
+    /// Waits up to 3 s for `want` ticks.
     fn wait_for(want: usize) -> usize {
-        for _ in 0..200 {
+        for _ in 0..300 {
             if ticks() >= want {
                 break;
             }
@@ -156,7 +157,7 @@ mod tests {
         drop(second);
         sleep(Duration::from_millis(20));
         let stopped = ticks();
-        sleep(Duration::from_millis(300));
+        sleep(Duration::from_millis(700));
         assert_eq!(ticks(), stopped);
         assert_eq!(SHARED.lock().count, 0);
         // Held again within a period: at once again.

@@ -64,6 +64,24 @@ pub(crate) fn is_lih(head: &[u8]) -> bool {
     head.starts_with(MAGIC)
 }
 
+/// Where the patch file holds the patched package's container, from its header alone (no
+/// block placed): its entries' offsets are relative to it, so it reads as at that offset.
+pub(crate) fn container_at(pkg: &mut Pkg) -> Result<u64> {
+    if pkg.len < BLOCK {
+        return Err(err(CORRUPT, "the patch header is truncated"));
+    }
+    let mut head = [0u8; 0x40];
+    pkg.read_at(0, &mut head)?;
+    let (off, size) = (le64(&head, 0x30), le64(&head, 0x38));
+    if off < BLOCK || off.checked_add(size).is_none_or(|e| e > pkg.len) {
+        return Err(err(
+            CORRUPT,
+            format!("the patch's container ({size} bytes at {off:#x}) is outside the file"),
+        ));
+    }
+    Ok(off)
+}
+
 impl View {
     pub fn open(file: Box<dyn ReadSeek>, len: u64) -> Result<(Self, Facts)> {
         let mut pkg = Pkg::new(file, len);

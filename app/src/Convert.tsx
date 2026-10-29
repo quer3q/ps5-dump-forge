@@ -1,5 +1,5 @@
 // Convert: source → target format → output → Build.
-// LZ4 asset packs (trace, pack, unpack, the in-place patch) have their own screen (Lz4.tsx).
+// LZ4 and zstd packs (pack, unpack) have their own screen (Pack.tsx).
 
 import { useEffect, useRef, useState } from "react";
 
@@ -37,7 +37,6 @@ import {
   KrakenField,
   Lead,
   OutputField,
-  PkgWarning,
   useOutput,
   VerifySwitch,
 } from "./target";
@@ -155,7 +154,7 @@ export function Convert(props: {
     [source],
   );
 
-  // A job that changed this source in place (an edit, an LZ4 Patch or Unpatch) has finished:
+  // A job that changed this source in place (an edit) has finished:
   // read it again. Every job seen unfinished counts, also one started on another tab.
   const live = useRef(new Set<JobId>());
   useEffect(() => {
@@ -166,7 +165,7 @@ export function Convert(props: {
         continue;
       }
       if (!live.current.delete(j.id)) continue;
-      if (source !== null && j.request?.source === source && (j.request.edits?.length || j.request.lz4_in_place)) again = true;
+      if (source !== null && j.request?.source === source && j.request.edits?.length) again = true;
     }
     if (again && source !== null) void open(source);
   }, [props.jobs, source]);
@@ -181,14 +180,21 @@ export function Convert(props: {
   const libs = ins ? ins.backport.length : 0;
   const emus = ins ? emulatorNames(ins) : [];
 
-  // A packed source (LZ4 asset packs) keeps its packs; core refuses what needs them unpacked
-  // first, which the LZ4 tab does.
+  // A packed source (LZ4 or zstd asset packs) keeps its packs; core refuses what needs them
+  // unpacked first, which the Pack tab does.
   const lz4 = ins?.lz4 ?? null;
-  const lz4Reason = lz4?.packed && removable && removeBackport ? t.lz4Backport : null;
+  const zstdPacked = ins?.zstd_packed === true;
+  const lz4Reason = !(removable && removeBackport)
+    ? null
+    : zstdPacked
+      ? t.zstdBackport
+      : lz4?.packed
+        ? t.lz4Backport
+        : null;
 
   // What core's plain conversion does to an AMPR game by itself (nothing to choose, only said):
   // core's runtime_action installs, replaces or keeps its ampr_emu, and a stale, damaged or
-  // missing ampr_emu.index is written afresh, leaving the old traces out. A package's builder
+  // missing ampr_emu.index is written afresh. A package's builder
   // always writes its own index. A game that doesn't use AMPR gets no note.
   const shipped = lz4?.shipped_runtime_version;
   const action = lz4?.imports_ampr ? lz4.runtime_action : null;
@@ -196,16 +202,26 @@ export function Convert(props: {
   const runtimeNote =
     !action || !shipped
       ? null
-      : t.amprRuntime(action === "replace" && lz4?.runtime === "forge_trace" ? "trace" : action, own, shipped);
+      : zstdPacked
+        ? // A kept zstd runtime is named on the source card's zstd tile.
+          action === "keep"
+          ? null
+          : t.amprZstdRuntime
+        : lz4?.runtime === "zstd"
+          ? // A kept ampr-emu-ng is named on the source card's tile.
+            action === "replace"
+            ? t.amprNgReplaced(shipped)
+            : null
+          : t.amprRuntime(action === "replace" && lz4?.runtime === "forge_trace" ? "trace" : action, own, shipped);
   // Remove backport leaves fakelib files out before core compares the index, so an ok one goes stale.
   const indexState = lz4?.index === "ok" && removable && removeBackport ? "stale" : lz4?.index;
   const indexNote =
-    !lz4?.imports_ampr || lz4.packed
+    !lz4?.imports_ampr || lz4.packed || zstdPacked
       ? null
       : format === "pkg"
-        ? t.amprPkgIndex(lz4.journal_bytes !== null)
+        ? t.amprPkgIndex
         : indexState && indexState !== "ok"
-          ? t.amprIndex(indexState, lz4.journal_bytes !== null)
+          ? t.amprIndex(indexState)
           : null;
 
   // Build would certainly fail: say why next to it instead.
@@ -234,7 +250,7 @@ export function Convert(props: {
       full_verify: fullVerify,
       kraken_level: krakenLevel,
       ffpfsc_level: ffpfscLevel,
-      // LZ4 tracing, packing and unpatching start from the LZ4 tab.
+      // LZ4 and zstd packing and unpacking start from the Pack tab.
       lz4: null,
       ...(password !== null && { archive_password: password }),
     };
@@ -304,7 +320,6 @@ export function Convert(props: {
           <p className="muted desc">
             <Lead note={formatInfo(format)} />
           </p>
-          {format === "pkg" && <PkgWarning />}
           {format === "ffpfsc" && (
             <FfpfscField
               prefix="c"

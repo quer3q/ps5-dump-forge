@@ -6,7 +6,6 @@
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "dialog:allow-open",
     "allow-inspect",
     "allow-library-scan",
     "allow-library-cover",
@@ -18,8 +17,6 @@
     "allow-start-job",
     "allow-cancel-job",
     "allow-stale-parts",
-    "allow-lz4-patch",
-    "allow-lz4-unpatch",
     "allow-delete-path",
     "allow-move-path",
     "allow-list-dir",
@@ -44,6 +41,7 @@
     "allow-connect-nas-save",
     "allow-connect-nas-forget",
     "allow-connect-cancel-job",
+    "allow-connect-install",
     "allow-connect-payload-install",
     "allow-connect-payload-send"
   ]

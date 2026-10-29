@@ -1,8 +1,8 @@
 // Development only: drives dist-http and src/http-client.ts against the real
 // `ps5-dump-forge serve` (built here with cargo, so it embeds the current dist-http) with
 // plain node (no browser), on a temp root holding a small game: the bundle's files, a real job
-// (folder -> .exfat) and a cancelled one through the poller, the LZ4 trace download (bytes),
-// delete_path's refusals, a reload's restore, a server restart (the list rebuilt) and quit.
+// (folder -> .exfat) and a cancelled one through the poller, delete_path's refusals, a
+// reload's restore, a server restart (the list rebuilt) and quit.
 //
 //   npm run build:http && node scripts/smoke.mjs      (FORGE_BIN=<serve binary> skips cargo)
 
@@ -158,47 +158,26 @@ const listed = await a.c.call("list_dir", { path: images });
 assert.ok(listed.entries.some((e) => e.name === name && e.size > 64 << 20), "the image");
 console.log(`jobs: ${lines.length}/${total} log lines once each, done once, cancel -> {"Err":"cancelled"}, ${name} written`);
 
-// Download traces: the page links one zip (a download, not fetch) of both files, STORED, so each
-// entry's bytes follow its 30-byte local header and name.
-const traced = `${root}/traced game`;
-mkdirSync(`${traced}/sce_sys`, { recursive: true });
-writeFileSync(`${traced}/sce_sys/param.json`, JSON.stringify({ titleId: "PPSA05678", titleName: "Smoke: Traced" }));
-const journal = Buffer.alloc(3 << 20, 0x5a);
-journal.write("AMPR journal head");
-writeFileSync(`${traced}/ampr_commands.bin`, journal);
-writeFileSync(`${traced}/ampr_emu.index`, "fake index");
-const traceUrl = (source) => `${ORIGIN}/api/lz4_traces?source=${encodeURIComponent(source)}`;
-const dl = await realFetch(traceUrl(traced));
-assert.equal(dl.status, 200);
-assert.equal(dl.headers.get("content-disposition"), 'attachment; filename="[Smoke Traced]-[PPSA05678]-amprtrace.zip"');
-const zip = Buffer.from(await dl.arrayBuffer());
-assert.equal(dl.headers.get("content-length"), String(zip.length));
-let at = 0;
-for (const [name, bytes] of [["ampr_commands.bin", journal], ["ampr_emu.index", Buffer.from("fake index")]]) {
-  assert.equal(zip.readUInt32LE(at), 0x04034b50, `${name}'s local header`);
-  assert.equal(zip.subarray(at + 30, at + 30 + name.length).toString(), name);
-  const data = at + 30 + name.length;
-  assert.ok(zip.subarray(data, data + bytes.length).equals(bytes), `${name}, byte for byte`);
-  at = data + bytes.length + 16;
-}
-const zipPath = `${root}/traces.zip`;
-writeFileSync(zipPath, zip);
-mkdirSync(`${root}/no index`);
-writeFileSync(`${root}/no index/ampr_commands.bin`, "x");
-assert.equal((await realFetch(traceUrl(`${root}/no index`))).status, 404);
+// A game folder the deletes below must leave alone, and a file to delete.
+const kept = `${root}/kept game`;
+mkdirSync(`${kept}/sce_sys`, { recursive: true });
+writeFileSync(`${kept}/sce_sys/param.json`, JSON.stringify({ titleId: "PPSA05678", titleName: "Smoke: Kept" }));
+const zipPath = `${root}/fixture.zip`;
+writeFileSync(zipPath, "not a zip");
+mkdirSync(`${root}/a folder`);
+writeFileSync(`${root}/a folder/x.bin`, "x");
 // Delete (Inspect's, after the page asks): disposable fixtures only. A file and a folder go;
 // a browse root, a folder holding one, an empty path and a missing one are refused.
 assert.equal(await a.c.call("delete_path", { path: zipPath }), null);
-assert.equal(await a.c.call("delete_path", { path: `${root}/no index` }), null);
-assert.ok(!(await a.c.call("list_dir", { path: root })).entries.some((e) => e.name === "traces.zip" || e.name === "no index"), "both gone");
+assert.equal(await a.c.call("delete_path", { path: `${root}/a folder` }), null);
+assert.ok(!(await a.c.call("list_dir", { path: root })).entries.some((e) => e.name === "fixture.zip" || e.name === "a folder"), "both gone");
 const delStatus = async (path) => (await raw("POST", "/api/delete_path", json, JSON.stringify({ path }))).status;
 assert.equal(await delStatus(root), 400, "a browse root");
 assert.equal(await delStatus(dirname(root)), 400, "a folder holding a browse root");
 assert.equal(await delStatus(""), 400, "an empty path");
-assert.equal(await delStatus(`${root}/no index`), 404, "already gone");
-assert.ok((await a.c.call("list_dir", { path: traced })).entries.length > 0, "the rest is untouched");
+assert.equal(await delStatus(`${root}/a folder`), 404, "already gone");
+assert.ok((await a.c.call("list_dir", { path: kept })).entries.length > 0, "the rest is untouched");
 console.log("delete_path: a file and a folder deleted; browse root, its parent, empty 400; missing 404");
-console.log(`lz4_traces: a ${zip.length}-byte zip of a 3 MiB journal and its index, entries byte for byte; no index 404`);
 
 // A reload: the list restored whole.
 const b = await page_("b");

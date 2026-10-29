@@ -88,12 +88,12 @@ impl Table {
         ended
     }
 
-    /// The unfinished jobs' ids and outputs (an in-place job's is its source, whose `.part`
-    /// it writes beside it; so is an edit job's, whose `output` is ignored).
+    /// The unfinished jobs' ids and outputs (an edit job's is its source, whose `output` is
+    /// ignored; a rebuild writes its `.part` beside the source).
     pub fn unfinished(&self) -> Vec<(JobId, PathBuf)> {
         self.requests()
             .map(|(id, r)| {
-                let in_place = r.lz4_in_place || !r.edits.is_empty();
+                let in_place = !r.edits.is_empty();
                 (id, if in_place { &r.source } else { &r.output }.clone())
             })
             .collect()
@@ -184,15 +184,17 @@ mod tests {
             kraken_level: ps5_dump_forge_core::KrakenLevel::Fast,
             ffpfsc_level: 6,
             lz4: None,
-            lz4_profile: None,
-            lz4_traces: None,
-            lz4_trace_space_mib: 256,
-            lz4_in_place: false,
+            zstd_pack: false,
+            zstd_level: 5,
+            zstd_unpack: false,
+            lz4_level: 0,
+            lz4_runtime: Default::default(),
             edits: Vec::new(),
             extract: Vec::new(),
             transfer: Vec::new(),
             replace: false,
             edit_rebuild: false,
+            install: None,
             archive_password: None,
         }
     }
@@ -223,16 +225,8 @@ mod tests {
             serde_json::json!(["scan", "write"])
         );
         assert_eq!(t.unfinished(), [(1, PathBuf::from("/o/a.exfat"))]);
-        // In place, the `.part` goes beside the source.
-        t.admit(
-            2,
-            ConvertRequest {
-                source: "/i/game.ffpkg".into(),
-                lz4_in_place: true,
-                ..request("")
-            },
-        );
-        assert_eq!(t.unfinished()[1], (2, PathBuf::from("/i/game.ffpkg")));
+        t.admit(2, request("/o/b.exfat"));
+        assert_eq!(t.unfinished()[1], (2, PathBuf::from("/o/b.exfat")));
         // An edit job's `output` is ignored: it edits the source (or rebuilds beside it).
         t.admit(
             3,
