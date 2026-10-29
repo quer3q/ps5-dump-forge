@@ -120,7 +120,8 @@ pub(crate) fn source_findings(
 
     let ampr = readiness.imports_ampr;
     // `prepare` builds the index anew for a libSceAmpr title and for a source with its own,
-    // except an LZ4-packed one (its index is kept: the pack manifest's file ids come from it);
+    // except an LZ4- or zstd-packed one (its index is kept: it lists the packed files, and
+    // the LZ4 pack manifest's file ids come from it; vendor patch 0030);
     // that copy itself is left out, and so is artwork the container may carry instead (`prepare`
     // still refuses a clash it does index). A manifest that cannot be read skips this check:
     // `prepare` fails with that read's error.

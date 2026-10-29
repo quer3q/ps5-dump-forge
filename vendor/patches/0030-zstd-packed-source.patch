@@ -1,0 +1,95 @@
+diff --git a/ps5upload-fpkg/src/source.rs b/ps5upload-fpkg/src/source.rs
+index 8b662e7..a2f26d2 100644
+--- a/ps5upload-fpkg/src/source.rs
++++ b/ps5upload-fpkg/src/source.rs
+@@ -701,17 +701,24 @@ fn scan_for(tree: &mut dyn SourceTree, rel: &str, start: u64, len: u64, needle:
+     false
+ }
+ 
+-/// Is `tree` an LZ4-packed folder (ampr_emu's asset packs): a root `ampr_assets.index` that
+-/// starts with `AMPRPAK4`? Its `ampr_emu.index` also lists the files inside the packs, and the
+-/// pack manifest is checked against it (file id = record order, path, size), so a package
+-/// carries that index as it is. A listed manifest whose first bytes cannot be read is an error,
+-/// never "not packed": that answer would regenerate the index and drop the packed records.
++/// Is `tree` a packed folder: ampr_emu's LZ4 asset packs (a root `ampr_assets.index` that
++/// starts with `AMPRPAK4`) or Forge's zstd packs (a root `ampr_zstd.index` that starts with
++/// `AMPRZPK1`)? Its `ampr_emu.index` also lists the files inside the packs, and the runtime
++/// looks them up through it (LZ4: the pack manifest is checked against it, file id = record
++/// order, path, size), so a package carries that index as it is. A listed manifest whose first
++/// bytes cannot be read is an error, never "not packed": that answer would regenerate the index
++/// and drop the packed records.
+ pub fn lz4_packed(tree: &mut dyn SourceTree) -> crate::Result<bool> {
+-    let listed = tree
+-        .files()
+-        .iter()
+-        .any(|f| f.path == "ampr_assets.index" && f.size >= 8);
+-    Ok(listed && tree.read_range("ampr_assets.index", 0, 8)? == b"AMPRPAK4")
++    for (index, magic) in [
++        ("ampr_assets.index", b"AMPRPAK4"),
++        ("ampr_zstd.index", b"AMPRZPK1"),
++    ] {
++        let listed = tree.files().iter().any(|f| f.path == index && f.size >= 8);
++        if listed && tree.read_range(index, 0, 8)? == magic {
++            return Ok(true);
++        }
++    }
++    Ok(false)
+ }
+ 
+ /// Does the folder's own `ampr_emu.index` describe the folder? `ampr_emu` trusts its sizes, so
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index 740233c..72ea551 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -560,6 +560,51 @@ fn a_packed_sources_own_index_is_packaged_as_is() {
+     }
+ }
+ 
++/// A zstd-packed folder (a root `ampr_zstd.index` starting `AMPRZPK1`) keeps its own index too:
++/// it lists the files inside the packs, which the package does not hold as files.
++#[test]
++fn a_zstd_packed_sources_own_index_is_packaged_as_is() {
++    use ps5upload_fpkg::ampr_index::{self, Entry};
++    let src = TempDir::new("zstd-index-src");
++    write_tree(src.path());
++    let mut index = b"AMPRZPK1".to_vec();
++    index.resize(128, 0);
++    std::fs::write(src.path().join("ampr_zstd.index"), &index).unwrap();
++    std::fs::write(src.path().join("ampr_zstd-000.pak"), [0u8; 64]).unwrap();
++    let records: Vec<Entry> = [("eboot.bin", 4096), ("data/packed/a.bin", 5_000_000)]
++        .map(|(path, size)| Entry {
++            path: path.into(),
++            size,
++            mtime: 42,
++        })
++        .to_vec();
++    let own = ampr_index::build_entries(&records).unwrap();
++    std::fs::write(src.path().join("ampr_emu.index"), &own).unwrap();
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    assert!(ps5upload_fpkg::source::lz4_packed(&mut tree).unwrap());
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let entry = prepared
++        .manifest()
++        .iter()
++        .find(|e| e.path == "ampr_emu.index")
++        .unwrap();
++    assert_eq!(
++        (entry.origin, entry.size),
++        (Origin::Source, own.len() as u64)
++    );
++    assert!(prepared.generated_bytes("ampr_emu.index").is_none());
++
++    // Not the zstd pack magic: generated anew.
++    std::fs::write(src.path().join("ampr_zstd.index"), [0u8; 128]).unwrap();
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    assert!(!ps5upload_fpkg::source::lz4_packed(&mut tree).unwrap());
++}
++
+ /// A listed `ampr_assets.index` whose first bytes cannot be read is an error, not "not packed":
+ /// that answer would regenerate the index and drop the records of the packed files.
+ #[test]

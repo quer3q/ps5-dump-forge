@@ -501,7 +501,7 @@ impl Work<'_> {
         let mut hasher = blake3::Hasher::new();
         let (hosts, ctx, total) = (self.hosts, self.ctx, self.total);
         let done = &mut self.done;
-        crate::lz4_patch::write_temp(&folder, name, &mut |file| {
+        crate::temp_file::write_temp(&folder, name, &mut |file| {
             hasher = blake3::Hasher::new();
             let mut emit = |chunk: &[u8], file: &mut File| -> io::Result<()> {
                 if ctx.cancel.load(Ordering::Relaxed) {
@@ -730,7 +730,7 @@ fn spelled(folder: &Path, name: &str) -> anyhow::Result<bool> {
 /// step fails.
 fn recase(from: &Path, to: &Path) -> std::io::Result<()> {
     let name = from.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = from.with_file_name(crate::lz4_patch::temp_name(&name));
+    let tmp = from.with_file_name(crate::temp_file::temp_name(&name));
     crate::finalize::rename_no_replace(from, &tmp)?;
     crate::finalize::rename_no_replace(&tmp, to).inspect_err(|_| {
         let _ = crate::finalize::rename_no_replace(&tmp, from);
@@ -1153,11 +1153,11 @@ mod tests {
             assert_eq!(snapshot(&root), before);
         }
         let mut req = request(&root, vec![mkdir("x")]);
-        req.lz4_in_place = true;
+        req.lz4 = Some(crate::Lz4Mode::Unpack);
         req.remove_backport = true;
         let err = format!("{:#}", run_with(&req, |_, _| {}).unwrap_err());
         assert!(
-            err.contains("lz4_in_place") && err.contains("remove_backport"),
+            err.contains("no LZ4 option (lz4)") && err.contains("remove_backport"),
             "{err}"
         );
         assert_eq!(snapshot(&root), before);

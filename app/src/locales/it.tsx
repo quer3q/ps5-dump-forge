@@ -17,6 +17,7 @@ const it: Messages = {
     convert: "Converti",
     active: (n) => `, ${num(n)} ${plural(n, { one: "attiva", many: "attive", other: "attive" })}`,
     edit: "Modifica",
+    pack: "Impacchetta",
     storage: "Archiviazione",
     connect: "Connetti",
     disconnected: "Non connesso",
@@ -63,16 +64,20 @@ const it: Messages = {
     targetFormat: "Formato di destinazione",
     alreadyFolder: "la sorgente è già una cartella",
     lz4Backport:
-      "Gli asset di questo gioco sono impacchettati con LZ4 e il suo manifest LZ4 elenca il backport: prima spacchettalo nella scheda LZ4, poi rimuovi qui il backport.",
+      "Gli asset di questo gioco sono impacchettati con LZ4 e il suo manifest LZ4 elenca il backport: prima spacchettalo nella scheda Impacchetta, poi rimuovi qui il backport.",
+    zstdBackport:
+      "Gli asset di questo gioco sono impacchettati con zstd e il suo indice zstd elenca il backport: prima spacchettalo nella scheda Impacchetta, poi rimuovi qui il backport.",
     unreadable: "Impossibile creare: non è stato possibile leggere questa sorgente (vedi “Sorgente”).",
     patchBlocked: "Impossibile creare: è un pacchetto di patch, che contiene solo ciò che l’aggiornamento ha cambiato. Aprilo in “Modifica” per estrarne i file.",
     openInEdit: "Apri in “Modifica”",
     noContentId: "Impossibile creare come fpkg: il param.json di questo gioco non ha un Content ID, che un pacchetto richiede.",
     blocked: (first, more) =>
       `Impossibile creare: ${first}${more > 0 ? ` (e ${num(more)} ${plural(more, { one: "altro", many: "altri", other: "altri" })}, vedi “Sorgente”)` : ""}.`,
+    amprZstdRuntime: "Questa conversione installa ampr-emu-ng in fakelib/libSceAmpr.sprx, che serve a questi pacchetti.",
+    amprNgReplaced: (version) => `Sostituisce l'ampr-emu-ng di questo gioco con l'ampr_emu ${version}.`,
     amprRuntime: (a, own, version) => {
       if (a === "install") return `Questo gioco usa AMPR ma non ha ampr_emu: la conversione installa l'ampr_emu ${version} incluso.`;
-      if (a === "trace") return `La conversione sostituisce il runtime di tracciamento LZ4 con l'ampr_emu ${version} di rilascio incluso.`;
+      if (a === "trace") return `La conversione sostituisce l'ampr_emu di questo gioco con l'ampr_emu ${version} incluso.`;
       if (a === "replace")
         return own
           ? `La conversione sostituisce l'ampr_emu ${own} di questo gioco con l'ampr_emu ${version} incluso.`
@@ -81,10 +86,9 @@ const it: Messages = {
         ? `L'ampr_emu ${own} di questo gioco è uguale o più recente dell'ampr_emu ${version} incluso: la conversione lo mantiene.`
         : `Questo gioco ha già l'ampr_emu ${version} incluso: la conversione lo mantiene.`;
     },
-    amprIndex: (state, traces) =>
-      `${state === "stale" ? "ampr_emu.index non elenca i file di questo gioco" : state === "damaged" ? "ampr_emu.index non è leggibile" : "Questo gioco non ha ampr_emu.index"}: la conversione ne scrive uno nuovo${traces ? " e lascia fuori le vecchie tracce" : ""}.`,
-    amprPkgIndex: (traces) =>
-      `Il pacchetto riceve un nuovo ampr_emu.index creato dai suoi file${traces ? ", senza le vecchie tracce" : ""}.`,
+    amprIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "ampr_emu.index non elenca i file di questo gioco" : state === "damaged" ? "ampr_emu.index non è leggibile" : "Questo gioco non ha ampr_emu.index"}: la conversione ne scrive uno nuovo.`,
+    amprPkgIndex: "Il pacchetto riceve un nuovo ampr_emu.index creato dai suoi file.",
     removeBackport: "Rimuovi backport",
     removeHint: (libs, emulators, other) =>
       `Esclude ${num(libs)} ${plural(libs, { one: "libreria", many: "librerie", other: "librerie" })} di backport da fakelib/` +
@@ -119,6 +123,7 @@ const it: Messages = {
         tagline: "Il migliore, se il firmware lo consente",
         cells: ["Nativa, piena velocità", "Dal 30 al 60% in meno, a seconda del gioco"],
       },
+      zstd: { tagline: "Per i giochi che usano AMPR, con ampr-emu-ng", cells: ["Caricamento fino all’80% più veloce", "Fino alla metà delle dimensioni del gioco"] },
       lz4: {
         tagline: "Sperimentale, per giochi che usano AMPR",
         cells: ["Caricamenti più rapidi del 30–40%, secondo gli autori", "Circa metà del gioco, secondo gli autori"],
@@ -139,7 +144,7 @@ const it: Messages = {
       ["In streaming", "da qualsiasi origine a qualsiasi destinazione: senza copia temporanea, nemmeno per l’immagine dentro un ffpfsc o un gioco in un archivio."],
       ["Archivi", "uno .zip, .7z o .rar con un gioco si sfoglia, converte o impacchetta come una cartella."],
       ["USB e schede SD", "scritto su chiavette e schede formattate exFAT o FAT32."],
-      ["LZ4", "traccia un gioco AMPR, poi impacchettane gli asset con riparazione intelligente (sperimentale)."],
+      ["Impacchetta", "pacchetti di asset zstd o LZ4 (sperimentale) con riparazione intelligente."],
       ["Archiviazione", "una Libreria dei tuoi giochi ed Esplora file per rinominare, spostare ed eliminare."],
       ["Sicuro", "il tuo gioco non cambia mai se non lo chiedi; i file spazzatura vengono saltati e i nomi di file errati segnalati in anticipo."],
     ],
@@ -151,13 +156,15 @@ const it: Messages = {
     upstream: (app) =>
       `Dati degli autori: quanto riportano gli autori di ampr_emu e Lazy_AMPR, non misurato da ${app}; variano da gioco a gioco. ampr_emu 0.4.2.1 è una build di prova dei suoi autori; problema noto: alcuni giochi vanno in crash durante il salvataggio.`,
     bundled: "Le cartelle impacchettate con LZ4 funzionano con ampr_emu 0.4.2.1 di drakmor (GPL-3.0), incluso senza modifiche. Codice sorgente:",
-    lazy: "Il flusso “prima traccia, poi impacchetta” segue Lazy_AMPR di Nazky:",
+    lazy: "L’impacchettamento LZ4 si basa su Lazy_AMPR di Nazky:",
+    ng: "I pacchetti zstd e LZ4 funzionano con ampr-emu-ng. Sorgente:",
+    logo: "Il logo è di Xxcco:",
     unrar:
       "Gli archivi .rar vengono letti con la libreria UnRAR inclusa, di Alexander Roshal (solo estrazione, con la licenza UnRAR).",
     language: "Lingua",
     system: "Sistema",
     notifications: "Avvisa al termine di un'attività",
-    notificationsHint: "Appare sulla console per le attività di conversione, LZ4 e trasferimento.",
+    notificationsHint: "Appare sulla console per le attività di conversione, impacchettamento e trasferimento.",
     notificationsFailed: "Impossibile modificare le notifiche.",
   },
   // Edit.tsx
@@ -341,6 +348,7 @@ const it: Messages = {
       pack: "Impacchettamento",
       verify: "Verifica",
       finalize: "Completamento",
+      install: "Installazione",
     },
     steps: {
       scan: "Lettura",
@@ -353,6 +361,7 @@ const it: Messages = {
       pack: "Impacchettamento",
       verify: "Verifica",
       finalize: "Completamento",
+      install: "Installazione",
     },
     stepsLabel: "Passaggi",
     stepDone: (s) => `Completato: ${s}`,
@@ -363,12 +372,12 @@ const it: Messages = {
     showFinder: "Mostra nel Finder",
     showExplorer: "Mostra in Esplora file",
     showFolder: "Mostra nella cartella",
-    lz4: {
-      pack: "LZ4: impacchetta",
-      unpack: "LZ4: spacchetta",
-      trace: "LZ4: tracciamento",
-      unpatch: "LZ4: rimuovi patch",
-      runtime: "Runtime AMPR",
+    packTag: {
+      lz4Pack: (level: string) => `LZ4: impacchetta · ${level}`,
+      lz4Unpack: "LZ4: spacchetta",
+      zstdPack: (level: string) => `zstd: impacchetta · ${level}`,
+      level: (n: number) => `livello ${num(n)}`,
+      zstdUnpack: "zstd: spacchetta",
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Modifica",
@@ -444,11 +453,13 @@ const it: Messages = {
     convert: (n) => `Converti ${n}`,
     remove: (n) => `Elimina ${n}`,
     deleting: (n) => `Eliminazione di ${n}`,
-    lz4Tip: "Impacchettato con LZ4: pacchetti di asset ampr_emu",
+    lz4Tip: "Pacchetti di asset LZ4",
+    zstdTip: "Pacchetti di asset zstd",
     showAs: "Mostra come",
     kinds: "Mostra tipo",
     all: "Tutti",
-    lz4Chip: "Impacchettato LZ4",
+    lz4Chip: "LZ4",
+    zstdChip: "zstd",
     countIn: (n, path) => (
       <>
         <b>{num(n)}</b> {plural(n, { one: "gioco in", many: "giochi in", other: "giochi in" })} {path}
@@ -505,100 +516,70 @@ const it: Messages = {
     deleted: (path) => `Eliminato ${path}`,
     renamed: (path) => `Rinominato in ${path}`,
     moved: (path) => `Spostato in ${path}`,
+    devices: "Dispositivi",
+    thisDevice: "Questo dispositivo",
+    otherDevice: "“Sposta” resta su un solo dispositivo: trascinalo sulla scheda di un altro dispositivo per copiarlo lì.",
+    dropCopy: (folder) => `Rilascia per copiare in ${folder}`,
+    dropMove: (folder) => `Rilascia per spostare in ${folder}`,
+    cantCopy: "Impossibile copiare:",
+    copyNoFolder: "Apri prima una cartella su quel dispositivo.",
+    copyOne: (name, to) => `Copia di ${name} in ${to}. Il trasferimento è elencato in “Connetti”.`,
+    copyMany: (n, to) =>
+      plural(n, {
+        one: `Copia di ${num(n)} elemento in ${to}. Il trasferimento è elencato in “Connetti”.`,
+        many: `Copia di ${num(n)} di elementi in ${to}. Il trasferimento è elencato in “Connetti”.`,
+        other: `Copia di ${num(n)} elementi in ${to}. Il trasferimento è elencato in “Connetti”.`,
+      }),
+    openConnect: "Apri “Connetti”",
   },
-  // Lz4.tsx
-  lz4: {
-    title: "Pacchetti di asset LZ4",
-    help: "Come funziona LZ4",
-    scenario: "Scenario LZ4",
-    scenarios: { trace: "Tracciamento", pack: "Impacchetta/Spacchetta" },
-    actions: { patch: "Applica patch", unpatch: "Rimuovi patch", pack: "Impacchetta", unpack: "Spacchetta" },
-    scenarioInfo: (s, packed) => s === "trace"
-      ? "Registra quali asset legge il gioco mentre giochi, da usare con “Impacchetta”."
-      : packed
-        ? "Riscrive i pacchetti LZ4 del gioco come file normali."
-        : "Raccoglie gli asset del gioco in volumi LZ4 che ampr_emu legge mentre il gioco è in esecuzione.",
-    traceInfo: (a, image) => a === "patch"
-      ? image
-        ? "Ricrea questa immagine con il runtime di tracciamento, poi la sostituisce."
-        : "Installa il runtime di tracciamento in questa cartella."
-      : image
-        ? "Ricrea questa immagine con il runtime di rilascio, poi la sostituisce."
-        : "Rimette il runtime di rilascio in questa cartella.",
-    noAmpr: "il gioco non usa AMPR",
-    isPatch: "è un pacchetto di patch",
-    noEboot: "manca eboot.bin",
-    packedFirst: "la sorgente è impacchettata con LZ4: prima spacchettala",
-    damaged: "i suoi pacchetti LZ4 sono danneggiati",
-    archive: "un archivio non supporta il tracciamento: prima convertilo",
-    nas: "un gioco su un NAS non supporta il tracciamento: prima convertilo",
-    peer: "un gioco su un altro dispositivo non supporta il tracciamento: prima convertilo",
-    chooseFirst: "scegli prima una sorgente",
-    notRead: "la sorgente non è ancora stata letta",
-    pickProfile: "Profilo LZ4",
-    profileFilter: "Profilo LZ4 (TOML)",
-    pickTracesFolder: "Tracce LZ4 (una cartella con ampr_commands.bin e ampr_emu.index)",
-    pickTracesEither: "Tracce LZ4: lo zip, oppure una cartella con entrambi i file",
-    pickTracesZip: "Tracce LZ4 (zip)",
-    unreadable: "Impossibile avviare: non è stato possibile leggere questa sorgente (vedi “Sorgente”).",
-    pending: (a) => a === "patch"
-      ? "Impossibile applicare la patch con operazioni in corso o in coda."
-      : "Impossibile rimuovere la patch con operazioni in corso o in coda.",
-    replacing: "Un'operazione sta già ricreando questa immagine: attendi che termini.",
-    blocked: (a, first, more) => {
-      const rest = `${first}${more > 0 ? ` (e ${num(more)} ${plural(more, { one: "altro", many: "altri", other: "altri" })}, vedi “Sorgente”)` : ""}.`;
-      if (a === "patch") return `Impossibile applicare la patch: ${rest}`;
-      if (a === "unpatch") return `Impossibile rimuovere la patch: ${rest}`;
-      if (a === "pack") return `Impossibile impacchettare: ${rest}`;
-      return `Impossibile spacchettare: ${rest}`;
-    },
-    chooseGame: "Scegli prima una cartella, un'immagine o un archivio di gioco.",
-    noAmprGame: "Questo gioco non usa AMPR, quindi LZ4 non si può usare qui.",
-    patch: "Questo è un pacchetto di patch, quindi LZ4 non si può usare qui.",
-    additionalContent: "Questo è contenuto aggiuntivo (senza eboot.bin), quindi LZ4 non si può usare qui.",
-    installsRuntime: (a, version) =>
-      a === "pack"
-        ? `Questo gioco non ha ampr_emu: Impacchetta installa l'ampr_emu ${version} incluso.`
-        : a === "patch"
-          ? `Questo gioco non ha ampr_emu: Applica patch installa il runtime di tracciamento incluso (ampr_emu ${version}).`
-          : `Questo gioco non ha ampr_emu: Rimuovi patch installa il runtime di rilascio incluso (ampr_emu ${version}).`,
-    freshIndex: (state, a) =>
-      `${state === "stale" ? "ampr_emu.index non elenca i file di questo gioco" : state === "damaged" ? "ampr_emu.index non è leggibile" : "Questo gioco non ha ampr_emu.index"}: ${a === "pack" ? "Impacchetta" : a === "patch" ? "Applica patch" : "Rimuovi patch"} ne scrive uno nuovo.`,
-    unavailable: (items) => `Non disponibile per questa sorgente: ${items.join("; ")}.`,
-    unavailableItem: (name, why) => `${name} (${why})`,
-    optionWhy: (why) => `, ${why}`,
-    readOnly: (kind) => <>
-      <b>{kind}</b> è di sola lettura sulla console, quindi non supporta il tracciamento. Prima convertilo in <b>ffpkg</b> o <b>exfat</b>.
-    </>,
-    action: "Azione",
-    changes: (a, image) => a === "patch"
-      ? image
-        ? "Modifica questa immagine: il runtime di tracciamento sostituisce fakelib/libSceAmpr.sprx, senza copia di backup."
-        : "Modifica questa cartella: il runtime di tracciamento sostituisce fakelib/libSceAmpr.sprx, senza copia di backup."
-      : image
-        ? "Modifica questa immagine: torna il runtime di rilascio e le tracce vengono eliminate, senza copia di backup."
-        : "Modifica questa cartella: torna il runtime di rilascio e le tracce vengono eliminate, senza copia di backup.",
-    replay: (web) => web
-      ? "Gioca, poi scegli di nuovo questa sorgente per usarne le tracce. “Tracciamento” le offre anche come zip."
-      : "Gioca, poi scegli di nuovo questa sorgente per usarne le tracce.",
-    room: "Spazio per la traccia",
-    roomHint: "Spazio libero per la traccia del gioco. Monta l'immagine con image_rw=, altrimenti non viene registrato nulla.",
-    alreadyRelease: "Ha già il runtime di rilascio: viene riscritto solo l'indice.",
-    spaceHint: "Serve uno spazio libero pari circa alla dimensione dell'immagine; viene sostituita solo dopo che la copia ha superato la verifica.",
-    deletesTraces: (a, bytes, web) => a === "patch"
-      ? web
-        ? `Applicare la patch elimina le tracce di questa sorgente (${bytes}): prima scaricale.`
-        : `Applicare la patch elimina le tracce di questa sorgente (${bytes}): prima copiale.`
-      : web
-        ? `Rimuovere la patch elimina le tracce di questa sorgente (${bytes}): prima scaricale.`
-        : `Rimuovere la patch elimina le tracce di questa sorgente (${bytes}): prima copiale.`,
-    useProfile: "Usa invece un profilo di regole",
-    profile: "Profilo",
-    choose: "Scegli",
-    profileHint: "Un file TOML di regole di impacchettamento, usato al posto delle tracce.",
+  // Pack.tsx
+  pack: {
+    title: "Impacchetta",
+    help: "Come funziona l'impacchettamento",
+    engine: "Tipo di pacchetti",
+    engines: { zstd: "zstd", lz4: "LZ4" },
+    actions: { pack: "Impacchetta", unpack: "Spacchetta" },
+    info: (e, packed) =>
+      e === "zstd"
+        ? packed
+          ? "Riscrive i pacchetti zstd come file normali."
+          : "Impacchetta gli asset del gioco in volumi zstd."
+        : packed
+          ? "Sperimentale. Riscrive i pacchetti LZ4 come file normali."
+          : "Sperimentale: alcuni giochi potrebbero non avviarsi. Impacchetta gli asset del gioco in volumi LZ4.",
+    chooseGame: "Scegli prima un gioco.",
+    noAmprGame: (e) => `Questo gioco non usa AMPR, quindi i pacchetti ${e === "zstd" ? "zstd" : "LZ4"} non si possono usare.`,
+    patch: "Un pacchetto di patch non si può impacchettare.",
+    additionalContent: "Il contenuto aggiuntivo (senza eboot.bin) non si può impacchettare.",
+    unreadable: "Impossibile avviare: non è stato possibile leggere la sorgente (vedi “Sorgente”).",
+    blocked: (a, first, more) =>
+      `Impossibile ${a === "pack" ? "impacchettare" : "spacchettare"}: ${first}${more > 0 ? ` (e altri ${num(more)}, vedi “Sorgente”)` : ""}.`,
     target: "Destinazione",
-    direct: "Impacchetta direttamente nell'immagine; i file del gioco vengono letti due volte.",
-    unpackFolder: "Una nuova cartella di gioco con i pacchetti riscritti come file normali.",
+    packFolder: (e) => `Consigliato. Il più veloce, latenza minima: una nuova cartella di gioco, con gli asset in pacchetti ${e === "zstd" ? "zstd" : "LZ4"}.`,
+    levels: { fast: "Veloce", medium: "Medio", max: "Massimo" },
+    levelNotes: {
+      zstd: {
+        fast: { tone: "good", text: "Consigliato. zstd 5: veloce, buone dimensioni." },
+        medium: { text: "zstd 9: più piccolo, più lento." },
+        max: { text: "zstd 19: il più piccolo; molto più lento, più memoria." },
+      },
+      lz4: {
+        fast: { tone: "good", text: "Consigliato. LZ4 predefinito: il più veloce." },
+        medium: { text: "LZ4 HC 9: più piccolo, più lento." },
+        max: { text: "LZ4 HC 12: il più piccolo, il più lento." },
+      },
+    },
+    runtime: "Runtime",
+    runtimeNotes: {
+      ng: { tone: "good", text: "Consigliato. Legge i pacchetti zstd e LZ4." },
+      ampr_emu: { text: "L'ampr_emu originale." },
+    },
+    ngNote: "Serve ampr-emu-ng: Impacchetta lo installa in fakelib/. Disattiva l'aggiornamento di fakelib di ShadowMount+, altrimenti sostituisce il runtime.",
+    installsRuntime: (version) => `Qui non c'è ampr_emu: Impacchetta installa ampr_emu ${version}.`,
+    freshIndex: (state) =>
+      `${state === "stale" ? "ampr_emu.index non è aggiornato" : state === "damaged" ? "ampr_emu.index è danneggiato" : "Manca ampr_emu.index"}: Impacchetta ne scrive uno nuovo.`,
+    direct: "Impacchetta direttamente nell'immagine; legge il gioco due volte.",
+    unpackFolder: "Una nuova cartella di gioco con file normali.",
     unpackHint: (n) =>
       n === null
         ? "Riscrive i file impacchettati come file normali."
@@ -615,72 +596,35 @@ const it: Messages = {
     already: (a, fmt) => a === "pack"
       ? <>Questo gioco è già in scrittura come <b>{fmt}</b>; impacchettandolo di nuovo ottieni una seconda copia.</>
       : <>Questo gioco è già in scrittura come <b>{fmt}</b>; spacchettandolo di nuovo ottieni una seconda copia.</>,
-    profileRules: "Impacchetta ciò che indicano le regole del profilo; i file che il motore apre direttamente restano sciolti.",
-    chosenRules: "Impacchetta i file che il gioco ha letto in queste tracce; i file che il motore apre direttamente restano sciolti.",
-    ownRules: "Impacchetta i file che il gioco ha letto nell'ultima sessione tracciata; i file che il motore apre direttamente restano sciolti.",
-    guessRules: "Nessuna traccia: impacchetta secondo una stima integrata, meno affidabile. Prima esegui il tracciamento, oppure scegli tracce o un profilo.",
-    recorded: "Tracce registrate",
-    recordedHint: (bytes) => `ampr_commands.bin (${bytes}): “Impacchetta” usa queste tracce.`,
-    downloadHint: "Chiudi il gioco, attendi un minuto, poi scarica dal browser di un computer. Lì scegli lo zip in “Impacchetta/Spacchetta” → “Tracce”.",
-    download: (bytes, zip) => `Scarica le tracce (${bytes}) come ${zip}`,
-    missingIndex: "Nessun ampr_emu.index in questa sorgente: “Impacchetta” ne ha bisogno accanto ad ampr_commands.bin.",
-    truncatedJournal: "Un registro troncato alla fine si impacchetta comunque, fino all'ultimo record completo.",
-    fakelibWarning: (recorded) => recorded
-      ? "Poche tracce o nessuna? Disattiva il programma di aggiornamento di fakelib, applica di nuovo la patch e rigioca."
-      : "Disattiva il programma di aggiornamento di fakelib durante il tracciamento, altrimenti non viene registrato nulla.",
     emptyTitle: "Scegli un gioco che usa AMPR",
     experimental: "Sperimentale: conserva una copia del gioco originale.",
-    chooseSource: "Scegli sorgente",
     source: "Sorgente",
-    traces: "Tracce",
-    optionalTraces: "Tracce (facoltative)",
-    unlock: "Sblocca per scegliere altre tracce",
-    loaded: "Tracce già caricate da questa sorgente",
-    lockedHint: (bytes) => `ampr_commands.bin (${bytes}). Usa il lucchetto per sceglierne altre.`,
-    clear: "Rimuovi",
-    zip: "Zip",
-    folder: "Cartella",
-    tracesHint: "Scegli lo zip amprtrace di “Scarica le tracce”, oppure una cartella con entrambi i file di traccia.",
-    useOwn: "Usa le tracce della sorgente",
-    patchResult: (a, n) => a === "patch"
-      ? `Patch applicata: il runtime di tracciamento è installato; l'indice elenca ${num(n)} ${plural(n, FILES)}.`
-      : `Patch rimossa: il runtime di rilascio è tornato; l'indice elenca ${num(n)} ${plural(n, FILES)}.`,
-    removed: (files) => `${plural(files.length, { one: "Rimosso il vecchio file di traccia", many: "Rimossi i vecchi file di traccia", other: "Rimossi i vecchi file di traccia" })}: ${files.join(", ")}.`,
   },
-  // Lz4Help.tsx
-  lz4Help: {
-    title: "Come funziona LZ4",
+  // PackHelp.tsx
+  packHelp: {
+    title: "Come funziona l'impacchettamento",
     close: "Chiudi",
-    warning: "Sperimentale, solo per giochi AMPR. Conserva una copia del gioco originale.",
     body: () => (
       <>
-        <h3>1. Impacchetta/Spacchetta</h3>
+        <h3>zstd</h3>
         <ol>
-          <li>
-            Scegli il gioco originale, <b>Impacchetta/Spacchetta</b> e le tracce (o un profilo).
-          </li>
-          <li>
-            Scrivi una cartella impacchettata o un'immagine semplice; una cartella si converte in qualsiasi formato in{" "}
-            <b>Converti</b>.
-          </li>
-          <li>
-            Una sorgente impacchettata mostra invece <b>Spacchetta</b>: i file sciolti tornano al loro posto.
-          </li>
-          <li>Impacchetta mantiene l'ampr_emu del gioco se è la versione inclusa o più recente e legge i pacchetti LZ4; altrimenti installa quello di rilascio incluso, anche al posto del runtime di tracciamento LZ4 e in un gioco che non ce l'ha.</li>
+          <li>Impacchetta gli asset del gioco in volumi zstd, in una cartella o in un'immagine. Solo per giochi che usano AMPR.</li>
+          <li><b>Veloce</b> (zstd 5) è rapido; <b>Medio</b> (9) e <b>Massimo</b> (19) sono più piccoli e più lenti.</li>
+          <li>Un gioco impacchettato mostra <b>Spacchetta</b>: tornano i file normali.</li>
         </ol>
 
-        <h3>2. Tracciamento</h3>
+        <h3>LZ4</h3>
         <ol>
-          <li>
-            Scegli l'<b>ffpkg</b> o l'<b>exfat</b> del gioco, poi <b>Tracciamento</b> → <b>Applica patch</b>.
-          </li>
-          <li>Disattiva il programma di aggiornamento di fakelib: sovrascrive il runtime di tracciamento.</li>
-          <li>
-            Montalo con <span className="path">image_rw=</span>, gioca una sessione e chiudi il gioco.
-          </li>
-          <li>
-            Usa <b>Scarica le tracce</b> nella pagina della PS5, oppure copia ampr_commands.bin e ampr_emu.index.
-          </li>
+          <li><b>Sperimentale</b>: alcuni giochi potrebbero non avviarsi. Conserva una copia.</li>
+          <li>Impacchetta in volumi LZ4, in una cartella o in un'immagine: <b>Veloce</b> (LZ4), <b>Medio</b> (HC 9), <b>Massimo</b> (HC 12).</li>
+          <li>Runtime: <b>ampr-emu-ng</b> (predefinito) o l'<b>ampr_emu</b> originale.</li>
+          <li>Un gioco impacchettato mostra <b>Spacchetta</b>.</li>
+        </ol>
+
+        <h3>ampr-emu-ng</h3>
+        <ol>
+          <li>Legge i pacchetti zstd e LZ4; Impacchetta lo installa in fakelib/.</li>
+          <li>Disattiva l'aggiornamento di fakelib di ShadowMount+, altrimenti sostituisce il runtime e il gioco non riesce a leggere i suoi pacchetti.</li>
         </ol>
       </>
     ),
@@ -689,7 +633,6 @@ const it: Messages = {
   picker: {
     devices: "Dispositivi",
     thisDevice: "Questo dispositivo",
-    systemDialog: "Finestra di sistema",
     drives: "Unità",
     location: "Posizione",
     parent: "Cartella superiore",
@@ -709,15 +652,10 @@ const it: Messages = {
   // common.tsx
   common: {
     folder: "Cartella",
-    pickFolder: "Cartella del gioco",
-    pickImage: "Immagine o archivio del gioco",
-    pickImageFilter: "Immagini e archivi",
-    pickFolderButton: "Cartella",
-    pickImageButton: "Immagine/Archivio",
+    pickButton: "Scegli",
+    pickAny: "Cartella, immagine o archivio del gioco",
     source: "Sorgente",
     emptyTitle: "Scegli una cartella, un'immagine o un archivio di gioco",
-    emptyText:
-      "Una cartella di gioco PS5 oppure un'immagine, un pacchetto o un archivio che la contiene.",
     accepted: "Sorgenti accettate",
     unknownTitle: "Titolo sconosciuto",
     patch: "Patch",
@@ -743,19 +681,18 @@ const it: Messages = {
     noAmpr: "eboot.bin non importa libSceAmpr",
     runtime: {
       forge_release: "Forge (versione di rilascio)",
-      forge_trace: "Forge (versione di tracciamento)",
+      forge_trace: "vecchio runtime di tracciamento LZ4",
+      zstd: "ampr-emu-ng",
       other: "altro",
       none: "nessuno",
     },
     packed: "Impacchettato",
+    zstdKept: "pacchetti di asset zstd: una conversione li mantiene",
     damaged: "Pacchetti danneggiati",
-    traced: "Tracciato",
     plain: "Non impacchettato",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} ${plural(files, FILES)} in ${num(volumes)} ${plural(volumes, { one: "volume", many: "volumi", other: "volumi" })}` +
       (percent === null ? "" : `, ${num(percent)}% della dimensione`),
-    journal: (size) => `registro di ${size}`,
-    noJournal: "ancora nessun registro",
     runtimeIs: (label) => `runtime: ${label}`,
     index: {
       stale: "ampr_emu.index non aggiornato: una conversione lo rinnova",
@@ -860,26 +797,21 @@ const it: Messages = {
         text: "Per i giochi che non funzionano bene come ffpkg e girano solo come contenuto di un'unità esterna. Si apre anche su Mac o PC.",
       },
       ffpkg: {
-        tone: "good",
-        text: "Consigliato. Il file system della PS5 (UFS2). Supporta il montaggio in scrittura.",
+        text: "Il file system della PS5 (UFS2). Supporta il montaggio in scrittura.",
       },
       ffpfs: {
-        tone: "warn",
-        text: "Sperimentale. Il file system PFS della PS5, non compresso. I nomi di file devono essere in ASCII semplice.",
+        text: "Il file system PFS della PS5, non compresso. I nomi di file devono essere in ASCII semplice.",
       },
       ffpfsc: {
-        tone: "warn",
-        text: "Sperimentale. Il più piccolo: un contenitore compresso attorno a un'immagine, sempre montato in sola lettura.",
+        text: "Il più piccolo: un contenitore compresso attorno a un'immagine, sempre montato in sola lettura.",
       },
-      pkg: {
-        text: "Si installa come un gioco dello store e gira a velocità nativa. Richiede kstuff, fpkg-enable e ppr-patch.",
-      },
+      pkg: { tone: "good", text: "Consigliato. Funziona come un gioco nativo, ma solo se il firmware lo consente." },
       lz4: {
         tone: "warn",
         text: "Sperimentale. Una cartella di gioco con gli asset impacchettati in volumi LZ4, che l'emulatore AMPR incluso (ampr_emu) spacchetta mentre il gioco è in esecuzione. Solo per giochi che usano AMPR.",
       },
     },
-    innerFfpkg: { tone: "good", text: "Consigliato. Il file system della PS5 (UFS2)." },
+    innerFfpkg: { text: "Il file system della PS5 (UFS2)." },
     level0: { text: "Nessuna compressione: ogni blocco viene salvato così com'è. Il file è grande quanto l'immagine." },
     levelDefault: {
       tone: "good",
@@ -912,7 +844,6 @@ const it: Messages = {
         },
       },
     },
-    pkgFirmware: "Funziona solo con firmware 11.60 o inferiore.",
     imageInside: "Immagine interna",
     imageInsideLabel: "Immagine all'interno del ffpfsc",
     compressionLevel: "Livello di compressione",
@@ -1097,6 +1028,39 @@ const it: Messages = {
     sentPayload: (name, size, host) => `${name} (${size}) inviato a ${host}.`,
     helpInstallTitle: "Installa Dump Forge su una PS5 con un clic",
     helpInstallText: "Usa la scheda per installare Dump Forge e inviare il payload alla console. Scarica da GitHub la versione corrispondente (o la più recente) e la avvia.",
+  },
+  // Packages.tsx (Storage's Package installer), InstallDialog.tsx, Files.tsx and Connect.tsx's Install pkg
+  install: {
+    view: "Installazione pacchetti",
+    packages: "Pacchetti",
+    refresh: "Aggiorna",
+    scanning: "Ricerca dei pacchetti",
+    none: "Nessun pacchetto trovato su questa console.",
+    noneHint: "Copia un file .pkg nella memoria della console o su un’unità USB, poi premi Aggiorna.",
+    truncated: "L’elenco potrebbe essere incompleto",
+    limits: "La ricerca si è fermata a uno dei suoi limiti: potrebbero mancare alcuni pacchetti.",
+    cantScan: "Impossibile cercare:",
+    cantInstall: "Impossibile installare:",
+    content: { game: "Gioco", patch: "Patch", additional_content: "Contenuto aggiuntivo", unknown: "Sconosciuto" },
+    install: "Installa",
+    installName: (name) => `Installa ${name}`,
+    started: (name) => `Installazione di ${name} in corso. L’operazione è elencata qui sotto.`,
+    tag: "Installazione",
+    title: "Installare questo pacchetto?",
+    titleOn: (device) => `Installare questo pacchetto su ${device}?`,
+    file: "File",
+    game: "Gioco",
+    titleId: "ID titolo",
+    version: "Versione",
+    size: "Dimensione",
+    text: "La PS5 scarica il pacchetto da Dump Forge e lo installa. Tieni Dump Forge in esecuzione finché l’operazione non termina.",
+    reinstall: "Se questo gioco è già installato, la PS5 elimina la copia installata prima di installare questa.",
+    cancel: "Annulla",
+    confirm: "Installa",
+    installPkg: "Installa pkg",
+    installPkgOn: (device) => `Installa un pacchetto su ${device}`,
+    pickTitle: "Scegli un pacchetto da installare",
+    sent: (device) => `${device} sta installando il pacchetto. L’operazione è elencata qui sotto.`,
   },
   duration: { s: (s) => `${s} s`, ms: (m, s) => `${m} min ${s} s`, hm: (h, m) => `${h} h ${m} min` },
 };

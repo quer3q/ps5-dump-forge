@@ -22,6 +22,7 @@ ps5-dump-forge-ufs2.workspace = true
 ps5-dump-forge-pfs.workspace = true
 ps5-dump-forge-fpkg.workspace = true
 ps5-dump-forge-lz4.workspace = true
+ps5-dump-forge-zstd.workspace = true
 ps5-dump-forge-archive.workspace = true
 ps5-dump-forge-smb.workspace = true
 ps5-dump-forge-ftp.workspace = true

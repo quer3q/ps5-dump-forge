@@ -81,6 +81,14 @@ impl Response {
         Self::new(status, JSON, Cow::Owned(body.into_bytes()))
     }
 
+    /// An [`Response::error`]'s text (the whole body for another response).
+    pub fn error_text(&self) -> String {
+        serde_json::from_slice::<serde_json::Value>(&self.body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(&self.body).into_owned())
+    }
+
     /// Vite names `assets/*` by content hash, so a new build never reuses a name: those are
     /// cached for good. Everything else (`index.html`, the AppCache manifest `forge.appcache`)
     /// is checked on every load, so reloading the payload always shows its own UI (found on
@@ -389,7 +397,7 @@ impl Read for BodyReader<'_> {
 }
 
 /// Writes the response within `timeout`, however slowly the client reads, and closes; a
-/// download gets `timeout` for each write of its body instead (a GiB journal takes minutes, a
+/// download gets `timeout` for each write of its body instead (a GiB file takes minutes, a
 /// client that stops reading still loses its thread). A download whose body fails part way is
 /// cut short: the client sees fewer bytes than `Content-Length` says, and marks it failed. Unread request bytes are
 /// drained for a moment first, so the close doesn't reset the connection before the client
@@ -649,13 +657,13 @@ mod tests {
             "the body is streamed after the head"
         );
         assert_eq!(
-            disposition("[Stellar Blade]-[PPSA13197]-amprtrace.zip"),
-            "attachment; filename=\"[Stellar Blade]-[PPSA13197]-amprtrace.zip\""
+            disposition("[Stellar Blade]-[PPSA13197].zip"),
+            "attachment; filename=\"[Stellar Blade]-[PPSA13197].zip\""
         );
         assert_eq!(
-            disposition("[ドラゴン é]-[PPSA1]-amprtrace.zip"),
-            "attachment; filename=\"[____ _]-[PPSA1]-amprtrace.zip\"; \
-             filename*=UTF-8''%5B%E3%83%89%E3%83%A9%E3%82%B4%E3%83%B3%20%C3%A9%5D-%5BPPSA1%5D-amprtrace.zip"
+            disposition("[ドラゴン é]-[PPSA1].zip"),
+            "attachment; filename=\"[____ _]-[PPSA1].zip\"; \
+             filename*=UTF-8''%5B%E3%83%89%E3%83%A9%E3%82%B4%E3%83%B3%20%C3%A9%5D-%5BPPSA1%5D.zip"
         );
         let hostile = disposition("a\"b\\c\r\nSet-Cookie: x=1.zip");
         assert!(!hostile.contains(['\r', '\n']), "{hostile}");

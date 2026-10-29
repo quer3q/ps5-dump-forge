@@ -47,24 +47,29 @@ export interface Job {
   remote?: { keyId: string; name: string; cancelling: boolean; instance?: string };
 }
 
-/** What an LZ4 job does, for its row: its tag, and whether it is an LZ4 tab job (the yellow
- * accent). A legacy `lz4` target is a pack into a folder. An `unpatch` without `lz4_in_place` (a
- * server API request; Convert no longer sends one) is no LZ4 tab job and never "packing". */
-export function lz4Job(r: ConvertRequest | undefined): { id: "pack" | "unpack" | "trace" | "unpatch" | "runtime"; tab: boolean } | null {
+/** What a Pack tab job does, for its row's tag: an LZ4 or zstd pack or unpack. A legacy `lz4`
+ * target is an LZ4 pack into a folder. */
+export function packJob(r: ConvertRequest | undefined): { kind: "lz4" | "zstd"; id: "pack" | "unpack" } | null {
   if (!r) return null;
+  if (r.zstd_pack) return { kind: "zstd", id: "pack" };
+  if (r.zstd_unpack) return { kind: "zstd", id: "unpack" };
   const mode = r.lz4 ?? (r.format === "lz4" ? "pack" : null);
-  if (mode === "pack" || mode === "unpack" || mode === "trace") return { id: mode, tab: true };
-  if (mode === "unpatch") return r.lz4_in_place ? { id: "unpatch", tab: true } : { id: "runtime", tab: false };
+  if (mode === "pack" || mode === "unpack") return { kind: "lz4", id: mode };
   return null;
 }
 
-/** The tab a job belongs to (its counter and colour): a transfer (Connect), an edit or extract
- * (Edit), an LZ4 tab job, else a conversion. */
-export type JobType = "convert" | "edit" | "lz4" | "transfer";
+/** The zstd level a zstd pack request without one gets (core's `DEFAULT_ZSTD_LEVEL`). */
+export const DEFAULT_ZSTD_LEVEL = 5;
+
+/** The tab a job belongs to (its counter and colour): a package install (Storage; a peer's, using
+ * this device's package, Connect), a transfer (Connect), an edit or extract (Edit), a Pack tab
+ * job (LZ4 or zstd, pack or unpack), else a conversion. */
+export type JobType = "convert" | "edit" | "pack" | "transfer" | "install";
 export function jobType(r: ConvertRequest | undefined): JobType {
+  if (r?.install) return "install";
   if (r?.transfer?.length) return "transfer";
   if (r?.edits?.length || r?.extract?.length) return "edit";
-  if (lz4Job(r)?.tab) return "lz4";
+  if (packJob(r)) return "pack";
   return "convert";
 }
 
@@ -140,7 +145,7 @@ function update(jobs: Job[], id: JobId, f: (j: Job) => Job): Job[] {
 
 /** Stages whose time grows with the bytes they stream: speed and time left are shown only for
  * these. */
-const BYTE_STAGES = new Set(["compress", "write", "measure", "pack", "verify"]);
+const BYTE_STAGES = new Set(["compress", "write", "measure", "pack", "verify", "install"]);
 
 export function jobsReducer(jobs: Job[], a: Action): Job[] {
   switch (a.type) {

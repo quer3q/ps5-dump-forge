@@ -24,11 +24,10 @@ export const ARCHIVE_PASSWORD_REQUIRED = "This archive needs a password.";
 export const ARCHIVE_PASSWORD_WRONG = "The password is not correct.";
 /** A target: every source kind, plus the LZ4 packed folder (a folder, read as one). */
 export type Format = Kind | "lz4";
-/** What a job does with LZ4 asset packs, besides the target: install the trace runtime (`trace`),
- * write packs back as plain files (`unpack`), put Forge's release runtime back (`unpatch`), or
- * pack into `format` (`pack`: folder, exfat, ffpkg, ffpfs, ffpfsc; the `lz4` format is the same
- * as `folder` with `pack`). */
-export type Lz4Mode = "trace" | "unpack" | "unpatch" | "pack";
+/** What a job does with LZ4 asset packs, besides the target: write packs back as plain files
+ * (`unpack`), or pack into `format` (`pack`: folder, exfat, ffpkg, ffpfs, ffpfsc; the `lz4`
+ * format is the same as `folder` with `pack`). */
+export type Lz4Mode = "unpack" | "pack";
 /** The image inside a `.ffpfsc` container. */
 export type InnerFormat = "exfat" | "ffpkg" | "ffpfs";
 /** How hard a `.pkg` build compresses (Kraken); `stored`: every inner block raw, same layout. */
@@ -62,6 +61,9 @@ export interface EditCheck {
   free_beside: number | null;
 }
 
+/** The runtime an LZ4 Pack installs: ampr-emu-ng (reads zstd and LZ4 packs) or upstream ampr_emu. */
+export type Lz4Runtime = "ng" | "ampr_emu";
+
 export interface ConvertRequest {
   source: string;
   format: Format;
@@ -79,20 +81,20 @@ export interface ConvertRequest {
   kraken_level?: KrakenLevel;
   /** For `.ffpfsc`: the zlib level, 0 (store) to 9 (smallest); missing: 6. */
   ffpfsc_level?: number;
-  /** `"trace"`: install the trace runtime (folder, `.exfat`, `.ffpkg`); `"unpack"`: write
-   * packed assets back as plain files; `"unpatch"`: install Forge's release runtime, drop the
-   * journal and logs; missing or null: none of these. */
+  /** `"pack"`: pack into LZ4 asset packs; `"unpack"`: write packed assets back as plain files;
+   * missing or null: neither. */
   lz4?: Lz4Mode | null;
-  /** With `"trace"` or `"unpatch"` on an `.exfat`/`.ffpkg` source and `format` the source's
-   * own: the verified output replaces the source (`output` is derived: a `.part` beside it). */
-  lz4_in_place?: boolean;
-  /** For the LZ4 target: a TOML rules profile (a path on the machine that runs the job). */
-  lz4_profile?: string | null;
-  /** For the LZ4 target: a trace journal (`ampr_commands.bin`) copied from elsewhere, with its
-   * `ampr_emu.index` next to it; never with `lz4_profile`. */
-  lz4_traces?: string | null;
-  /** With `"trace"` into an image: the free space added for the trace, 64–1024 MiB in 64 MiB steps; missing: 256. */
-  lz4_trace_space_mib?: number;
+  /** For an LZ4 pack: 0 (fast, the default) or 3..=12 (LZ4 HC; 9 medium, 12 max). */
+  lz4_level?: number;
+  /** For an LZ4 pack: the runtime it installs; missing: `"ng"` (ampr-emu-ng). */
+  lz4_runtime?: Lz4Runtime;
+  /** The Pack tab's zstd: pack into zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, zstd in
+   * 256 KiB blocks) and install ampr-emu-ng. `format`: folder, exfat, ffpkg or ffpfs; no `lz4` option. */
+  zstd_pack?: boolean;
+  /** With `zstd_pack`: the zstd level, 1 (fastest) to 22 (smallest); missing: 5. */
+  zstd_level?: number;
+  /** The Pack tab's zstd: write a zstd packed source's files back as plain files into `format`. */
+  zstd_unpack?: boolean;
   /** For an archive source: the password inspect accepted. Never echoed back (the job list
    * from the server has none). */
   archive_password?: string | null;
@@ -110,6 +112,9 @@ export interface ConvertRequest {
   /** An extract or a transfer the user confirmed (`existingTargets` found names there): a file
    * replaces a file, a folder merges into a folder; any other clash still fails preflight. */
   replace?: boolean;
+  /** Set: an install job (the PS5 only): this `.pkg` (here, on a peer or a NAS) is handed to the
+   * PS5's installer, which fetches it from the job. `source`, `output` and `format` are ignored. */
+  install?: string;
 }
 
 /** How the output was verified. `samples` and `seed` are 0 for full. */
@@ -189,14 +194,16 @@ export interface Lz4Packed {
   stored_percent: number | null;
 }
 
-/** LZ4 asset packs (AMPR): present when eboot.bin imports libSceAmpr or a pack, trace or
- * runtime artifact is there. */
+/** LZ4 asset packs (AMPR): present when eboot.bin imports libSceAmpr or a pack or runtime
+ * artifact is there. */
 export interface Lz4Facts {
   imports_ampr: boolean;
   packed: Lz4Packed | null;
   /** The manifest starts like one but doesn't parse (also a finding); `packed` is null. */
   manifest_error: string | null;
-  runtime: "forge_release" | "forge_trace" | "other" | "none";
+  /** `forge_trace`: the old LZ4 trace runtime, which a conversion replaces; `zstd`:
+   * ampr-emu-ng, which reads zstd and LZ4 packs. */
+  runtime: "forge_release" | "forge_trace" | "zstd" | "other" | "none";
   /** The ampr_emu version of the runtimes Forge ships (and installs on unpatch), e.g.
    * "0.4.2.1"; missing from an older backend. */
   shipped_runtime_version?: string;
@@ -207,7 +214,7 @@ export interface Lz4Facts {
    * "keep" (Forge's release runtime, or ampr_emu at the bundled version or newer:
    * runtime_version names it). Null for a non-AMPR title; missing from an older backend. */
   runtime_action?: "install" | "replace" | "keep" | null;
-  /** The same for the LZ4 tab's Pack (an unpacked source) or Unpack (a packed one): Pack also
+  /** The same for the Pack tab's LZ4 Pack (an unpacked source) or Unpack (a packed one): Pack also
    * replaces a not-older runtime that can't read packs. */
   pack_runtime_action?: "install" | "replace" | "keep" | null;
   /** ampr_emu.index against the files a plain conversion writes: "stale", "damaged" and
@@ -215,13 +222,6 @@ export interface Lz4Facts {
    * kept as it is; a non-AMPR title; an archive's index too large to read); missing from an
    * older backend. */
   index?: "ok" | "stale" | "damaged" | "missing" | null;
-  /** ampr_emu.index against the files Patch writes with the trace runtime installed; the same
-   * states and null cases as index. Missing from an older backend. */
-  trace_index?: "ok" | "stale" | "damaged" | "missing" | null;
-  /** Size of the trace journal (ampr_commands.bin), when present. */
-  journal_bytes: number | null;
-  /** With the journal and its ampr_emu.index both present: the name Get traces' zip takes. */
-  traces_zip: string | null;
 }
 
 export interface InspectFile {
@@ -278,6 +278,8 @@ export interface Inspection {
   /** LZ4 asset packs; null (or missing from an older server) when the title has nothing to do
    * with AMPR. */
   lz4?: Lz4Facts | null;
+  /** zstd packed (a root `ampr_zstd.index` starting `AMPRZPK1`). Missing from an older backend. */
+  zstd_packed?: boolean;
   /** icon0.png as a data: URL. */
   cover: string | null;
   param_json: unknown;
@@ -295,16 +297,6 @@ export interface Inspection {
   /** A patch package (`.pkg` starting `\x7FLIH`): `files` are the ones it carries whole;
    * browsed and extracted from only. Missing from an older backend. */
   patch?: boolean;
-}
-
-/** What patching (or unpatching) a folder in place for LZ4 tracing did. */
-export interface Lz4Patch {
-  /** Files listed in the fresh `ampr_emu.index`. */
-  indexed: number;
-  /** Stale trace files deleted from the folder's root (relative paths). */
-  removed: string[];
-  /** The installed runtime's known issue (`ps5_dump_forge_lz4::runtime::WARNING`). */
-  warning?: string;
 }
 
 /** One job in `GET /api/jobs` (http build): what a reloaded page rebuilds its list from. */
@@ -362,6 +354,8 @@ export interface LibraryEntry {
   has_cover: boolean;
   /** LZ4 packed (ampr_emu asset packs: `ampr_assets.index` at the root). Missing from an older backend. */
   lz4_packed?: boolean;
+  /** zstd packed (`ampr_zstd.index` at the root). Missing from an older backend. */
+  zstd_packed?: boolean;
   /** No eboot.bin but a param.json with a title ID: a DLC, an update or another package. */
   additional_content?: boolean;
 }
@@ -373,6 +367,28 @@ export interface LibraryScan {
   warnings: string[];
   /** The PS5 only: the internal storage (`/data`) in bytes, as of this scan. */
   storage?: { free: number; total: number };
+}
+
+/** What a package installs, by its container (core's `PackageContent`). */
+export type PackageContent = "game" | "patch" | "additional_content" | "unknown";
+
+/** One `.pkg` the PS5's package scan found; the title fields are null when its container can't
+ * be read (the console judges it). */
+export interface PackageEntry {
+  path: string;
+  size: number;
+  content_id: string | null;
+  title_id: string | null;
+  title_name: string | null;
+  title_names: Record<string, string>;
+  version: string | null;
+  content: PackageContent;
+  has_cover: boolean;
+}
+
+export interface PackageScan {
+  entries: PackageEntry[];
+  truncated: boolean;
 }
 
 /** One entry of a folder (`list_dir`). A link's `path` is where it points, resolved. */
@@ -561,6 +577,9 @@ export const connect = {
   payloadInstall: (address: string, version: string) => cc<null>("payload_install", { address, version }),
   /** Desktop app: the ELF file at `path` streamed to elfldr at `address`; the bytes sent. */
   payloadSend: (address: string, path: string) => cc<number>("payload_send", { address, path }),
+  /** Asks the paired PS5 `keyId` to install the `.pkg` at `path` on this device (it reads the
+   * file over FLINK; the job shows here mirrored); the PS5's job id. */
+  install: (keyId: string, path: string) => transport.connectInstall(keyId, path),
   /** http build: a browser file into the server's folder `dir`; its path. */
   upload: transport.connectUpload,
   /** http build: the URL that downloads the server's file; the app: null. */
@@ -611,12 +630,6 @@ export const api = {
   /** http build: drop `source`'s staged uploads (after Discard all, or once the job is done). */
   discardStaged: (source: string) => transport.discardStaged(source),
   cancelJob: (id: JobId) => invoke<void>("cancel_job", { id }),
-  /** Patch a game folder in place for LZ4 tracing: the trace runtime in fakelib/, a fresh
-   * index, stale traces removed. Not a job; core refuses it while a job runs. */
-  lz4Patch: (source: string) => transport.lz4Patch<Lz4Patch>(source),
-  /** Put Forge's release runtime back in a game folder in place: journal and logs removed, a
-   * fresh index. Not a job; core refuses it while a job runs. */
-  lz4Unpatch: (source: string) => transport.lz4Unpatch<Lz4Patch>(source),
   /** Delete a file or folder for good (the page asks first). Refused for a link, a drive or
    * browse root or a folder holding one, and anything an unfinished job reads or writes. */
   deletePath: (path: string) => invoke<null>("delete_path", { path }).then(() => undefined),
@@ -636,6 +649,8 @@ export const api = {
    * may be left out only in the http build (the PS5 scans its roots; a computer answers 400);
    * the app's `library_scan` requires it. */
   libraryScan: (root?: string) => invoke<LibraryScan>("library_scan", root ? { root } : {}),
+  /** http build on the PS5: every `.pkg` under its roots (read-only, bounded like the Library). */
+  packageScan: () => transport.packageScan(),
   /** A dump's cover as a data URL, or null. */
   libraryCover: (path: string) => invoke<string | null>("library_cover", { path }),
   /** Leftover `.part` files in these folders (deduplicated,

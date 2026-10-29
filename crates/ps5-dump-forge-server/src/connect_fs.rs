@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ps5_dump_forge_core::DeleteError;
 use ps5_dump_forge_core::remote::{self, FlinkPath, RemoteEntry, RemoteStat};
 use ps5_dump_forge_flink::{
     CHUNK, Conn, DEAD_AFTER, DataHead, DataOk, Frame, Handshake, MAX_BODY, MAX_RPC_BODY,
@@ -638,6 +639,12 @@ pub fn answer(
         }),
         "remove" => path().and_then(|p| writes.remove(&sid, root, p, me).map(|()| Value::Null)),
         "free" => path().and_then(|p| free(root, p)),
+        "delete_path" => path().and_then(|p| writes.delete_path(root, p).map(|()| Value::Null)),
+        "move_path" => text("from").and_then(|from| {
+            let to = text("to")?;
+            let replace = r.body["replace"].as_bool().unwrap_or(false);
+            (writes.move_path(root, from, to, replace)).map(|()| Value::Null)
+        }),
         #[cfg(test)]
         "reattach" if writes.old.load(Ordering::SeqCst) => return None,
         "reattach" => path().and_then(|p| writes.reattach(hs, root, p, me)),
@@ -658,6 +665,18 @@ pub type Busy = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 /// Delete refuses, an undo journal's image, this device's jobs' paths; on the PS5 mounted
 /// images): a peer's replacing rename is refused with it.
 pub type ReplaceCheck = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+
+/// A paired device's Delete here: this device's own `Jobs::delete_path` with its protected
+/// paths (the server's keep list, the app's home folder).
+pub type DeleteHook = Arc<dyn Fn(&Path) -> Result<(), DeleteError> + Send + Sync>;
+/// ... and its Move to (`from`, `to`, `replace`): `Jobs::move_path`.
+pub type MoveHook = Arc<dyn Fn(&Path, &Path, bool) -> Result<(), DeleteError> + Send + Sync>;
+
+/// Leads the RPC error of a refused delete or move, so the caller keeps the kind (a missing
+/// path leads with [`NOT_FOUND`]; any other failure has no lead).
+pub const REFUSED: &str = "refused: ";
+/// ... and of one a job, or a peer's write, holds off.
+pub const BUSY: &str = "busy: ";
 
 /// How long a file whose session ended unrenamed is kept for a `reattach` (the writer's link
 /// broke and it reconnects), then removed.
@@ -685,6 +704,8 @@ pub struct Writes {
     busy: Mutex<Option<Busy>>,
     /// Asked before a replacing rename (unset: nothing beyond the checks here).
     replace_check: Mutex<Option<ReplaceCheck>>,
+    /// A peer's Delete and Move to here (unset: refused).
+    delete_move: Mutex<Option<(DeleteHook, MoveHook)>>,
     /// The control sessions up now (`guard`), changed and checked under `files`' lock: a put
     /// on a lane that outlives its session creates nothing its sweep would miss.
     live: Mutex<HashSet<String>>,
@@ -721,6 +742,37 @@ impl Drop for SessionWrites<'_> {
         drop(files);
         self.0.sweep();
     }
+}
+
+/// A [`DeleteError`] as an RPC error, its kind in the lead.
+fn delete_text(e: DeleteError) -> String {
+    match e {
+        DeleteError::Refused(m) => format!("{REFUSED}{m}"),
+        DeleteError::Missing(m) => format!("{NOT_FOUND}{m}"),
+        DeleteError::Busy(m) => format!("{BUSY}{m}"),
+        DeleteError::Failed(m) => m,
+    }
+}
+
+/// The peer's answer to a delete or move, its kind back from the lead.
+fn deleted(e: io::Error) -> DeleteError {
+    let text = e.to_string();
+    if e.kind() == io::ErrorKind::NotFound {
+        return DeleteError::Missing(text);
+    }
+    if let Some(m) = text.strip_prefix(REFUSED) {
+        return DeleteError::Refused(m.to_string());
+    }
+    if let Some(m) = text.strip_prefix(BUSY) {
+        return DeleteError::Busy(m.to_string());
+    }
+    if text.starts_with("unknown method") {
+        return DeleteError::Refused(
+            "that device's Dump Forge is older: update it to delete or move its files from here"
+                .to_string(),
+        );
+    }
+    DeleteError::Failed(text)
 }
 
 fn write_all_at(f: &fs::File, bytes: &[u8], at: u64) -> io::Result<()> {
@@ -786,6 +838,51 @@ impl Writes {
 
     pub fn set_replace_check(&self, check: ReplaceCheck) {
         *lock(&self.replace_check) = Some(check);
+    }
+
+    pub fn set_delete_move(&self, delete: DeleteHook, move_: MoveHook) {
+        *lock(&self.delete_move) = Some((delete, move_));
+    }
+
+    /// A peer's Delete of `rel` (never the shared folder itself), confined as every RPC's path
+    /// is, then judged as this device's own Delete judges it.
+    fn delete_path(&self, root: Option<&Share>, rel: &str) -> Result<(), String> {
+        let (delete, _) = self.delete_move()?;
+        let p = Self::own(root, rel)?;
+        delete(&p).map_err(delete_text)
+    }
+
+    /// A peer's Move to: both paths confined, then this device's own Move to.
+    fn move_path(
+        &self,
+        root: Option<&Share>,
+        from: &str,
+        to: &str,
+        replace: bool,
+    ) -> Result<(), String> {
+        let (_, move_) = self.delete_move()?;
+        let (from, to) = (Self::own(root, from)?, Self::own(root, to)?);
+        move_(&from, &to, replace).map_err(delete_text)
+    }
+
+    fn delete_move(&self) -> Result<(DeleteHook, MoveHook), String> {
+        let hooks = lock(&self.delete_move).clone();
+        hooks.ok_or_else(|| {
+            format!("{REFUSED}this device doesn't delete or move files for a paired device")
+        })
+    }
+
+    /// `rel` [`locate`]d, refused for the share root itself.
+    fn own(root: Option<&Share>, rel: &str) -> Result<PathBuf, String> {
+        if rel.is_empty() {
+            return Err(format!(
+                "{REFUSED}the shared folder itself is not deleted or moved"
+            ));
+        }
+        locate(root, rel).map_err(|e| match e.starts_with(NOT_FOUND) {
+            true => e,
+            false => format!("{REFUSED}{e}"),
+        })
     }
 
     /// Whether a peer has a file here it created and hasn't renamed yet: one being written, or
@@ -2132,6 +2229,25 @@ impl remote::Remote for Services {
     fn free_space(&self, dir: &FlinkPath) -> io::Result<u64> {
         self.of(&dir.key_id)?.free_space(dir)
     }
+    fn delete_path(&self, path: &FlinkPath) -> Result<(), DeleteError> {
+        self.of(&path.key_id)
+            .map_err(|e| unpaired(path, e))?
+            .delete_path(path)
+    }
+    fn move_path(
+        &self,
+        from: &FlinkPath,
+        to: &FlinkPath,
+        replace: bool,
+    ) -> Result<(), DeleteError> {
+        self.of(&from.key_id)
+            .map_err(|e| unpaired(from, e))?
+            .move_path(from, to, replace)
+    }
+}
+
+fn unpaired(at: &FlinkPath, e: io::Error) -> DeleteError {
+    DeleteError::Refused(format!("{}: {e}", at.url().display()))
 }
 
 impl remote::Remote for ConnectRemote {
@@ -2450,6 +2566,43 @@ impl remote::Remote for ConnectRemote {
         v["free"]
             .as_u64()
             .ok_or_else(|| io::Error::other("flink: free gave no number"))
+    }
+
+    /// The peer deletes it as its own Delete would (`delete_path` RPC).
+    // ponytail: a session found broken is tried once more; a delete the peer did before the
+    // link broke then reads as missing.
+    fn delete_path(&self, path: &FlinkPath) -> Result<(), DeleteError> {
+        let body = serde_json::json!({ "path": path.path });
+        self.with(&path.key_id, |s| {
+            s.rpc.call("delete_path", body.clone()).map(drop)
+        })
+        .map_err(deleted)
+    }
+
+    /// The peer moves it as its own Move to would (`move_path` RPC); one device only.
+    fn move_path(
+        &self,
+        from: &FlinkPath,
+        to: &FlinkPath,
+        replace: bool,
+    ) -> Result<(), DeleteError> {
+        if from.key_id != to.key_id {
+            return Err(DeleteError::Refused(
+                "a file is moved on its own device only".to_string(),
+            ));
+        }
+        let body = serde_json::json!({ "from": from.path, "to": to.path, "replace": replace });
+        let moved = self.with(&from.key_id, |s| {
+            s.rpc.call("move_path", body.clone()).map(drop)
+        });
+        match moved.map_err(deleted) {
+            // The retry of a move the peer did before the link broke finds `from` gone: `to`
+            // there and `from` not means it moved.
+            Err(DeleteError::Missing(_)) if self.stat(to).is_ok() && self.stat(from).is_err() => {
+                Ok(())
+            }
+            r => r,
+        }
     }
 }
 
@@ -3513,6 +3666,104 @@ mod tests {
         assert!(r.write_at(h, 0, b"x").is_err());
         b.shutdown();
         for d in dirs.iter().chain([&share]) {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    /// A peer's Delete and Move to: refused until the peer sets its hooks, then its own
+    /// `Jobs::delete_path`/`move_path` (its protected paths) inside its share only; core's
+    /// `Jobs` hands a `flink://` path to the peer.
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_deletes_and_moves_its_files_for_this_device() {
+        use ps5_dump_forge_core::Jobs;
+        let share = temp_dir("delmove-share");
+        let outside = temp_dir("delmove-outside");
+        for d in ["g/sub", "keep"] {
+            fs::create_dir_all(share.join(d)).unwrap();
+        }
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(share.join("g/a.bin"), b"a").unwrap();
+        fs::write(share.join("g/b.bin"), b"b").unwrap();
+        fs::write(share.join("g/sub/x"), b"x").unwrap();
+        fs::write(outside.join("f"), b"theirs").unwrap();
+        std::os::unix::fs::symlink(&outside, share.join("out")).unwrap();
+        let share = dunce::canonicalize(&share).unwrap();
+        let (a, b, mut rpc, _, dirs) = paired("delmove", &share);
+        let key = a.state().device.key_id;
+        let at = |rel: &str| FlinkPath::parse(Path::new(&format!("flink://{key}/{rel}"))).unwrap();
+        let r = remote::get().unwrap();
+
+        // No hooks: refused, nothing gone.
+        let e = r.delete_path(&at("g/a.bin")).unwrap_err();
+        assert!(matches!(e, DeleteError::Refused(_)), "{e:?}");
+        assert!(share.join("g/a.bin").exists());
+
+        let a_jobs = Arc::new(Jobs::new(|_| {}));
+        let keep = vec![share.join("keep")];
+        let (j, k) = (a_jobs.clone(), keep.clone());
+        let (j2, k2) = (a_jobs.clone(), keep.clone());
+        a.set_delete_move(
+            Arc::new(move |p| j.delete_path(p, &k)),
+            Arc::new(move |f, t, replace| j2.move_path(f, t, replace, &k2)),
+        );
+
+        r.delete_path(&at("g/a.bin")).unwrap();
+        assert!(!share.join("g/a.bin").exists());
+        let e = r.delete_path(&at("g/a.bin")).unwrap_err();
+        assert!(matches!(e, DeleteError::Missing(_)), "{e:?}");
+        // The peer's protected paths, and its share root, stay.
+        let e = r.delete_path(&at("keep")).unwrap_err();
+        assert!(matches!(e, DeleteError::Refused(_)), "{e:?}");
+        assert!(share.join("keep").is_dir());
+        let e = r.delete_path(&at("")).unwrap_err();
+        assert!(matches!(e, DeleteError::Refused(_)), "{e:?}");
+
+        // Outside the share: through a link, and spelled with `..` on the wire.
+        let e = r.delete_path(&at("out/f")).unwrap_err();
+        assert!(
+            matches!(&e, DeleteError::Refused(m) if m.contains("outside")),
+            "{e:?}"
+        );
+        let e = r
+            .move_path(&at("g/b.bin"), &at("out/b.bin"), false)
+            .unwrap_err();
+        assert!(matches!(e, DeleteError::Refused(_)), "{e:?}");
+        for m in ["delete_path", "move_path"] {
+            let body = serde_json::json!({ "path": "../x", "from": "../x", "to": "g/y" });
+            let e = rpc.call(m, body).unwrap_err().to_string();
+            assert!(e.starts_with(REFUSED), "{m}: {e}");
+        }
+        assert_eq!(fs::read(outside.join("f")).unwrap(), b"theirs");
+        assert!(!outside.join("b.bin").exists());
+
+        // Moves: a folder renamed, a taken name kept unless replaced.
+        r.move_path(&at("g/sub"), &at("moved"), false).unwrap();
+        assert_eq!(fs::read(share.join("moved/x")).unwrap(), b"x");
+        assert!(!share.join("g/sub").exists());
+        let e = r
+            .move_path(&at("g/b.bin"), &at("moved/x"), false)
+            .unwrap_err();
+        assert!(!matches!(e, DeleteError::Missing(_)), "{e:?}");
+        assert_eq!(fs::read(share.join("moved/x")).unwrap(), b"x");
+        r.move_path(&at("g/b.bin"), &at("moved/x"), true).unwrap();
+        assert_eq!(fs::read(share.join("moved/x")).unwrap(), b"b");
+
+        // Core's Jobs on this side: a flink path goes to the peer; across devices refused.
+        let b_jobs = Jobs::new(|_| {});
+        let url = |rel: &str| at(rel).url();
+        b_jobs.delete_path(&url("moved/x"), &[]).unwrap();
+        assert!(!share.join("moved/x").exists());
+        let e = b_jobs
+            .move_path(&url("moved"), &dirs[1].join("moved"), false, &[])
+            .unwrap_err();
+        assert!(matches!(e, DeleteError::Refused(_)), "{e:?}");
+        assert!(share.join("moved").is_dir());
+
+        drop(rpc);
+        a.shutdown();
+        b.shutdown();
+        for d in dirs.iter().chain([&share, &outside]) {
             let _ = fs::remove_dir_all(d);
         }
     }

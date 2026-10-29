@@ -28,15 +28,15 @@ mod finalize;
 pub mod ftp;
 mod host_tree;
 mod inspect;
+mod install;
 mod jobs;
+mod zstd_pack;
 pub use awake::{Awake, awake};
 mod awake;
 mod library;
 mod library_roots;
 mod listing;
 mod lz4;
-mod lz4_patch;
-mod lz4_traces;
 pub mod net;
 mod nfs;
 mod package;
@@ -47,18 +47,18 @@ pub mod remote;
 mod scan;
 mod sdk;
 pub mod smb;
+mod temp_file;
 mod transfer;
 mod verify;
 #[cfg(windows)]
 mod win;
-mod zip;
 
 pub use delete::DeleteError;
 pub use dlc::Dlc;
 pub use extract::extraction_findings;
 pub use finalize::rename_no_replace;
 pub use host_tree::{HostFile, HostKind, HostTree, host_tree};
-pub use library::{LibraryEntry, LibraryScan};
+pub use library::{LibraryEntry, LibraryScan, PackageContent, PackageEntry, PackageScan};
 pub use listing::{ListEntry, Listing, list_dir, list_explorer};
 pub use ps5_dump_forge_archive::{
     ARCHIVE_PASSWORD_REQUIRED, ARCHIVE_PASSWORD_WRONG, ArchiveFormat,
@@ -93,19 +93,23 @@ pub enum Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lz4Mode {
-    /// Install the tracing runtime, so the game records what it reads (the next `Lz4` job
-    /// packs those files). A folder, `.exfat` or `.ffpkg` only: `/app0` must be writable.
-    Trace,
     /// Decode the packs back to plain files.
     Unpack,
-    /// Undo a trace patch: install Forge's release runtime (whatever runtime is there), drop
-    /// the journal and logs and write a fresh `ampr_emu.index`. Refused for a packed source
-    /// (unpack it first) and with the `Lz4` target (which always installs the release one).
-    Unpatch,
     /// Pack the assets into LZ4 packs, into the request's `format`: a folder (as the `Lz4`
     /// target), `.exfat`, `.ffpkg`, `.ffpfs` or `.ffpfsc` (not `.pkg`). An image gets its packs
     /// straight from the source in two passes (measure, then write), with no staging folder.
     Pack,
+}
+
+/// The runtime an LZ4 Pack installs ([`ConvertRequest::lz4_runtime`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lz4Runtime {
+    /// ampr-emu-ng (`runtime::ZSTD`): reads LZ4 and zstd packs.
+    #[default]
+    Ng,
+    /// The bundled upstream ampr_emu release build (`runtime::RELEASE`).
+    AmprEmu,
 }
 
 /// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same,
@@ -157,8 +161,7 @@ pub struct ConvertRequest {
     /// from the archive with nothing unpacked to disk.
     pub source: PathBuf,
     pub format: Format,
-    /// The final output path (file, or directory for `Folder`). Must not exist yet. Ignored
-    /// with [`ConvertRequest::lz4_in_place`].
+    /// The final output path (file, or directory for `Folder`). Must not exist yet.
     pub output: PathBuf,
     /// Compression thread cap for `.pkg` and `.ffpfsc` builds (all cores when unset).
     #[serde(default)]
@@ -183,40 +186,41 @@ pub struct ConvertRequest {
     /// every other target.
     #[serde(default = "default_ffpfsc_level")]
     pub ffpfsc_level: u32,
-    /// Trace or unpack LZ4 packs; unset, packs travel as plain files (Forge's own trace
+    /// Pack or unpack LZ4 packs; unset, packs travel as plain files (Forge's old trace
     /// runtime in an unpacked dump is swapped for the release one).
     #[serde(default)]
     pub lz4: Option<Lz4Mode>,
-    /// When packing (`Lz4`, or [`Lz4Mode::Pack`]): a TOML packing profile (else this dump's traces, else a built-in guess).
-    /// Any other target fails preflight.
+    /// When packing LZ4: the C liblz4 level, 0 (fast, `LZ4_compress_default`) or an HC level
+    /// 3 through 12 (9 medium, 12 max); 0 when unset. Any other value fails preflight.
     #[serde(default)]
-    pub lz4_profile: Option<PathBuf>,
-    /// When packing: traces copied from the console: the `*-amprtrace.zip` [`lz4_traces`] writes
-    /// (STORED entries, each checked against its CRC-32), a folder holding `ampr_commands.bin`
-    /// and `ampr_emu.index`, or that journal with its index beside it. Picks the files to pack
-    /// ahead of the dump's own traces. Any other target, or a profile too, fails preflight.
+    pub lz4_level: u8,
+    /// When packing LZ4: the runtime the packs get, ampr-emu-ng when unset (kept where the
+    /// game already has it), or the bundled ampr_emu release build. Ignored otherwise.
     #[serde(default)]
-    pub lz4_traces: Option<PathBuf>,
-    /// For [`Lz4Mode::Trace`] into an `.exfat`/`.ffpkg`: free space for the trace, 64..=1024 MiB in
-    /// 64 MiB steps, 256 when unset. Ignored otherwise.
-    #[serde(default = "default_lz4_trace_space_mib")]
-    pub lz4_trace_space_mib: u32,
-    /// The output replaces the source: a patched copy is written beside the source image
-    /// (its `.part`), verified as usual, then renamed over the source once the source is seen
-    /// unchanged; on any failure the source stays as it was. Only for an `.exfat` or `.ffpkg`
-    /// source, with `format` the source's own and [`Lz4Mode::Trace`] or [`Lz4Mode::Unpatch`];
-    /// anything else is a preflight finding, as is a packed source. Needs about the image's
-    /// size of free space beside it until the rename. `output` is ignored. With
-    /// [`lz4_patch`], the explicit exceptions to "never touch the source".
+    pub lz4_runtime: Lz4Runtime,
+    /// Pack the game into zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, zstd, 256 KiB chunks;
+    /// `docs/PAK.md`) and install the zstd runtime. Into a `Folder` or an `Exfat`, `Ffpkg`,
+    /// `Ffpfs` or `Ffpfsc` image (straight in, after a measure pass; not `Pkg`), for a title
+    /// that imports libSceAmpr, and with no LZ4 option; anything else fails preflight.
     #[serde(default)]
-    pub lz4_in_place: bool,
+    pub zstd_pack: bool,
+    /// With [`Self::zstd_pack`]: the zstd level, 1 through 22, [`DEFAULT_ZSTD_LEVEL`] when
+    /// unset. Ignored otherwise.
+    #[serde(default = "default_zstd_level")]
+    pub zstd_level: u8,
+    /// Decode a zstd-packed source's packs into its logical files and write them to `format`
+    /// (any target): the bundled release runtime replaces the zstd one and a fresh
+    /// `ampr_emu.index` is written. A source without zstd packs, [`Self::zstd_pack`] or any
+    /// LZ4 option fails preflight.
+    #[serde(default)]
+    pub zstd_unpack: bool,
     /// File changes applied in place, in order (an edit job when not empty).
     #[serde(default)]
     pub edits: Vec<Edit>,
     /// With [`Self::edits`] on an image: rebuild it instead of editing it in place. A new image
     /// of the source's own format is written from the source plus the edits beside it (its
-    /// `.part`), verified, then renamed over the source once the source is seen unchanged, as
-    /// [`Self::lz4_in_place`] does; on any failure the source stays as it was. `format` and
+    /// `.part`), verified, then renamed over the source once the source is seen unchanged; on
+    /// any failure the source stays as it was. `format` and
     /// `output` are ignored. Ignored for a folder, which is always changed directly.
     #[serde(default)]
     pub edit_rebuild: bool,
@@ -240,6 +244,12 @@ pub struct ConvertRequest {
     /// every other job.
     #[serde(default)]
     pub replace: bool,
+    /// A `.pkg` on this device or another one (`flink://`, `smb://`, `ftp://`, `nfs://`) to hand
+    /// to the PS5's installer, which fetches it from a 127.0.0.1 server the job runs (an install
+    /// job when set; `source`, `output` and `format` are ignored, any other job option fails
+    /// preflight, and off the PS5 it fails preflight). It runs in the transfer slot.
+    #[serde(default)]
+    pub install: Option<PathBuf>,
     /// For an archive source that needs one. Never serialized.
     #[serde(default, skip_serializing)]
     pub archive_password: Option<ArchivePassword>,
@@ -280,20 +290,18 @@ pub struct EditCheck {
     pub free_beside: Option<u64>,
 }
 
-/// The trace space a request without one gets, in MiB.
-/// ponytail: measured once (Stellar Blade): ~2 MB of journal per 5 minutes of heavy loading, about
-/// 25 MB/hour, so 256 MiB is ~10 hours; the cap is 1024 MiB. Recalibrate on more titles.
-pub const DEFAULT_LZ4_TRACE_SPACE_MIB: u32 = 256;
-
-fn default_lz4_trace_space_mib() -> u32 {
-    DEFAULT_LZ4_TRACE_SPACE_MIB
-}
-
 /// The `.ffpfsc` zlib level a request without one gets.
 pub const DEFAULT_FFPFSC_LEVEL: u32 = ps5_dump_forge_pfs::DEFAULT_LEVEL;
 
 fn default_ffpfsc_level() -> u32 {
     DEFAULT_FFPFSC_LEVEL
+}
+
+/// The zstd level a request without one gets.
+pub const DEFAULT_ZSTD_LEVEL: u8 = 5;
+
+fn default_zstd_level() -> u8 {
+    DEFAULT_ZSTD_LEVEL
 }
 
 pub type JobId = u64;
@@ -395,7 +403,9 @@ impl Jobs {
     /// writing through [`Jobs::set_external_busy`]; on the PS5 also
     /// anything at or in ShadowMount+'s mount folder, an image it has mounted and a folder
     /// holding one (fails closed). No job is admitted while it runs. The third explicit exception to "never touch
-    /// the source", with the LZ4 patches.
+    /// the source", with the LZ4 patches. A paired peer's `flink://` path, unless one of this
+    /// device's unfinished jobs uses it, is deleted by that peer under its own rules
+    /// ([`remote::Remote::delete_path`]); a NAS share's is refused.
     pub fn delete_path(&self, path: &Path, protected: &[PathBuf]) -> Result<(), DeleteError> {
         self.inner.delete_path(path, protected)
     }
@@ -410,7 +420,8 @@ impl Jobs {
     /// folder merged (each entry moved, same-named files replaced, folders both hold merged,
     /// everything else there kept, the emptied source folders removed); a kind mismatch at any
     /// level refuses. Every check runs before the first rename; a failure part way says what
-    /// moved. Both folders are synced after; no job is admitted while it runs.
+    /// moved. Both folders are synced after; no job is admitted while it runs. Two `flink://`
+    /// paths on one peer are moved by that peer, as [`Jobs::delete_path`] deletes one there.
     pub fn move_path(
         &self,
         from: &Path,
@@ -422,7 +433,7 @@ impl Jobs {
     }
 
     /// Whether an unfinished job reads or writes `path`, or anything inside or around it
-    /// (its source, output, `.part`s, profile, traces; an edit's undo journal and added
+    /// (its source, output, `.part`s; an edit's undo journal and added
     /// files), compared by identity as [`Jobs::delete_path`] compares them. A snapshot: a
     /// job may start right after.
     pub fn uses(&self, path: &Path) -> bool {
@@ -535,6 +546,8 @@ pub struct Inspection {
     /// AMPR / LZ4 pack facts; `None` when the title does not import `libSceAmpr` and holds
     /// no LZ4 artifact (packs, journal, path index, Forge's runtime).
     pub lz4: Option<Lz4Facts>,
+    /// zstd packed: a root `ampr_zstd.index` that starts with `AMPRZPK1`.
+    pub zstd_packed: bool,
     /// An archive source: the archive's own facts (`files` and `total_bytes` are the game's,
     /// unpacked). `None` for anything else.
     pub archive: Option<ArchiveFacts>,
@@ -571,10 +584,10 @@ pub struct Lz4Facts {
     /// A root `ampr_assets.index` starts with the pack magic but does not parse: the reason
     /// (also a finding). `packed` is `None` then.
     pub manifest_error: Option<String>,
-    /// The runtime at `fakelib/libSceAmpr.sprx`: `forge_release`, `forge_trace`, `other`
-    /// or `none`.
+    /// The runtime at `fakelib/libSceAmpr.sprx`: `forge_release`, `forge_trace`, `zstd`
+    /// (ampr-emu-ng, which reads LZ4 and zstd packs), `other` or `none`.
     pub runtime: String,
-    /// The ampr_emu version of the runtimes Forge ships (and installs on unpatch).
+    /// The ampr_emu version of the release runtime Forge ships.
     pub shipped_runtime_version: &'static str,
     /// The ampr_emu version the game's own runtime names itself with, when it does.
     pub runtime_version: Option<String>,
@@ -583,8 +596,10 @@ pub struct Lz4Facts {
     /// bundled release runtime goes in) or `keep` (Forge's release runtime, or ampr_emu at
     /// [`Lz4Facts::shipped_runtime_version`] or newer). `None` for a non-AMPR title.
     pub runtime_action: Option<&'static str>,
-    /// The same for the LZ4 tab's Pack (an unpacked source) or Unpack (a packed one): Pack
-    /// also replaces a not-older runtime that can't read packs.
+    /// The same for the LZ4 tab's Unpack (a packed source) or Pack with
+    /// [`Lz4Runtime::AmprEmu`] (an unpacked one), which also replaces a not-older runtime that
+    /// can't read packs, and ampr-emu-ng. Pack with [`Lz4Runtime::Ng`] keeps ampr-emu-ng where
+    /// [`Lz4Facts::runtime`] is `zstd` and installs it otherwise.
     pub pack_runtime_action: Option<&'static str>,
     /// `ampr_emu.index` against the files a plain conversion writes (the same comparison the
     /// job makes, the runtime as it installs, replaces or keeps it): `ok`, `stale`, `damaged`
@@ -592,14 +607,6 @@ pub struct Lz4Facts {
     /// touches it: a packed source (kept byte for byte), a non-AMPR title or an archive's
     /// unread index.
     pub index: Option<&'static str>,
-    /// `ampr_emu.index` against the files Patch writes, with the trace runtime installed:
-    /// `ok`, `stale`, `damaged` or `missing`. `None` in the same cases as [`Lz4Facts::index`].
-    pub trace_index: Option<&'static str>,
-    /// Size of the trace journal (`ampr_commands.bin`), when present.
-    pub journal_bytes: Option<u64>,
-    /// With the journal and its `ampr_emu.index` both present: the name [`lz4_traces`] gives
-    /// their zip (`[GAME_TITLE]-[TITLE_ID]-amprtrace.zip`).
-    pub traces_zip: Option<String>,
 }
 
 /// Counts from an LZ4 manifest.
@@ -648,36 +655,6 @@ pub fn inspect_with(path: &Path, password: Option<&str>) -> anyhow::Result<Inspe
     inspect::inspect(path, password)
 }
 
-/// What [`lz4_patch`] or [`lz4_unpatch`] did to a game folder.
-#[derive(Debug, Clone, Serialize)]
-pub struct Lz4Patch {
-    /// Files the new `ampr_emu.index` lists (the runtime included).
-    pub indexed: usize,
-    /// Stale trace files deleted from the folder's root (the journal, the logs).
-    pub removed: Vec<String>,
-    /// The runtime's known-issue line, for the report.
-    pub warning: String,
-}
-
-/// Patches a game folder in place for recording LZ4 traces: the embedded trace runtime
-/// replaces whatever `fakelib/libSceAmpr.sprx` is there, the last session's journal and logs
-/// are deleted and `ampr_emu.index` is rebuilt for the folder's files. An exception to "never
-/// touch the source", on request (with [`ConvertRequest::lz4_in_place`] for images and
-/// [`lz4_unpatch`]). Refuses an image or package (an `.exfat`/`.ffpkg` is patched by a
-/// conversion in place), a packed folder and a title whose `eboot.bin` does not import
-/// `libSceAmpr`. Each file is written under a temporary name, synced and renamed over its
-/// target; the folders are synced after. On the PS5 every file it writes is 0777.
-pub fn lz4_patch(folder: &Path) -> anyhow::Result<Lz4Patch> {
-    lz4_patch::patch(folder, lz4_patch::Runtime::Trace)
-}
-
-/// Undoes [`lz4_patch`] in place, with the same checks and writes: Forge's release runtime
-/// (0.4.2.1) replaces whatever `fakelib/libSceAmpr.sprx` is there (no backup of an earlier one
-/// exists), the journal and logs are deleted and `ampr_emu.index` is rebuilt.
-pub fn lz4_unpatch(folder: &Path) -> anyhow::Result<Lz4Patch> {
-    lz4_patch::patch(folder, lz4_patch::Runtime::Release)
-}
-
 /// PS5 only (FreeBSD; any other OS returns an error for non-empty `roots`). Lists the game dumps
 /// under `roots` (folders and `.exfat`, `.ffpkg`, `.ffpfs`, `.ffpfsc`,
 /// `.pkg` images, by extension, any case) on local disk filesystems: breadth first, at most 6
@@ -688,6 +665,14 @@ pub fn lz4_unpatch(folder: &Path) -> anyhow::Result<Lz4Patch> {
 /// scan runs at a time; a second call waits. Empty `roots` is an empty result.
 pub fn scan_library(roots: &[PathBuf]) -> anyhow::Result<LibraryScan> {
     library::scan_library(roots)
+}
+
+/// PS5 only, as [`scan_library`]: every `.pkg` under `roots` (any case), walked by the same
+/// rules and limits, game folders entered too. Each is read only for its header and container
+/// (a few KiB; a patch's blocks are not placed); one that can't be read is listed as
+/// [`PackageContent::Unknown`] with no title. Sorted by title, untitled last.
+pub fn scan_packages(roots: &[PathBuf]) -> anyhow::Result<PackageScan> {
+    library::scan_packages(roots)
 }
 
 /// Like [`scan_library`] for one folder the user chose: any filesystem (a network share, mounts
@@ -713,23 +698,6 @@ pub fn folder_refusal(path: &Path) -> Option<String> {
 /// be opened.
 pub fn library_cover(path: &Path) -> anyhow::Result<Option<String>> {
     library::library_cover(path)
-}
-
-pub use lz4_traces::Lz4Traces;
-
-/// The LZ4 trace files a traced game writes at its root: the journal, and the path index
-/// whose file ids it names. Pack takes both from one folder.
-pub const LZ4_TRACE_FILES: [&str; 2] = [ps5_dump_forge_lz4::JOURNAL, ps5_dump_forge_lz4::INDEX];
-
-/// Both [`LZ4_TRACE_FILES`] at the root of `source` (a folder or any image this app reads), to
-/// copy off the console, with the name their download takes:
-/// `[GAME_TITLE]-[TITLE_ID]-amprtrace.zip` from `param.json`, the stem exactly as
-/// [`generated_output`] builds it (the title made file-safe and cut first to keep the stem within
-/// 63 bytes; a part it lacks left out; `amprtrace.zip` without either). The inner `Err`
-/// says which file is missing; the outer one is a source that can't be read. A folder's files
-/// are opened directly; an image is read through its own reader. Only metadata is read here.
-pub fn lz4_traces(source: &Path) -> anyhow::Result<Result<Lz4Traces, String>> {
-    lz4_traces::open(source)
 }
 
 /// The default output path for `source` in `format`: in `dir`, named from the title id. An

@@ -461,6 +461,60 @@ pub fn is_patch(path: &Path) -> bool {
         .is_ok_and(|()| lih::is_lih(&magic))
 }
 
+/// What a package says about itself from its header and container alone (a few KiB): the
+/// image is never opened and a patch's blocks are not placed, so listing packages stays cheap.
+#[derive(Debug, Clone)]
+pub struct Peek {
+    /// A patch package (`\x7FLIH`); its container is the patched package's.
+    pub patch: bool,
+    pub content_id: String,
+    /// The container's content type (`0x20`/`0x26` a game, `0x21` additional content).
+    pub content_type: u32,
+    /// The container's plaintext `param.json`, when it carries one of at most `max_param` bytes.
+    pub param_json: Option<Vec<u8>>,
+    /// The size of the container's plaintext `icon0.png`, when it carries one.
+    pub icon0_size: Option<u64>,
+}
+
+/// [`Peek`] at the package `path`. Errors as [`FpkgSource::open`] does for its header and
+/// container (not a PS5 package, retail, corrupt).
+pub fn peek(path: &Path, max_param: u64) -> Result<Peek> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut pkg = Pkg::new(Box::new(file), len);
+    let mut magic = [0u8; 4];
+    if len >= 4 {
+        pkg.read_at(0, &mut magic)?;
+    }
+    let patch = lih::is_lih(&magic);
+    let cnt_offset = if patch {
+        lih::container_at(&mut pkg)?
+    } else {
+        pfs::header(&mut pkg)?.cnt_offset
+    };
+    let cnt = pfs::container(&mut pkg, cnt_offset)?;
+    // As the merge reads them: an empty slot or a protected (encrypted) entry is no file.
+    let plain = |id| {
+        cnt.entry(id)
+            .filter(|e| e.size > 0 && e.flags1 & 0x8000_0000 == 0)
+    };
+    let param_json = match plain(ids::PARAM_JSON).filter(|e| e.size <= max_param) {
+        Some(e) => {
+            let mut bytes = vec![0u8; e.size as usize];
+            pkg.read_at(e.at, &mut bytes)?;
+            Some(bytes)
+        }
+        None => None,
+    };
+    Ok(Peek {
+        patch,
+        content_type: cnt.content_type,
+        icon0_size: plain(ids::ICON0_PNG).map(|e| e.size),
+        content_id: cnt.content_id,
+        param_json,
+    })
+}
+
 impl SourceTree for FpkgSource {
     fn files(&self) -> &[SourceFile] {
         &self.files

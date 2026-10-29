@@ -24,8 +24,9 @@ const FEATURE_ICONS: IconName[] = [
 ];
 
 /** The comparison's rows in order, with each cell's rating; the words are messages (`rows`). */
-const ROWS: { kind: Format; rates: [Rating, Rating] }[] = [
+const ROWS: { kind: Format | "zstd"; rates: [Rating, Rating] }[] = [
   { kind: "pkg", rates: ["good", "good"] },
+  { kind: "zstd", rates: ["good", "good"] },
   { kind: "lz4", rates: ["good", "good"] },
   { kind: "ffpkg", rates: ["good", "ok"] },
   { kind: "exfat", rates: ["good", "ok"] },
@@ -116,7 +117,13 @@ export function Formats(props: { shown: boolean }) {
           <li>
             {t.lazy} <span className="path" dir="ltr">https://github.com/Nazky/Lazy_AMPR</span>
           </li>
+          <li>
+            {t.ng} <span className="path" dir="ltr">https://github.com/quer3q/ampr-emu-ng</span>
+          </li>
           <li>{t.unrar}</li>
+          <li>
+            {t.logo} <span className="path" dir="ltr">https://github.com/Xxcco</span>
+          </li>
         </ul>
       </section>
     </div>

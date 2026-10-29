@@ -7,11 +7,12 @@
 // are listed and can be opened, never changed. The folder is listed again after each action and
 // whenever the view shows. From 880px a folder tree beside the list shows the way from the root
 // to the folder shown, each folder on it with its subfolders (listed lazily, kept while the view
-// shows, dropped on Refresh); narrower, the crumbs do that.
+// shows, dropped on Refresh); narrower, the crumbs do that. On a computer each online paired PS5
+// gets a tab of its own (FilesTabs.tsx): its files, changed as these are; drags copy between them.
 
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
-import { api, errorText, pick, prettyBytes, runtimePlatform, web, type DirEntry, type DirListing, type RuntimePlatform } from "./api";
+import { api, errorText, onDrop, pick, prettyBytes, runtimePlatform, web, type DirEntry, type DirListing, type RuntimePlatform } from "./api";
 import {
   ARCHIVE_EXTENSIONS,
   basename,
@@ -24,12 +25,19 @@ import {
   joinPath,
   notifyDeleted,
   onDeleted,
+  panelId,
   PathLine,
+  tabId,
+  TabList,
   type SourceSelection,
 } from "./common";
 import { confirmDelete, type DeletedFile } from "./delete";
+import { installHere } from "./InstallDialog";
+import type { Action } from "./jobs";
+import { readable } from "./peers";
 import { confirmReplace } from "./replace";
 import { MAX_ROWS, NameInput } from "./Edit";
+import { CopyStatus, FILES_TABS, LOCAL, tabAt, useCopy, usePs5Tabs, useRowDrag, type DeviceTab, type DragTarget } from "./FilesTabs";
 import { FreeSpace } from "./Library";
 import { useMessages } from "./i18n";
 import { Icon } from "./icons";
@@ -91,17 +99,102 @@ const rowsOf = (l: DirListing): DirListing => ({
   ),
 });
 
+/** Storage's File explorer view: one explorer, or on a computer with a paired PS5 online, a tab
+ * per device (each kept mounted, so it keeps its folder). */
 export function Files(props: {
+  visible: boolean;
+  folder: string | null;
+  onFolder: (folder: string) => void;
+  onEdit: HandOff;
+  onConvert: HandOff;
+  dispatch: (a: Action) => void;
+  /** Opens the Connect tab (a started copy's button). */
+  onConnect: () => void;
+  switcher?: ReactNode;
+}) {
+  const t = useMessages().storage;
+  const [platform, setPlatform] = useState<RuntimePlatform | null>(null);
+  useEffect(() => {
+    runtimePlatform().then(setPlatform, () => {});
+  }, []);
+  const peers = usePs5Tabs(platform === "host");
+  const [tab, setTab] = useState(LOCAL);
+  const [overTab, setOverTab] = useState<string | null>(null);
+  // Each tab's folder shown (null: none to copy into), where a drag onto its tab lands.
+  const heres = useRef(new Map<string, string | null>());
+  const { copy, line } = useCopy(props.dispatch);
+  const online = peers.all.filter((d) => peers.online.has(d.id));
+  // A device gone offline: its explorer stays (and its folder), its tab goes, This device shows.
+  const shown = online.some((d) => d.id === tab) ? tab : LOCAL;
+  const tabs =
+    online.length === 0 ? undefined : (
+      <TabList
+        label={t.devices}
+        prefix={FILES_TABS}
+        className="files-tabs"
+        tabs={[
+          { id: LOCAL, label: t.thisDevice, className: overTab === LOCAL ? "drop" : undefined },
+          ...online.map((d) => ({ id: d.id, label: <span title={d.name}>{d.name}</span>, className: overTab === d.id ? "drop" : undefined })),
+        ]}
+        value={shown}
+        onChange={setTab}
+      />
+    );
+  const pane = (key: string, device?: DeviceTab) => (
+    <div key={key} hidden={key !== shown} {...(tabs && { role: "tabpanel", id: panelId(FILES_TABS, key), "aria-labelledby": tabId(FILES_TABS, key) })}>
+      <Explorer
+        {...props}
+        visible={props.visible && key === shown}
+        device={device}
+        tabKey={key}
+        // One tab bar in the page (its buttons' ids are unique): only the shown pane renders it.
+        tabs={key === shown ? tabs : undefined}
+        copy={(paths, dest) => void copy(paths, dest)}
+        folderOf={(k) => heres.current.get(k) ?? null}
+        copyLine={<CopyStatus line={line} onConnect={props.onConnect} />}
+        // A PS5's root (`/`: list only, data and drives below) takes no copy: none to drop into.
+        onHere={(p) => heres.current.set(key, device && p === device.root ? null : p)}
+        onOverTab={setOverTab}
+      />
+    </div>
+  );
+  return (
+    <>
+      {pane(LOCAL)}
+      {peers.all.map((d) => pane(d.id, d))}
+    </>
+  );
+}
+
+function Explorer(props: {
   visible: boolean;
   /** The folder both Storage views share (computer). */
   folder: string | null;
   onFolder: (folder: string) => void;
   onEdit: HandOff;
   onConvert: HandOff;
+  /** Starts an install job's row (a `.pkg` row's Install, the PS5 only). */
+  dispatch: (a: Action) => void;
   /** Storage's Library | File explorer switch, first in this view's card. */
   switcher?: ReactNode;
+  /** Another device's tab (a paired PS5): its share root, no Choose folder. */
+  device?: DeviceTab;
+  /** This explorer's tab id, and the device tabs (under the head; none without a peer online). */
+  tabKey: string;
+  tabs?: ReactNode;
+  /** Copies `paths` into `dest` as a transfer job; `folderOf`: a tab's folder shown. */
+  copy: (paths: string[], dest: string | null) => void;
+  folderOf: (tab: string) => string | null;
+  /** The started copy's line (shared by the tabs). */
+  copyLine: ReactNode;
+  /** The folder shown (null: the server's roots), for drags onto this tab. */
+  onHere: (path: string | null) => void;
+  /** The device tab a drag is over, to ring it. */
+  onOverTab: (tab: string | null) => void;
 }) {
+  const device = props.device;
   const t = useMessages().storage;
+  const inst = useMessages().install;
   const tabs = useMessages().app;
   const deleting = useMessages().library.deleting;
   const actionsHead = useMessages().edit.actions;
@@ -166,10 +259,15 @@ export function Files(props: {
   // The root: the server's roots (named at render; the PS5, or a computer's http build before a
   // folder is chosen), the chosen folder, else the app's home; a new one starts the trail again.
   // undefined: not known yet (or none), so no trail.
-  const root: string | null | undefined =
-    platform === "ps5" ? null : platform === "host" ? (props.folder ?? (web ? null : (home ?? undefined))) : undefined;
+  const root: string | null | undefined = device
+    ? device.root
+    : platform === "ps5"
+      ? null
+      : platform === "host"
+        ? (props.folder ?? (web ? null : (home ?? undefined)))
+        : undefined;
   useEffect(() => {
-    setTrail(root === undefined ? [] : [{ path: root, name: root === null ? "" : basename(root) || root }]);
+    setTrail(root === undefined ? [] : [{ path: root, name: root === null ? "" : device ? device.name : basename(root) || root }]);
     setFilter("");
     setFocus(0);
     setRenaming(null);
@@ -181,6 +279,11 @@ export function Files(props: {
 
   const key = trail.map((c) => c.path ?? "").join("\0");
   const here = trail.length > 0 ? trail[trail.length - 1] : null;
+  const onHere = props.onHere;
+  useEffect(() => {
+    onHere(here ? here.path : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [here?.path]);
 
   const load = async () => {
     if (!here) return;
@@ -371,6 +474,21 @@ export function Files(props: {
     const i = shown.findIndex((x) => x.path === e.path);
     return (shown[i + 1] ?? shown[i - 1])?.path ?? "";
   };
+  // A `.pkg` row's Install (the PS5): asked, then an install job listed under Storage. Nothing
+  // here changes, so the folder isn't listed again.
+  const install = async (e: DirEntry) => {
+    if (acting.current) return;
+    acting.current = true;
+    setActError(null);
+    setNotice(null);
+    try {
+      if (await installHere({ path: e.path, size: e.size }, props.dispatch)) setNotice(inst.started(e.name));
+    } catch (err) {
+      setActError({ lead: inst.cantInstall, text: errorText(err) });
+    } finally {
+      acting.current = false;
+    }
+  };
   const remove = (e: DirEntry) =>
     act(
       t.cantDelete,
@@ -406,12 +524,16 @@ export function Files(props: {
       e.path,
     );
   };
-  const move = (e: DirEntry) =>
+  // `into`: a folder row it was dragged onto; else the picker asks (on a peer's tab, its tabs:
+  // core moves within one device only).
+  const move = (e: DirEntry, into?: string) =>
     act(
       t.cantMove,
       async () => {
-        const dir = await pick({ directory: true, title: t.moveTitle(e.name), start: here?.path ?? undefined });
+        const dir =
+          into ?? (await pick({ directory: true, title: t.moveTitle(e.name), start: here?.path ?? undefined, ...(device && { devices: true, peersOnly: true }) }));
         if (dir === null) return null;
+        if (device && !isWithin(dir, device.root)) throw new Error(t.otherDevice);
         if (dirname(e.path) === dir) throw new Error(t.sameFolder);
         const to = joinPath(dir, e.name);
         // A file onto a file, a folder onto a folder (merged): asked, then replaced. Any other
@@ -451,6 +573,72 @@ export function Files(props: {
     if (kind) to({ path: e.path, kind });
   };
 
+  // Drags: a row onto a folder row of this tab moves it there, onto another device's tab copies
+  // it into that tab's folder shown. Files dropped from the system copy into the folder row
+  // under them, the tab under them, else the folder shown. ponytail: the web build's browser
+  // files have no path here, so its drops are ignored (Upload under Connect sends them).
+  const card = useRef<HTMLElement>(null);
+  const folderRow = (el: Element, not?: DirEntry): DirEntry | undefined => {
+    const row = el.closest<HTMLElement>("[role=row][data-path]");
+    const d = row ? shown.find((x) => x.path === row.dataset.path) : undefined;
+    return d && d.dir && !d.link && !d.mounted && d.path !== not?.path ? d : undefined;
+  };
+  const rowDrag = useRowDrag({
+    target: (x, y, e) => {
+      const el = document.elementFromPoint(x, y);
+      if (!el) return null;
+      const tab = tabAt(el);
+      if (tab !== undefined) return tab !== props.tabKey ? { tab } : null;
+      if (!card.current?.contains(el) || busy !== null || acting.current) return null;
+      const d = folderRow(el, e);
+      return d ? { dir: d } : null;
+    },
+    drop: (e, to) => ("tab" in to ? props.copy([e.path], props.folderOf(to.tab)) : void move(e, to.dir.path)),
+  });
+  type Landing = { tab: string } | { into: string | null };
+  const [osOver, setOsOver] = useState<Landing | null>(null);
+  const osHit = (x: number, y: number): Landing | null => {
+    if (!props.visible || roots) return null;
+    const el = document.elementFromPoint(x, y);
+    if (!el || !card.current?.contains(el)) return null;
+    const tab = tabAt(el);
+    return tab !== undefined ? { tab } : { into: folderRow(el)?.path ?? here?.path ?? null };
+  };
+  const land = (l: Landing): string | null =>
+    "tab" in l ? (l.tab === props.tabKey ? (here?.path ?? null) : props.folderOf(l.tab)) : l.into;
+  const liveDrop = useRef({ osHit, land, copy: props.copy });
+  liveDrop.current = { osHit, land, copy: props.copy };
+  useEffect(() => {
+    if (web) return;
+    return onDrop(
+      (d) => {
+        const l = liveDrop.current;
+        const at = l.osHit(d.x, d.y);
+        setOsOver(null);
+        const paths = d.items.flatMap((i) => (i.path ? [i.path] : []));
+        if (at && paths.length > 0) l.copy(paths, l.land(at));
+      },
+      (pt) => setOsOver(pt ? liveDrop.current.osHit(pt.x, pt.y) : null),
+    );
+  }, []);
+  const over: DragTarget | Landing | null = rowDrag.over ?? osOver;
+  const overTab = over && "tab" in over ? over.tab : null;
+  const onOverTab = props.onOverTab;
+  useEffect(() => {
+    if (props.visible) onOverTab(overTab);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overTab, props.visible]);
+  // The folder row (or the folder shown) a drop would land in, ringed, and what the count line says.
+  const dropAt = over && "dir" in over ? over.dir.path : over && "into" in over ? over.into : null;
+  const dropNote = !over
+    ? null
+    : "dir" in over
+      ? t.dropMove(readable(over.dir.path))
+      : (() => {
+          const dest = land(over);
+          return dest === null ? null : t.dropCopy(readable(dest));
+        })();
+
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.defaultPrevented || (e.target as HTMLElement).closest?.("[role=menu]")) return; // a row's ⋯ menu
     if ((e.target as HTMLElement).tagName === "BUTTON" && (e.key === "Enter" || e.key === " ")) return;
@@ -487,13 +675,15 @@ export function Files(props: {
     }
   };
 
-  const host = platform === "host";
+  // A computer's own files (a peer's tab has its root: no Choose folder).
+  const host = platform === "host" && !device;
   // A computer with no folder to show (no home, or the start can't be listed): choose one.
   const unrooted = host && !props.folder && (root === undefined ? home === null : !!error && trail.length === 1);
   if (unrooted)
     return (
       <section className="card explorer files storage-card bare" aria-label={t.title}>
         <div className="storage-head">{props.switcher}</div>
+        {props.tabs}
         {error && (
           <p className="note-line block" role="alert">
             <Icon name="alert" />
@@ -592,7 +782,8 @@ export function Files(props: {
   };
 
   return (
-    <section className="card explorer files storage-card" aria-label={t.title}>
+    <section className="card explorer files storage-card" aria-label={t.title} ref={card}>
+      {rowDrag.ghost}
       <div className="storage-head">
         {props.switcher}
         <div className="storage-actions">
@@ -615,6 +806,7 @@ export function Files(props: {
           )}
         </div>
       </div>
+      {props.tabs}
       <div className={`files-panes${tree ? " tree" : ""}`}>
         {tree && (
           <nav className="files-tree" ref={treeNav} aria-label={t.folders} onKeyDown={treeKey}>
@@ -662,6 +854,7 @@ export function Files(props: {
               </span>
             </p>
           )}
+          {props.copyLine}
           {/* Always there, so screen readers announce the text when it arrives. */}
           <p className="muted files-notice" role="status">
             {notice}
@@ -693,10 +886,10 @@ export function Files(props: {
               spellCheck={false}
             />
             <span className="muted count-text" role="status">
-              {count}
+              {dropNote ?? count}
             </span>
           </div>
-          <div className="explorer-well">
+          <div className={dropAt !== null && dropAt === here?.path ? "explorer-well drop" : "explorer-well"}>
             {/* Mounted while a folder lists too (its head row only), so focus can rest on it. */}
             <div
               role="grid"
@@ -724,6 +917,7 @@ export function Files(props: {
                   const mine = i === atState ? 0 : -1;
                   const changeable = !roots && !e.link && !e.mounted;
                   const source = !roots && !e.link && (e.dir || sourceKind(e.name) !== null);
+                  const pkg = platform === "ps5" && !roots && !e.link && !e.dir && extOf(e.name) === "pkg";
                   const editing = renaming === e.path;
                   // The row being changed keeps focus on its button (aria-disabled); the others' lock.
                   const acted = busy?.path === e.path;
@@ -736,7 +930,8 @@ export function Files(props: {
                       data-dir={e.dir ? "1" : undefined}
                       aria-rowindex={i + 2}
                       tabIndex={mine}
-                      className={`xrow${e.dir ? " dir" : ""}`}
+                      className={`xrow${e.dir ? " dir" : ""}${dropAt === e.path ? " drop" : ""}`}
+                      onPointerDown={(ev) => changeable && !editing && busy === null && rowDrag.onPointerDown(ev, e)}
                       onFocus={(ev) => ev.target === ev.currentTarget && setFocus(i)}
                       onDoubleClick={() => !editing && open(e)}
                     >
@@ -808,6 +1003,11 @@ export function Files(props: {
                             ]}
                             onChoose={(what) => handOff(what === "edit" ? props.onEdit : props.onConvert, e)}
                           />
+                        )}
+                        {pkg && !editing && (
+                          <button type="button" className="small icon-only xbtn" tabIndex={mine} disabled={locked || acted} aria-label={inst.installName(e.name)} title={inst.installName(e.name)} onClick={() => void install(e)}>
+                            <Icon name="package" />
+                          </button>
                         )}
                         {e.dir && (
                           <button type="button" className="small icon-only xopen" tabIndex={-1} disabled={acted} aria-label={t.open(e.name)} title={t.open(e.name)} onClick={() => open(e)}>

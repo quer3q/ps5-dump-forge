@@ -1,7 +1,7 @@
 <p align="center"><img src="app/src-tauri/icons/128x128@2x.png" width="128" alt="PS5 Dump Forge"></p>
 
 Runs on PS5, Windows, macOS and Linux, and can convert and edit any format: game `folders`, `exfat`, `ffpkg`, `ffpfs`,
-`ffpfsc` and `FPKG (pkg)` packages, straight from `zip`, `7z` and `rar` too, with experimental `LZ4` asset packs for AMPR games.
+`ffpfsc` and `FPKG (pkg)` packages, straight from `zip`, `7z` and `rar` too, with `zstd` and experimental `LZ4` asset packs for AMPR games.
 
 Also supports **transfers and on-the-fly conversion** on all platforms, with the interface translated into **11 languages**.
 
@@ -15,10 +15,11 @@ Also supports **transfers and on-the-fly conversion** on all platforms, with the
 ## Features
 
 - **Any source to any target**, streamed straight through: no temporary copy, not even the image inside a `.ffpfsc` or a game in an archive.
-- **Every format ShadowMountPlus mounts**, created and read back, plus the debug FPKG; the app's About tab compares their console speed and size on disk.
+- **Every format ShadowMountPlus mounts**, created and read back, plus the debug FPKG.
 - **Archives as sources**: a `.zip`, `.7z` or `.rar` holding one game is browsed, converted or packed like a folder.
-- **LZ4 compression**, new experimental way to pack ampr_emu enabled games.
-- **Storage**: a **Library** of your games to convert and edit, and a **File explorer** to rename, move and delete files and folders.
+- **Pack**: compress an AMPR game's assets into zstd packs, or experimental LZ4 packs, and unpack them again; a packed game converts to any format like any other.
+- **Storage**: a **Library** of your games to convert and edit, and a **File explorer** to rename, move and delete files and folders, on a computer a paired PS5's too, with drag and drop between them.
+- **Package installer on the PS5**: lists every `.pkg` on the console's storage and drives and installs one; a `.pkg` on a computer installs on a paired PS5 from Connect, read over the network.
 - **Edit** a dump or image: browse its files, rename, delete, add or replace files and folders, then apply the changes in place or by rebuilding the image; extract files and folders from any source. The game card shows the cover, title, required firmware, backport firmware (`fakelib/`), embedded DLC and `param.json`; leftover `.part` files from interrupted jobs are listed under it when there are any.
 - **Connect, transfers and on-the-fly conversion**: another Forge or a NAS (SMB, FTP, NFS), found by **Autodiscovery**, is a source and an output: convert straight between devices or copy files, nothing staged here.
 - **One-click install on the PS5** from the desktop app: the console downloads the matching Dump Forge release from GitHub and starts it. Any other ELF payload can be sent the same way.
@@ -28,7 +29,7 @@ Also supports **transfers and on-the-fly conversion** on all platforms, with the
 ## Transfers and on-the-fly conversion
 
 A paired Forge (a computer or a PS5) and a saved NAS (SMB, FTP or NFS) are sources and outputs like a local
-folder. While a device is online it is a tab in every file picker.
+folder.
 
 - **On-the-fly conversion**: Convert reads a game folder or image on one device and writes the new image or
   folder onto another, streamed over the network: nothing is copied to this device first, a debug FPKG
@@ -39,6 +40,38 @@ folder. While a device is online it is a tab in every file picker.
   when it lands. Nothing there is ever replaced.
 - **Phones and browsers**: in the web UI, File Transfer uploads files from the browser's device or downloads one
   to it.
+
+## Pack: zstd and LZ4 asset packs
+
+Only for games whose `eboot.bin` imports `libSceAmpr` (AMPR titles). The app's **Pack** tab compresses a game's
+assets into packs that a runtime installed at `fakelib/libSceAmpr.sprx` reads back on the console while the game
+runs. Choose the kind of packs:
+
+- **zstd** (the default): zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`) at **Fast** (zstd 5), **Medium** (9)
+  or **Max** (19), into a game folder or straight into an `.ffpkg`, `.exfat` or `.ffpfs`. A zstd packed game gets
+  **Unpack** instead, into a folder, `.ffpkg`, `.exfat`, `.ffpfs` or fpkg.
+- **LZ4** (experimental): ampr_emu's LZ4 packs (`ampr_assets.index` + `ampr_assets-NNN.pak`) at **Fast** (LZ4),
+  **Medium** (LZ4 HC 9) or **Max** (LZ4 HC 12), into an LZ4 packed folder or straight into an `.ffpkg`, `.exfat`
+  or `.ffpfs`. The runtime is **ampr-emu-ng** (the default) or the bundled
+  [ampr_emu](https://github.com/drakmor/ampr_emu) 0.4.2.1, an upstream test build with which some games crash
+  when saving. An LZ4 packed game gets **Unpack**.
+
+Both kinds are read by **ampr-emu-ng**, the bundled runtime that Pack installs (an LZ4 Pack with ampr_emu
+excepted). ShadowMount+ can update `fakelib/` and replace it: turn that off for packed games.
+
+## Storage
+
+The **Storage** tab holds the **Library** (the games found in a folder you choose, or on the PS5's drives)
+and a **File explorer**. Both open a game in Edit or Convert, and the Library deletes one after you confirm. The
+File explorer renames, moves and deletes at once (a delete after you confirm): a delete is permanent (no Trash), a
+move stays on the same drive and never replaces anything, and anything an unfinished job uses is refused. On the
+PS5, images ShadowMountPlus has mounted are tagged **Mounted** in the File explorer and can't be edited, renamed,
+moved or deleted, and both views show the console's free space.
+
+On the PS5, the **Package installer** view lists every `.pkg` on the console's storage and drives, with its title,
+version and kind (game, patch, additional content). **Install** (also on a `.pkg` row of the File explorer)
+asks first, then hands the package to the console's installer, which fetches it from Dump Forge: keep Dump Forge
+running until the job ends. If the game is already installed, the console deletes that copy first.
 
 ## Editing a game
 
@@ -60,20 +93,6 @@ Before you press Apply the tab says how the changes will go in:
   the only way for `.ffpfsc` and `.pkg`, and the way when the changes don't fit in place.
 - **Changed directly**: a game folder is changed file by file, with no undo file.
 
-**Extract** copies a file or folder (a row's Extract button, or **Extract folder** for the folder shown, the
-whole game at the top) out of any source, images, `.pkg` and archives included, into a folder you choose (on this
-device, a paired Forge or a NAS).
-Nothing there is ever replaced: a name that already exists stops it before anything is copied.
-
-## Storage
-
-The **Storage** tab holds the **Library** (the games found in a folder you choose, or on the PS5's drives)
-and a **File explorer**. Both open a game in Edit or Convert, and the Library deletes one after you confirm. The
-File explorer renames, moves and deletes at once (a delete after you confirm): a delete is permanent (no Trash), a
-move stays on the same drive and never replaces anything, and anything an unfinished job uses is refused. On the
-PS5, images ShadowMountPlus has mounted are tagged **Mounted** in the File explorer and can't be edited, renamed,
-moved or deleted, and both views show the console's free space.
-
 ## Connect
 
 The **Connect** tab pairs this Forge with another one on the local network (**Autodiscovery**, which also runs
@@ -81,37 +100,14 @@ at every start, or an address under **Add a device**), and you allow it on the o
 show the same check number. A NAS (SMB, FTP, NFS) is saved the same way; one saved by IP that comes back on a new
 address under the same name moves there by itself. While online, paired and saved devices are tabs in the file pickers:
 their games are converted and their folders take outputs, but in Edit they are only browsed and extracted from.
-**File Transfer** copies files and folders between any of them. In a browser, the tab's QR code opens the page
+**File Transfer** copies files and folders between any of them. A paired PS5's **Install pkg** installs a
+`.pkg` from this computer on the console, which reads it over the network. In a browser, the tab's QR code opens the page
 on a phone, and File Transfer can upload to or download from the device serving the page.
 
 In the desktop app, **Dump Forge on PS5** installs Dump Forge on a console in one click: type its address and press
 **Install on PS5**, and the app downloads the release matching it (or the latest) from GitHub and sends it to the
 console's ELF loader, which starts it (the console needs no internet). **Send a payload** sends any other ELF file from the computer the same way. It needs an ELF loader
 that listens on the network (port 9021).
-
-## LZ4 asset packs
-
-Experimental, and only for games whose `eboot.bin` imports `libSceAmpr` (AMPR titles). Forge LZ4-compresses
-a game's assets into `ampr_assets-NNN.pak` volumes that the [ampr_emu](https://github.com/drakmor/ampr_emu)
-runtime, installed under `fakelib/`, reads back on the console; the result is a plain game folder, or an
-image holding one. Everything is in the app's **LZ4** tab:
-
-1. **Trace**: make a plain `.ffpkg`, patch it (**LZ4** → **Trace** → **Patch**), mount it writable
-   (`image_rw=`) with ShadowMountPlus and play one long session.
-2. **Download traces**: close the game, wait about a minute, open the console's Forge in a computer's
-   browser and choose **Download traces** on that image (one zip).
-3. **Pack** the original dump on the computer: **LZ4** → **Pack/Unpack**, pick the zip under **Traces** and
-   a target (LZ4 packed folder, `.ffpkg`, `.exfat` or `.ffpfs`).
-
-Without traces or a profile, Pack falls back to a built-in guess of which files to pack, which is less reliable.
-ampr_emu 0.4.2.1 is an upstream test build: some games crash when saving. Details, CLI options and
-caveats: [docs/LZ4.md](docs/LZ4.md).
-
-A plain conversion (Convert, or the CLI without LZ4 options) also repairs an AMPR title: it installs the bundled
-ampr_emu where there is none, replaces an older, unknown or trace build, and writes a fresh `ampr_emu.index` when
-the old one doesn't match the files written, dropping the old traces and logs with it (into a `.pkg`, the package
-builder writes the index). An LZ4-packed source keeps its index, traces and logs as they are. Convert says up
-front what it will do.
 
 ## Download and run
 
@@ -212,10 +208,12 @@ rules the `.exfat`/`.ffpkg` writers follow, the format guidance in SMP's README 
 which makes debug `.pkg` installs possible.
 
 Thanks again to **[drakmor](https://github.com/drakmor)** for **[ampr_emu](https://github.com/drakmor/ampr_emu)**
-(GPL-3.0-or-later), the runtime that makes LZ4 asset packs work: its 0.4.2.1 release and trace runtimes are embedded
-unmodified, with their source archive in `vendor/ampr_emu/`. **[Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR)**
-by Nazky was the reference for the trace-then-pack workflow (no code taken). The bundled LZ4 (BSD-2-Clause)
-and HDE64 notices are in `THIRD-PARTY-NOTICES.md`.
+(GPL-3.0-or-later), the runtime that first made LZ4 asset packs work: its 0.4.2.1 release runtime is embedded
+unmodified, with its source archive in `vendor/ampr_emu/`. **[Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR)**
+by Nazky was a reference for the pack rules (no code taken). The LZ4 library (BSD-2-Clause) that
+Forge and ampr_emu compile in, and the HDE64 notice, are in `THIRD-PARTY-NOTICES.md`.
+
+Thanks to **[Xxcco](https://github.com/Xxcco)** for the logo.
 
 Credits for other references are in `THIRD-PARTY-NOTICES.md`.
 

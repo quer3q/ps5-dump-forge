@@ -97,13 +97,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "lz4_journal"
-path = "fuzz_targets/lz4_journal.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "lz4_unpack"
 path = "fuzz_targets/lz4_unpack.rs"
 test = false

@@ -1,10 +1,10 @@
-// http build: the folder and file browser over `POST /api/list_dir` that stands in for the
-// native dialog. A modal in its own React root; the app behind it is inert. Three modes: a
+// Every picker (by user decision, no system dialog on any platform): the folder and file
+// browser over the backend's `list_dir`. A modal in its own React root; the app behind it is inert. Three modes: a
 // folder, a file, or (`folderToo`) either: a file click picks it, "Choose this folder" the
 // folder shown. `pickFiles`: file clicks select (in one folder), "Choose N files" takes them.
 // A picker that offers other devices (`devices`) gets a tab row while one is online: This device,
 // then each online paired Forge (`flink://<key_id>`), then each online saved NAS (not with
-// `peersOnly`); with none online it is exactly the picker without tabs (the app: the system dialog).
+// `peersOnly`); with none online it is exactly the picker without tabs.
 
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 
@@ -48,12 +48,10 @@ export interface SavedDevices {
 
 /** How the picker lists: the backend's `list_dir` (`null`: its roots), and Connect's saved
  * devices: a picker that offers them adds the saved NAS devices to the roots as
- * `smb://`, `ftp://` or `nfs://host[:port]`, or, in tabs, the online ones. `native`: the app's system dialog, used
- * when no tab is shown and offered on the This device tab. */
+ * `smb://`, `ftp://` or `nfs://host[:port]`, or, in tabs, the online ones. */
 export interface PickerBackend {
   list(path: string | null): Promise<Listing>;
   saved(): Promise<SavedDevices>;
-  native?(o: PickOptions, multiple: boolean): Promise<string[] | null>;
 }
 
 /** One tab: this device (`root` null: the backend's roots) or another device's root. */
@@ -107,17 +105,10 @@ async function open(o: PickOptions, multiple: boolean, b: PickerBackend): Promis
   if (opening) return null;
   opening = true;
   const tabs = await tabsOf(o, b).finally(() => (opening = false));
-  // The system dialog opens only at a local folder (a start on another device is dropped).
-  const dialog = b.native;
-  const native = dialog
-    ? (o: PickOptions, multiple: boolean) => dialog(o.start && isNet(o.start) ? { ...o, start: undefined } : o, multiple)
-    : undefined;
-  if (tabs.length === 0 && native) return native(o, multiple);
   // common's overlay: counted with the others (File Transfer), so the app stays inert until
   // the last one closes; a cancel from `closeOverlays` gives null.
   return new Promise((resolve) => {
     let picked: string[] | null = null;
-    let system = false;
     openOverlay(
       (close) => (
         <Picker
@@ -125,20 +116,13 @@ async function open(o: PickOptions, multiple: boolean, b: PickerBackend): Promis
           multiple={multiple}
           b={b}
           tabs={tabs}
-          native={
-            native &&
-            (() => {
-              system = true;
-              close();
-            })
-          }
           done={(path) => {
             picked = path;
             close();
           }}
         />
       ),
-      () => (system && native ? native(o, multiple).then(resolve, () => resolve(null)) : resolve(picked)),
+      () => resolve(picked),
     );
   });
 }
@@ -213,14 +197,12 @@ function Picker({
   multiple,
   b,
   tabs,
-  native,
   done: give,
 }: {
   o: PickOptions;
   multiple: boolean;
   b: PickerBackend;
   tabs: Tab[];
-  native?: () => void;
   done: (paths: string[] | null) => void;
 }) {
   const t = useMessages().picker;
@@ -490,11 +472,6 @@ function Picker({
           )}
         </div>
         <div className="row end pick-foot">
-          {native && dev.root === null && (
-            <button type="button" className="pick-native" onClick={native}>
-              {t.systemDialog}
-            </button>
-          )}
           <button type="button" ref={cancel} onClick={() => done(null)}>
             {t.cancel}
           </button>

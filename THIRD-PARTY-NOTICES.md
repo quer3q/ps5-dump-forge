@@ -157,10 +157,14 @@ SUCH DAMAGE.
 
 ## ampr_emu (GPL-3.0-or-later)
 
-`vendor/ampr_emu/` holds the unmodified upstream 0.4.2.1 binaries `libSceAmpr.sprx` (release) and
-`libSceAmpr-trace.sprx` (trace), which Forge embeds and installs into LZ4-packed or traced games, and the
-tagged source archive `ampr_emu-0.4.2.1-src.tar.gz`, kept there as their corresponding source (the exact
-compile-time options of the release binaries are not recorded; this is no claim of reproducibility).
+`vendor/ampr_emu/` holds the unmodified upstream 0.4.2.1 release binary `libSceAmpr.sprx`, which Forge
+embeds and installs into AMPR games (and on LZ4 Pack with runtime `ampr_emu`), and the tagged source archive
+`ampr_emu-0.4.2.1-src.tar.gz`, kept there as its corresponding source (the exact compile-time options of
+the release binary are not recorded; this is no claim of reproducibility). It also holds
+`libSceAmpr-zstd.sprx`, ampr-emu-ng, built locally from `ampr-emu zstd` (a Rust rewrite of ampr_emu,
+GPL-3.0-or-later) that reads zstd and LZ4 packs, which Forge embeds and installs on zstd Pack and LZ4
+Pack (runtime `ng`, the default); it compiles in libzstd (through `zstd-sys`) and the `no_std` part of
+`crates/ps5-dump-forge-zstd` (the pack convention).
 Forge's pack format code is written from the documented format and checked against upstream's Python
 tools (`scripts/check-lz4.sh`); no ampr_emu code is compiled into Forge.
 
@@ -237,13 +241,48 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-[Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR) is the reference workflow (trace, then pack). No code or
-profile of it is included.
+[Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR) is the reference workflow. No code or profile of it is
+included.
+
+## liblz4 (BSD 2-Clause) and lz4-sys (MIT)
+
+`crates/ps5-dump-forge-lz4` compresses and decompresses LZ4 blocks with the C **LZ4 library** 1.10.0
+by Yann Collet (https://github.com/lz4/lz4; block API only: the default compressor for Fast, LZ4 HC
+levels 9 and 12 for Medium and Max), compiled in through
+[lz4-sys](https://crates.io/crates/lz4-sys) 1.11.1 (MIT, Artem V. Navrotskiy, as stated in its
+package metadata). The license of the library's `lib` files:
+
+```
+LZ4 Library
+Copyright (c) 2011-2020, Yann Collet
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions and the following disclaimer in the documentation and/or
+  other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
 
 ## lz4_flex (MIT)
 
-`crates/ps5-dump-forge-lz4` compresses and decompresses LZ4 blocks with
-[lz4_flex](https://github.com/PSeitz/lz4_flex) 0.14.
+The vendored `ps5upload-fpkg` crate (`vendor/ps5upload-fpkg/src/ampr_pack/lz4.rs`) compresses and
+decompresses LZ4 blocks with [lz4_flex](https://github.com/PSeitz/lz4_flex) 0.14.
 
 ```
 The MIT License (MIT)

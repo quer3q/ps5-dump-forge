@@ -3,7 +3,7 @@
 //! `ps5-dump-forge-smb`. A path's first part is the share; `smb://host` alone lists the server's
 //! disk shares. Credentials come from [`set_credentials`] (the Connect service's saved NAS
 //! devices); a host with none logs in as guest. A game on a share is still never changed in
-//! place: edits, LZ4 in place and patch, delete and move refuse an `smb://` path
+//! place: edits, delete and move refuse an `smb://` path
 //! ([`crate::net::refuse`]).
 
 use std::collections::HashMap;

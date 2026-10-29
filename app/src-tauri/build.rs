@@ -14,8 +14,6 @@ const COMMANDS: &[&str] = &[
     "start_job",
     "cancel_job",
     "stale_parts",
-    "lz4_patch",
-    "lz4_unpatch",
     "delete_path",
     "move_path",
     "list_dir",
@@ -40,6 +38,7 @@ const COMMANDS: &[&str] = &[
     "connect_nas_save",
     "connect_nas_forget",
     "connect_cancel_job",
+    "connect_install",
     "connect_payload_install",
     "connect_payload_send",
 ];

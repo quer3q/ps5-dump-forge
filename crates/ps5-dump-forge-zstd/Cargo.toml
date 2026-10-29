@@ -1,0 +1,23 @@
+[package]
+name = "ps5-dump-forge-zstd"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["std"]
+# Off (`default-features = false`): `no_std`, the format's convention only
+# (magics, layout, names, `Chunk`, the volume header), for the runtime.
+std = ["dep:getrandom", "dep:ps5upload-fpkg", "dep:rayon", "dep:zstd", "crc32fast/std"]
+
+[dependencies]
+crc32fast = { version = "1.5", default-features = false }
+getrandom = { workspace = true, optional = true }
+ps5upload-fpkg = { workspace = true, optional = true }
+rayon = { version = "1.11", optional = true }
+zstd = { version = "0.13.3", default-features = false, optional = true }
+
+[[test]]
+name = "roundtrip"
+required-features = ["std"]

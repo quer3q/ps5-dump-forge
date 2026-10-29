@@ -77,20 +77,16 @@ pub(crate) fn request_findings(req: &ConvertRequest) -> Vec<String> {
             from_nas.join(", ")
         ));
     }
-    let lz4: Vec<&str> = [
-        ("lz4", req.lz4.is_some()),
-        ("lz4_profile", req.lz4_profile.is_some()),
-        ("lz4_traces", req.lz4_traces.is_some()),
-        ("lz4_in_place", req.lz4_in_place),
-    ]
-    .into_iter()
-    .filter_map(|(name, set)| set.then_some(name))
-    .collect();
-    if !lz4.is_empty() {
-        findings.push(format!(
-            "an edit takes no LZ4 option ({}): edit the game, then use the LZ4 tab",
-            lz4.join(", ")
-        ));
+    if req.lz4.is_some() {
+        findings
+            .push("an edit takes no LZ4 option (lz4): edit the game, then use the Pack tab".into());
+    }
+    if req.zstd_pack || req.zstd_unpack {
+        findings.push(
+            "an edit takes no zstd option (zstd_pack, zstd_unpack): edit the game, then pack \
+             it"
+            .into(),
+        );
     }
     if req.remove_backport {
         findings.push(
@@ -724,12 +720,16 @@ pub(crate) fn fold(
     cancel: &AtomicBool,
 ) -> anyhow::Result<Result<Folded, Vec<String>>> {
     let packs = if reader::detect(tree.as_mut()).context("looking for LZ4 packs")? {
-        match Packs::of(tree.as_mut())? {
-            Ok(packs) => Some(packs),
-            Err(findings) => return Ok(Err(findings)),
-        }
+        Some(Packs::of(tree.as_mut())?)
+    } else if crate::zstd_pack::packed(tree.as_mut()) {
+        Some(Packs::of_zstd(tree.as_mut())?)
     } else {
         None
+    };
+    let packs = match packs {
+        Some(Err(findings)) => return Ok(Err(findings)),
+        Some(Ok(packs)) => Some(packs),
+        None => None,
     };
     let had_index = tree.files().iter().any(|f| f.path == INDEX);
     let before = sizes(&crate::lz4::plain_listing(
@@ -757,7 +757,7 @@ pub(crate) fn fold(
                 .map(|h| format!("{} is the image being edited", h.path.display())),
         );
     }
-    let index = if packs.is_some() {
+    let index = if let Some(packs) = &packs {
         // The runtime matches the index's records to the manifest's by file id: both stay.
         // The runtime, journal and logs aren't looked up through the index.
         let listing = crate::lz4::plain_listing(edited.files(), RuntimeAction::Keep);
@@ -765,9 +765,10 @@ pub(crate) fn fold(
         let after = sizes(&listing);
         if after.symmetric_difference(&before).any(|(p, _)| !own(p)) {
             notes.push(format!(
-                "LZ4: the game is packed; its packs and {INDEX} stay as they are, so a file \
+                "{0}: the game is packed; its packs and {INDEX} stay as they are, so a file \
                  added, resized or removed here keeps its old entry there (ampr_emu answers \
-                 /app0 lookups from {INDEX}: a file it doesn't list is missing to the game)"
+                 /app0 lookups from {INDEX}: a file it doesn't list is missing to the game)",
+                packs.kind
             ));
         }
         None
@@ -862,6 +863,8 @@ fn for_pkg(
 /// locked: the runtime, the journal, logs, `eboot.bin` and every loose file may change (the
 /// runtime reads a loose file from the disk as it is).
 struct Packs {
+    /// `LZ4` or `zstd`, for the findings.
+    kind: &'static str,
     /// The manifest, its two sidecars, every volume it names and `ampr_emu.index` (its records
     /// match the manifest's by file id), each with its size in the source (`None`: absent).
     locked: Vec<(String, Option<u64>)>,
@@ -914,6 +917,53 @@ impl Packs {
             .flat_map(|p| parents(p).map(String::from))
             .collect();
         Ok(Ok(Packs {
+            kind: "LZ4",
+            locked,
+            packed,
+            dirs,
+        }))
+    }
+
+    /// The zstd packs of `tree`, which holds a root `ampr_zstd.index`: the index, every volume it
+    /// names and `ampr_emu.index` (it lists the packed files) are locked. An index that can't
+    /// be read is a finding.
+    fn of_zstd(tree: &mut dyn SourceTree) -> anyhow::Result<Result<Packs, Vec<String>>> {
+        use crate::zstd_pack::PACK_INDEX;
+        // ponytail: the index is read whole; 256 MiB is about 8 million chunk records.
+        const MAX_INDEX: u64 = 256 << 20;
+        let size_of = |tree: &dyn SourceTree, path: &str| {
+            (tree.files().iter())
+                .find(|f| f.path == path)
+                .map(|f| f.size)
+        };
+        let size = size_of(tree, PACK_INDEX).unwrap_or(0);
+        if size > MAX_INDEX {
+            return Ok(Err(vec![format!(
+                "{PACK_INDEX} is {size} bytes, over {MAX_INDEX}"
+            )]));
+        }
+        let bytes = (tree.read_range(PACK_INDEX, 0, size as usize))
+            .with_context(|| format!("reading {PACK_INDEX}"))?;
+        let index = match ps5_dump_forge_zstd::decode_index(&bytes) {
+            Ok(index) => index,
+            Err(e) => return Ok(Err(vec![format!("{PACK_INDEX} can't be read: {e}")])),
+        };
+        let volumes = (0..index.volume_sizes.len() as u32).map(ps5_dump_forge_zstd::volume_name);
+        let locked = ([PACK_INDEX, INDEX].map(String::from).into_iter())
+            .chain(volumes)
+            .map(|path| {
+                let size = size_of(tree, &path);
+                (path, size)
+            })
+            .collect();
+        let packed: HashSet<String> = (index.files.iter())
+            .map(|f| f.path.to_ascii_lowercase())
+            .collect();
+        let dirs = (packed.iter())
+            .flat_map(|p| parents(p).map(String::from))
+            .collect();
+        Ok(Ok(Packs {
+            kind: "zstd",
             locked,
             packed,
             dirs,
@@ -942,24 +992,32 @@ impl Packs {
                 .map(|(path, _)| path.clone()),
         );
         let mut out: Vec<String> = (changed.into_iter())
-            .map(|p| format!("{p} is part of the LZ4 packs: edits can't change it"))
+            .map(|p| {
+                format!(
+                    "{p} is part of the {} packs: edits can't change it",
+                    self.kind
+                )
+            })
             .collect();
         let files = edited.files().iter().map(|f| (&f.path, true));
         for (path, file) in files.chain(edited.empty_dirs().iter().map(|d| (d, false))) {
             let key = path.to_ascii_lowercase();
             if self.packed.contains(&key) {
                 out.push(format!(
-                    "{path} is packed in the LZ4 packs: edits can't add a file there"
+                    "{path} is packed in the {} packs: edits can't add a file there",
+                    self.kind
                 ));
             } else if let Some(at) = parents(&key).find(|d| self.packed.contains(*d)) {
                 out.push(format!(
-                    "{path} is under {}, a file packed in the LZ4 packs: edits can't add \
+                    "{path} is under {}, a file packed in the {} packs: edits can't add \
                      anything there",
-                    &path[..at.len()]
+                    &path[..at.len()],
+                    self.kind
                 ));
             } else if file && self.dirs.contains(&key) {
                 out.push(format!(
-                    "{path} is a folder in the LZ4 packs: edits can't add a file there"
+                    "{path} is a folder in the {} packs: edits can't add a file there",
+                    self.kind
                 ));
             }
         }
@@ -1424,15 +1482,11 @@ mod tests {
         assert_eq!(got, ["editing a folder is not supported yet"]);
         // The request's own refusals come with the kind's.
         let mut req = request(&dir.join("game.pkg"), vec![mkdir("x")]);
-        req.lz4 = Some(crate::Lz4Mode::Trace);
-        req.lz4_traces = Some(dir.join("t.zip"));
+        req.lz4 = Some(crate::Lz4Mode::Unpack);
         req.remove_backport = true;
         let got = findings(&req);
         assert_eq!(got.len(), 3, "{got:?}");
-        assert!(
-            got[0].contains("no LZ4 option (lz4, lz4_traces)"),
-            "{got:?}"
-        );
+        assert!(got[0].contains("no LZ4 option (lz4)"), "{got:?}");
         assert!(got[1].contains("remove_backport"), "{got:?}");
         assert!(got[2].contains("can only be rebuilt"), "{got:?}");
     }

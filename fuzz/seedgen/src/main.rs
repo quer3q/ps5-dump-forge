@@ -279,9 +279,8 @@ impl ps5_dump_forge_lz4::writer::PackOutput for MemOut {
 }
 
 /// LZ4 packs: a tiny pack (one compressible file, one noise file, one loose record) for the
-/// manifest and unpack targets, the path index, and a two-record journal.
+/// manifest and unpack targets, and the path index.
 fn lz4_seeds(out: &Path) -> Res<()> {
-    use ps5_dump_forge_lz4::format::{CMD_HEADER, CMD_MAGIC, cmd_hash, put_u16, put_u32, put_u64};
     use ps5_dump_forge_lz4::writer::{PackFile, pack};
     use ps5_dump_forge_lz4::{CRC_SIDECAR, MANIFEST, PackSpec, volume_name};
 
@@ -326,6 +325,7 @@ fn lz4_seeds(out: &Path) -> Res<()> {
         1_700_000_000,
         None,
         1,
+        0,
         &mut packed,
         &mut |_| {},
         &AtomicBool::new(false),
@@ -357,25 +357,5 @@ fn lz4_seeds(out: &Path) -> Res<()> {
     )?;
     seed(out, "lz4_index", "three", &index)?;
 
-    // Journal: a ReadFile of id 2 (len 100 at 0), then of id 3; the file count leads.
-    let record = |seq: u64, words: [u32; 5]| {
-        let payload: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let mut b = vec![0u8; CMD_HEADER];
-        b[..8].copy_from_slice(CMD_MAGIC);
-        put_u16(&mut b, 8, 1).unwrap();
-        put_u16(&mut b, 10, CMD_HEADER as u16).unwrap();
-        put_u32(&mut b, 12, (CMD_HEADER + payload.len()) as u32).unwrap();
-        put_u64(&mut b, 16, seq).unwrap();
-        put_u64(&mut b, 56, cmd_hash(&payload)).unwrap();
-        put_u32(&mut b, 64, payload.len() as u32).unwrap();
-        put_u32(&mut b, 72, 1).unwrap();
-        put_u32(&mut b, 80, 1).unwrap();
-        b.extend_from_slice(&payload);
-        b
-    };
-    let mut journal = 3u32.to_le_bytes().to_vec();
-    journal.extend(record(1, [40 | 4 << 8, 99, 2, 0, 0]));
-    journal.extend(record(2, [40 | 4 << 8, 49, 3, 0, 0]));
-    seed(out, "lz4_journal", "two-reads", &journal)?;
     Ok(())
 }

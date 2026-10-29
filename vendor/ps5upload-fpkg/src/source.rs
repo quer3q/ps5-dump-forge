@@ -701,17 +701,24 @@ fn scan_for(tree: &mut dyn SourceTree, rel: &str, start: u64, len: u64, needle: 
     false
 }
 
-/// Is `tree` an LZ4-packed folder (ampr_emu's asset packs): a root `ampr_assets.index` that
-/// starts with `AMPRPAK4`? Its `ampr_emu.index` also lists the files inside the packs, and the
-/// pack manifest is checked against it (file id = record order, path, size), so a package
-/// carries that index as it is. A listed manifest whose first bytes cannot be read is an error,
-/// never "not packed": that answer would regenerate the index and drop the packed records.
+/// Is `tree` a packed folder: ampr_emu's LZ4 asset packs (a root `ampr_assets.index` that
+/// starts with `AMPRPAK4`) or Forge's zstd packs (a root `ampr_zstd.index` that starts with
+/// `AMPRZPK1`)? Its `ampr_emu.index` also lists the files inside the packs, and the runtime
+/// looks them up through it (LZ4: the pack manifest is checked against it, file id = record
+/// order, path, size), so a package carries that index as it is. A listed manifest whose first
+/// bytes cannot be read is an error, never "not packed": that answer would regenerate the index
+/// and drop the packed records.
 pub fn lz4_packed(tree: &mut dyn SourceTree) -> crate::Result<bool> {
-    let listed = tree
-        .files()
-        .iter()
-        .any(|f| f.path == "ampr_assets.index" && f.size >= 8);
-    Ok(listed && tree.read_range("ampr_assets.index", 0, 8)? == b"AMPRPAK4")
+    for (index, magic) in [
+        ("ampr_assets.index", b"AMPRPAK4"),
+        ("ampr_zstd.index", b"AMPRZPK1"),
+    ] {
+        let listed = tree.files().iter().any(|f| f.path == index && f.size >= 8);
+        if listed && tree.read_range(index, 0, 8)? == magic {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Does the folder's own `ampr_emu.index` describe the folder? `ampr_emu` trusts its sizes, so

@@ -37,7 +37,7 @@ const KIND_LABEL: Record<Format | ArchiveKind, string> = {
 };
 
 /** What a source can be, in picker order; also the target picker's formats. The LZ4 packed
- * folder is not among them: the LZ4 tab's Pack picks it. */
+ * folder is not among them: the Pack tab's LZ4 Pack picks it. */
 export const KINDS: Kind[] = ["folder", "exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
 
 /** Archives holding one game: sources only, never a target. */
@@ -58,7 +58,7 @@ export function kindLabel(kind: string): string {
 /** A format as a small tinted tag (hues: `.fmt-*` in styles.css). */
 export function FormatPill({ kind }: { kind: string }) {
   useLang(); // re-render on a language switch: kindLabel reads the current one
-  const known = kind in KIND_LABEL;
+  const known = kind in KIND_LABEL || kind === "zstd";
   // The three archives share one hue: what they hold is the same.
   const hue = isArchive(kind) ? "archive" : kind;
   return <span className={known ? `tag fmt fmt-${hue}` : "tag"}>{kindLabel(kind)}</span>;
@@ -139,7 +139,7 @@ export function panelId(prefix: string, id: string): string {
 export function TabList<T extends string>(props: {
   label: string;
   prefix: string;
-  /** `className`: extra classes on that tab's button (the LZ4 tab's straps). `sep`: a divider
+  /** `className`: extra classes on that tab's button (none use it now). `sep`: a divider
    * before it (drawn only; the keys still move through every tab). */
   tabs: { id: T; label: ReactNode; className?: string; sep?: boolean }[];
   value: T;
@@ -234,7 +234,7 @@ export function FormatPicker<F extends Format>(props: {
   reason?: (f: F) => string | undefined;
   /** Default: every source kind (the LZ4 packed folder is chosen elsewhere). */
   formats?: F[];
-  /** A format shown as Folder (label and colour): the LZ4 tab's packed folder. */
+  /** A format shown as Folder (label and colour): the Pack tab's LZ4 packed folder. */
   asFolder?: F;
   className?: string;
 }) {
@@ -511,28 +511,30 @@ export function isWithin(path: string, dir: string): boolean {
 
 /** The picker for a game folder, or an image or archive file; `onPick` unless cancelled
  * (`isImage`: a file, so not a plain folder). */
-export async function pickSource(
-  what: "folder" | "image",
-  onPick: (path: string, isImage: boolean) => void,
-): Promise<void> {
+/** Pick (by user request, one button): Forge's own picker, where a file click picks an image or
+ * archive and "Choose this folder" the folder shown; what was picked is told by its extension. */
+export async function pickSource(onPick: (path: string, isImage: boolean) => void): Promise<void> {
   const t = msg().common;
-  // The http build lists the saved NAS devices as roots of both pickers; a saved NAS online is a
-  // tab of both (a game folder or image there, read only: no .pkg or archive, core reads those
-  // from a local path only).
-  const p =
-    what === "folder"
-      ? await pick({ directory: true, title: t.pickFolder, nas: true, devices: true })
-      : await pick({
-          directory: false,
-          title: t.pickImage,
-          filterName: t.pickImageFilter,
-          extensions: [...IMAGE_EXTENSIONS, ...ARCHIVE_EXTENSIONS],
-          nas: true,
-          nasExtensions: NAS_IMAGES,
-          devices: true,
-        });
-  if (p !== null) onPick(p, what === "image");
+  // The http build lists the saved NAS devices as roots; a saved NAS online is a tab (a game
+  // folder or image there, read only: no .pkg or archive, core reads those from a local path only).
+  const p = await pick({
+    directory: false,
+    folderToo: true,
+    title: t.pickAny,
+    extensions: [...IMAGE_EXTENSIONS, ...ARCHIVE_EXTENSIONS],
+    nas: true,
+    nasExtensions: NAS_IMAGES,
+    devices: true,
+  });
+  // ponytail: a folder named like an image (`game.exfat/`) reads as an image here; core's
+  // inspect then says what it is.
+  if (p !== null) onPick(p, isImagePath(p));
 }
+
+const isImagePath = (p: string): boolean => {
+  const ext = /\.([^./\\]+)$/.exec(p)?.[1]?.toLowerCase();
+  return !!ext && (IMAGE_EXTENSIONS.includes(ext) || ARCHIVE_EXTENSIONS.includes(ext) || /^(part\d+\.rar|r\d\d|\d{3})$/.test(ext));
+};
 
 /** The images a NAS share can serve as a source (common's IMAGE_EXTENSIONS without .pkg). */
 const NAS_IMAGES = ["exfat", "ffpkg", "ffpfs", "ffpfsc"];
@@ -546,22 +548,14 @@ export const isPeer = (path: string | null | undefined): boolean => !!path && /^
 /** A source on another device (a NAS or a paired Forge). */
 export const isNetwork = (path: string | null | undefined): boolean => isNas(path) || isPeer(path);
 
-/** "Folder" / "Image/Archive": a game folder, or an image or archive file. */
+/** "Pick": a game folder, or an image or archive file, in one picker. */
 function PickButtons(props: { onPick: (path: string, isImage: boolean) => void; big?: boolean; disabled?: boolean }) {
   const t = useMessages().common;
-  const pickFolder = () => pickSource("folder", props.onPick);
-  const pickImage = () => pickSource("image", props.onPick);
   return (
-    <>
-      <button className={props.big ? "primary" : "small"} onClick={pickFolder} disabled={props.disabled}>
-        <Icon name="folder" />
-        {t.pickFolderButton}
-      </button>
-      <button className={props.big ? undefined : "small"} onClick={pickImage} disabled={props.disabled}>
-        <Icon name="archive" />
-        {t.pickImageButton}
-      </button>
-    </>
+    <button className={props.big ? "primary" : "small"} onClick={() => void pickSource(props.onPick)} disabled={props.disabled}>
+      <Icon name="disc" />
+      {t.pickButton}
+    </button>
   );
 }
 
@@ -589,7 +583,7 @@ export function SourceCard(props: {
   children?: ReactNode;
   /** Keeps element ids apart per screen; default "i" with `full`, else "c". */
   prefix?: string;
-  /** Stands in for the default empty state (the LZ4 tab's). */
+  /** Stands in for the default empty state (the Pack tab's). */
   empty?: ReactNode;
   /** More buttons in the title row once a source is chosen (Edit's Delete). */
   actions?: ReactNode;
@@ -633,7 +627,6 @@ export function SourceCard(props: {
             <Icon name="disc" />
           </span>
           <p className="empty-title">{t.emptyTitle}</p>
-          <p className="muted">{t.emptyText}</p>
           <div className="kinds" role="group" aria-label={t.accepted}>
             {[...KINDS, ...ARCHIVE_KINDS].map((k) => (
               <FormatPill key={k} kind={k} />
@@ -760,7 +753,11 @@ function Facts({ ins, full, rest }: { ins: Inspection; full: boolean; rest?: boo
         </dd>
       </div>
       {full && ins.archive && <ArchiveTile facts={ins.archive} />}
-      {ins.lz4 && lz4Shown(ins.lz4) && <Lz4Tile facts={ins.lz4} />}
+      {ins.zstd_packed ? (
+        <ZstdTile ins={ins} />
+      ) : (
+        ins.lz4 && lz4Shown(ins.lz4) && <Lz4Tile facts={ins.lz4} />
+      )}
       {full && (
         <div className="tile wide">
           <dt>{t.contentId}</dt>
@@ -795,14 +792,9 @@ function ArchiveTile({ facts }: { facts: NonNullable<Inspection["archive"]> }) {
   );
 }
 
-/** The source records (or recorded) LZ4 traces: Forge's trace runtime, or a journal. */
-export function lz4Traced(f: Lz4Facts | null | undefined): boolean {
-  return !!f && (f.runtime === "forge_trace" || f.journal_bytes !== null);
-}
-
 /** LZ4 asset packs, as the CLI's `inspect` line says it ("LZ4 (AMPR): packed, …"): the state
- * as the value, the details under it. Packed gets the green neon straps, a traced source the
- * lime, magenta and cyan ones; damaged packs keep the warning colour and no straps. */
+ * as the value, the details under it. Packed gets the green neon straps; damaged packs keep
+ * the warning colour and no straps. */
 function Lz4Tile({ facts }: { facts: Lz4Facts }) {
   const t = useMessages().common;
   const { state, detail } = lz4State(facts);
@@ -811,15 +803,9 @@ function Lz4Tile({ facts }: { facts: Lz4Facts }) {
   if (!facts.imports_ampr) notes.push(t.noAmpr);
   const runtime = facts.imports_ampr ? runtimeAction(facts) : null;
   if (runtime) notes.push(runtime);
-  const index = tileIndex(facts);
+  const index = facts.index;
   if (index && index !== "ok") notes.push(t.index[index]);
-  const look = facts.packed
-    ? " neon packed"
-    : facts.manifest_error !== null
-      ? " damaged"
-      : lz4Traced(facts)
-        ? " neon"
-        : "";
+  const look = facts.packed ? " neon packed" : facts.manifest_error !== null ? " damaged" : "";
   return (
     <div className={`tile wide${look}`}>
       <dt>LZ4 (AMPR)</dt>
@@ -829,6 +815,23 @@ function Lz4Tile({ facts }: { facts: Lz4Facts }) {
           {facts.manifest_error !== null ? <bdi>{detail}</bdi> : detail}
           {notes.map((n) => ` · ${n}`).join("")}
         </span>
+      </dd>
+    </div>
+  );
+}
+
+/** A zstd packed source (`ampr_zstd.index` at the root): the LZ4 tile's packed look,
+ * in its place (its AMPR facts would say "Plain"); the runtime as the LZ4 tile names it. */
+function ZstdTile({ ins }: { ins: Inspection }) {
+  const t = useMessages().common;
+  const notes = [t.zstdKept];
+  if (ins.lz4 && ins.lz4.runtime !== "none") notes.push(t.runtimeIs(t.runtime[ins.lz4.runtime]));
+  return (
+    <div className="tile wide neon packed">
+      <dt>zstd</dt>
+      <dd>
+        <span className="value">{t.packed}</span>
+        <span className="note">{notes.join(" · ")}</span>
       </dd>
     </div>
   );
@@ -845,28 +848,21 @@ function runtimeAction(f: Lz4Facts): string | null {
   return f.runtime === "other" && f.runtime_version ? t.runtimeAction("keep", f.runtime_version) : null;
 }
 
-/** The index state the tile reports: a traced game's against its traced files (Patch's
- * comparison), any other's as a conversion compares it. */
-function tileIndex(f: Lz4Facts): Lz4Facts["index"] {
-  return f.runtime === "forge_trace" ? f.trace_index : f.index;
-}
-
 /** The LZ4 (AMPR) tile shows for a game with its own ampr_emu, any LZ4 artifact (packs, a
- * damaged manifest, traces), an ampr_emu.index a conversion rewrites, or an AMPR game a
- * conversion gives the bundled ampr_emu. */
+ * damaged manifest), an ampr_emu.index a conversion rewrites, or an AMPR game a conversion
+ * gives the bundled ampr_emu. */
 function lz4Shown(f: Lz4Facts): boolean {
-  const index = tileIndex(f);
+  const index = f.index;
   return (
     f.runtime !== "none" ||
     !!f.packed ||
     f.manifest_error !== null ||
-    f.journal_bytes !== null ||
     (!!index && index !== "ok") ||
     (f.imports_ampr && f.runtime_action === "install")
   );
 }
 
-/** "Packed" / "Damaged packs" / "Traced" / "Plain", and what backs it (read at call time). */
+/** "Packed" / "Damaged packs" / "Plain", and what backs it (read at call time). */
 export function lz4State(f: Lz4Facts): { state: string; detail: string } {
   const t = msg().common;
   if (f.packed) {
@@ -874,8 +870,6 @@ export function lz4State(f: Lz4Facts): { state: string; detail: string } {
     return { state: t.packed, detail: t.packedDetail(p.files, p.volumes, p.stored_percent) };
   }
   if (f.manifest_error !== null) return { state: t.damaged, detail: f.manifest_error };
-  if (f.journal_bytes !== null) return { state: t.traced, detail: t.journal(prettyBytes(f.journal_bytes)) };
-  if (f.runtime === "forge_trace") return { state: t.traced, detail: t.noJournal };
   return { state: t.plain, detail: t.runtimeIs(t.runtime[f.runtime]) };
 }
 
@@ -1044,8 +1038,7 @@ export function InspectSummary({ ins, full = false, rest = false }: { ins: Inspe
   );
 }
 
-/** A button that opens a short menu of choices: the native dialog picks files or folders,
- * never both (rfd), so the kind is asked first. Esc or a click outside closes it; focus goes
+/** A button that opens a short menu of choices. Esc or a click outside closes it; focus goes
  * back to the button before the choice runs, so a cancelled dialog leaves it there. The menu
  * opens upwards, or towards the other side, where its scrolling container would clip it. */
 export function ChooseMenu<K extends string>(props: {

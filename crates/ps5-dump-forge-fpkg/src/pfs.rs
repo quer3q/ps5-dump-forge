@@ -189,6 +189,8 @@ pub(crate) struct Entry {
 
 pub(crate) struct Container {
     pub content_id: String,
+    /// The header's content type (`0x20`/`0x26` a game, `0x21` additional content).
+    pub content_type: u32,
     pub entries: Vec<Entry>,
 }
 
@@ -246,6 +248,7 @@ pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
         .to_string();
     Ok(Container {
         content_id,
+        content_type: be32(&head, 0x74),
         entries,
     })
 }

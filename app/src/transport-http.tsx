@@ -96,8 +96,6 @@ export const transport: Transport = {
   platform: serverPlatform,
   notifications: serverNotifications,
   setNotifications: setServerNotifications,
-  lz4Patch: (source) => call("lz4_patch", { source }),
-  lz4Unpatch: (source) => call("lz4_unpatch", { source }),
   updateTarget: serverUpdateTarget,
   // The new version serves a new bundle: AppCache swaps it in and reloads (appcache.ts, when no
   // dialog is open); otherwise the page just reloads.
@@ -111,4 +109,6 @@ export const transport: Transport = {
   connect: connectCall,
   connectUpload,
   connectDownloadUrl,
+  packageScan: () => call("package_scan", {}),
+  connectInstall: (keyId, path) => connectCall<{ job: number }>("install", { key_id: keyId, path }).then((r) => r.job),
 };

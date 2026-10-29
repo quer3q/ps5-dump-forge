@@ -560,6 +560,51 @@ fn a_packed_sources_own_index_is_packaged_as_is() {
     }
 }
 
+/// A zstd-packed folder (a root `ampr_zstd.index` starting `AMPRZPK1`) keeps its own index too:
+/// it lists the files inside the packs, which the package does not hold as files.
+#[test]
+fn a_zstd_packed_sources_own_index_is_packaged_as_is() {
+    use ps5upload_fpkg::ampr_index::{self, Entry};
+    let src = TempDir::new("zstd-index-src");
+    write_tree(src.path());
+    let mut index = b"AMPRZPK1".to_vec();
+    index.resize(128, 0);
+    std::fs::write(src.path().join("ampr_zstd.index"), &index).unwrap();
+    std::fs::write(src.path().join("ampr_zstd-000.pak"), [0u8; 64]).unwrap();
+    let records: Vec<Entry> = [("eboot.bin", 4096), ("data/packed/a.bin", 5_000_000)]
+        .map(|(path, size)| Entry {
+            path: path.into(),
+            size,
+            mtime: 42,
+        })
+        .to_vec();
+    let own = ampr_index::build_entries(&records).unwrap();
+    std::fs::write(src.path().join("ampr_emu.index"), &own).unwrap();
+    let mut tree = FolderSource::open(src.path()).unwrap();
+    assert!(ps5upload_fpkg::source::lz4_packed(&mut tree).unwrap());
+    let prepared = build::prepare(
+        &mut tree,
+        &request(src.path()),
+        &mut BuildControl::default(),
+    )
+    .unwrap();
+    let entry = prepared
+        .manifest()
+        .iter()
+        .find(|e| e.path == "ampr_emu.index")
+        .unwrap();
+    assert_eq!(
+        (entry.origin, entry.size),
+        (Origin::Source, own.len() as u64)
+    );
+    assert!(prepared.generated_bytes("ampr_emu.index").is_none());
+
+    // Not the zstd pack magic: generated anew.
+    std::fs::write(src.path().join("ampr_zstd.index"), [0u8; 128]).unwrap();
+    let mut tree = FolderSource::open(src.path()).unwrap();
+    assert!(!ps5upload_fpkg::source::lz4_packed(&mut tree).unwrap());
+}
+
 /// A listed `ampr_assets.index` whose first bytes cannot be read is an error, not "not packed":
 /// that answer would regenerate the index and drop the records of the packed files.
 #[test]

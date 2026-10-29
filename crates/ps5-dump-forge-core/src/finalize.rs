@@ -159,7 +159,7 @@ impl Part {
     }
 
     /// Puts the (already verified and fsynced) file part in place of `target`, the source image
-    /// it replaces ([`crate::ConvertRequest::lz4_in_place`]), keeping the original recoverable
+    /// it replaces ([`crate::ConvertRequest::edit_rebuild`]), keeping the original recoverable
     /// until the new one is durable: the original gets a second name beside it (`*.orig.part`,
     /// a hard link, or a rename where the volume has no hard links: macOS exFAT/FAT), the folder
     /// is synced, the part renamed to `target`, the folder synced again, and only then the

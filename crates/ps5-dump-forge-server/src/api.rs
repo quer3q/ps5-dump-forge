@@ -66,8 +66,6 @@ pub(crate) struct Server {
     inspecting: AtomicUsize,
     /// Reads waiting in [`Server::capped`] for a slot.
     waiting: AtomicUsize,
-    /// Trace downloads being streamed (`quit {"if_idle": true}` waits for none).
-    streaming: Arc<AtomicUsize>,
     /// A `self_update` is waiting on elfldr.
     updating: AtomicBool,
     /// Staged files being uploaded (`edit_upload`): one upload per file at a time, and no
@@ -290,22 +288,6 @@ impl Drop for Inspecting<'_> {
     }
 }
 
-/// One trace download being streamed; frees its place once the body is written or dropped.
-struct Streaming(Arc<AtomicUsize>);
-
-impl Streaming {
-    fn new(count: &Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count.clone())
-    }
-}
-
-impl Drop for Streaming {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Clears its flag when dropped, also when the handler unwinds.
 struct Flag<'a>(&'a AtomicBool);
 
@@ -501,7 +483,6 @@ impl Server {
             stopping: AtomicBool::new(false),
             inspecting: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
-            streaming: Arc::new(AtomicUsize::new(0)),
             updating: AtomicBool::new(false),
             uploads: Mutex::new(HashSet::new()),
             cores,
@@ -610,14 +591,12 @@ impl Server {
                 Ok(Response::json(&()))
             }
             (true, "stale_parts") => self.stale_parts(body),
-            (true, "lz4_patch") => self.lz4_patch(body, false),
-            (true, "lz4_unpatch") => self.lz4_patch(body, true),
-            (false, "lz4_traces") => self.lz4_traces(&head.query),
             (true, "list_dir") => self.list_dir(body),
             (true, "delete_path") => self.delete_path(body),
             (true, "move_path") => self.move_path(body),
             (true, "edit_discard") => self.edit_discard(body),
             (true, "library_scan") => self.library_scan(body),
+            (true, "package_scan") => self.package_scan(body),
             (true, "library_cover") => self.library_cover(body),
             // The PS5's internal storage (`/data`) `{free, total}` in bytes for the Storage tab's
             // heads; `null` on a computer or when `statfs` fails.
@@ -778,6 +757,18 @@ impl Server {
         }))
     }
 
+    /// `{}`: every `.pkg` under the PS5's current roots (core's `scan_packages`, a
+    /// `PackageScan`), capped like an inspection, refused once stopping; 400 on a computer.
+    fn package_scan(&self, body: &[u8]) -> Reply {
+        parse::<serde_json::Map<String, serde_json::Value>>(body)?;
+        self.refuse_if_stopping()?;
+        if self.opts.platform != Platform::Ps5 {
+            return Err(Response::error(400, "packages install only on a PS5"));
+        }
+        let found = self.capped(|| ps5_dump_forge_core::scan_packages(&self.roots.current()))?;
+        Ok(Response::json(&found))
+    }
+
     /// One Library cover, capped like an inspection, and refused once stopping.
     fn library_cover(&self, body: &[u8]) -> Reply {
         let arg: PathArg = parse(body)?;
@@ -882,9 +873,14 @@ impl Server {
     }
 
     fn start_job(&self, body: &[u8]) -> Reply {
-        let mut request = parse::<StartArg>(body)?.request;
+        let id = self.start(parse::<StartArg>(body)?.request)?;
+        Ok(Response::json(&id))
+    }
+
+    /// Admits and starts `request` (`start_job`, a peer's `install`): its id.
+    fn start(&self, mut request: ConvertRequest) -> Result<JobId, Response> {
         readable(&request.source)?;
-        for p in &request.transfer {
+        for p in request.transfer.iter().chain(&request.install) {
             readable(p)?;
         }
         // Below the core count by default, so the server stays responsive; on the PS5 by two,
@@ -924,34 +920,46 @@ impl Server {
         let ended = lock(&self.table).admit(id, request);
         drop(_admission);
         self.notices.send(ended);
-        Ok(Response::json(&id))
+        Ok(id)
     }
 
-    /// Patches a game folder in place for LZ4 traces (`unpatch`: undoes it, core's
-    /// `lz4_unpatch`). Refused while a job is queued or running (it could be reading the
-    /// folder); admission is held throughout, so no job starts and no quit lands mid-patch.
-    fn lz4_patch(&self, body: &[u8], unpatch: bool) -> Reply {
-        let arg: SourceArg = parse(body)?;
-        let _admission = lock(&self.admission);
-        if self.stopping.load(Ordering::SeqCst) {
-            return Err(Response::error(409, "Dump Forge is stopping"));
+    /// A paired peer's Delete and Move to here are this server's own routes' (its keep list,
+    /// under admission, refused once stopping); on the PS5 its `install {path}` starts an
+    /// install job of its package (read over FLINK) as `start_job` would. Holds the server weakly.
+    pub(crate) fn wire_install(self: &Arc<Self>) {
+        let Ok(connect) = &self.connect else { return };
+        let gone = || DeleteError::Refused("Dump Forge is stopping".to_string());
+        let weak = Arc::downgrade(self);
+        let delete: crate::connect_fs::DeleteHook = Arc::new(move |path| {
+            let server = weak.upgrade().ok_or_else(gone)?;
+            let _admission = lock(&server.admission);
+            if server.stopping.load(Ordering::SeqCst) {
+                return Err(gone());
+            }
+            server.jobs.delete_path(path, &server.keep())
+        });
+        let weak = Arc::downgrade(self);
+        let move_: crate::connect_fs::MoveHook = Arc::new(move |from, to, replace| {
+            let server = weak.upgrade().ok_or_else(gone)?;
+            let _admission = lock(&server.admission);
+            if server.stopping.load(Ordering::SeqCst) {
+                return Err(gone());
+            }
+            server.jobs.move_path(from, to, replace, &server.keep())
+        });
+        connect.set_delete_move(delete, move_);
+        if self.opts.platform != Platform::Ps5 {
+            return;
         }
-        if self.running.load(Ordering::SeqCst) > 0 {
-            return Err(Response::error(
-                409,
-                format!(
-                    "a conversion is queued or running; {} once it has finished",
-                    if unpatch { "unpatch" } else { "patch" }
-                ),
-            ));
-        }
-        let done = if unpatch {
-            ps5_dump_forge_core::lz4_unpatch(&arg.source)
-        } else {
-            ps5_dump_forge_core::lz4_patch(&arg.source)
-        }
-        .map_err(core)?;
-        Ok(Response::json(&done))
+        let weak = Arc::downgrade(self);
+        connect.set_install(Arc::new(move |path| {
+            let server = weak.upgrade().ok_or("Dump Forge is stopping")?;
+            let request = serde_json::from_value(json!({
+                "source": "", "format": "folder", "output": "", "install": path,
+            }))
+            .map_err(|e| e.to_string())?;
+            server.start(request).map_err(|r| r.error_text())
+        }));
     }
 
     /// [`keep_list`] of this server's roots.
@@ -1122,39 +1130,6 @@ impl Server {
         }
     }
 
-    /// `GET ?source=<path>` (percent-encoded): both LZ4 trace files at the root of a folder or
-    /// image as one STORED zip, streamed (core's `Lz4Traces::write_zip`). Opening reads the
-    /// source's metadata, so it counts as an inspection; the transfer doesn't. Jobs may run
-    /// meanwhile: this only reads. A source that changes part way ends the body short.
-    fn lz4_traces(&self, query: &str) -> Reply {
-        let Some(source) = http::query_value(query, "source").filter(|v| !v.is_empty()) else {
-            return Err(Response::error(
-                400,
-                "bad request: needs source=, percent-encoded",
-            ));
-        };
-        let source = PathBuf::from(source);
-        readable(&source)?;
-        // Counted under `admission` after a `stopping` check, as `quit_if_idle` checks and sets,
-        // so a download and a takeover never both go ahead.
-        let streaming = {
-            let _admission = lock(&self.admission);
-            self.refuse_if_stopping()?;
-            Streaming::new(&self.streaming)
-        };
-        let mut traces = self
-            .capped(|| ps5_dump_forge_core::lz4_traces(&source))?
-            .map_err(|missing| Response::error(404, missing))?;
-        let (name, len) = (traces.zip_name().to_string(), traces.zip_len());
-        let body = Box::new(move |out: &mut dyn std::io::Write| {
-            let _streaming = streaming;
-            // U8: auto rest mode waits while the browser downloads it.
-            let _awake = ps5_dump_forge_core::awake();
-            traces.write_zip(out)
-        });
-        Ok(Response::download("application/zip", &name, len, body))
-    }
-
     /// Leftover `.part` files in `dirs` (missing ones skip), each
     /// folder listed once, without the ones unfinished jobs are writing; the first 1,000 by
     /// path. Matches as core's `stale_parts` does, but keeps only what it returns while listing.
@@ -1263,9 +1238,9 @@ impl Server {
     }
 
     /// `quit {"if_idle": true}` (a newer copy taking over): quits as `quit` does, but only when
-    /// no job is queued or running, no trace download is streaming and no paired device is
+    /// no job is queued or running and no paired device is
     /// reading or writing files here; else 409.
-    /// Admission within `IDLE_WAIT`, else a 409: a patch or delete holds it for long, and a
+    /// Admission within `IDLE_WAIT`, else a 409: a delete holds it for long, and a
     /// late yes would act after the asker gave up (the newer copy's 3 s request, the page's
     /// minute).
     fn admission_soon(&self) -> Result<MutexGuard<'_, ()>, Response> {
@@ -1280,7 +1255,7 @@ impl Server {
                 Err(std::sync::TryLockError::WouldBlock) => {
                     return Err(Response::error(
                         409,
-                        "Dump Forge is busy: a game is being patched or deleted",
+                        "Dump Forge is busy: a game is being deleted",
                     ));
                 }
             }
@@ -1297,12 +1272,6 @@ impl Server {
                 return Err(Response::error(
                     409,
                     "Dump Forge is busy: a conversion is queued or running",
-                ));
-            }
-            if self.streaming.load(Ordering::SeqCst) > 0 {
-                return Err(Response::error(
-                    409,
-                    "Dump Forge is busy: a trace download is running",
                 ));
             }
             // A paired device's transfer reading or writing here would end mid-way.
@@ -1421,6 +1390,9 @@ struct ConnectArg {
     id: String,
     #[serde(default)]
     allow: bool,
+    /// `install`: a `.pkg` on this device.
+    #[serde(default)]
+    path: PathBuf,
 }
 
 /// `cancel_job`: a peer's job shown here.
@@ -1488,6 +1460,13 @@ impl Server {
             // This device's user answers another device's pairing request.
             "approve" => Ok(Response::json(&c.approve(&a.id, a.allow))),
             "forget" => Ok(Response::json(&c.forget(&a.key_id).map_err(failed)?)),
+            // The paired PS5 `key_id` installs this device's package `path`; `{job}` there.
+            "install" => {
+                let job = c.install(&a.key_id, &a.path);
+                Ok(Response::json(
+                    &json!({ "job": job.map_err(|e| Response::error(400, e))? }),
+                ))
+            }
             "discover_start" => {
                 c.discover_start();
                 Ok(Response::json(&()))
@@ -2119,29 +2098,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// No patch or unpatch while a job is queued or running, or once stopping.
-    #[test]
-    fn lz4_patch_waits_for_jobs() {
-        for (route, verb) in [("lz4_patch", "patch"), ("lz4_unpatch", "unpatch")] {
-            let server = Arc::new(server());
-            let body = json!({ "source": "/nonexistent/game" });
-            server.running.store(1, Ordering::SeqCst);
-            let r = post(&server, route, body.clone());
-            assert_eq!(r.status, 409);
-            assert!(
-                r.text()
-                    .contains(&format!("a conversion is queued or running; {verb} once")),
-                "{}",
-                r.text()
-            );
-            server.running.store(0, Ordering::SeqCst);
-            // Through to core, which finds no folder.
-            assert_eq!(post(&server, route, body.clone()).status, 500);
-            assert!(server.stop());
-            assert_eq!(post(&server, route, body).status, 409);
-        }
-    }
-
     /// Admission is held until a job is in the table, and both `stop` and `stale_parts`
     /// wait for it, though core's events can come first. A job queued behind one blocked on
     /// a FIFO stays unfinished; its `.part` (made here, as a worker would) is not stale.
@@ -2168,15 +2124,17 @@ mod tests {
             kraken_level: ps5_dump_forge_core::KrakenLevel::Fast,
             ffpfsc_level: 6,
             lz4: None,
-            lz4_profile: None,
-            lz4_traces: None,
-            lz4_trace_space_mib: 256,
-            lz4_in_place: false,
+            zstd_pack: false,
+            zstd_level: 5,
+            zstd_unpack: false,
+            lz4_level: 0,
+            lz4_runtime: Default::default(),
             edits: Vec::new(),
             extract: Vec::new(),
             transfer: Vec::new(),
             replace: false,
             edit_rebuild: false,
+            install: None,
             archive_password: None,
         });
         let starter = {
@@ -2364,8 +2322,44 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
-    /// `quit {"if_idle": true}`: 409 while a job is queued or running, a trace download is
-    /// streaming or once stopping; else `{}`, stopping, and quitting after the reply. A plain
+    /// The Pack tab's zstd request (`zstd_pack` + `zstd_level`) goes through `start_job` as it is:
+    /// the job list keeps both, and core's preflight answers it (a game that doesn't import
+    /// libSceAmpr is refused, nothing written).
+    #[test]
+    fn zstd_pack_through_start_job() {
+        let tmp = dir("zstdpack");
+        let game = tmp.join("game");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("a.bin"), b"abc").unwrap();
+        let out = tmp.join("packed");
+        let server = Arc::new(server());
+        let request = json!({ "request": {
+            "source": game, "format": "folder", "output": out,
+            "zstd_pack": true, "zstd_level": 9,
+        }});
+        let r = post(&server, "start_job", request);
+        assert_eq!(r.status, 200, "{}", r.text());
+        let id: u64 = r.text().parse().unwrap();
+        let start = Instant::now();
+        let (admitted, done) = loop {
+            let jobs = lock(&server.table).snapshot();
+            let job = jobs.iter().find(|j| j["id"] == id).cloned();
+            if let Some(j) = job.filter(|j| !j["done"].is_null()) {
+                break (j["request"].clone(), j["done"].clone());
+            }
+            assert!(start.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            (&admitted["zstd_pack"], &admitted["zstd_level"]),
+            (&json!(true), &json!(9))
+        );
+        assert!(done["result"]["Err"].is_string(), "{done}");
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// `quit {"if_idle": true}`: 409 while a job is queued or running or once stopping; else `{}`, stopping, and quitting after the reply. A plain
     /// `quit` is unchanged.
     #[test]
     fn quit_if_idle() {
@@ -2380,20 +2374,11 @@ mod tests {
             r.text()
         );
         server.running.store(0, Ordering::SeqCst);
-        let stream = Streaming::new(&server.streaming);
-        let r = post(&server, "quit", idle.clone());
-        assert_eq!(r.status, 409);
-        assert!(
-            r.text().contains("a trace download is running"),
-            "{}",
-            r.text()
-        );
-        drop(stream);
-        // Admission held (a patch or delete): busy after a short wait, never stopping later.
+        // Admission held (a delete): busy after a short wait, never stopping later.
         let held = lock(&server.admission);
         let r = post(&server, "quit", idle.clone());
         assert_eq!(r.status, 409);
-        assert!(r.text().contains("patched or deleted"), "{}", r.text());
+        assert!(r.text().contains("being deleted"), "{}", r.text());
         drop(held);
         assert!(!server.stopping.load(Ordering::SeqCst));
         let r = post(&server, "quit", idle.clone());
@@ -2497,12 +2482,12 @@ mod tests {
             r.text()
         );
         server.running.store(0, Ordering::SeqCst);
-        // A patch or delete holding admission past 1 s: refused before elfldr is asked.
+        // A delete holding admission past 1 s: refused before elfldr is asked.
         {
             let _held = server.admission.lock().unwrap();
             let r = post(&server, "self_update", newer.clone());
             assert_eq!(r.status, 409);
-            assert!(r.text().contains("patched or deleted"), "{}", r.text());
+            assert!(r.text().contains("being deleted"), "{}", r.text());
         }
         server.updating.store(true, Ordering::SeqCst);
         let r = post(&server, "self_update", newer.clone());

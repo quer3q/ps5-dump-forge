@@ -382,7 +382,15 @@ pub(crate) struct Inner {
     writes: crate::connect_fs::Writes,
     /// Jobs mirrored both ways (`connect_jobs`).
     jobs: crate::connect_jobs::Mirror,
+    /// How a peer's `install` starts a job here (the PS5's server sets it); `None`: refused.
+    install: Mutex<Option<InstallHook>>,
 }
+
+/// Starts an install job of a package (a `flink://<peer>/...` path): the job's id, or why not.
+pub type InstallHook = Arc<dyn Fn(PathBuf) -> Result<JobId, String> + Send + Sync>;
+
+/// A peer's `install` with no hook set: this device isn't a PS5.
+pub const CANT_INSTALL: &str = "this device can't install packages";
 
 pub struct Connect {
     inner: Arc<Inner>,
@@ -488,6 +496,7 @@ impl Connect {
             reads: Default::default(),
             writes: Default::default(),
             jobs: Default::default(),
+            install: Mutex::default(),
         });
         crate::connect_fs::register(&inner);
         let mut threads = Vec::new();
@@ -794,6 +803,17 @@ impl Connect {
         self.inner.writes.set_replace_check(check);
     }
 
+    /// What a paired device's Delete and Move to here run (this device's own
+    /// `Jobs::delete_path`/`move_path` with its protected paths), after the paths are confined
+    /// to the share; unset, both are refused.
+    pub fn set_delete_move(
+        &self,
+        delete: crate::connect_fs::DeleteHook,
+        move_: crate::connect_fs::MoveHook,
+    ) {
+        self.inner.writes.set_delete_move(delete, move_);
+    }
+
     /// What says a peer is writing a path here (a file it created and hasn't renamed), for
     /// core's `Jobs::set_external_busy`. Holds the service weakly (Connect holds the jobs' hook).
     pub fn writing_hook(&self) -> crate::connect_fs::Busy {
@@ -832,6 +852,27 @@ impl Connect {
     /// How a peer's cancel reaches this device's jobs.
     pub fn set_cancel(&self, cancel: crate::connect_jobs::CancelHook) {
         self.inner.jobs.set_cancel(cancel);
+    }
+
+    /// How a paired peer's `install {path}` starts an install job here (the PS5 only).
+    pub fn set_install(&self, install: InstallHook) {
+        *lock(&self.inner.install) = Some(install);
+    }
+
+    /// Asks the paired PS5 `key_id` to install the package at `path` on this device (read by
+    /// it over FLINK, so the job is mirrored here); the PS5's job id. `path` must be inside
+    /// this device's share root.
+    pub fn install(&self, key_id: &str, path: &Path) -> Result<JobId, String> {
+        let root = (self.inner.share_root()).ok_or("this device shares no files")?;
+        let rel = (path.to_str())
+            .and_then(|s| crate::connect_jobs::relative(root, s))
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| format!("{}: not on this device's shared disk", path.display()))?;
+        let reply = (self.call(key_id, "install", serde_json::json!({ "path": rel })))
+            .map_err(|e| error_text(&e))?;
+        reply["job"]
+            .as_u64()
+            .ok_or_else(|| "the device answered no job".to_string())
     }
 
     /// This device's user cancels a paired peer's job shown here; false when it isn't listed.
@@ -1404,9 +1445,30 @@ impl Inner {
                 let (me, root) = (&self.me.key_id, self.share_root());
                 self.jobs.received(&hs.peer.key_id, &r.body, me, root)
             }
+            // A package on the peer (`path` relative to its share root) installed here.
+            "install" => {
+                let path = (r.body["path"].as_str()).ok_or("install needs a \"path\" string")?;
+                let hook = lock(&self.install).clone().ok_or(CANT_INSTALL)?;
+                let job = hook(peer_package(&hs.peer.key_id, path)?)?;
+                Ok(serde_json::json!({ "job": job }))
+            }
             m => Err(format!("unknown method {m}")),
         }
     }
+}
+
+/// `flink://<key_id>/<path>` for a peer's package path: plain `/`-separated names, no `.`,
+/// `..`, `\` or NUL (the peer confines it to its share root again when it is read).
+fn peer_package(key_id: &str, path: &str) -> Result<PathBuf, String> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let bad = |p: &&str| *p == "." || *p == ".." || p.contains(['\\', '\0']);
+    if parts.is_empty() || parts.iter().any(bad) {
+        return Err(format!("install: {path:?} is not a file path"));
+    }
+    Ok(PathBuf::from(format!(
+        "flink://{key_id}/{}",
+        parts.join("/")
+    )))
 }
 
 // ---- The share root ----------------------------------------------------------------------------
@@ -2363,6 +2425,45 @@ mod tests {
         assert_eq!(refusal(&e), Some(NOT_PAIRED));
 
         for s in [a, b, c] {
+            s.shutdown();
+        }
+        for d in dirs {
+            fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    /// A peer's `install` is refused on a device with no install hook (not a PS5); with one,
+    /// the job starts on the caller's package, spelled `flink://<caller>/...`.
+    #[test]
+    fn install_is_refused_without_a_hook() {
+        let dirs = ["inst-a", "inst-b"].map(temp_dir);
+        let a = Connect::start(&dirs[0], 0).unwrap();
+        let b = Connect::start(&dirs[1], 0).unwrap();
+        let addr_a = format!("127.0.0.1:{}", a.me().port);
+        assert_eq!(pair_for_test(&b, &a, &addr_a, true).state, "paired");
+        let pkg = dunce::canonicalize(&dirs[1]).unwrap().join("game.pkg");
+        let ka = a.me().key_id.clone();
+
+        assert_eq!(b.install(&ka, &pkg).unwrap_err(), CANT_INSTALL);
+        let e = (b.call(&ka, "install", serde_json::json!({ "path": "x/../y.pkg" }))).unwrap_err();
+        assert_eq!(error_text(&e), CANT_INSTALL, "the hook is asked for first");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let got = seen.clone();
+        a.set_install(Arc::new(move |p| {
+            lock(&got).push(p);
+            Ok(7)
+        }));
+        assert_eq!(b.install(&ka, &pkg), Ok(7));
+        let rel =
+            crate::connect_jobs::relative(b.inner.share_root().unwrap(), pkg.to_str().unwrap());
+        let want = PathBuf::from(format!("flink://{}/{}", b.me().key_id, rel.unwrap()));
+        assert_eq!(*lock(&seen), [want]);
+        let e = (b.call(&ka, "install", serde_json::json!({ "path": "x/../y.pkg" }))).unwrap_err();
+        assert!(error_text(&e).contains("is not a file path"), "{e}");
+        assert_eq!(lock(&seen).len(), 1);
+
+        for s in [a, b] {
             s.shutdown();
         }
         for d in dirs {

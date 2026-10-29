@@ -10,9 +10,9 @@ use anyhow::bail;
 use ps5_dump_forge_archive::{ArchiveError, ArchiveFormat, Reader};
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
+use crate::ConvertRequest;
 use crate::convert::SourceStamp;
 use crate::jobs::Ctx;
-use crate::{ConvertRequest, Lz4Mode};
 
 pub(crate) fn name(format: ArchiveFormat) -> &'static str {
     match format {
@@ -31,15 +31,6 @@ pub(crate) fn open(
     stamp: SourceStamp,
 ) -> anyhow::Result<(Box<dyn SourceTree>, SourceStamp)> {
     let kind = name(format);
-    if req.lz4_in_place {
-        bail!("a .{kind} archive can't be patched in place; convert it to .exfat or .ffpkg first");
-    }
-    if req.lz4 == Some(Lz4Mode::Trace) {
-        bail!(
-            "the LZ4 trace runtime is installed into a game folder, .exfat or .ffpkg, not a \
-             .{kind} archive; convert it first"
-        );
-    }
     let given = req.archive_password.as_ref().map(|p| p.as_str());
     let password = password(&req.source, given, ctx.cancel)?;
     let password = password.as_deref();

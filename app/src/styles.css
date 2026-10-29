@@ -21,16 +21,10 @@
   --focus: #9db6ff;
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-  /* LZ4 yellow: the LZ4 tab button, its scenario and action pickers, Choose source, its job
-     rows. The tab: a grey ground darker than a selected tab's --raise-hi, yellow straps over it
-     (unselected: --lz4-ink 9.2:1 on a strap) and over --raise-hi (selected: --lz4-ink-hi
-     6.4:1). Pickers: --lz4-ink on --lz4-tint 10.2:1 over --inset, 9.3:1 over --card (also the
-     button and the job tag); unselected --lz4-soft 11.4:1, disabled --muted 6.9:1 on --inset. */
-  --tab-lz4: #1c1c26;
-  --strap: rgba(255, 210, 40, 0.12);
-  --strap-hi: rgba(255, 210, 40, 0.2);
+  /* Pack yellow: the Pack tab's zstd | LZ4 and target pickers, Choose source, its job tags.
+     Pickers: --lz4-ink on --lz4-tint 10.2:1 over --inset, 9.3:1 over --card (also the button
+     and the job tag); unselected --lz4-soft 11.4:1, disabled --muted 6.9:1 on --inset. */
   --lz4-ink: #ffd84d;
-  --lz4-ink-hi: #ffe27a;
   --lz4-soft: #e3c766;
   --lz4-tint: rgba(255, 210, 40, 0.14);
   --lz4-tint-hi: rgba(255, 210, 40, 0.22);
@@ -78,21 +72,13 @@
   --view-files-ink: #c3d3ff;
   --view-files-tint: rgba(61, 107, 255, 0.18);
   --view-files-line: rgba(157, 182, 255, 0.5);
-  /* A packed source's LZ4 (AMPR) tile: green neon straps. Tile (over --inset, brightest strap
+  /* A packed source's LZ4 (AMPR) tile: green straps. Tile (over --inset, brightest strap
      green 14%): --pk-ink 10.4:1, --fg 12.5:1, --muted 5.0:1. */
   --pk-green: rgba(60, 255, 140, 0.14);
   --pk-cyan: rgba(40, 230, 200, 0.12);
   --pk-line: rgba(110, 240, 160, 0.42);
   --pk-glow: rgba(60, 255, 140, 0.16);
   --pk-ink: #86f5b4;
-  /* A traced source's LZ4 (AMPR) tile: muted neon straps over --inset. On the brightest strap
-     (lime) --fg is 12.8:1, --muted 5.2:1, --neon-ink 10.7:1. */
-  --neon-lime: rgba(190, 255, 60, 0.12);
-  --neon-magenta: rgba(255, 60, 200, 0.12);
-  --neon-cyan: rgba(40, 230, 255, 0.12);
-  --neon-line: rgba(214, 232, 117, 0.38);
-  --neon-glow: rgba(190, 255, 60, 0.16);
-  --neon-ink: #d6e875;
   --top: 57px; /* the header's height: sticky things sit under it */
   color-scheme: dark;
   font: 14px/1.45 var(--sans);
@@ -107,6 +93,7 @@
 .fmt-ffpfs  { --h: #7ee0e0; --h-bg: rgba(40, 200, 210, 0.15);   --h-line: rgba(110, 220, 225, 0.5); }
 .fmt-ffpfsc { --h: #ffc580; --h-bg: rgba(255, 170, 60, 0.15);   --h-line: rgba(255, 190, 110, 0.5); }
 .fmt-pkg    { --h: #8fe0ab; --h-bg: rgba(47, 210, 122, 0.15);   --h-line: rgba(110, 225, 160, 0.5); }
+.fmt-zstd   { --h: #7fe3d8; --h-bg: rgba(60, 200, 190, 0.14);   --h-line: rgba(110, 225, 215, 0.5); }
 .fmt-lz4    { --h: #d6e875; --h-bg: rgba(190, 220, 60, 0.14);   --h-line: rgba(210, 232, 110, 0.5); }
 /* Archives (.zip, .7z, .rar; sources only): one sand hue for the three, the label tells them
    apart (text 8.7:1 on its tint over --card, 9.5:1 over --inset). */
@@ -241,22 +228,7 @@ img.qr { display: block; border-radius: 4px; image-rendering: pixelated; backgro
   /* One look on every tab and the Library: white with --page text (19:1). */
   background: #fff; color: var(--page); font-size: 11px; font-weight: 600;
 }
-/* The LZ4 screen tab: a grey pill with four evenly spaced straps from the top-right to the
-   bottom-left ("/", 135deg puts the bands across that diagonal). Static. Selected: brighter
-   ground and straps, --fg, a ring; the focus ring is the usual outline. */
-.seg-opt.tab-lz4 {
-  color: var(--lz4-ink); background-color: var(--tab-lz4);
-  background-image: linear-gradient(135deg,
-    transparent 16.5%, var(--strap) 16.5% 23.5%, transparent 23.5% 36.5%,
-    var(--strap) 36.5% 43.5%, transparent 43.5% 56.5%, var(--strap) 56.5% 63.5%,
-    transparent 63.5% 76.5%, var(--strap) 76.5% 83.5%, transparent 83.5%);
-}
-.seg-opt.tab-lz4:hover { color: var(--lz4-ink-hi); }
-.seg-opt.tab-lz4.on {
-  --strap: var(--strap-hi); color: var(--lz4-ink-hi); background-color: var(--raise-hi); font-weight: 600;
-  box-shadow: inset 0 0 0 1px var(--lz4-line), 0 1px 2px rgba(0, 0, 0, 0.4);
-}
-/* [Convert Edit] | LZ4 | Storage | Connect | About: dividers drawn between the groups (aria-hidden; the arrow
+/* [Convert Edit] | Pack | Storage | Connect | About: dividers drawn between the groups (aria-hidden; the arrow
    keys still move through every tab). */
 .tab-sep { flex: none; align-self: center; width: 1px; height: 16px; margin: 0 5px; background: var(--line-hi); }
 /* PS5 only: L2 / R2 trigger hints on either side of the tab bar, outside its pill. Buttons, but
@@ -284,8 +256,8 @@ button.shoulder:hover:not(:disabled, [aria-disabled="true"]) { background: var(-
 @media (max-width: 599px) { .seg.formats.inner { border-radius: 16px; } }
 .field.inner > .hint { margin: 6px 0 0; margin-inline-start: 4px; }
 .seg-choice .seg-opt .icon { width: 15px; height: 15px; }
-/* The .ffpfsc compression level and the LZ4 trace's room: a native range input in the accent colour. */
-.field.inner > .range-label, .field.lz4 > .range-label { display: flex; justify-content: space-between; margin: 14px 4px 4px; }
+/* The .ffpfsc compression level: a native range input in the accent colour. */
+.field.inner > .range-label { display: flex; justify-content: space-between; margin: 14px 4px 4px; }
 .range-value { color: var(--fg); font-variant-numeric: tabular-nums; font-weight: 600; }
 .range { width: 100%; accent-color: var(--accent); cursor: pointer; }
 .range:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
@@ -299,7 +271,7 @@ button.shoulder:hover:not(:disabled, [aria-disabled="true"]) { background: var(-
 .seg-choice input:focus:not(:focus-visible) + .seg-opt { outline: none; }
 .seg-choice input:disabled + .seg-opt { opacity: 0.38; cursor: default; }
 .seg-choice input:disabled + .seg-opt:hover { color: var(--muted); }
-/* The LZ4 tab's scenario and action pickers: yellow. Unselected in --lz4-soft, chosen in the
+/* The Pack tab's zstd | LZ4 and preset pickers: yellow. Unselected in --lz4-soft, chosen in the
    tint with its ring; a disabled one is plain --muted (not dimmed: its reason is read out and
    listed under the picker). Format pickers keep each format's hue. */
 .lz4-y { --h: var(--lz4-ink); --h-bg: var(--lz4-tint); --h-line: var(--lz4-line); }
@@ -313,7 +285,7 @@ button.shoulder:hover:not(:disabled, [aria-disabled="true"]) { background: var(-
   display: flex; flex-direction: column; gap: 16px;
 }
 @media (max-width: 599px) { .screen { padding: 12px 12px 24px; } }
-/* The one job list under Convert, Edit, LZ4 and Connect: its own screen right under theirs. */
+/* The one job list under Convert, Edit, Pack and Connect: its own screen right under theirs. */
 .screen.jobs-screen { padding-top: 0; }
 .cols { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
 .stack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
@@ -374,7 +346,7 @@ button.shoulder:hover:not(:disabled, [aria-disabled="true"]) { background: var(-
 .card.compact > .card-head + * { margin-top: 0; }
 
 /* ---------- Controls ---------- */
-/* A download link (Get traces) is drawn as a secondary button. */
+/* A download link is drawn as a secondary button. */
 button, a.button {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
   height: 36px; padding: 0 16px; border-radius: 999px; border: 1px solid transparent;
@@ -448,43 +420,17 @@ select.lang-select option { background: var(--card); color: var(--fg); }
 /* A refused switch: the track dims, the label keeps its contrast (the reason sits below it). */
 .switch:has(input:disabled) { cursor: not-allowed; }
 .switch input:disabled + .switch-track { opacity: .4; cursor: not-allowed; }
-/* "Remove backport", "Full verification" and the LZ4 tab's action settings: each in its own
+/* "Remove backport", "Full verification" and the Pack tab's settings: each in its own
    inset box, apart from the one-liners around it. */
 .field.backport, .field.lz4, .field.verify {
   padding: 10px 12px; border-radius: 12px; background: var(--inset); border: 1px solid var(--line);
 }
 .field.backport > .note-line, .field.verify > .note-line { margin-top: 8px; }
-.field.lz4 > .hint, .field.lz4 .field > .hint { margin: 6px 0 0; margin-inline-start: 4px; }
+.field.lz4 > .hint { margin: 6px 0 0; margin-inline-start: 4px; }
 .field.lz4 > :first-child { margin-top: 0; }
-/* Get traces: the one download, its label (with the zip's name) wrapping in a narrow card. */
-.field.lz4 > .downloads { margin-top: 10px; }
-.downloads a.button {
-  height: auto; min-height: 36px; padding: 8px 16px; white-space: normal; text-align: start;
-  overflow-wrap: break-word; overflow-wrap: anywhere;
-}
-.field.lz4 > .note-line { margin: 8px 0 0; margin-inline-start: 4px; }
-/* The LZ4 tab: why an action is off, under the action picker; the target picker's label. */
+/* The Pack tab: why it can't be used, under the zstd | LZ4 picker; the target picker's label. */
 p.lz4-why { margin: 6px 0 0; } /* p: over .hint's 2px, which comes later */
 .target-label { margin: 12px 0 6px; margin-inline-start: 4px; }
-/* Trace: the traces this source recorded, above the action picker (both builds; the web build adds the download). */
-.field.lz4.recorded > .label { margin: 0 0 2px; margin-inline-start: 4px; color: var(--fg-2); font-weight: 500; }
-/* Pack: the rules profile, folded under Traces. */
-.field.lz4 > details.fold.rules { margin-top: 10px; }
-.field.lz4 > details.fold.rules > summary { background: var(--card); }
-.field.lz4 > details.fold.rules > .field { margin: 8px 0 2px; }
-.field.lz4 .field > button.link { margin: 6px 0 0 0; }
-/* Traces locked to the source's own: a greyed box, the lock its only control. */
-.lock-box {
-  display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 3px 0 3px; padding-inline-start: 3px; padding-inline-end: 14px;
-  border-radius: 18px; background: var(--raise); border: 1px dashed var(--line-hi);
-  color: var(--fg-2); font-size: 13px;
-}
-button.lock-btn {
-  width: 30px; height: 30px; padding: 0; flex: none;
-  background: var(--raise-hi); color: var(--fg); border-color: var(--line-hi);
-}
-button.lock-btn:hover:not(:disabled, [aria-disabled="true"]) { background: #3a3a49; }
-button.lock-btn .icon { width: 15px; height: 15px; }
 /* Desktop's Choose menu (Zip / Folder) under its button. */
 .menu-wrap { position: relative; display: inline-flex; }
 .menu-wrap > button .icon { width: 13px; height: 13px; margin-inline-end: -3px; }
@@ -510,7 +456,7 @@ button.lock-btn .icon { width: 15px; height: 15px; }
 
 .build-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
 .build-row .primary { height: 38px; padding: 0 22px; margin-inline-start: auto; }
-/* The LZ4 empty Source's Choose source: yellow tint, ring and ink. */
+/* The Pack empty Source's Choose source: yellow tint, ring and ink. */
 button.lz4-btn { background: var(--lz4-tint); color: var(--lz4-ink); border-color: var(--lz4-line); font-weight: 600; }
 button.lz4-btn:hover:not(:disabled, [aria-disabled="true"]) { background: var(--lz4-tint-hi); }
 .menu-wrap > button.lz4-btn > .icon:first-child { width: 18px; height: 18px; margin: 0; }
@@ -519,7 +465,7 @@ button.lz4-btn:hover:not(:disabled, [aria-disabled="true"]) { background: var(--
    >= 9:1 on --card and --inset. */
 .lead-good { color: var(--good); }
 .lead-warn { color: var(--warn); }
-/* A quiet text button (e.g. LZ4's "Use the source's traces"). */
+/* A quiet text button (e.g. the explorer's crumbs). */
 button.link {
   height: auto; padding: 2px 4px; margin: 2px 0 0; margin-inline-start: -4px; gap: 6px; background: none;
   color: var(--accent-ink); font-size: 12.5px; font-weight: 500;
@@ -577,7 +523,7 @@ button.link .icon { width: 15px; height: 15px; }
 .empty-icon .icon { width: 22px; height: 22px; }
 .empty-title { font-size: 16px; font-weight: 600; }
 .empty .muted { max-width: 380px; font-size: 13px; }
-/* The LZ4 tab's empty Source: the yellow of its tab. */
+/* The Pack tab's empty Source: yellow. */
 .empty.lz4 { background: var(--inset) radial-gradient(60% 80% at 50% 0%, rgba(255, 210, 40, 0.08), transparent 70%); }
 .empty.lz4 .empty-icon { background: var(--lz4-tint); color: var(--lz4-ink); }
 .empty.lz4 .row { margin-top: 8px; }
@@ -634,19 +580,8 @@ button.link .icon { width: 15px; height: 15px; }
 .tile dd .tag { white-space: normal; height: auto; min-height: 22px; max-width: 100%; padding: 2px 9px; }
 .tile.wide .value.mono { font-size: 14px; }
 .note { flex-basis: 100%; margin: 0; font-size: 11.5px; line-height: 1.35; color: var(--muted); }
-/* A traced source (Forge's trace runtime, or a journal): the LZ4 (AMPR) tile in muted neon
-   straps (lime, magenta, cyan; "/" like the LZ4 tab's), a lime ring and glow, the state in
-   --neon-ink. Static; contrast in :root. */
-.tile.neon {
-  border-color: var(--neon-line);
-  box-shadow: 0 0 16px -6px var(--neon-glow), inset 0 0 12px -6px var(--neon-glow);
-  background-image: repeating-linear-gradient(135deg,
-    var(--neon-lime) 0 10px, transparent 10px 26px,
-    var(--neon-magenta) 26px 36px, transparent 36px 52px,
-    var(--neon-cyan) 52px 62px, transparent 62px 78px);
-}
-.tile.neon .value { color: var(--neon-ink); }
-/* A packed source: green neon straps instead (over the traced ones). */
+/* A packed source: the LZ4 (AMPR) tile in green straps ("/"), a green ring and glow, the
+   state in --pk-ink. Static; contrast in :root. */
 .tile.neon.packed {
   border-color: var(--pk-line);
   box-shadow: 0 0 16px -6px var(--pk-glow), inset 0 0 12px -6px var(--pk-glow);
@@ -730,11 +665,12 @@ ul.findings li.info .icon { color: var(--accent-ink); }
    luminance; at 80% --muted on --inset stays 4.8:1 and --fg 11:1. The tags, and the bar's
    fill, lose their hue. */
 .job.remote > :not(.job-head), .job.remote .job-head > :not(button) { opacity: 0.8; filter: grayscale(1); }
-/* Each type's tag in its own hue (the tile is the same for all): an LZ4 tab job (pack, unpack,
-   trace, unpatch), an edit or extract, a transfer. */
+/* Each type's tag in its own hue (the tile is the same for all): a Pack tab job (LZ4 or zstd, pack or
+   unpack), an edit or extract, a transfer, a package install (Transfer green: it moves a file to
+   the console's installer). */
 .tag.lz4 { background: var(--lz4-tint); color: var(--lz4-ink); font-weight: 600; }
 .tag.edit { background: var(--edit-tint); color: var(--edit-ink); font-weight: 600; }
-.tag.transfer { background: var(--transfer-tint); color: var(--transfer-ink); font-weight: 600; }
+.tag.transfer, .tag.install { background: var(--transfer-tint); color: var(--transfer-ink); font-weight: 600; }
 .job-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 10px; }
 /* Flex-start (the name wraps): the 22px tags and the name's first line centred on the 30px buttons. */
 .job-head > .tag { margin-top: 4px; }
@@ -964,7 +900,7 @@ pre.code { padding: 14px 16px; }
    over a full-width input. */
 .modal.password p#pw-text { margin: 12px 0 10px; }
 .pw-input { display: block; width: 100%; margin-bottom: 20px; }
-/* LZ4's "How LZ4 works": the quit modal's frame, wider; the body scrolls, title and Close stay. */
+/* The Pack tab's "How pack works" (also Connect's How to connect): the quit modal's frame, wider; the body scrolls, title and Close stay. */
 .modal.help { width: 560px; display: flex; flex-direction: column; max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); }
 .head-icon.lz4 { color: var(--lz4-ink); }
 .help-body { overflow-y: auto; min-height: 0; margin: 12px -24px 16px; padding: 0 24px; }
@@ -1156,7 +1092,6 @@ button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; 
 .seg.pick-tabs { display: flex; flex-wrap: wrap; align-self: flex-start; max-width: 100%; padding: 2px; margin-top: 12px; border-radius: 16px; }
 .pick-tabs .seg-opt { display: block; line-height: 26px; height: 26px; padding: 0 12px; font-size: 12.5px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .pick-tabs .seg-opt:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-.pick-foot .pick-native { margin-inline-end: auto; }
 /* Crumbs, list and error: the selected tab's panel, laid out as the dialog's own column. */
 .pick-panel { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; }
 
@@ -1336,6 +1271,10 @@ button.kind-chip.addon { --h: var(--fg); --h-bg: var(--raise-hi); --h-line: var(
   background: var(--view-files-tint); color: var(--view-files-ink); font-weight: 600;
   box-shadow: inset 0 0 0 1px var(--view-files-line);
 }
+.view-switch .view-packages.on {
+  background: var(--done-tint); color: var(--done-ink); font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgba(47, 210, 122, 0.35);
+}
 @media (max-width: 599px) { .library-well { padding: 8px; } }
 @media (min-width: 880px) {
   .storage .explorer { position: static; height: calc(100vh - var(--top) - 96px); }
@@ -1349,6 +1288,21 @@ button.kind-chip.addon { --h: var(--fg); --h-bg: var(--raise-hi); --h-line: var(
 .files .library-empty { margin: 0; }
 .files-notice { margin: 0 0 10px; font-size: 12.5px; overflow-wrap: anywhere; }
 .files-notice:empty { display: none; }
+/* The device tabs (a computer with a paired PS5 online), a started copy's line, a dragged row. */
+.files-tabs { align-self: flex-start; max-width: 100%; overflow-x: auto; }
+.files-tabs .seg-opt span { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seg-opt.drop { box-shadow: inset 0 0 0 2px var(--focus); }
+.files-copy:empty { display: none; }
+.files-copy > .note-line { margin: 0 0 10px; align-items: center; }
+.files-copy > .note-line .icon { margin-top: 0; }
+.files-ghost {
+  position: fixed; z-index: 1000; pointer-events: none; display: flex; align-items: center; gap: 6px;
+  max-width: 280px; padding: 4px 10px; border-radius: 6px; background: var(--raise-hi); color: var(--fg);
+  font: 12px var(--mono); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+.files-ghost .icon { flex: none; width: 15px; height: 15px; color: var(--accent-ink); }
+.files-ghost span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+body.files-dragging, body.files-dragging * { cursor: grabbing !important; user-select: none; -webkit-user-select: none; }
 .files .empty-note.note-line { margin: 0; }
 .files-main > .note-line.block { margin: 0 0 10px; }
 /* The card pads as the Library's does, so the head stays put when the view switches; its children
@@ -1384,7 +1338,8 @@ button.kind-chip.addon { --h: var(--fg); --h-bg: var(--raise-hi); --h-line: var(
 .files-tree button[aria-current="true"] .icon { color: var(--view-files-ink); }
 /* The arrows move focus to tabindex="-1" folders, which the global reset leaves ringless. */
 .files-tree button:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-/* Rename, Move, Delete, ⋯ (Edit, Convert) and open: 5 × 30px + 4 × 2px. Under 600px (and with
+/* Rename, Move, Delete, ⋯ (Edit, Convert) and open (a .pkg on the PS5: Install in its place):
+   5 × 30px + 4 × 2px. Under 600px (and with
    finger sized buttons) the actions take their own line under the name. */
 .xgrid.files.editable .xrow { grid-template-columns: minmax(0, 1fr) auto 158px; }
 .xgrid.files:not(.editable) .xrow { grid-template-columns: minmax(0, 1fr) auto 30px; }
@@ -1413,10 +1368,9 @@ button.kind-chip.addon { --h: var(--fg); --h-bg: var(--raise-hi); --h-line: var(
 @media (pointer: coarse) {
   button, a.button, input, .menu > button, .build-row .primary, select.lang-select { height: 40px; }
   button.small, .seg-opt, button.kind-chip { height: 40px; }
-  .downloads a.button { min-height: 40px; }
   .pick-tabs .seg-opt, .view-switch .seg-opt { height: 40px; }
   .pick-tabs .seg-opt, .seg.view-switch.devices .seg-opt { line-height: 40px; }
-  button.small.icon-only, .gh-link, button.lock-btn { width: 40px; height: 40px; }
+  button.small.icon-only, .gh-link { width: 40px; height: 40px; }
   button.link, button.pick-row, .xrow, details.fold > summary, .job details.fold > summary, .switch { min-height: 40px; }
   .xinput { height: 40px; }
   input, input.mono, .xinput, select, select.lang-select, textarea { font-size: 16px; }
@@ -1484,6 +1438,8 @@ button.kind-chip.addon { --h: var(--fg); --h-bg: var(--raise-hi); --h-line: var(
 .dev-sub { display: flex; flex-wrap: wrap; gap: 2px 10px; margin: 3px 0 0; font-size: 12.5px; color: var(--muted); overflow-wrap: break-word; overflow-wrap: anywhere; }
 .dev-sub .mono { font-size: 12px; color: var(--fg-2); }
 .dev-actions { display: flex; gap: 6px; }
+/* A paired PS5's Install pkg: green text (the Done green), so it reads apart from Send. */
+.dev-actions button.install { color: var(--done-ink); }
 @media (max-width: 479px) {
   .dev-row { grid-template-columns: auto minmax(0, 1fr); }
   .dev-actions { grid-column: 2; }

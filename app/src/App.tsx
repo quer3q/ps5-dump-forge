@@ -15,7 +15,7 @@ import { useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
 import { Icon } from "./icons";
 import { Edit } from "./Edit";
-import { Lz4 } from "./Lz4";
+import { Pack } from "./Pack";
 import { Storage } from "./Storage";
 import { stepTab, watchShoulders, type Step } from "./shoulders";
 import { UpdateToast } from "./UpdateToast";
@@ -23,12 +23,20 @@ import { jobName, JobsCard } from "./JobList";
 import { jobsReducer, jobType, remoteJobs, type Job, type JobType } from "./jobs";
 import { useConnectState, useOnlineCount } from "./useConnectState";
 
-// Tabs: [Convert Edit] | LZ4 | Storage | Connect | About (the dividers are drawn only).
-type Tab = "convert" | "storage" | "lz4" | "edit" | "connect" | "formats";
+// Tabs: [Convert Edit] | Pack | Storage | Connect | About (the dividers are drawn only).
+type Tab = "convert" | "storage" | "pack" | "edit" | "connect" | "formats";
 /** The bar's order, which L2 / R2 step through. */
-const TAB_ORDER: readonly Tab[] = ["convert", "edit", "lz4", "storage", "connect", "formats"];
-/** The job type each tab lists under it (Storage and About list none). */
-const TAB_JOBS: Partial<Record<Tab, JobType>> = { convert: "convert", edit: "edit", lz4: "lz4", connect: "transfer" };
+const TAB_ORDER: readonly Tab[] = ["convert", "edit", "pack", "storage", "connect", "formats"];
+/** The job type each tab lists under it (About lists none). */
+const TAB_JOBS: Record<JobType, Tab> = { convert: "convert", edit: "edit", pack: "pack", transfer: "connect", install: "storage" };
+/** The tab that lists and counts `j`: its type's, but a peer's install (a PS5 installing this
+ * device's package) under Connect, with the transfers. Null until its request arrives (its
+ * events can beat `startJob`'s reply). */
+const tabOf = (j: Job): Tab | null => {
+  if (!j.request) return null;
+  const type = jobType(j.request);
+  return type === "install" && j.remote ? "connect" : TAB_JOBS[type];
+};
 
 export function App() {
   const t = useMessages().app;
@@ -92,9 +100,8 @@ export function App() {
   const unfinished = jobs.filter((j) => !j.result);
   const active = unfinished.length;
   // A tab's label with its counter: that tab's unfinished jobs (one white counter on every tab).
-  const counted = (label: string, type: JobType) => {
-    // A job whose request hasn't arrived yet (its events can beat `startJob`'s reply) has no type.
-    const n = [...unfinished, ...remote.filter((j) => !j.result)].filter((j) => j.request && jobType(j.request) === type).length;
+  const counted = (label: string, at: Tab) => {
+    const n = [...unfinished, ...remote.filter((j) => !j.result)].filter((j) => tabOf(j) === at).length;
     return (
       <>
         {label}
@@ -110,12 +117,12 @@ export function App() {
     );
   };
 
-  // Under Convert, Edit, LZ4 and Connect, inside the tab's panel: that tab's own jobs (its type's),
+  // Under Convert, Edit, Pack, Storage and Connect, inside the tab's panel: that tab's own jobs (`tabOf`),
   // as its count counts them; each list kept mounted (open logs stay open). A job whose request
   // hasn't arrived yet has no type: listed nowhere yet.
   const jobsOf = (at: Tab) => {
     // Newest first: this device's above the peers'.
-    const mine = [...remote, ...jobs].filter((j) => j.request && jobType(j.request) === TAB_JOBS[at]);
+    const mine = [...remote, ...jobs].filter((j) => tabOf(j) === at);
     return (
       mine.length > 0 && (
         <div className="screen jobs-screen">
@@ -218,9 +225,9 @@ export function App() {
               tabs={[
                 { id: "convert", label: counted(t.convert, "convert") },
                 { id: "edit", label: counted(t.edit, "edit") },
-                { id: "lz4", label: counted("LZ4", "lz4"), className: "tab-lz4", sep: true },
-                { id: "storage", label: t.storage, sep: true },
-                { id: "connect", label: counted(t.connect, "transfer"), sep: true },
+                { id: "pack", label: counted(t.pack, "pack"), sep: true },
+                { id: "storage", label: counted(t.storage, "storage"), sep: true },
+                { id: "connect", label: counted(t.connect, "connect"), sep: true },
                 { id: "formats", label: t.about, sep: true },
               ]}
             />
@@ -283,16 +290,19 @@ export function App() {
               visible={tab === "storage"}
               onEdit={(e) => handOff("edit", e)}
               onConvert={(e) => handOff("convert", e)}
+              dispatch={dispatch}
+              onConnect={() => goTo("connect")}
             />
+            {jobsOf("storage")}
           </div>
           <div
-            id={panelId("screen", "lz4")}
+            id={panelId("screen", "pack")}
             role="tabpanel"
-            aria-labelledby={tabId("screen", "lz4")}
-            hidden={tab !== "lz4"}
+            aria-labelledby={tabId("screen", "pack")}
+            hidden={tab !== "pack"}
           >
-            <Lz4 jobs={jobs} dispatch={dispatch} />
-            {jobsOf("lz4")}
+            <Pack jobs={jobs} dispatch={dispatch} />
+            {jobsOf("pack")}
           </div>
           <div
             id={panelId("screen", "edit")}

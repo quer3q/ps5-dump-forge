@@ -1,4 +1,4 @@
-// Pieces of a Target card that Convert and LZ4 share: format copy, the per-format settings,
+// Pieces of a Target card that Convert and Pack share: format copy, the per-format settings,
 // Full verification, and the output name (generated or typed) with its folder.
 
 import { useRef, useState } from "react";
@@ -77,17 +77,6 @@ const KRAKEN_ICON: Record<KrakenLevel, IconName> = {
   smallest: "compress",
   stored: "file",
 };
-
-/** The `.fpkg` firmware limit, under the format's one-liner. */
-export function PkgWarning() {
-  const t = useMessages().target;
-  return (
-    <p className="alert-bar warn">
-      <Icon name="warn" />
-      <span>{t.pkgFirmware}</span>
-    </p>
-  );
-}
 
 /** `.ffpfsc`: the image inside and the zlib level. `prefix` keeps ids and radio names apart
  * per screen. */

@@ -645,6 +645,11 @@ impl<T: SourceTree + ?Sized> Unpacked<T> {
         &self.manifest
     }
 
+    /// The relative paths the packs held (packed records).
+    pub fn packed_paths(&self) -> impl Iterator<Item = &str> {
+        self.packed.keys().map(String::as_str)
+    }
+
     /// The validated runtime profile, if the tree has one.
     pub fn profile(&self) -> Option<RuntimeProfile> {
         self.profile
@@ -675,8 +680,8 @@ impl<T: SourceTree + ?Sized> Unpacked<T> {
                 Codec::Raw => stored,
                 Codec::Lz4 => {
                     let mut out = vec![0; derived];
-                    match lz4_flex::block::decompress_into(&stored, &mut out) {
-                        Ok(n) if n == derived => out,
+                    match crate::block::decompress_into(&stored, &mut out) {
+                        Some(n) if n == derived => out,
                         _ => {
                             return Err(bad(format!(
                                 "{}: LZ4 data does not decode to {derived} bytes",
@@ -1093,7 +1098,7 @@ mod tests {
     fn accepts_upstream_geometry_forge_does_not_emit() {
         let page = 4096u64;
         let raw = noise(1000, 1);
-        let lz = lz4_flex::block::compress(&raw);
+        let lz = crate::block::compress(&raw, 0).unwrap();
         assert!(lz.len() > raw.len(), "LZ4 of noise is not smaller");
         let tail = text(500, 2);
         let shared = BOTH | CHUNK_SHARED;

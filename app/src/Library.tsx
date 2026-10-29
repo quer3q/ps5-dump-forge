@@ -1,5 +1,5 @@
 // The Storage tab's Library view: the game dumps under one folder, as cards or compact rows,
-// filtered by kind chips (All, each kind present, LZ4 packed, Additional content). On a
+// filtered by kind chips (All, each kind present, LZ4, zstd, Additional content). On a
 // computer the user chooses the folder (nothing scans before that; a refused folder gets an
 // error screen), here or in the File explorer (one folder for both views); on the PS5 the first
 // visit scans the server's roots. The list, the folder and the view live in memory; only the
@@ -17,17 +17,25 @@ import { Icon } from "./icons";
 // Read at render: gameTitle follows the language, and the components re-render on a switch.
 const name = (e: LibraryEntry) => gameTitle(e.title_names, e.title_name) || e.title_id || basename(e.path);
 
-/** The kind chips' filter: "all", an entry's kind, or one of the two labels (LZ4 packed,
- * Additional content), which can't clash with a kind. */
+/** The kind chips' filter: "all", an entry's kind, or one of the three labels (LZ4,
+ * zstd, Additional content), which can't clash with a kind. */
 type Filter = string;
 const LZ4 = "#lz4";
+const ZSTD = "#zstd";
 const ADDON = "#addon";
 const KIND_ORDER = ["folder", "ffpkg", "exfat", "ffpfs", "ffpfsc", "pkg"];
 /** The cards' row gap (`.library-cards`), and how much of the second row the well shows. */
 const ROW_GAP = 16;
 const PEEK = 56;
 const matches = (e: LibraryEntry, f: Filter) =>
-  f === "all" || (f === LZ4 ? e.lz4_packed === true : f === ADDON ? e.additional_content === true : e.kind === f);
+  f === "all" ||
+  (f === LZ4
+    ? e.lz4_packed === true
+    : f === ZSTD
+      ? e.zstd_packed === true
+      : f === ADDON
+        ? e.additional_content === true
+        : e.kind === f);
 
 /** Storage in decimal GB as the console's Settings shows it: whole numbers, one decimal under 10 GB. */
 const gb = (bytes: number) => {
@@ -301,16 +309,17 @@ export function Library(props: {
   const host = platform === "host";
   const storage = platform === "ps5" ? result?.storage : undefined; // the PS5's /data, as of the last scan
   const empty = host && !folder && !props.folder && !refused; // a computer with no folder chosen yet
-  // The kind chips: All, then each kind present in a fixed order (any other after), then LZ4
-  // packed and Additional content; each with its count.
+  // The kind chips: All, then each kind present in a fixed order (any other after), then the
+  // packs (LZ4, zstd) and Additional content; each with its count.
   const counts = new Map<Filter, number>();
   const add = (k: Filter) => counts.set(k, (counts.get(k) ?? 0) + 1);
   for (const e of entries) {
     add(e.kind);
     if (e.lz4_packed === true) add(LZ4);
+    if (e.zstd_packed === true) add(ZSTD);
     if (e.additional_content === true) add(ADDON);
   }
-  const kinds = [...KIND_ORDER.filter((k) => counts.has(k)), ...[...counts.keys()].filter((k) => !KIND_ORDER.includes(k) && k !== LZ4 && k !== ADDON)];
+  const kinds = [...KIND_ORDER.filter((k) => counts.has(k)), ...[...counts.keys()].filter((k) => !KIND_ORDER.includes(k) && k !== LZ4 && k !== ZSTD && k !== ADDON)];
   // A chosen kind that is gone (deleted, or not in a new scan) shows everything.
   const shown: Filter = filter === "all" || counts.has(filter) ? filter : "all";
   filterRef.current = shown;
@@ -501,6 +510,7 @@ export function Library(props: {
           {chip("all", "all", t.all, entries.length)}
           {kinds.map((k) => chip(k, `fmt-${isArchive(k) ? "archive" : k}`, kindLabel(k), counts.get(k) ?? 0))}
           {counts.has(LZ4) && chip(LZ4, "lz4", t.lz4Chip, counts.get(LZ4) ?? 0)}
+          {counts.has(ZSTD) && chip(ZSTD, "lz4", t.zstdChip, counts.get(ZSTD) ?? 0)}
           {counts.has(ADDON) && chip(ADDON, "addon", c.additionalContent, counts.get(ADDON) ?? 0)}
         </div>
       )}
@@ -556,12 +566,12 @@ const Item = memo(function Item(props: {
       </button>
     </span>
   );
-  const packed = e.lz4_packed === true;
+  const packed = e.zstd_packed === true ? "zstd" : e.lz4_packed === true ? "lz4" : null;
   const ac = e.additional_content === true && <span className="tag violet">{c.additionalContent}</span>;
   const box = (
     <div className="library-cover-box">
       {cover}
-      {packed && <Lz4Badge />}
+      {packed && <PackBadge engine={packed} />}
     </div>
   );
   return props.list ? (
@@ -572,7 +582,7 @@ const Item = memo(function Item(props: {
         <div className="library-sub muted">
           <span>{e.title_id}</span>
           {e.version && <span>{e.version}</span>}
-          {packed && <Lz4Badge />}
+          {packed && <PackBadge engine={packed} />}
           {ac}
         </div>
       </div>
@@ -607,13 +617,14 @@ const Item = memo(function Item(props: {
   );
 });
 
-/** An LZ4 packed dump's badge: "LZ4" in LZ4 yellow on a liquid-glass pill. */
-function Lz4Badge() {
+/** A packed dump's badge: "LZ4" or "zstd" in LZ4 yellow on a liquid-glass pill. */
+function PackBadge({ engine }: { engine: "lz4" | "zstd" }) {
   const t = useMessages().library;
+  const tip = engine === "zstd" ? t.zstdTip : t.lz4Tip;
   return (
-    <span className="lz4-badge" title={t.lz4Tip}>
-      <span aria-hidden="true">LZ4</span>
-      <span className="visually-hidden">{t.lz4Tip}</span>
+    <span className="lz4-badge" title={tip}>
+      <span aria-hidden="true">{engine === "zstd" ? "zstd" : "LZ4"}</span>
+      <span className="visually-hidden">{tip}</span>
     </span>
   );
 }

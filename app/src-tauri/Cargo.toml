@@ -25,7 +25,6 @@ ps5-dump-forge-server.workspace = true
 ps5-dump-forge-updater.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
-tauri-plugin-dialog = "2"
 
 # The WebView2 runtime check before any window (main.rs); already in tauri's tree on Windows.
 [target.'cfg(windows)'.dependencies]

@@ -52,9 +52,11 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
         || !req.extract.is_empty()
         || req.edit_rebuild
         || req.lz4.is_some()
-        || req.lz4_in_place
+        || req.zstd_pack
+        || req.zstd_unpack
     {
-        findings.push("transfer: a transfer takes no edit, extract or LZ4 options".to_string());
+        findings
+            .push("transfer: a transfer takes no edit, extract, LZ4 or zstd options".to_string());
     }
     #[cfg(target_os = "freebsd")]
     findings.extend(crate::edit_job::smp_inside(&req.output).map(|why| format!("transfer: {why}")));
@@ -508,7 +510,7 @@ mod tests {
         req.extract = vec!["eboot.bin".into()];
         has(
             run(&req).unwrap_err(),
-            "takes no edit, extract or LZ4 options",
+            "takes no edit, extract, LZ4 or zstd options",
         );
         assert_eq!(std::fs::read_dir(&other).unwrap().count(), 0);
 

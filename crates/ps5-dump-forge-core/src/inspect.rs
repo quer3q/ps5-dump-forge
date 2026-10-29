@@ -261,6 +261,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
     } else {
         lz4_facts(tree.as_mut(), &mut findings)
     };
+    let zstd_packed = crate::zstd_pack::packed(tree.as_mut());
     let files: Vec<InspectFile> = tree
         .files()
         .iter()
@@ -294,6 +295,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         details,
         findings,
         lz4,
+        zstd_packed,
         archive,
         interrupted_edit: kind != Kind::Folder
             && !net
@@ -478,7 +480,6 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         tree.files().iter().find(|f| f.path == path).map(|f| f.size)
     };
     let imports_ampr = crate::lz4::imports_ampr(tree);
-    let journal_bytes = size(tree, JOURNAL);
     let rt = crate::lz4::runtime_of(tree);
     let kind = rt.kind;
     let mut packed = None;
@@ -502,33 +503,35 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         }
     }
     let artifact = holds_packs
-        || journal_bytes.is_some()
+        || size(tree, JOURNAL).is_some()
         || size(tree, INDEX).is_some()
-        || matches!(kind, RuntimeKind::ForgeRelease | RuntimeKind::ForgeTrace);
+        || matches!(
+            kind,
+            RuntimeKind::ForgeRelease | RuntimeKind::ForgeTrace | RuntimeKind::Zstd
+        );
     if !imports_ampr && !artifact {
         return None;
     }
     // As a plain conversion sees it (`lz4::plain`): a runtime it installs or replaces is
     // compared at the release runtime's size.
-    let action = rt.action(imports_ampr, holds_packs);
-    let (index, trace_index) = if holds_packs || action == RuntimeAction::Untouched {
-        (None, None)
+    // A zstd-packed game keeps its index too, and gets the zstd runtime (`lz4::plain`).
+    let zstd_packed = !holds_packs && crate::zstd_pack::packed(tree);
+    let action = if zstd_packed {
+        rt.zstd_action()
+    } else {
+        rt.action(imports_ampr, holds_packs)
+    };
+    let index = if holds_packs || zstd_packed || action == RuntimeAction::Untouched {
+        None
     } else {
         let files = crate::lz4::plain_listing(tree.files(), action);
-        let traced = crate::lz4::trace_listing(files.clone());
-        let name = |state: &IndexState| match state {
-            IndexState::Ok(_) => "ok",
-            IndexState::Stale => "stale",
-            IndexState::Damaged => "damaged",
-            IndexState::Missing => "missing",
-        };
-        // One read of the index for both comparisons.
-        let states = crate::lz4::index_states(tree, &[&files, &traced]);
-        let (index, trace_index) = match &states {
-            Ok(s) => (Some(name(&s[0])), Some(name(&s[1]))),
-            Err(_) => (None, None),
-        };
-        (index, trace_index)
+        match crate::lz4::index_state(tree, &files) {
+            Ok(IndexState::Ok(_)) => Some("ok"),
+            Ok(IndexState::Stale) => Some("stale"),
+            Ok(IndexState::Damaged) => Some("damaged"),
+            Ok(IndexState::Missing) => Some("missing"),
+            Err(_) => None,
+        }
     };
     // Only an AMPR title's runtime is the user's concern (`lz4::Runtime::action`).
     let name = |a: RuntimeAction| match a {
@@ -541,6 +544,7 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
     let runtime = match kind {
         RuntimeKind::ForgeRelease => "forge_release",
         RuntimeKind::ForgeTrace => "forge_trace",
+        RuntimeKind::Zstd => "zstd",
         RuntimeKind::Other => "other",
         RuntimeKind::None => "none",
     };
@@ -551,18 +555,15 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         runtime: runtime.to_string(),
         shipped_runtime_version: ps5_dump_forge_lz4::runtime::VERSION,
         runtime_action: name(action),
-        // Pack writes packs; Unpack (a packed source) writes none (`lz4::prepare`).
-        pack_runtime_action: name(rt.action(imports_ampr, !holds_packs)),
+        // Unpack (a packed source) writes no packs; Pack with ampr_emu (`lz4::prepare`). Pack
+        // with ampr-emu-ng keeps it where `runtime` is `zstd`, else installs it.
+        pack_runtime_action: name(if holds_packs {
+            rt.action(imports_ampr, false)
+        } else {
+            rt.pack_action(crate::Lz4Runtime::AmprEmu)
+        }),
         runtime_version: rt.version,
         index,
-        trace_index,
-        journal_bytes,
-        traces_zip: (journal_bytes.is_some() && size(tree, INDEX).is_some()).then(|| {
-            let param = size(tree, "sce_sys/param.json")
-                .filter(|&s| s <= preflight::MAX_PARAM_JSON)
-                .and_then(|_| tree.read("sce_sys/param.json").ok());
-            traces_zip_name(param.as_deref())
-        }),
     })
 }
 
@@ -909,29 +910,6 @@ pub(crate) fn generated_output(
         "{stem} and its -2 to -{MAX_SUFFIX} variants are all taken in {}",
         dir.display()
     )
-}
-
-/// The download name of a source's LZ4 traces, from its `param.json` bytes: the generated
-/// output stem ([`NameParts::stem`], `[GAME_TITLE]-[TITLE_ID]`, the title cut first to keep the
-/// stem within 63 bytes) and `-amprtrace.zip`; either part alone without the other,
-/// `amprtrace.zip` with neither.
-pub(crate) fn traces_zip_name(param_json: Option<&[u8]>) -> String {
-    let info = param_json.map(preflight::parse_param).unwrap_or_default();
-    download_name(&info, "amprtrace.zip")
-}
-
-/// `[GAME_TITLE]-[TITLE_ID]-<suffix>` as [`traces_zip_name`] builds it, `<suffix>` alone
-/// without either part.
-pub(crate) fn download_name(info: &GameInfo, suffix: &str) -> String {
-    match name_stem(info) {
-        Some(stem) => format!("{stem}-{suffix}"),
-        None => suffix.to_string(),
-    }
-}
-
-/// The generated stem, `[GAME_TITLE]-[TITLE_ID]` within 63 bytes; `None` with neither part.
-pub(crate) fn name_stem(info: &GameInfo) -> Option<String> {
-    NameParts::of(info).stem(63)
 }
 
 /// The parts of a generated name: the game's title made file-safe (`None` when nothing of it

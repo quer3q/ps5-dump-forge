@@ -1,7 +1,7 @@
 //! PS5 Dump Forge: the Tauri shell over `ps5-dump-forge-core`. No settings file: what the UI
 //! remembers lives in memory until the app closes, except its language (WebView localStorage).
 //!
-//! All file access stays in these commands; the webview only gets the dialog plugin
+//! All file access stays in these commands; the webview only gets event listening
 //! and the app's own commands (see `build.rs` and `capabilities/default.json`).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ps5_dump_forge_core::{
     ArchivePassword, ConvertRequest, EditCheck, Event, Format, HostTree, Inspection, JobId, Jobs,
-    LibraryScan, Listing, Lz4Patch, folder_refusal,
+    LibraryScan, Listing, folder_refusal,
 };
 use ps5_dump_forge_server::connect::{self, Connect};
 use ps5_dump_forge_server::payload;
@@ -253,55 +253,18 @@ async fn start_job(app: AppHandle, request: ConvertRequest) -> Result<JobId, Str
     .await
 }
 
-/// Patches a game folder in place for LZ4 traces. Refused while a job is queued or running
-/// (it could be reading the folder). The quit lock is held throughout, so no job starts and
-/// no quit is decided mid-patch.
-// ponytail: a close request during the patch waits for it on the event loop (a few seconds
-// at most: a scan, one runtime and one index written).
-#[tauri::command]
-async fn lz4_patch(app: AppHandle, path: PathBuf) -> Result<Lz4Patch, String> {
-    patch_folder(app, path, false).await
-}
-
-/// Undoes `lz4_patch` in place (core's `lz4_unpatch`), on the same terms.
-#[tauri::command]
-async fn lz4_unpatch(app: AppHandle, path: PathBuf) -> Result<Lz4Patch, String> {
-    patch_folder(app, path, true).await
-}
-
-async fn patch_folder(app: AppHandle, path: PathBuf, unpatch: bool) -> Result<Lz4Patch, String> {
-    blocking(app, move |_, state| {
-        let quitting = state.quitting();
-        if *quitting {
-            return Err("PS5 Dump Forge is quitting".to_string());
-        }
-        if state.running.load(Ordering::SeqCst) > 0 {
-            let verb = if unpatch { "unpatch" } else { "patch" };
-            return Err(format!(
-                "a conversion is queued or running; {verb} once it has finished"
-            ));
-        }
-        let done = if unpatch {
-            ps5_dump_forge_core::lz4_unpatch(&path)
-        } else {
-            ps5_dump_forge_core::lz4_patch(&path)
-        }
-        .map_err(err);
-        drop(quitting);
-        done
-    })
-    .await
-}
-
 /// Deletes a file or folder for good (core's `Jobs::delete_path`; the UI asks first): never a
 /// drive root, the home folder or a folder holding it, nor anything an unfinished job uses,
 /// nor anything in a folder the Library refuses (`folder_refusal`: `~/Library`, the OS's
 /// own folders), which the File explorer could otherwise reach from the home folder.
-/// Under the quit lock, like `lz4_patch`.
+/// Under the quit lock.
 #[tauri::command]
 async fn delete_path(app: AppHandle, path: PathBuf) -> Result<(), String> {
     blocking(app, move |app, state| {
-        if let Some(why) = folder_refusal(&path) {
+        // A peer's path (`flink://`) is judged by the peer; a NAS share's is refused by core.
+        if !ps5_dump_forge_core::net::is_network(&path)
+            && let Some(why) = folder_refusal(&path)
+        {
             return Err(why);
         }
         let quitting = state.quitting();
@@ -332,6 +295,7 @@ async fn move_path(
     blocking(app, move |app, state| {
         if let Some(why) = [from.as_path(), to.as_path()]
             .into_iter()
+            .filter(|p| !ps5_dump_forge_core::net::is_network(p))
             .find_map(folder_refusal)
         {
             return Err(why);
@@ -355,8 +319,10 @@ async fn move_path(
 async fn list_dir(app: AppHandle, path: PathBuf) -> Result<Listing, String> {
     blocking(app, move |_, _| {
         // A NAS share (`smb://`, the NAS source picker) or a peer (`flink://`) has no local
-        // folder to refuse.
+        // folder to refuse. A filesystem root (`/`, `C:\`) lists too: with no system dialog,
+        // the picker reaches other folders (`/srv`, another drive) through it.
         if !ps5_dump_forge_core::net::is_network(&path)
+            && path.parent().is_some()
             && let Some(why) = folder_refusal(&path)
         {
             return Err(why);
@@ -909,6 +875,13 @@ async fn connect_cancel_job(app: AppHandle, key_id: String, job: JobId) -> Resul
     connect_call(app, move |c| Ok(c.cancel_remote_job(&key_id, job))).await
 }
 
+/// Asks the paired PS5 `key_id` to install the `.pkg` at `path` on this computer (read over
+/// FLINK; the job shows here mirrored); the PS5's job id.
+#[tauri::command]
+async fn connect_install(app: AppHandle, key_id: String, path: PathBuf) -> Result<JobId, String> {
+    blocking(app, move |_, state| connect(state)?.install(&key_id, &path)).await
+}
+
 /// Asks the device at `address` to pair; `connect_state`'s `outgoing` follows it.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_pair(app: AppHandle, address: String) -> Result<(), String> {
@@ -1039,7 +1012,6 @@ fn main() {
         }
     });
     let app = builder
-        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // No exe path (or a panic in core) leaves WebView data in the OS default place.
             #[cfg(not(target_os = "macos"))]
@@ -1077,6 +1049,38 @@ fn main() {
                         None => Err("PS5 Dump Forge is starting; try again".to_string()),
                     }
                 }));
+                // A peer's Delete and Move to here are this device's own (the home folder
+                // kept), refused while quitting.
+                use ps5_dump_forge_core::DeleteError;
+                let keep = || -> Vec<PathBuf> { std::env::home_dir().into_iter().collect() };
+                let starting = || DeleteError::Refused("PS5 Dump Forge is starting".into());
+                let handle = app.handle().clone();
+                let delete: ps5_dump_forge_server::connect_fs::DeleteHook = Arc::new(move |path| {
+                    let state = handle.try_state::<AppState>().ok_or_else(starting)?;
+                    let quitting = state.quitting();
+                    if *quitting {
+                        return Err(DeleteError::Refused("PS5 Dump Forge is quitting".into()));
+                    }
+                    // The folders this app's own Delete refuses (`~/Library`, the OS's), too.
+                    if let Some(why) = folder_refusal(path) {
+                        return Err(DeleteError::Refused(why));
+                    }
+                    state.jobs(&handle).delete_path(path, &keep())
+                });
+                let handle = app.handle().clone();
+                let move_: ps5_dump_forge_server::connect_fs::MoveHook =
+                    Arc::new(move |from, to, replace| {
+                        let state = handle.try_state::<AppState>().ok_or_else(starting)?;
+                        let quitting = state.quitting();
+                        if *quitting {
+                            return Err(DeleteError::Refused("PS5 Dump Forge is quitting".into()));
+                        }
+                        if let Some(why) = [from, to].into_iter().find_map(folder_refusal) {
+                            return Err(DeleteError::Refused(why));
+                        }
+                        state.jobs(&handle).move_path(from, to, replace, &keep())
+                    });
+                connect.set_delete_move(delete, move_);
                 // A peer shown one of this device's jobs may cancel it.
                 let handle = app.handle().clone();
                 connect.set_cancel(Arc::new(move |id| {
@@ -1143,8 +1147,6 @@ fn main() {
             start_job,
             cancel_job,
             stale_parts,
-            lz4_patch,
-            lz4_unpatch,
             delete_path,
             move_path,
             list_dir,
@@ -1165,6 +1167,7 @@ fn main() {
             connect_nas_save,
             connect_nas_forget,
             connect_cancel_job,
+            connect_install,
             connect_payload_install,
             connect_payload_send,
         ])

@@ -26,7 +26,7 @@ fi
 out=target/ps5
 cc="$PS5_PAYLOAD_SDK/bin/prospero-clang"
 mkdir -p "$out/shim"
-for src in ps5/shim/freebsd11.c ps5/shim/syscalls.S ps5/entry.c ps5/compat.c ps5/launcher.c; do
+for src in ps5/shim/freebsd11.c ps5/shim/syscalls.S ps5/entry.c ps5/compat.c ps5/launcher.c ps5/installer.c; do
   name=$(basename "${src%.*}")
   "$cc" -O2 -Wall -Wextra -Werror -c "$src" -o "$out/shim/$name.o"
 done
