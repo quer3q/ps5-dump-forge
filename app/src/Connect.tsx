@@ -4,17 +4,17 @@
 // comes from the shared 2 s poller (useConnectState.ts); every dialog opens in its own root
 // (common.tsx `openOverlay`) and reads the same state.
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 import { api, connect, errorText, pick, prettyBytes, serverAddress, web, type ConnectDevice, type ConnectState, type NasDevice, type PairOutgoing, type PairRequest } from "./api";
-import { AddressQr, basename, CardHead, Dots, Head, Modal, openOverlay, ViewSwitch } from "./common";
+import { AddressQr, basename, CardHead, ChooseMenu, Dots, Head, Modal, openOverlay, ViewSwitch } from "./common";
 import { openConnectHelp } from "./ConnectHelp";
 import { getLang, msg, num, useMessages } from "./i18n";
 import { Icon } from "./icons";
 import { confirmInstall } from "./InstallDialog";
 import type { Action } from "./jobs";
-import { NAS_PORT, type NasProtocol } from "./peers";
+import { NAS_PORT, readable, type NasProtocol } from "./peers";
 import { nasRoot } from "./Picker";
 import { openTransfer } from "./Transfer";
 import { ps5Release } from "./update";
@@ -99,6 +99,152 @@ export function ErrorLine({ text, lead }: { text: string; lead?: string }) {
 
 function OnlineDot({ online }: { online: boolean }) {
   return <span className={online ? "online-dot on" : "online-dot"} aria-hidden="true" />;
+}
+
+/** Speed tests (a paired Forge's row menu and its details dialog, each opening `SpeedDialog`): one at a
+ * time, results kept in memory until the page closes. `running` is the key id of the test under way. */
+type Speed = { result?: string; error?: string };
+let speed: { running: string | null; byKey: Record<string, Speed> } = { running: null, byKey: {} };
+const speedListeners = new Set<() => void>();
+function setSpeed(next: typeof speed) {
+  speed = next;
+  for (const l of speedListeners) l();
+}
+function useSpeed() {
+  return useSyncExternalStore(
+    (l) => {
+      speedListeners.add(l);
+      return () => speedListeners.delete(l);
+    },
+    () => speed,
+  );
+}
+
+/** The run under way (its id, sent with the test and its cancel, so a late cancel never stops
+ * another run) and the one the user stopped (its outcome is dropped). */
+let speedCount = 0;
+let speedRun = "";
+let speedStopped = "";
+
+/** Runs a speed test with `keyId` (`name` for its dialog) unless one runs, in a dialog over the
+ * page; its outcome lands in `speed.byKey` unless the user stopped it. Every close of the dialog
+ * while it runs (Stop, Escape, a click outside, the quit prompt's `closeOverlays`) stops it. */
+async function runSpeedTest(keyId: string, name: string) {
+  if (speed.running) return;
+  // Not `crypto.randomUUID`: a page over plain HTTP (the PS5's) has none.
+  const run = `${++speedCount}-${Math.random().toString(36).slice(2)}`;
+  speedRun = run;
+  setSpeed({ running: keyId, byKey: { ...speed.byKey, [keyId]: {} } });
+  openOverlay(
+    (close) => <SpeedDialog keyId={keyId} name={name} run={run} close={close} />,
+    () => stopSpeedTest(keyId, run),
+  );
+  let out: Speed;
+  try {
+    const r = await connect.speedTest(keyId, run);
+    // Decimal MB per second, one decimal under 10.
+    const mb = (b: number) => num(b / 1e6, b < 10e6 ? 1 : 0);
+    out = { result: msg().connect.speedResult(mb(r.up_bytes_per_s), mb(r.down_bytes_per_s)) };
+  } catch (e) {
+    out = { error: readable(connectError(e)) };
+  }
+  // Stopped: no result and no error (the test's own "cancelled" included).
+  if (speedStopped === run) out = {};
+  setSpeed({ running: null, byKey: { ...speed.byKey, [keyId]: out } });
+}
+
+/** Stops run `run` with `keyId` while it runs; its outcome is dropped. */
+function stopSpeedTest(keyId: string, run: string) {
+  if (speed.running !== keyId || speedRun !== run || speedStopped === run) return;
+  speedStopped = run;
+  connect.speedTestCancel(keyId, run).catch(() => {});
+}
+
+/** The speed test's dialog: "Testing" with Stop (focused; Escape and a click outside stop it
+ * too: the test is cancelled and nothing kept), then the result or the error with Close. */
+function SpeedDialog(props: { keyId: string; name: string; run: string; close: () => void }) {
+  const t = useMessages().connect;
+  const running = useSpeed().running === props.keyId && speedRun === props.run;
+  return (
+    <Modal close={props.close} className="modal card" labelledBy="speed-title" describedBy="speed-text">
+      <div className="modal-head">
+        <span className="head-icon">
+          <Icon name="bolt" />
+        </span>
+        <h2 id="speed-title" dir="auto">
+          {t.speedTestWith(props.name)}
+        </h2>
+      </div>
+      <div id="speed-text">
+        {running ? (
+          <>
+            <p role="status">
+              {t.speedTesting}
+              <Dots />
+            </p>
+            <p className="muted">{t.speedNote}</p>
+          </>
+        ) : (
+          <SpeedLine keyId={props.keyId} />
+        )}
+      </div>
+      <div className="row end">
+        {running ? (
+          <button key="stop" autoFocus onClick={props.close}>
+            <Icon name="x" />
+            {t.stop}
+          </button>
+        ) : (
+          <button key="close" autoFocus onClick={props.close}>
+            {t.close}
+          </button>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/** The details dialog's speed test button: "Testing" (busy, focus kept) while its own runs, off while
+ * another does. A device row has it in its ⋯ menu. */
+function SpeedButton({ keyId, name, disabled }: { keyId: string; name: string; disabled?: boolean }) {
+  const t = useMessages().connect;
+  const s = useSpeed();
+  const mine = s.running === keyId;
+  return (
+    <button
+      type="button"
+      aria-label={mine ? undefined : t.speedTestWith(name)}
+      aria-disabled={mine || undefined}
+      aria-busy={mine || undefined}
+      disabled={disabled || (!!s.running && !mine)}
+      aria-haspopup="dialog"
+      onClick={() => void runSpeedTest(keyId, name)}
+    >
+      <Icon name="bolt" />
+      {mine ? (
+        <span>
+          {t.speedTesting}
+          <Dots />
+        </span>
+      ) : (
+        t.speedTest
+      )}
+    </button>
+  );
+}
+
+/** A speed test's outcome under a device (row or details): the result, or why it failed. */
+function SpeedLine({ keyId, row }: { keyId: string; row?: boolean }) {
+  const t = useMessages().connect;
+  const s = useSpeed().byKey[keyId];
+  if (!s || (!s.result && !s.error)) return null;
+  if (s.error) return <ErrorLine lead={t.speedFailed} text={s.error} />;
+  return (
+    <p className={row ? "dev-sub" : "note-line good"} role="status">
+      {!row && <Icon name="bolt" />}
+      <span>{s.result}</span>
+    </p>
+  );
 }
 
 /** Which saved devices the list shows. */
@@ -187,6 +333,7 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
             live={!!state}
             onSend={() => send(`flink://${d.key_id}`)}
             onInstall={d.platform === "ps5" ? () => void installOn(d) : undefined}
+            speedKey={d.key_id}
             onDetails={() => openDevice(d.key_id, props.dispatch)}
           />,
         );
@@ -354,9 +501,15 @@ function DeviceRow(props: {
   onDetails: () => void;
   /** A paired PS5: Install pkg (online only). */
   onInstall?: () => void;
+  /** A paired Forge: its key id, for the menu's Speed test (online only) and the last result. */
+  speedKey?: string;
 }) {
   const t = useMessages().connect;
   const inst = useMessages().install;
+  const more = useMessages().storage.more;
+  const details = useMessages().edit.details;
+  const s = useSpeed();
+  const testing = !!props.speedKey && s.running === props.speedKey;
   return (
     <li className="dev-row">
       <OnlineDot online={props.online} />
@@ -369,6 +522,7 @@ function DeviceRow(props: {
             <span key={i}>{f}</span>
           ))}
         </p>
+        {props.speedKey && <SpeedLine keyId={props.speedKey} row />}
       </div>
       <div className="dev-actions">
         {props.online && props.onInstall && (
@@ -383,16 +537,37 @@ function DeviceRow(props: {
             {t.send}
           </button>
         )}
-        <button
-          type="button"
+        <ChooseMenu
           className="small icon-only"
-          aria-haspopup="dialog"
-          aria-label={t.details(props.name)}
-          title={t.details(props.name)}
-          onClick={props.onDetails}
-        >
-          <Icon name="dots" />
-        </button>
+          label={<Icon name="dots" />}
+          buttonLabel={more(props.name)}
+          menuLabel={more(props.name)}
+          items={[
+            { id: "details" as const, icon: "info" as const, label: details },
+            ...(props.online && props.speedKey
+              ? [
+                  {
+                    id: "speed" as const,
+                    icon: "bolt" as const,
+                    label: testing ? (
+                      <span>
+                        {t.speedTesting}
+                        <Dots />
+                      </span>
+                    ) : (
+                      t.speedTest
+                    ),
+                    disabled: !props.live || !!s.running,
+                    busy: testing,
+                  },
+                ]
+              : []),
+          ]}
+          onChoose={(what) => {
+            if (what === "details") props.onDetails();
+            else if (props.speedKey) void runSpeedTest(props.speedKey, props.name);
+          }}
+        />
       </div>
     </li>
   );
@@ -795,9 +970,11 @@ function DeviceDetails({ keyId, dispatch, close }: { keyId: string; dispatch: (a
           ))}
         </dl>
       )}
+      <SpeedLine keyId={keyId} />
       <p className="muted">{t.forgetNote}</p>
       {error && <ErrorLine text={error} />}
       <div className="row end">
+        <SpeedButton keyId={keyId} name={d?.name ?? keyId} disabled={!d || !d.online || !state} />
         <button
           type="button"
           disabled={!d || !d.online}

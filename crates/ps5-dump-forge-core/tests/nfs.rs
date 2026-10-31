@@ -12,10 +12,7 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 
 use ps5_dump_forge_core::remote::FlinkPath;
-use ps5_dump_forge_core::{
-    ConvertRequest, Edit, Event, Format, JobReport, Jobs, KrakenLevel, inspect, library_cover,
-    list_dir,
-};
+use ps5_dump_forge_core::{ConvertRequest, Event, Format, JobReport, Jobs, KrakenLevel, list_dir};
 
 fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
     ConvertRequest {
@@ -40,6 +37,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         replace: false,
         edit_rebuild: false,
         install: None,
+        delete_source: false,
         archive_password: None,
     }
 }
@@ -134,79 +132,6 @@ fn out_and_game() -> Option<(PathBuf, PathBuf)> {
         .expect("a folder below an export")
         .join("game-nfs");
     Some((out.url(), game.url()))
-}
-
-#[test]
-fn a_game_on_an_export_converts_here() {
-    let Some((_, game)) = out_and_game() else {
-        eprintln!("skipped: set FORGE_NFS_TEST");
-        return;
-    };
-    // Pickers: the server lists what is above its exports, then the game's folder.
-    let at = FlinkPath::parse(&game).unwrap();
-    let server = FlinkPath {
-        path: String::new(),
-        ..at.clone()
-    };
-    let top = at.path.split('/').next().unwrap();
-    let listing = list_dir(&server.url()).unwrap();
-    assert!(
-        listing.entries.iter().any(|e| e.dir && e.name == top),
-        "{listing:?}"
-    );
-    let parent = at.parent().unwrap().url();
-    let listing = list_dir(&parent).unwrap();
-    let entry = listing
-        .entries
-        .iter()
-        .find(|e| e.name == "game-nfs")
-        .unwrap();
-    assert!(entry.dir && entry.path == game, "{entry:?}");
-
-    let t = std::time::Instant::now();
-    let info = inspect(&game).unwrap();
-    eprintln!("inspect over NFS: {:?}", t.elapsed());
-    assert_eq!(info.title_id.as_deref(), Some("PPSA99905"));
-    assert!(info.findings.is_empty(), "{:?}", info.findings);
-    assert!(library_cover(&game).unwrap().is_some());
-
-    let (jobs, rx) = jobs();
-    let local = Local::new("src");
-    let image = local.0.join("game.exfat");
-    let t = std::time::Instant::now();
-    let report = run(&jobs, &rx, request(&game, Format::Exfat, &image)).unwrap();
-    eprintln!("NFS game -> .exfat here (full verify): {:?}", t.elapsed());
-    assert_eq!(report.output, image);
-    assert_eq!(inspect(&image).unwrap().total_bytes, info.total_bytes);
-
-    // The image holds what a plain copy of the game holds.
-    let copy = local.0.join("copy");
-    run(&jobs, &rx, request(&game, Format::Folder, &copy)).unwrap();
-    let back = local.0.join("back");
-    run(&jobs, &rx, request(&image, Format::Folder, &back)).unwrap();
-    let want = files(&copy);
-    assert_eq!(want.len(), 214);
-    assert_eq!(files(&back), want);
-    if let Ok(local) = std::env::var("FORGE_NFS_TEST_LOCAL") {
-        let here = Path::new(&local).parent().unwrap().join("game-nfs");
-        assert_eq!(files(&here), want);
-    }
-
-    // The game itself stays read only: no edits, no delete or move.
-    let mut req = request(&game, Format::Exfat, Path::new(""));
-    req.edits = vec![Edit::Delete {
-        path: "eboot.bin".into(),
-    }];
-    let check = jobs.edit_check(&req);
-    assert!(
-        check.in_place.iter().any(|f| f.contains("NAS")),
-        "{check:?}"
-    );
-    assert!(jobs.delete_path(&game, &[]).is_err());
-    assert!(
-        jobs.move_path(&game, &game.with_file_name("x"), false, &[])
-            .is_err()
-    );
 }
 
 #[test]

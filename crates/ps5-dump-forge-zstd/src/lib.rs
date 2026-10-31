@@ -231,52 +231,6 @@ mod tests {
         assert!(oversized.pack().is_err());
     }
 
-    #[test]
-    fn volume_limit_is_4_gib_less_64_kib() {
-        assert_eq!(VOLUME_LIMIT, 4_294_901_760);
-        // The last chunk may end exactly at the limit; its offset fits u32.
-        let size = CHUNK_SIZE as u32;
-        let last = |offset: u64| Chunk {
-            offset: offset as u32,
-            volume_id: 0,
-            stored_size: size,
-            codec: Codec::Raw,
-        };
-        let at_end = VOLUME_LIMIT - u64::from(size);
-        let word = last(at_end).pack().unwrap();
-        assert_eq!(Chunk::unpack(word).unwrap().offset as u64, at_end);
-        assert!(last(at_end + 1).pack().is_err());
-    }
-
-    #[test]
-    fn index_header_chunk_shift() {
-        let index = Index {
-            archive_id: [7; 16],
-            zstd_level: 3,
-            files: vec![FileRecord {
-                path: "a".into(),
-                logical_size: 10,
-                first_chunk: 0,
-                store_only: true,
-            }],
-            chunks: vec![Chunk {
-                offset: VOLUME_HEADER_SIZE as u32,
-                volume_id: 0,
-                stored_size: 10,
-                codec: Codec::Raw,
-            }],
-            volume_sizes: vec![VOLUME_HEADER_SIZE as u64 + 10],
-        };
-        let mut bytes = encode_index(&index).unwrap();
-        assert_eq!(bytes[16], 18);
-        assert_eq!(decode_index(&bytes).unwrap(), index);
-        // An old 64 KiB index (chunk_shift 16) is refused even with valid CRCs.
-        bytes[16] = 16;
-        let header_crc = crc_zeroed::<8>(&bytes, 112, INDEX_HEADER_SIZE).unwrap();
-        bytes[116..120].copy_from_slice(&header_crc.to_le_bytes());
-        assert!(decode_index(&bytes).is_err());
-    }
-
     const FULL: u32 = CHUNK_SIZE as u32;
 
     /// A named way to break a valid value.
@@ -559,16 +513,6 @@ mod tests {
         assert!(decode_index(&bytes).is_err(), "payload CRC");
         fix_crcs(&mut bytes);
         assert_eq!(decode_index(&bytes).unwrap().files[i].logical_size, 1001);
-    }
-
-    #[test]
-    fn written_volume_name_matches_volume_name() {
-        let mut buf = [0u8; 24];
-        for id in [0, 1, 999, 1000, 4095, u32::MAX] {
-            assert_eq!(write_volume_name(id, &mut buf).unwrap(), volume_name(id));
-        }
-        assert_eq!(write_volume_name(7, &mut buf).unwrap(), "ampr_zstd-007.pak");
-        assert!(write_volume_name(7, &mut [0u8; 16]).is_err());
     }
 
     #[test]

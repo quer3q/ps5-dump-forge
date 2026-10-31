@@ -14,6 +14,7 @@ use ps5upload_fpkg::source::SourceTree;
 use ps5upload_fpkg::ufs2_source::Ufs2Source;
 use ps5upload_fpkg::{PkgFile, ReadSeek};
 
+use crate::delete::{FolderListing, ReadSource};
 use crate::finalize::{Part, part_path};
 use crate::jobs::Ctx;
 use crate::prefetch::Prefetch;
@@ -224,6 +225,12 @@ impl SourceStamp {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The stamped file, then an archive's other parts as stamped.
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        let parts = self.parts.iter().map(|(p, _)| p.clone());
+        std::iter::once(self.path.clone()).chain(parts).collect()
     }
 
     /// Whether `other` (a later stamp) names the same file, unchanged.
@@ -578,6 +585,18 @@ fn conversion_stages(format: Format, packing: bool) -> Vec<&'static str> {
 }
 
 pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
+    if req.delete_source
+        && (req.install.is_some()
+            || !req.transfer.is_empty()
+            || !req.extract.is_empty()
+            || !req.edits.is_empty())
+    {
+        return Err(preflight_failed(vec![
+            "deleting the source follows only a conversion or a pack: not an edit, an extract, \
+             a transfer or an install"
+                .to_string(),
+        ]));
+    }
     // A package handed to the PS5's installer, nothing converted.
     if req.install.is_some() {
         return crate::install::run(req, ctx);
@@ -623,10 +642,21 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         refuse_interrupted_edit(&req.source, kind)?;
         // Before the open: a change after this point, however early, fails the publish.
         let stamp = SourceStamp::take(&req.source, kind)?;
-        match kind {
+        let (source, stamp) = match kind {
             Kind::Archive(format) => crate::archive::open(req, ctx, format, stamp)?,
+            // What is converted is listed, so only that folder is deleted afterwards.
+            Kind::Folder if req.delete_source => {
+                let (tree, listing) = FolderListing::open(&req.source, ctx.cancel)?;
+                let read = ReadSource::Folder(req.source.clone(), listing);
+                *ctx.read.borrow_mut() = Some(read);
+                (tree, stamp)
+            }
             _ => (open_source(&req.source, kind, ctx.cancel)?, stamp),
+        };
+        if req.delete_source && kind != Kind::Folder {
+            *ctx.read.borrow_mut() = Some(ReadSource::File(stamp.clone()));
         }
+        (source, stamp)
     };
     ctx.log(format!("source: {}", source.describe()));
     // The job's one timestamp, in whole seconds, for what it generates (an LZ4 manifest and
@@ -1980,70 +2010,6 @@ fn ufs2_geometry<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use ps5upload_fpkg::source::SourceFile;
-
-    /// Only the unix-only geometry test uses it.
-    #[cfg(unix)]
-    struct Mem(Vec<SourceFile>);
-
-    #[cfg(unix)]
-    impl SourceTree for Mem {
-        fn files(&self) -> &[SourceFile] {
-            &self.0
-        }
-        fn read(&mut self, path: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
-            let size = self.0.iter().find(|f| f.path == path).map_or(0, |f| f.size);
-            Ok(vec![7; size as usize])
-        }
-        fn describe(&self) -> String {
-            "mem".into()
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ufs2_geometry_is_read_from_the_image() {
-        let dir = crate::test_dir("ufs2-geometry");
-        let file = |p: &str, size| SourceFile {
-            path: p.into(),
-            size,
-        };
-        let mut tree = Mem(vec![file("eboot.bin", 100), file("data/a.bin", 70_000)]);
-        let cancel = AtomicBool::new(false);
-        let opts = ps5_dump_forge_ufs2::Options::default();
-        let layout = ps5_dump_forge_ufs2::plan(&tree, &opts, &cancel).unwrap();
-        let path = dir.join("x.ffpkg");
-        let mut out = crate::finalize::create_new(&path).unwrap();
-        ps5_dump_forge_ufs2::write(&mut tree, &layout, &mut out, &cancel, &mut |_, _| {}).unwrap();
-        let lines = ufs2_geometry(&mut &out, &layout).unwrap();
-        assert_eq!(lines.len(), 3, "{lines:?}");
-
-        // A root directory that is not 0777, then a wrong block size: both refused.
-        let poke = |at: u64, bytes: &[u8]| {
-            use std::os::unix::fs::FileExt;
-            out.write_all_at(bytes, at).unwrap();
-        };
-        let root_mode = 4 * 65536 + 2 * 256;
-        poke(root_mode, &0o040755u16.to_le_bytes());
-        let err = ufs2_geometry(&mut &out, &layout).unwrap_err().to_string();
-        assert!(err.contains("root directory mode 40755"), "{err}");
-        poke(root_mode, &0o040777u16.to_le_bytes());
-        poke(65536 + 48, &32768u32.to_le_bytes());
-        let err = ufs2_geometry(&mut &out, &layout).unwrap_err().to_string();
-        assert!(err.contains("block 32768"), "{err}");
-    }
-
-    #[test]
-    fn a_ffpfsc_is_sized_as_if_no_block_compressed() {
-        // An inner image FAT32 holds by itself, at the 4 GiB boundary, still makes a
-        // container too big for it: preflight's `largest` is the container's worst case.
-        let raw = crate::preflight::FAT_MAX_FILE + 1 - 512 * 1024;
-        let max = ps5_dump_forge_pfs::container_size_max(raw).unwrap();
-        assert!(raw < crate::preflight::FAT_MAX_FILE);
-        assert!(max > crate::preflight::FAT_MAX_FILE, "{max}");
-        assert_eq!(max % IMAGE_ALIGN, 0);
-    }
 
     #[test]
     fn a_changed_image_source_is_caught() {

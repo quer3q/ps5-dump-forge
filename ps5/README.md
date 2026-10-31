@@ -70,9 +70,10 @@ FORGE_DEBUG_API=1 ps5/build.sh   # bring-up only: adds POST /api/debug, GET /pro
   `libSceNet.sprx` (the SDK libc's `getaddrinfo`: NAS and Add a device host names),
   `libSceSystemService.sprx` (rest-mode tick), `libSceNotification.sprx` (job-end toasts) and
   `libSceAppInstUtil.sprx` (the tile, package installs), no `PT_INTERP`, no TLS.
-  `scripts/release-ps5.sh` checks that, the entry point, that every `app/dist-http` file is embedded byte for
-  byte, no debug routes, the version marker (`VERSION_MARKER` in the server) against the workspace version,
-  and the self copy (stage 1 carries none; the release ELF exactly one, decompressing to stage 1).
+  `scripts/release-ps5.sh` checks that, the entry point, that every `app/dist-http` file is embedded raw or as a
+  gzip stream decoding to it, no debug routes, the version marker (`VERSION_MARKER` in the server) against the workspace version,
+  and the self copy (stage 1 carries none; the release ELF exactly one, decompressing to stage 1 through the
+  `zstd` CLI, which the host needs: brew/apt).
 
 ## Package installer
 
@@ -149,6 +150,8 @@ kernel EINVAL before calling Sony). Calls are serialized and logged in the serve
 | `POST /api/connect/approve` | `{id, allow}` | `bool`: this device's user answers a waiting request (`pending[].id`); `false` once it no longer waits. As open as every route here (by user decision) |
 | `POST /api/connect/forget` | `{key_id}` | `bool`: the pairing removed on this side |
 | `POST /api/connect/install` | `{key_id, path}` | `{job}`: asks the paired PS5 `key_id` to install this device's `.pkg` at `path` (inside the share root); the PS5 starts an install job reading it over FLINK (mirrored here) and answers its id; 400 off the share, a device that isn't a PS5 ("this device can't install packages") or its start's error |
+| `POST /api/connect/speed_test` | `{key_id, run}` | `{up_bytes_per_s, down_bytes_per_s, bytes}`: times the link to the paired device `key_id`, 128 MiB sent and then fetched over FLINK's data lanes (the `speed` RPC, then speed lanes of zeros; nothing written to disk on either side; at most 8 lanes and 256 MiB in flight per device at once), holding off auto rest mode meanwhile; 409 stopping, 400 offline, not paired or its error (an older peer: "that device's Dump Forge is older: update it to run a speed test") |
+| `POST /api/connect/speed_test_cancel` | `{key_id, run}` | `null`: cancels that run of the speed test (a cancel before it starts is remembered; another run is never touched) |
 | `POST /api/connect/discover_start` / `discover_stop` | `{}` | `null`: a 10 s search (Forge UDP 8094, mDNS, WS-Discovery) starts or stops; results in `state.discovery` |
 | `POST /api/connect/nas_save` | `{id?, name, host, port?, user?, password?, protocol?}` | `{id}`: a NAS saved (`protocol` `smb`, `ftp` or `nfs`: `smb` when none is named, an edit naming none keeps its own; `host` `host[:port]`, port default 445, 21 or 2049 by protocol; an NFS entry keeps no user or password; one entry per host + port, updated in place; `id` an edit's entry, moved to the new address; `user`/`password` omitted keep the saved ones, `""` clears them); 400 a bad address or one another entry has |
 | `POST /api/connect/nas_forget` | `{id}` | `bool`: the saved NAS (and its password) removed |
@@ -249,7 +252,8 @@ and exit 0 (see [Updates](#updates)); by anything else, exits 1.
   `Done` and `start_job`'s admission comes last.
 - The web bundle: `npm run build:http` (Vite mode `http`) writes `app/dist-http` with `transport-http.tsx`
   in place of Tauri (`Picker.tsx` for the dialogs, `http-client.ts`'s poller for the events); `build.rs`
-  embeds it, or a placeholder page with a warning (`FORGE_REQUIRE_WEB=1`, set by `ps5/build.sh`, makes that
+  embeds it (an `assets/` file that gzip shrinks by 5% or more stored gzipped, sent with `Content-Encoding:
+  gzip` or decoded per request; `index.html` and `forge.appcache` plain), or a placeholder page with a warning (`FORGE_REQUIRE_WEB=1`, set by `ps5/build.sh`, makes that
   an error). Paths are the server's (`/`), never the viewer's. Plain-node checks: `app/scripts/`
   (`check-paths`, `check-poller`, `check-launcher`, `check-update`, `check-upload`, `check-explorer`,
   `check-shoulders`, `check-peers`, `smoke`).
@@ -268,7 +272,8 @@ and exit 0 (see [Updates](#updates)); by anything else, exits 1.
   place: another title's. Runs in
   the background and never fails the server; the serve log says what it did.
 - Self copy (`self_copy.rs`): stage 2 embeds `PDFGSELF`, u64 LE raw length, u64 LE compressed length,
-  SHA-256 of stage 1, then stage 1 zlib-compressed (6.3 MB ELF holding 1.7 MB for a 4.5 MB copy). On start a
+  SHA-256 of stage 1, then stage 1 as one zstd frame at level 22 (a 17.5 MB ELF holding 4.5 MB for a 12.9 MB
+  copy; `scripts/release-ps5.sh` checks it with the `zstd` CLI). On start a
   thread unpacks it (bounded, hash, ELF magic and version marker checked) into
   `/data/dumpforge/ps5-dump-forge.elf`: written when missing, older, the same version with other bytes,
   or unmarked; kept when identical or newer. One save at a time across processes (`flock` on

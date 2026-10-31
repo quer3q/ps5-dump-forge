@@ -166,6 +166,13 @@ pub(crate) fn decode_chunk(frame: &[u8], codec: Codec, expected: usize) -> Resul
 }
 
 impl<T: SourceTree + ?Sized> Unpacked<T> {
+    /// The file at `path` in the sorted listing (a binary search, not a scan per read).
+    fn listed(&self, path: &str) -> Option<usize> {
+        self.files
+            .binary_search_by(|file| file.path.as_str().cmp(path))
+            .ok()
+    }
+
     pub fn index(&self) -> &Index {
         &self.index
     }
@@ -239,7 +246,7 @@ impl<T: SourceTree + ?Sized> SourceTree for Unpacked<T> {
                 .map_err(|_| bad(format!("{path}: too large to read at once")))?;
             return self.read_packed(file_id, 0, size);
         }
-        if self.hidden.contains(path) || !self.files.iter().any(|file| file.path == path) {
+        if self.hidden.contains(path) || self.listed(path).is_none() {
             return Err(bad(format!("{path} is not in the unpacked tree")));
         }
         self.inner.read(path)
@@ -249,7 +256,7 @@ impl<T: SourceTree + ?Sized> SourceTree for Unpacked<T> {
         if let Some(&file_id) = self.packed.get(path) {
             return self.read_packed(file_id, offset, len);
         }
-        if self.hidden.contains(path) || !self.files.iter().any(|file| file.path == path) {
+        if self.hidden.contains(path) || self.listed(path).is_none() {
             return Err(bad(format!("{path} is not in the unpacked tree")));
         }
         self.inner.read_range(path, offset, len)

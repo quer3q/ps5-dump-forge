@@ -54,6 +54,18 @@ int sceAppInstUtilInstallByPackage(meta_info *meta, pkg_info *pkg, playgo_info *
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int initialized;
+
+/* Every sceAppInstUtil user (an install here, launcher.c's tile registration) runs between
+ * these, one at a time, so launcher.c's Terminate never lands under an install. Returns
+ * whether an install has initialized the library (kept, never terminated: then the caller
+ * neither initializes nor terminates it). */
+int forge_appinst_begin(void) {
+    pthread_mutex_lock(&lock);
+    return initialized;
+}
+
+void forge_appinst_end(void) { pthread_mutex_unlock(&lock); }
+
 /* Static, not on the thread's stack: PlayGoInfo is about 10 KiB. Used under `lock`. */
 static meta_info meta;
 static pkg_info pkg;
@@ -112,11 +124,10 @@ int forge_pkg_install(const char *url, const char *name, unsigned *code) {
     }
     pthread_mutex_lock(&lock);
     creds saved = creds_acquire();
-    int rc;
-    /* ponytail: initialized once and never terminated, as ps5upload does; launcher.c's
-     * Initialize/Terminate pair runs once at start, before any install. Only a success is
-     * kept: a failed Initialize is tried again by the next install. */
-    rc = 0;
+    /* ponytail: initialized once and never terminated, as ps5upload does (after the
+     * credentials: Initialize runs as SYSTEM). Only a success is kept: a failed Initialize
+     * is tried again by the next install. */
+    int rc = 0;
     if (!initialized) {
         rc = sceAppInstUtilInitialize();
         if (rc == 0)

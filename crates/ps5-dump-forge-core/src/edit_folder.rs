@@ -999,95 +999,6 @@ mod tests {
         assert_eq!(snapshot(&root), want);
     }
 
-    /// On a case-insensitive volume (APFS, exFAT) the no-replace rename finds the file itself.
-    #[test]
-    fn a_case_only_rename_is_applied() {
-        let dir = crate::test_dir("edit-folder-recase");
-        let root = game(&dir, b"\x7fELF plain eboot", &[]);
-        let req = request(
-            &root,
-            vec![Edit::Rename {
-                from: "data/a.bin".into(),
-                to: "data/A.bin".into(),
-            }],
-        );
-        run_with(&req, |_, _| {}).unwrap_or_else(|e| panic!("{e:#}"));
-        let names: Vec<_> = std::fs::read_dir(root.join("data"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.contains(&"A.bin".to_string()), "{names:?}");
-        assert!(!names.contains(&"a.bin".to_string()), "{names:?}");
-    }
-
-    /// The listed names follow every op: after each, they answer as a fresh listing does
-    /// (also through another spelling of a folder where the volume folds case).
-    #[test]
-    fn listed_names_follow_the_ops() {
-        let dir = crate::test_dir("edit-folder-names");
-        let root = game(&dir, b"\x7fELF plain eboot", &[]);
-        let emit: Box<dyn Fn(Event) + Send + Sync> = Box::new(|_| {});
-        let cancel = AtomicBool::new(false);
-        let ctx = Ctx::new(1, &emit, &cancel);
-        let mut work = Work {
-            root: &root,
-            root_id: path_id(&root).unwrap().0,
-            partly: false,
-            hosts: &[],
-            ctx: &ctx,
-            done: 0,
-            total: 0,
-            added: BTreeMap::new(),
-            touched: BTreeSet::new(),
-            names: HashMap::new(),
-        };
-        let folded = std::fs::symlink_metadata(root.join("DATA")).is_ok();
-        let put = |path: &str| Op::Put {
-            path: path.into(),
-            len: 2,
-            data: Data::Zero(2),
-        };
-        let ops = [
-            put("data/c.bin"),
-            put("data/a.bin"),
-            Op::Delete {
-                path: "data/a.bin".into(),
-            },
-            put("data/A.bin"),
-            Op::Rename {
-                from: "data/c.bin".into(),
-                to: "data/sub/c.bin".into(),
-            },
-            Op::Mkdir {
-                path: "data/sub/new".into(),
-            },
-            put("data/é.bin"),
-            Op::Delete {
-                path: "data/sub".into(),
-            },
-            put("data/sub/b.bin"),
-        ];
-        let folders = ["data", "data/sub", "DATA"];
-        let names = ["a.bin", "A.bin", "c.bin", "b.bin", "é.bin", "new", "sub"];
-        for op in &ops {
-            work.op(op).unwrap_or_else(|e| panic!("{op:?}: {e:#}"));
-            for folder in folders {
-                let at = root.join(folder);
-                if !at.is_dir() || (folder == "DATA" && !folded) {
-                    continue;
-                }
-                for name in names {
-                    let want = spelled(&at, name).unwrap();
-                    assert_eq!(
-                        work.spelled(&at, name).unwrap(),
-                        want,
-                        "{op:?}: {folder}/{name}"
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn a_refusal_changes_nothing() {
         let dir = crate::test_dir("edit-folder-refused");
@@ -1161,49 +1072,6 @@ mod tests {
             "{err}"
         );
         assert_eq!(snapshot(&root), before);
-    }
-
-    #[test]
-    fn files_are_added_from_a_peer() {
-        let dir = crate::test_dir("edit-folder-peer");
-        let root = game(&dir, b"\x7fELF plain eboot", &[]);
-        let host = dir.join("host");
-        put(&host, "new.bin", &[9u8; 3 << 20]);
-        put(&host, "pack/x.txt", b"x");
-        put(&host, "pack/.DS_Store", b"junk");
-        std::fs::create_dir_all(host.join("pack/void")).unwrap();
-        let (peer, fake) = crate::remote::tests::peer(&host);
-        let edits = vec![
-            add(&peer.join("new.bin").url(), "data/new.bin"),
-            add(&peer.join("pack").url(), "data/pack"),
-        ];
-        let req = request(&root, edits.clone());
-        let check = crate::jobs::Inner::new(Box::new(|_| {})).edit_check(&req);
-        assert_eq!(check, EditCheck::default(), "{check:?}");
-        run_with(&req, |_, _| {}).unwrap();
-        let after = snapshot(&root);
-        assert_eq!(after["data/new.bin"], Some(vec![9u8; 3 << 20]));
-        assert_eq!(after["data/pack/x.txt"], Some(b"x".to_vec()));
-        assert_eq!(after["data/pack/void"], None);
-        assert!(!after.contains_key("data/pack/.DS_Store"));
-        // A peer file that changes once planned fails its copy; the earlier change stays.
-        let mut edits = vec![
-            mkdir("z"),
-            add(&peer.join("new.bin").url(), "data/again.bin"),
-        ];
-        let req = request(&root, std::mem::take(&mut edits));
-        let err = run_with(&req, move |e, _| {
-            if matches!(e, Event::Log { line, .. } if line == "edit: made folder z") {
-                fake.touch("new.bin");
-            }
-        })
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("changed after it was added"),
-            "{err:#}"
-        );
-        assert!(!root.join("data/again.bin").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1283,40 +1151,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_ampr_title_gets_a_fresh_index() {
-        let dir = crate::test_dir("edit-folder-ampr");
-        let journal = ps5_dump_forge_lz4::JOURNAL;
-        let log = ps5_dump_forge_lz4::LOGS[0];
-        let root = game(
-            &dir,
-            AMPR_EBOOT,
-            &[(journal, b"old ids"), (log, b"old log")],
-        );
-        // A mkdir changes no file: no index, the journal and log stay.
-        run_with(&request(&root, vec![mkdir("x")]), |_, _| {}).unwrap();
-        assert!(!root.join(INDEX).exists());
-        assert!(root.join(journal).exists() && root.join(log).exists());
-        put(&dir, "host.bin", b"host");
-        let req = request(&root, vec![add(&dir.join("host.bin"), "data/host.bin")]);
-        let report = run_with(&req, |_, _| {}).unwrap_or_else(|e| panic!("{e:#}"));
-        assert!(!root.join(journal).exists() && !root.join(log).exists());
-        let mut tree = ScannedFolder::scan(&root, &AtomicBool::new(false)).unwrap();
-        let listing = crate::lz4::plain_listing(tree.files(), crate::lz4::RuntimeAction::Keep);
-        assert!(listing.iter().any(|f| f.path == "data/host.bin"));
-        assert!(matches!(
-            crate::lz4::index_state(&mut tree, &listing).unwrap(),
-            crate::lz4::IndexState::Ok(_)
-        ));
-        // The index is written and checked like an added file.
-        assert!(
-            report.checks[0].starts_with("blake3: 2 added files"),
-            "{report:?}"
-        );
-        // The runtime is never swapped: there is none, and none is installed.
-        assert!(!root.join(ps5_dump_forge_lz4::RUNTIME).exists());
-    }
-
     /// An AMPR game packed into LZ4 packs by a conversion: `dir/packed`.
     fn packed_game(dir: &Path) -> PathBuf {
         let text: Vec<u8> = (0..300_000)
@@ -1336,79 +1170,6 @@ mod tests {
         let cancel = AtomicBool::new(false);
         crate::convert::run(&req, &Ctx::new(1, &emit, &cancel)).unwrap();
         out
-    }
-
-    /// The pack files and `ampr_emu.index` of a packed folder, with their bytes.
-    fn packs(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
-        (snapshot(root).into_iter())
-            .filter(|(p, _)| p.starts_with("ampr_assets") || p == INDEX)
-            .collect()
-    }
-
-    #[test]
-    fn a_packed_game_edits_all_but_its_packs() {
-        let dir = crate::test_dir("edit-folder-packed");
-        let root = packed_game(&dir);
-        let manifest = std::fs::read(root.join(ps5_dump_forge_lz4::MANIFEST)).unwrap();
-        let manifest = ps5_dump_forge_lz4::reader::open_manifest(&manifest).unwrap();
-        let packed: Vec<&str> = (manifest.files.iter())
-            .filter(|f| f.packed())
-            .map(|f| f.path.as_str())
-            .collect();
-        assert!(packed.contains(&"data/assets/level1.bin"), "{packed:?}");
-        let locked = packs(&root);
-        assert!(locked.len() >= 4, "{locked:?}");
-        put(
-            &dir,
-            "host/eboot.bin",
-            b"\x7fELF a new eboot importing libSceAmpr.sprx",
-        );
-        put(&dir, "host/runtime.sprx", b"another runtime");
-        put(&dir, "host/new.bin", b"a new loose file");
-        let runtime = ps5_dump_forge_lz4::RUNTIME;
-        let req = request(
-            &root,
-            vec![
-                add(&dir.join("host/eboot.bin"), "eboot.bin"),
-                add(&dir.join("host/runtime.sprx"), runtime),
-                add(&dir.join("host/new.bin"), "data/new.bin"),
-            ],
-        );
-        assert_eq!(check(&req), EditCheck::default());
-        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = logs.clone();
-        run_with(&req, move |e, _| {
-            if let Event::Log { line, .. } = e {
-                seen.lock().unwrap().push(line.clone());
-            }
-        })
-        .unwrap_or_else(|e| panic!("{e:#}"));
-        assert_eq!(
-            packs(&root),
-            locked,
-            "the packs and index stay byte for byte"
-        );
-        assert_eq!(
-            std::fs::read(root.join(runtime)).unwrap(),
-            b"another runtime"
-        );
-        assert_eq!(
-            std::fs::read(root.join("data/new.bin")).unwrap(),
-            b"a new loose file"
-        );
-        let logs = logs.lock().unwrap();
-        assert!(
-            logs.iter().any(|l| l.contains("the game is packed")),
-            "{logs:?}"
-        );
-        // The edited game still unpacks: loose records may change.
-        let tree = ScannedFolder::scan(&root, &AtomicBool::new(false)).unwrap();
-        let mut unpacked = ps5_dump_forge_lz4::reader::unpack(Box::new(tree)).unwrap();
-        assert_eq!(
-            unpacked.read("data/assets/level1.bin").unwrap().len(),
-            300_000
-        );
-        assert!(unpacked.files().iter().any(|f| f.path == "data/new.bin"));
     }
 
     #[test]

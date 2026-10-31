@@ -375,6 +375,9 @@ const zh: Messages = {
     inStep: (time) => `本步骤已用 ${time}`,
     result: (bytes, n) => `${bytes}，${num(n)} 个文件 →`,
     outputPath: "输出路径",
+    sourceDeleted: (v) => `已删除源：${v}`,
+    sourceKept: (v) => `已保留源：${v}`,
+    sourcePartlyDeleted: (v) => `已部分删除源：${v}`,
     checks: "检查项",
     verifiedPlain: (n) => `已校验：${num(n)} 项检查通过`,
     verifiedFull: (n) => `完整校验通过：${num(n)} 项检查`,
@@ -510,9 +513,8 @@ const zh: Messages = {
           ? "将 zstd 包还原为普通文件。"
           : "将游戏资源打包为 zstd 卷。"
         : packed
-          ? "实验性。将 LZ4 包还原为普通文件。"
-          : "实验性：部分游戏可能无法启动。将游戏资源打包为 LZ4 卷。",
-    chooseGame: "请先选择游戏。",
+          ? "将 LZ4 包还原为普通文件。"
+          : "部分游戏可能无法启动。将游戏资源打包为 LZ4 卷。",
     noAmprGame: (e) => `该游戏未使用 AMPR，因此无法使用 ${e === "zstd" ? "zstd" : "LZ4"} 包。`,
     patch: "补丁包无法打包。",
     additionalContent: "附加内容（没有 eboot.bin）无法打包。",
@@ -555,8 +557,6 @@ const zh: Messages = {
     already: (a, fmt) => <>
       已有任务正在将此游戏输出为 <b>{fmt}</b>；再次{a === "pack" ? "打包" : "解包"}会生成第二份副本。
     </>,
-    emptyTitle: "请选择使用 AMPR 的游戏",
-    experimental: "实验性：请保留原始游戏的副本。",
     source: "源",
   },
   // PackHelp.tsx
@@ -574,7 +574,7 @@ const zh: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>实验性</b>：部分游戏可能无法启动。请保留副本。</li>
+          <li><b>部分游戏可能无法启动。</b>请保留副本。</li>
           <li>打包为 LZ4 卷，输出到文件夹或镜像：<b>快速</b>（LZ4）、<b>中等</b>（HC 9）、<b>最大</b>（HC 12）。</li>
           <li>运行时：<b>ampr-emu-ng</b>（默认）或上游 <b>ampr_emu</b>。</li>
           <li>已打包的游戏会显示<b>解包</b>。</li>
@@ -764,6 +764,7 @@ const zh: Messages = {
       },
     },
     innerFfpkg: { text: "PS5 自身的文件系统（UFS2）。" },
+    innerExfat: { tone: "good", text: "推荐。压缩容器内最稳定的镜像。" },
     level0: { text: "不压缩：每个块按原样存储。文件与镜像一样大。" },
     levelDefault: {
       tone: "good",
@@ -802,6 +803,9 @@ const zh: Messages = {
     compression: "压缩",
     fullVerify: "完整校验",
     fullVerifyHint: "重新读取每个字节来核对输出。耗时更长。",
+    deleteSource: "删除源",
+    deleteSourceHint: "无法撤销。只有在转换成功后才会删除源。",
+    deleteSourceNas: "无法从这里删除 NAS 上的游戏。",
     separator: "名称中不能包含文件夹分隔符；请用“更改”选择文件夹。",
     badName: "名称不能为空，不能以点开头，不能以点或空格结尾，也不能包含控制字符。",
     tooLong: (bytes, max, folder) =>
@@ -959,6 +963,13 @@ const zh: Messages = {
       "“文件传输”可在它们之间复制文件和文件夹。目标位置已有同名项时，只有在你确认后才会替换。",
     ],
     helpSecurity: "设备之间发送的内容都不加密：同一网络中的任何人都能读取。保存的 NAS 密码以未加密形式保存在本设备上。请只在家庭网络中使用“连接”。",
+    helpSpeed: "已配对设备所在行或其详细信息中的“测速”会向它发送 128 MiB 并取回 128 MiB（不写入磁盘），显示每个方向的网络速度。",
+    speedTest: "测速",
+    speedTestWith: (name) => `与 ${name} 测速`,
+    speedTesting: "正在测速",
+    speedResult: (up, down) => `上传 ${up} MB/s · 下载 ${down} MB/s`,
+    speedFailed: "测速失败：",
+    speedNote: "发送 128 MiB 并取回 128 MiB；不写入磁盘。",
     installTitle: "PS5 上的 Dump Forge",
     ps5Address: "PS5 地址",
     install: "安装到 PS5",

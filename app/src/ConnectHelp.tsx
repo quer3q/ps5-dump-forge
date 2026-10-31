@@ -1,5 +1,5 @@
 // The Connect tab's "How it works": in the desktop app first a highlighted Install on PS5 box, then
-// a few short paragraphs, no headings (pairing and the check number, a NAS, File Transfer, phones
+// a few short paragraphs, no headings (pairing and the check number, a NAS, File Transfer, Speed test, phones
 // in the web build, what the network can see), in a modal over the inert app (common.tsx
 // `openOverlay`). Text only.
 
@@ -16,7 +16,7 @@ export function openConnectHelp() {
 function ConnectHelp({ close }: { close: () => void }) {
   const t = useMessages().connect;
   // Phones only where there is a page to open (the desktop app has no QR code).
-  const parts = [...t.help, ...(web ? [t.helpPhone] : []), t.helpSecurity];
+  const parts = [...t.help, t.helpSpeed, ...(web ? [t.helpPhone] : []), t.helpSecurity];
   return (
     <Modal close={close} className="modal card help" labelledBy="connect-help-title">
       <Head id="connect-help-title" icon="info" title={t.howItWorks} />

@@ -12,3 +12,8 @@ crc32fast = "1.5"
 sha2 = "0.11"
 # C liblz4 (block API only): the fast compressor and the HC levels.
 lz4-sys = "1.11"
+# The embedded runtimes are stored zstd-compressed (build.rs) and decoded on first use.
+zstd = { version = "0.13.3", default-features = false }
+
+[build-dependencies]
+zstd = { version = "0.13.3", default-features = false }

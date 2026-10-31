@@ -1,6 +1,9 @@
 //! Embeds the web UI bundle (`npm run build:http` in `app/` writes `app/dist-http`) as
-//! `static ASSETS: &[(&str, &[u8])]` in `$OUT_DIR/assets.rs`: each file by its path relative
-//! to the bundle, `/`-separated. `FORGE_WEB_DIST` points elsewhere. Without a bundle, a
+//! `static ASSETS: &[(&str, bool, &[u8])]` in `$OUT_DIR/assets.rs`: each file by its path
+//! relative to the bundle, `/`-separated, then whether its bytes are a gzip stream (a file under
+//! `assets/` gzip shrinks by 5% or more: scripts, styles, locales; `http.rs` sends it as it is
+//! to a client that takes gzip, decoded to any other) and the bytes. `index.html` and the
+//! AppCache manifest stay plain: small, and the console's browser fetches them first. `FORGE_WEB_DIST` points elsewhere. Without a bundle, a
 //! placeholder page is embedded so `cargo test` never needs node, unless `FORGE_REQUIRE_WEB=1`
 //! (`ps5/build.sh`), which makes it a build error.
 //!
@@ -49,11 +52,25 @@ fn main() {
         files = vec![("index.html".to_string(), page)];
     }
 
-    let mut code = String::from("static ASSETS: &[(&str, &[u8])] = &[\n");
-    for (name, path) in &files {
+    let mut code = String::from("static ASSETS: &[(&str, bool, &[u8])] = &[\n");
+    let gz_dir = out.join("web-gz");
+    std::fs::create_dir_all(&gz_dir).unwrap();
+    for (i, (name, path)) in files.iter().enumerate() {
         println!("cargo:rerun-if-changed={}", path.display());
+        let raw = std::fs::read(path).unwrap();
+        // No name and no time in the header, so a rebuild gives the same bytes.
+        let mut z = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::best());
+        z.write_all(&raw).unwrap();
+        let packed = z.finish().unwrap();
+        let (gzip, path) = if name.starts_with("assets/") && packed.len() * 20 <= raw.len() * 19 {
+            let gz = gz_dir.join(format!("{i}.gz"));
+            std::fs::write(&gz, packed).unwrap();
+            (true, gz)
+        } else {
+            (false, path.clone())
+        };
         let path = path.to_str().expect("bundle paths must be UTF-8");
-        code += &format!("    ({name:?}, include_bytes!({path:?})),\n");
+        code += &format!("    ({name:?}, {gzip}, include_bytes!({path:?})),\n");
     }
     code += "];\n";
     std::fs::write(out.join("assets.rs"), code).unwrap();
@@ -61,7 +78,8 @@ fn main() {
     std::fs::write(out.join("self_elf.rs"), self_elf(&out)).unwrap();
 }
 
-/// `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256 of the ELF, the zlib stream.
+/// `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256 of the ELF, one zstd frame
+/// (level 22: 4.4 MB where zlib's best took 5.6).
 fn self_elf(out: &Path) -> String {
     println!("cargo:rerun-if-env-changed=FORGE_SELF_ELF");
     let none = "static SELF_ELF: Option<&[u8]> = None;\n".to_string();
@@ -81,9 +99,7 @@ fn self_elf(out: &Path) -> String {
         "FORGE_SELF_ELF={}: not an ELF",
         path.display()
     );
-    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
-    z.write_all(&elf).unwrap();
-    let packed = z.finish().unwrap();
+    let packed = zstd::bulk::compress(&elf, 22).unwrap();
     let mut blob = b"PDFGSELF".to_vec();
     blob.extend_from_slice(&(elf.len() as u64).to_le_bytes());
     blob.extend_from_slice(&(packed.len() as u64).to_le_bytes());

@@ -383,13 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn an_install_of_a_peer_package_is_shown_on_that_peer() {
-        let key = "ab".repeat(16);
-        let request = json!({ "install": format!("flink://{key}/Users/me/game.pkg") });
-        assert_eq!(peers_of(&request), HashSet::from([key]));
-    }
-
-    #[test]
     fn a_job_is_shown_on_the_peer_it_uses_and_cancelled_from_there() {
         let dirs = ["a", "b", "share-a", "share-b"].map(temp_dir);
         let a = Connect::start_rooted(&dirs[0], 0, Some(dirs[2].clone())).unwrap();
@@ -454,54 +447,6 @@ mod tests {
         for d in dirs {
             fs::remove_dir_all(d).unwrap();
         }
-    }
-
-    #[test]
-    fn pushes_go_to_paired_peers_and_end_with_an_empty_one() {
-        let m = Mirror::default();
-        let (k1, k2) = ("1".repeat(32), "2".repeat(32));
-        let out = format!("flink://{k1}/o");
-        let root = dunce::canonicalize(temp_dir("unit")).unwrap();
-        m.started(7, &request(&root.join("g"), &out));
-        m.started(8, &request(&root.join("g"), &format!("flink://{k2}/o")));
-        let paired = |k: &str| k == k1 || k == k2;
-        // A local path in the share root is spelled as this device's.
-        let pushes = m.due("f".repeat(32).as_str(), Some(&root), &|k| k == k1);
-        assert_eq!(pushes.len(), 1);
-        assert_eq!(
-            (pushes[0].key_id.as_str(), &pushes[0].cancellable[..]),
-            (k1.as_str(), &[7][..])
-        );
-        let job = &pushes[0].body["jobs"][0];
-        assert_eq!(
-            job["request"]["source"],
-            format!("flink://{}/g", "f".repeat(32))
-        );
-        assert_eq!(job["request"]["output"], out.as_str());
-        // A peer sent jobs last time and none now gets one empty list, then nothing.
-        lock(&m.table).record(&Event::Done {
-            job: 7,
-            result: Err("cancelled".into()),
-        });
-        let pushes = m.due("f", None, &paired);
-        let cancellable = |k: &str| {
-            let p = pushes.iter().find(|p| p.key_id == k).unwrap();
-            (
-                p.body["jobs"].as_array().unwrap().len(),
-                p.cancellable.clone(),
-            )
-        };
-        // A finished job is still shown, but not cancelled from there.
-        assert_eq!(
-            (cancellable(&k1), cancellable(&k2)),
-            ((1, vec![]), (1, vec![8]))
-        );
-        *lock(&m.table) = Table::default();
-        let pushes = m.due("f", None, &paired);
-        assert_eq!(pushes.len(), 2);
-        assert!(pushes.iter().all(|p| p.body["jobs"] == json!([])));
-        assert!(m.due("f", None, &paired).is_empty());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

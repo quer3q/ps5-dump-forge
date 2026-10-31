@@ -31,14 +31,21 @@ https://github.com/quer3q/ampr-emu-ng/releases/download/v0.1.0/SHA256SUMS
 https://github.com/quer3q/ampr-emu-ng/archive/refs/tags/v0.1.0.tar.gz
 ```
 
-## Not used by the build yet
+## Used by the build
 
-Nothing in Forge reads this folder: `ps5-dump-forge-lz4` still embeds the local build at
-`vendor/ampr_emu/libSceAmpr-zstd.sprx` (679712 bytes, SHA-256
-`0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7`, not this release). Switching to the
-release means pointing `runtime::ZSTD`'s `include_bytes!` (`crates/ps5-dump-forge-lz4/src/runtime.rs`)
-at `libSceAmpr.sprx` here and updating `vendor/ampr_emu/README.md`; the runtime's hash is computed at run
-time, so no pin changes. The debug build is kept for bring-up only and is never embedded.
+`ps5-dump-forge-lz4` embeds `libSceAmpr.sprx` from here: `crates/ps5-dump-forge-lz4/build.rs` stores it
+zstd-compressed (`ZSTD_PACKED`, `ZSTD_LEN`) and `runtime::zstd()` decodes it on first use; a test pins its
+SHA-256 (`ZSTD_SHA256`, the value in `SHA256SUMS`). An upgrade changes the path in `build.rs` and that hash.
+Forge installs it at `fakelib/libSceAmpr.sprx` on every zstd Pack and on an LZ4 Pack with runtime `ng` (the
+default), and keeps it there and in a zstd-packed game converted as it is. Every other conversion (a plain
+convert, an LZ4 Unpack, an LZ4 Pack with `ampr_emu`, a zstd Unpack) replaces it with the upstream release
+runtime (`vendor/ampr_emu/`).
+
+The local build Forge embedded before this release (`vendor/ampr_emu/libSceAmpr-zstd.sprx`, 679712 bytes,
+SHA-256 `0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7`) is no longer in the repo; its
+hash stays pinned (`OLD_ZSTD_SHA256`) so a game carrying it is recognized as ampr-emu-ng (kept or replaced by
+the rule above). Any other build holding the `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng
+too. The debug build is kept for bring-up only and is never embedded.
 
 ## Corresponding source
 
@@ -57,4 +64,6 @@ the binaries byte for byte.
 ## Upgrading
 
 Replace the files with a newer release's assets, check them with `shasum -a 256 -c SHA256SUMS`, and update
-this README (version, tag commit, dates, sizes, hashes, URLs) together.
+this README (version, tag commit, dates, sizes, hashes, URLs) and the pin in `runtime.rs` (`ZSTD_SHA256` and
+the size in `pinned_sizes_and_hashes`) together. Keep the replaced release's hash pinned beside
+`OLD_ZSTD_SHA256` so games carrying it are still kept.

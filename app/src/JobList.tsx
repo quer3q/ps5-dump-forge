@@ -1,7 +1,7 @@
 // A tab's job list under its cards: one row per job of that tab's type, newest first (Convert,
 // Edit, Pack and Connect each list their own).
 
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
 import {
   api,
@@ -22,7 +22,7 @@ import { DEFAULT_ZSTD_LEVEL, jobType, packJob, type Action, type Job } from "./j
 import { LEVEL_OF, type PackLevel } from "./Pack";
 import { readable } from "./peers";
 import { askReplace } from "./replace";
-import { refreshConnect, useConnectState } from "./useConnectState";
+import { refreshConnect, useSavedNames } from "./useConnectState";
 
 type T = Messages["jobs"];
 
@@ -52,6 +52,21 @@ export function JobsCard(props: { jobs: Job[]; dispatch: (a: Action) => void; id
     </section>
   );
 }
+
+/** A job that deleted its source (`delete_source`): core's check line `source deleted: <path>`
+ * (`deleted`, `text` the path), `source kept: <reason>` or `source partly deleted: <what is
+ * gone>; <error>` (`partly`); null without one. Matched by its backend English prefix. */
+export function sourceLine(checks: string[]): { deleted: boolean; partly: boolean; text: string } | null {
+  for (const c of checks) {
+    if (c.startsWith(SOURCE_DELETED)) return { deleted: true, partly: false, text: c.slice(SOURCE_DELETED.length) };
+    if (c.startsWith(SOURCE_KEPT)) return { deleted: false, partly: false, text: c.slice(SOURCE_KEPT.length) };
+    if (c.startsWith(SOURCE_PARTLY)) return { deleted: false, partly: true, text: c.slice(SOURCE_PARTLY.length) };
+  }
+  return null;
+}
+const SOURCE_DELETED = "source deleted: ";
+const SOURCE_KEPT = "source kept: ";
+const SOURCE_PARTLY = "source partly deleted: ";
 
 /** What a stage's byte rate measures: verify reads the output back, compress and measure
  * (packing without writing, to size the packs) count the uncompressed bytes they took in, the
@@ -104,7 +119,9 @@ export function jobName(job: Job, shown: (path: string) => string, fallback: (id
   return /^flink:\/\/[^/\\]+[/\\]*$/i.test(out) ? shown(out).replace(/: \/$/, "") : basename(out);
 }
 
-function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => void }) {
+/** Memoized: a progress event re-renders only its own job's row (`jobsReducer` keeps the other
+ * jobs' objects; `dispatch` is stable). */
+const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => void }) {
   const { job, fresh, dispatch } = props;
   const t = useMessages().jobs;
   const installTag = useMessages().install.tag;
@@ -236,6 +253,8 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
   const transfer = job.request?.transfer?.length ? job.request.transfer : null;
   // A package install: the package shown as "from", no target format.
   const install = job.request?.install ?? null;
+  // Delete the source: core's one line on what became of it.
+  const sourceNote = result && "Ok" in result ? sourceLine(result.Ok.checks) : null;
   // Every step the job will run, once core said; gone when the job ends (its result says it).
   const steps = !result && job.stages?.length ? <Steps job={job} /> : null;
   // Packing straight into an image: its write pass packs too.
@@ -378,7 +397,7 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
                 <span>{coverage(t, result.Ok.verify)}</span>
               </li>
             )}
-            {result.Ok.checks.map((c, i) => (
+            {result.Ok.checks.filter((c) => !sourceLine([c])).map((c, i) => (
               <li key={i}>
                 <Icon name="check" />
                 <span className="backend">{readable(c)}</span>
@@ -386,6 +405,19 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
             ))}
           </ul>
         </details>
+      )}
+      {/* Delete the source after a successful conversion: what became of it (the job stays Ok). */}
+      {sourceNote && (
+        <p className={sourceNote.deleted ? "note-line muted" : "note-line warn"}>
+          <Icon name={sourceNote.deleted ? "trash" : "warn"} />
+          <span className="backend">
+            {sourceNote.deleted
+              ? t.sourceDeleted(readable(sourceNote.text))
+              : sourceNote.partly
+                ? t.sourcePartlyDeleted(readable(sourceNote.text))
+                : t.sourceKept(readable(sourceNote.text))}
+          </span>
+        </p>
       )}
       {/* A cancelled edit's "cancelled; …" says what stays changed: a note, not a failure. */}
       {result && "Err" in result && result.Err.startsWith("cancelled; ") && (
@@ -407,7 +439,7 @@ function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => voi
       {job.log.length > 0 && <Log lines={job.log} name={name} />}
     </article>
   );
-}
+});
 
 /** The job's steps in order, neighbours with one label merged (preflight and check are one
  * "Checking"): done before the current one, the rest not started. A stage the messages don't
@@ -456,7 +488,7 @@ function Steps({ job }: { job: Job }) {
 
 /** The verified fold's title: the mode (when the report has one) and the checks passed. */
 function verifiedTitle(t: T, r: JobReport): string {
-  const n = r.checks.length;
+  const n = r.checks.filter((c) => !sourceLine([c])).length;
   if (!r.verify) return t.verifiedPlain(n);
   return r.verify.mode === "full" ? t.verifiedFull(n) : t.verifiedFast(n);
 }
@@ -485,9 +517,9 @@ function FailureText(props: { err: string; format?: string; edit?: boolean; extr
   const { format, edit, extract, transfer, install } = props;
   const t = useMessages().jobs;
   const cantInstall = useMessages().install.cantInstall;
-  // A paired device's `flink://` address by its name (again once Connect's state arrives).
-  useConnectState();
-  const err = readable(props.err);
+  // A paired device's `flink://` address by its name (again once a name arrives or changes).
+  const names = useSavedNames();
+  const err = useMemo(() => readable(props.err), [props.err, names]);
   const pre = /^preflight failed:\n?/.exec(err);
   return (
     <div className="error-box">
@@ -500,7 +532,9 @@ function FailureText(props: { err: string; format?: string; edit?: boolean; extr
 /** Collapsed until asked for: the job's row stays short in the list. */
 function Log({ lines, name }: { lines: string[]; name: string }) {
   const t = useMessages().jobs;
-  useConnectState();
+  const names = useSavedNames();
+  // Up to 500 lines joined and rewritten once per change, not on every render.
+  const text = useMemo(() => readable(lines.join("\n")), [lines, names]);
   const [el, setEl] = useState<HTMLPreElement | null>(null);
   // Follow the tail as lines arrive, unless the reader scrolled up from it.
   const atEnd = useRef(true);
@@ -522,7 +556,7 @@ function Log({ lines, name }: { lines: string[]; name: string }) {
           atEnd.current = p.scrollHeight - p.scrollTop - p.clientHeight < 24;
         }}
       >
-        {readable(lines.join("\n"))}
+        {text}
       </pre>
     </details>
   );

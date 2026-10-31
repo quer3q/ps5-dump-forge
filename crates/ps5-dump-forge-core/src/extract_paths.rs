@@ -24,6 +24,7 @@ use ps5upload_fpkg::source::{SourceFile, SourceTree};
 use crate::convert::{Kind, SourceStamp, open_source};
 use crate::finalize::{fsync_dir, make_dir_open};
 use crate::jobs::Ctx;
+use crate::prefetch::Prefetch;
 use crate::preflight;
 use crate::remote::RemoteDir;
 use crate::temp_file::{write_temp, write_temp_new};
@@ -540,7 +541,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     let kind = Kind::of(&req.source)?;
     crate::convert::refuse_interrupted_edit(&req.source, kind)?;
     let stamp = SourceStamp::take(&req.source, kind)?;
-    let (mut tree, stamp) = match kind {
+    let (tree, stamp) = match kind {
         Kind::Archive(format) => crate::archive::open(req, ctx, format, stamp)?,
         _ => (open_source(&req.source, kind, ctx.cancel)?, stamp),
     };
@@ -588,8 +589,9 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     let mut made = Vec::new();
     let mut replaced = Vec::new();
     let mut done = 0u64;
+    let mut tree = read_ahead(tree, &selections)?;
     let wrote = write(
-        tree.as_mut(),
+        &mut tree,
         &root,
         peer.as_mut(),
         &selections,
@@ -647,6 +649,37 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             seed: 0,
         },
     })
+}
+
+/// `tree` read one range ahead on its own thread, so the next read overlaps writing and
+/// hashing the last one (as convert's writers do). When each selected file is the next
+/// non-empty one of `files()` after the one before it, the next file is read ahead too; else
+/// a guess past a file's end could send an archive's decoder past what is asked next.
+pub(crate) fn read_ahead(
+    tree: Box<dyn SourceTree>,
+    selections: &[Selection],
+) -> anyhow::Result<Prefetch> {
+    let rank: HashMap<&str, usize> = (tree.files().iter())
+        .filter(|f| f.size > 0)
+        .enumerate()
+        .map(|(i, f)| (f.path.as_str(), i))
+        .collect();
+    let mut order = (selections.iter().flat_map(|s| &s.files))
+        .filter(|f| f.size > 0)
+        .map(|f| rank.get(f.path.as_str()).copied());
+    let first = order.next().flatten();
+    let in_order = (order.try_fold(first, |at, next| match (at, next) {
+        (Some(a), Some(b)) if b == a + 1 => Some(Some(b)),
+        _ => None,
+    }))
+    .is_some();
+    drop(rank);
+    if in_order {
+        Prefetch::sequential(tree, CHUNK as usize)
+    } else {
+        Prefetch::new(tree)
+    }
+    .context("starting the read-ahead thread")
 }
 
 /// A new folder at `path`, exclusively (an existing one fails), 0777 on the PS5.
@@ -745,7 +778,7 @@ pub(crate) fn write(
             synced.push(target.clone());
             synced.extend(s.dirs.iter().map(|d| target.join(d)));
         }
-        for file in &s.files {
+        let files = s.files.iter().try_for_each(|file| -> anyhow::Result<()> {
             let rel = s.target(&file.path);
             let (parent, name) = rel.rsplit_once('/').unwrap_or(("", &rel));
             let dir = root.join(parent);
@@ -761,12 +794,33 @@ pub(crate) fn write(
                 write_temp_new(&dir, name, &mut fill)?;
             }
             written.push((path, file.size, hasher.finalize()));
+            Ok(())
+        });
+        if files.is_err() {
+            // The barrier for the files finished before the failure (they stay).
+            let _ = fsync_dir(root);
         }
-        for dir in synced.iter().rev() {
-            fsync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?;
+        files?;
+        // The root last: on macOS its F_FULLFSYNC is the barrier for every plain fsync before.
+        for (i, dir) in synced.iter().enumerate().rev() {
+            let synced = if i == 0 {
+                fsync_dir(dir)
+            } else {
+                sync_folder(dir)
+            };
+            synced.with_context(|| format!("syncing {}", dir.display()))?;
         }
     }
     Ok(())
+}
+
+/// A folder synced; on macOS a plain fsync, made durable by the F_FULLFSYNC of the
+/// [`fsync_dir`] that follows it ([`crate::extract::sync_file`]).
+fn sync_folder(dir: &Path) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    return crate::extract::sync_file(&File::open(dir)?);
+    #[cfg(not(target_vendor = "apple"))]
+    fsync_dir(dir)
 }
 
 /// A failure before any file was finished: the folders `write` made stay (a retry finds them
@@ -835,14 +889,18 @@ pub(crate) fn verify(
     };
     let mut done = 0u64;
     let mut buf = Vec::new();
+    let mut listed = Listed::default();
     for (path, size, hash) in written {
         ctx.check()?;
         let shown = || path.display().to_string();
         let peer = crate::remote::is_remote(path);
-        let len = if peer {
-            crate::remote::reader(path)?.len()
-        } else {
-            std::fs::symlink_metadata(path).with_context(shown)?.len()
+        // On another device: fast mode takes the size from its folder's one listing; the full
+        // check reads back through the reader whose open gave the size.
+        let mut reader = None;
+        let len = match peer {
+            true if !full && let Some(len) = listed.size(path) => len,
+            true => reader.insert(crate::remote::reader(path)?).len(),
+            false => std::fs::symlink_metadata(path).with_context(shown)?.len(),
         };
         if len != *size {
             bail!(
@@ -853,8 +911,8 @@ pub(crate) fn verify(
         if !full {
             continue;
         }
-        let mut file: Box<dyn Read> = if peer {
-            Box::new(crate::remote::reader(path)?)
+        let mut file: Box<dyn Read> = if let Some(reader) = reader {
+            Box::new(reader)
         } else {
             Box::new(File::open(path).with_context(shown)?)
         };
@@ -875,4 +933,27 @@ pub(crate) fn verify(
         }
     }
     Ok(done)
+}
+
+/// Written files' folders on another device, each listed once by [`verify`]: one request per
+/// folder, not one per file.
+#[derive(Default)]
+struct Listed(HashMap<PathBuf, HashMap<String, u64>>);
+
+impl Listed {
+    /// The size of the regular file at `path` by its folder's listing; `None` when the listing
+    /// fails or doesn't show it as one (then a stat, as before, says why).
+    fn size(&mut self, path: &Path) -> Option<u64> {
+        let (dir, name) = (path.parent()?, path.file_name()?.to_str()?);
+        let sizes = self.0.entry(dir.to_path_buf()).or_insert_with(|| {
+            let listing = crate::remote::FlinkPath::parse(dir)
+                .ok()
+                .and_then(|at| crate::remote::get_for(&at).ok()?.list(&at).ok());
+            (listing.into_iter().flatten())
+                .filter(|e| !e.dir && !e.link && !e.special && !e.bad_name)
+                .map(|e| (e.name, e.size))
+                .collect()
+        });
+        sizes.get(name).copied()
+    }
 }

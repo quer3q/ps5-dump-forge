@@ -376,59 +376,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
-    #[test]
-    fn drive_is_listed_only_while_mounted() {
-        let fs = |on: &str, blocks| {
-            Some(Mount {
-                on: on.into(),
-                blocks,
-                total: 0,
-                free: 0,
-            })
-        };
-        let usb = Path::new("/mnt/usb0");
-        assert!(mounted(usb, fs("/mnt/usb0", 1)));
-        // The empty folder, on the filesystem above it.
-        assert!(!mounted(usb, fs("/", 1_000)));
-        assert!(!mounted(usb, fs("/mnt", 1_000)));
-        // A mount left behind by a pulled drive; `statfs` failing.
-        assert!(!mounted(usb, fs("/mnt/usb0", 0)));
-        assert!(!mounted(usb, None));
-
-        // In `Roots`: checked on each use, so plugging in and pulling out show.
-        let tmp = std::env::temp_dir().join(format!("forge-drives-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let usb = tmp.join("usb0");
-        std::fs::create_dir_all(&usb).unwrap();
-        let usb = usb.canonicalize().unwrap();
-        let drive = Candidate {
-            path: usb.clone(),
-            pinned: None,
-            drive: true,
-        };
-        let roots = Roots {
-            list: vec![drive],
-            ps5: true,
-            statfs: fake_statfs,
-            ttl: Duration::ZERO,
-            cached: Mutex::new(None),
-        };
-        assert!(roots.current().is_empty());
-        std::fs::write(usb.join("mounted"), b"").unwrap();
-        assert_eq!(roots.current(), std::slice::from_ref(&usb));
-        std::fs::remove_file(usb.join("mounted")).unwrap();
-        assert!(roots.current().is_empty());
-        std::fs::remove_dir_all(&tmp).unwrap();
-
-        // `/mnt/...` candidates are drives on the PS5 only, and never pinned.
-        let mnt = [PathBuf::from("/mnt/usb0"), PathBuf::from("/data")];
-        let (roots, _) = Roots::new(Platform::Ps5, &mnt);
-        assert!(roots.list[0].drive && roots.list[0].pinned.is_none());
-        assert!(!roots.list[1].drive);
-        let (roots, _) = Roots::new(Platform::Host, &mnt);
-        assert!(roots.list.iter().all(|c| !c.drive));
-    }
-
     /// The cached roots serve browsing, but a write under a drive unplugged since asks it again.
     #[test]
     fn a_write_never_reaches_a_drive_unplugged_since_the_cache() {

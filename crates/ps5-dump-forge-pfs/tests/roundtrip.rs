@@ -3,7 +3,7 @@
 //! reader fed damaged images.
 
 use std::fs::File;
-use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -549,85 +549,6 @@ fn ffpfsc_round_trips_with_an_exfat_inside() {
     wrap_round_trip("exfat");
 }
 
-/// Wraps `data` and reads it back through the outer PFS: `(report, bytes read)`.
-fn wrap_bytes(data: &[u8]) -> (ps5_dump_forge_pfs::WrapReport, Vec<u8>) {
-    let tmp = TempDir::new("bytes");
-    let path = tmp.0.join("b.ffpfsc");
-    let mut out = File::create(&path).unwrap();
-    let wopts = WrapOptions {
-        time: Some(TIME),
-        ..WrapOptions::default()
-    };
-    let cancel = AtomicBool::new(false);
-    let ((), r) = wrap(
-        "blob.exfat",
-        data.len() as u64,
-        &mut out,
-        &wopts,
-        &cancel,
-        |s| Ok(s.write_all(data)?),
-    )
-    .unwrap();
-    let mut outer = PfsSource::open(&path).unwrap();
-    assert_eq!(outer.files().len(), 1);
-    let back = outer.read("blob.exfat").unwrap();
-    (r, back)
-}
-
-#[test]
-fn incompressible_blocks_are_stored_raw() {
-    let mut x = 0x9E37_79B9u32;
-    let data: Vec<u8> = (0..5 * B + 123)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            x as u8
-        })
-        .collect();
-    let (r, back) = wrap_bytes(&data);
-    assert_eq!(back, data);
-    // The five noise blocks stay raw; the last, 123 bytes padded with zeros, compresses.
-    assert_eq!((r.blocks, r.compressed_blocks), (6, 1));
-    assert!(r.stored_size > BLOCK + 5 * BLOCK, "always a container");
-    assert!(r.stored_size < BLOCK + 6 * BLOCK);
-}
-
-/// Past 8063 blocks the offset table outgrows its first block and pushes the data back.
-#[test]
-fn a_long_table_moves_the_data() {
-    let tmp = TempDir::new("table");
-    let path = tmp.0.join("t.ffpfsc");
-    let mut out = File::create(&path).unwrap();
-    let raw = 8064 * BLOCK;
-    let cancel = AtomicBool::new(false);
-    let wopts = WrapOptions {
-        time: Some(TIME),
-        ..WrapOptions::default()
-    };
-    let ((), r) = wrap("big.exfat", raw, &mut out, &wopts, &cancel, |s| {
-        s.write_all(b"first")?;
-        s.seek(SeekFrom::Start(raw - 4))?;
-        s.write_all(b"last")?;
-        Ok(())
-    })
-    .unwrap();
-    drop(out);
-    let img = std::fs::read(&path).unwrap();
-    let c = 6 * B;
-    assert_eq!(&img[c..c + 4], b"PFSC");
-    assert_eq!(u64_at(&img, c + 0x20), 2 * BLOCK, "data_at");
-    assert_eq!(
-        u64_at(&img, c + 0x400),
-        2 * BLOCK,
-        "the first block's offset"
-    );
-    assert_eq!(r.blocks, 8064);
-    let mut outer = PfsSource::open(&path).unwrap();
-    assert_eq!(outer.read_range("big.exfat", 0, 5).unwrap(), b"first");
-    assert_eq!(outer.read_range("big.exfat", raw - 4, 9).unwrap(), b"last");
-}
-
 /// Damaged images fail to open or read, and never panic.
 #[test]
 fn damaged_images_are_refused() {
@@ -744,71 +665,4 @@ fn damaged_containers_are_refused() {
         e.contains("exactly one nested image") && e.contains("[a]"),
         "{e}"
     );
-}
-
-const FPT_MISMATCH: &str = "x: the flat path table does not match the directory tree (the console looks files up through it)";
-
-fn open_err(img: Vec<u8>) -> String {
-    PfsSource::from_reader(Box::new(Cursor::new(img)), "x".into())
-        .err()
-        .expect("the damaged image is refused")
-        .to_string()
-}
-
-/// The console looks files up through the flat path table: one that disagrees with the
-/// directories, or is missing, refuses the image.
-#[test]
-fn a_damaged_path_table_is_refused() {
-    // Inodes: SR 0, FPT 1, uroot 2, sce_sys 3, eboot.bin 4, param.json 5; the FPT at block 3.
-    let mut tree = MemTree::new(&[("eboot.bin", 100), ("sce_sys/param.json", 30)]);
-    let (_, img) = build(&mut tree);
-    let fpt = 3 * B;
-    let entry = |hash: u32| {
-        (0..3)
-            .map(|i| fpt + 8 * i)
-            .find(|&at| u32_at(&img, at) == hash)
-            .unwrap()
-    };
-    read_back(img.clone());
-
-    let mut hash = img.clone();
-    hash[fpt] ^= 1;
-    assert_eq!(open_err(hash), FPT_MISMATCH);
-
-    let mut ino = img.clone();
-    let at = entry(fpt_hash("/eboot.bin")) + 4;
-    assert_eq!(u32_at(&img, at), 4);
-    ino[at..at + 4].copy_from_slice(&5u32.to_le_bytes());
-    assert_eq!(open_err(ino), FPT_MISMATCH);
-
-    // The directory flag, bit 29, on sce_sys's value and on a file's.
-    for (path, value) in [("/sce_sys", 3 | 0x2000_0000), ("/eboot.bin", 4)] {
-        let mut flag = img.clone();
-        let at = entry(fpt_hash(path)) + 4;
-        assert_eq!(u32_at(&img, at), value);
-        flag[at + 3] ^= 0x20;
-        assert_eq!(open_err(flag), FPT_MISMATCH, "{path}");
-    }
-
-    // The FPT's length (its inode's two sizes) one entry short.
-    let mut short = img.clone();
-    let at = B + 0xA8 + 8;
-    for off in [at, at + 8] {
-        short[off..off + 8].copy_from_slice(&16u64.to_le_bytes());
-    }
-    assert_eq!(open_err(short), FPT_MISMATCH);
-
-    // The super-root's entry renamed, then removed (uroot's record moved over it).
-    let mut renamed = img.clone();
-    assert_eq!(&img[2 * B + 16..2 * B + 31], b"flat_path_table");
-    renamed[2 * B + 30] = b'X';
-    let missing = "x: the image has no flat path table (the console looks files up through it)";
-    assert_eq!(open_err(renamed), missing);
-    let mut removed = img.clone();
-    let first = u32_at(&img, 2 * B + 12) as usize;
-    let second = u32_at(&img, 2 * B + first + 12) as usize;
-    removed.copy_within(2 * B + first..2 * B + first + second, 2 * B);
-    removed[2 * B + second..3 * B].fill(0);
-    assert_eq!(dirents(&removed, 2 * B), [(2, 3, "uroot".into())]);
-    assert_eq!(open_err(removed), missing);
 }

@@ -7,7 +7,7 @@ validates both headers, writes packs (`writer`), measures them without writing
 (`reader`, the packs served as a `SourceTree`). Built without its default `std`
 feature it is `no_std` and keeps only the convention (magics, layout, names,
 `Chunk`, the volume header): the console's runtime, ampr-emu-ng
-(`vendor/ampr_emu/libSceAmpr-zstd.sprx`), reads the packs with that part and
+(`vendor/ampr-emu-ng/libSceAmpr.sprx`), reads the packs with that part and
 decodes the chunks with its own code.
 
 All integers little-endian. CRC = CRC-32 (IEEE, as `crc32fast`).

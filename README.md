@@ -37,7 +37,7 @@ folder.
   place; a folder is written file by file. A `.pkg` or an archive source has to be on this device.
 - **File Transfer** (Connect tab) copies files and folders from any device to a folder on any other, a peer
   to peer copy relayed through this one. It runs beside a conversion, and every file is checked by its size
-  when it lands. Nothing there is ever replaced.
+  when it lands. A name already there is replaced only once you confirm.
 - **Phones and browsers**: in the web UI, File Transfer uploads files from the browser's device or downloads one
   to it.
 
@@ -64,7 +64,7 @@ excepted). ShadowMount+ can update `fakelib/` and replace it: turn that off for 
 The **Storage** tab holds the **Library** (the games found in a folder you choose, or on the PS5's drives)
 and a **File explorer**. Both open a game in Edit or Convert, and the Library deletes one after you confirm. The
 File explorer renames, moves and deletes at once (a delete after you confirm): a delete is permanent (no Trash), a
-move stays on the same drive and never replaces anything, and anything an unfinished job uses is refused. On the
+move stays on the same drive and replaces a name already there (a folder merged) only once you confirm, and anything an unfinished job uses is refused. On the
 PS5, images ShadowMountPlus has mounted are tagged **Mounted** in the File explorer and can't be edited, renamed,
 moved or deleted, and both views show the console's free space.
 

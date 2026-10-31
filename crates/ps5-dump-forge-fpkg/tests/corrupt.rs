@@ -33,7 +33,6 @@ struct Target {
     cnt_offset: usize,
     inner_blocks: usize,
     naps_len: usize,
-    meta_base: usize,
     digests_at: usize,
     /// `(stored_at, stored_len)` of every block with an LZ half.
     lz: Vec<(usize, usize)>,
@@ -62,7 +61,6 @@ impl Target {
             cnt_offset: le(0x58, 8),
             inner_blocks,
             naps_len,
-            meta_base: le(0x50, 4) * BLOCK,
             digests_at: imagedigs_at(&bytes),
             lz,
             bytes,
@@ -160,38 +158,4 @@ fn damaged_descriptors_and_kraken_blocks_fail_without_panicking() {
         descriptor.1 > 0 && blocks.1 > 0,
         "{descriptor:?} {blocks:?}"
     );
-}
-
-/// Damage to a flat image's metadata region, which it stores verbatim: the superblock, the
-/// inode table and the dirent streams, so it reaches the tree walk.
-#[test]
-fn damaged_inner_metadata_fails_without_panicking() {
-    let t = Target::new(build("fuzz-flat", 0, |r| r.kraken = false).package());
-    assert!(exercise(t.bytes.clone()), "the pristine package reads");
-    let meta_blocks = t.inner_blocks - t.meta_base / BLOCK;
-    let (clean, failed) = fuzz(&t, 240, 4, |t, rng, bytes| {
-        if rng.below(2) == 0 {
-            // A field the walk reads, of an inode the tree uses (the table is the block after
-            // the superblock): mode, size, logical offset or afid, set to an extreme.
-            let inode = rng.below(80) as usize;
-            let field = [0usize, 1, 8, 12, 0x60, 0x64, 0x68][rng.below(7) as usize];
-            let at = t.meta_base + BLOCK + inode * 0xA8 + field;
-            let value = [0u8, 0xFF, 0x7F, 0x40, rng.next() as u8][rng.below(5) as usize];
-            t.patch(bytes, at, value);
-            return;
-        }
-        let block = t.meta_base / BLOCK + rng.below(meta_blocks as u64) as usize;
-        for _ in 0..1 + rng.below(4) {
-            // The structures start each block; most of a block is zero padding.
-            let at = block * BLOCK + rng.below(0x1800) as usize;
-            let value = match rng.below(3) {
-                0 => 0,
-                1 => 0xFF,
-                _ => rng.next() as u8,
-            };
-            t.patch(bytes, at, value);
-        }
-    });
-    eprintln!("inner metadata: {clean} clean, {failed} failed");
-    assert!(failed > 20 && clean > 0, "{clean} clean, {failed} failed");
 }

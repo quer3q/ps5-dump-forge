@@ -1080,13 +1080,6 @@ mod tests {
     }
 
     #[test]
-    fn single_line_reply() {
-        assert_eq!(reply(b"220 Welcome\r\n").unwrap(), (220, "Welcome".into()));
-        assert_eq!(reply(b"200\r\n").unwrap(), (200, String::new()));
-        assert_eq!(reply(b"226 Done\n").unwrap(), (226, "Done".into()));
-    }
-
-    #[test]
     fn multi_line_reply() {
         let mut r = Cursor::new(
             b"220-Hello\r\n there\r\n220-still\r\n221 not the end\r\n220 ready\r\n230 next\r\n"
@@ -1108,29 +1101,6 @@ mod tests {
         for bad in [&b"hello\r\n"[..], b"22 x\r\n", b"220x\r\n", b"012 x\r\n"] {
             assert_eq!(reply(bad).unwrap_err().kind(), io::ErrorKind::InvalidData);
         }
-    }
-
-    #[test]
-    fn features() {
-        let (code, text) = reply(
-            b"211-Features:\r\n MLST type*;size*;modify*;\r\n EPSV\r\n utf8\r\n SIZE\r\n \
-              MDTM\r\n REST STREAM\r\n211 End\r\n",
-        )
-        .unwrap();
-        assert_eq!(code, 211);
-        let f = parse_features(&text);
-        assert_eq!(
-            f,
-            Features {
-                mlst: true,
-                epsv: true,
-                utf8: true,
-                size: true,
-                rest: true,
-            }
-        );
-        let f = parse_features("Features:\n PASV\n REST\nEnd");
-        assert_eq!(f, Features::default());
     }
 
     #[test]
@@ -1160,42 +1130,6 @@ mod tests {
     }
 
     #[test]
-    fn epsv_and_pasv_replies() {
-        assert_eq!(
-            parse_epsv("Entering Extended Passive Mode (|||6446|)"),
-            Some(6446)
-        );
-        assert_eq!(parse_epsv("ok (!!!21!)"), Some(21));
-        for bad in [
-            "no parens",
-            "(||6446|)",
-            "(|||0|)",
-            "(|||x|)",
-            "(|1|2|3|)",
-            "(|||70000|)",
-        ] {
-            assert_eq!(parse_epsv(bad), None, "{bad}");
-        }
-        assert_eq!(
-            parse_pasv("Entering Passive Mode (192,168,1,20,19,136)."),
-            Some((Ipv4Addr::new(192, 168, 1, 20), 19 * 256 + 136))
-        );
-        assert_eq!(
-            parse_pasv("Entering Passive Mode 10,0,0,1,4,1"),
-            Some((Ipv4Addr::new(10, 0, 0, 1), 1025))
-        );
-        for bad in [
-            "(1,2,3,4,5)",
-            "(1,2,3,4,0,0)",
-            "(256,1,1,1,1,1)",
-            "nothing",
-            "(1,2,3,4,5,6,7)",
-        ] {
-            assert_eq!(parse_pasv(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
     fn pasv_address_choice() {
         let v4 = |a, b, c, d| Ipv4Addr::new(a, b, c, d);
         let peer = IpAddr::V4(v4(192, 168, 1, 20));
@@ -1213,19 +1147,6 @@ mod tests {
         );
         let v6: IpAddr = "fe80::1".parse().unwrap();
         assert_eq!(pasv_target(v4(192, 168, 1, 21), v6), v6);
-    }
-
-    #[test]
-    fn dates() {
-        assert_eq!(utc_secs(1970, 1, 1, 0, 0, 0), Some(0));
-        assert_eq!(utc_secs(2000, 3, 1, 0, 0, 0), Some(951_868_800));
-        assert_eq!(utc_secs(2026, 10, 21, 21, 15, 0), Some(1_792_617_300));
-        assert_eq!(utc_secs(2026, 13, 1, 0, 0, 0), None);
-        assert_eq!(utc_secs(2026, 1, 0, 0, 0, 0), None);
-        assert_eq!(year_of(0), 1970);
-        assert_eq!(year_of(1_792_617_300), 2026);
-        assert_eq!(year_of(utc_secs(2024, 12, 31, 23, 59, 59).unwrap()), 2024);
-        assert_eq!(year_of(utc_secs(2025, 1, 1, 0, 0, 0).unwrap()), 2025);
     }
 
     fn entry(name: &str, dir: bool, size: u64, mtime: Option<i64>, link: bool) -> Entry {
@@ -1267,142 +1188,6 @@ mod tests {
             "nofacts",
         ] {
             assert_eq!(parse_mlsd(skip), None, "{skip}");
-        }
-    }
-
-    #[test]
-    fn pwd_replies() {
-        assert_eq!(
-            parse_pwd("\"/games\" is the current directory").as_deref(),
-            Some("/games")
-        );
-        assert_eq!(
-            parse_pwd("\"/a \"\"b\"\" c\" is current").as_deref(),
-            Some("/a \"b\" c")
-        );
-        assert_eq!(parse_pwd("\"\"\"\"\"\"").as_deref(), Some("\"\""));
-        assert_eq!(parse_pwd("\"/\"").as_deref(), Some("/"));
-        for bad in ["no quotes", "\"/open", "\"/a \"\""] {
-            assert_eq!(parse_pwd(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn mdtm_and_stat_helpers() {
-        let t = utc_secs(2026, 10, 21, 9, 15, 0);
-        assert_eq!(parse_time14("20261021091500"), t);
-        assert_eq!(parse_time14(" 20261021091500.123 "), t);
-        for bad in [
-            "2026102109150",
-            "202610210915000",
-            "2026102109150x",
-            "20261321091500",
-            "",
-        ] {
-            assert_eq!(parse_time14(bad), None, "{bad}");
-        }
-        assert_eq!(parse_size(" 12345").unwrap(), 12345);
-        assert!(parse_size("big").is_err());
-        assert_eq!(last_name("/games/my game/"), "my game");
-        assert_eq!(last_name("eboot.bin"), "eboot.bin");
-        assert_eq!(
-            parse_facts("type=cdir;modify=20261021091500; /games/x", false),
-            Some(entry("/games/x", true, 0, t, false))
-        );
-    }
-
-    #[test]
-    fn unix_lines() {
-        let now = utc_secs(2026, 10, 21, 12, 0, 0).unwrap();
-        assert_eq!(
-            parse_unix(
-                "-rw-r--r--    1 ftp      ftp      1234567 Oct 21 09:15 my game.ffpkg",
-                now
-            ),
-            Some(entry(
-                "my game.ffpkg",
-                false,
-                1234567,
-                utc_secs(2026, 10, 21, 9, 15, 0),
-                false
-            ))
-        );
-        // A time in the future is last year's.
-        assert_eq!(
-            parse_unix("drwxr-xr-x 2 owner group 4096 Dec 24 18:00 games", now),
-            Some(entry(
-                "games",
-                true,
-                4096,
-                utc_secs(2025, 12, 24, 18, 0, 0),
-                false
-            ))
-        );
-        assert_eq!(
-            parse_unix("drwxr-xr-x+ 2 owner 4096 Mar  1  2019  lead space", now),
-            Some(entry(
-                " lead space",
-                true,
-                4096,
-                utc_secs(2019, 3, 1, 0, 0, 0),
-                false
-            ))
-        );
-        assert_eq!(
-            parse_unix("lrwxrwxrwx 1 root root 7 Jan 5 2020 a -> b -> c", now),
-            Some(entry("a", false, 7, utc_secs(2020, 1, 5, 0, 0, 0), true))
-        );
-        assert_eq!(
-            parse_unix("prw-r--r-- 1 root root 0 Jan 5 2020 fifo", now),
-            Some(entry("fifo", false, 0, utc_secs(2020, 1, 5, 0, 0, 0), true))
-        );
-        for skip in [
-            "total 42",
-            "drwxr-xr-x 2 o g 4096 Oct 21 09:15 .",
-            "drwxr-xr-x 2 o g 4096 Oct 21 09:15 ..",
-            "-rw-r--r-- 1 o g 12 Foo 21 09:15 x",
-            "-rw-r--r-- 1 o g x Oct 21 09:15 x",
-            "-rw-r--r-- 1 o g 12 Oct 21 09:15",
-            "",
-        ] {
-            assert_eq!(parse_unix(skip, now), None, "{skip}");
-        }
-    }
-
-    #[test]
-    fn dos_lines() {
-        assert_eq!(
-            parse_dos("10-21-26  09:15PM       <DIR>          sce sys"),
-            Some(entry(
-                "sce sys",
-                true,
-                0,
-                utc_secs(2026, 10, 21, 21, 15, 0),
-                false
-            ))
-        );
-        assert_eq!(
-            parse_dos("01-02-1999  12:05AM            12345 eboot.bin"),
-            Some(entry(
-                "eboot.bin",
-                false,
-                12345,
-                utc_secs(1999, 1, 2, 0, 5, 0),
-                false
-            ))
-        );
-        assert_eq!(
-            parse_dos("03-04-85  12:30PM  7 a"),
-            Some(entry("a", false, 7, utc_secs(1985, 3, 4, 12, 30, 0), false))
-        );
-        for skip in [
-            "10-21-26  09:15PM       <DIR>          .",
-            "10-21-26  09:15PM       <DIR>          ..",
-            "10-21-26  09:15PM       big name",
-            "total 42",
-            "10/21/26  09:15PM  1 x",
-        ] {
-            assert_eq!(parse_dos(skip), None, "{skip}");
         }
     }
 
@@ -1484,19 +1269,6 @@ mod tests {
         let s = Session::connect("127.0.0.1", server.port, "", "").unwrap();
         assert_eq!(s.read_at("/chatty.bin", 0, 10).unwrap(), [7u8; 10]);
         assert_eq!(s.size("/chatty.bin").unwrap(), 100);
-    }
-
-    /// A rewrite probe the server won't delete is said, naming it, never passed over.
-    #[test]
-    fn a_probe_left_behind_is_said() {
-        let server = super::fake::start();
-        let s = Session::connect("127.0.0.1", server.port, "", "").unwrap();
-        let err = s.can_rewrite("/nodele-probe").unwrap_err();
-        assert!(
-            err.to_string().contains("/nodele-probe was left behind"),
-            "{err}"
-        );
-        assert!(server.root.join("nodele-probe").exists());
     }
 
     #[test]

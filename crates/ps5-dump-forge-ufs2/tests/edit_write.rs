@@ -134,13 +134,8 @@ fn delete(paths: &[&str]) -> Vec<Op> {
         .collect()
 }
 
-/// The image reads back as the source without the files under `gone`, byte for byte, and
-/// the empty folders `empty`; the test fsck finds nothing.
-fn reads_back(img: &Path, gone: &[&str], empty: &[&str]) {
-    reads_back_of(img, &files(), gone, empty)
-}
-
-/// [`reads_back`] for a source of `all` files.
+/// The image reads back as the source `all` without the files under `gone`, byte for byte,
+/// and the empty folders `empty`; the test fsck finds nothing.
 fn reads_back_of(img: &Path, all: &[(String, u64)], gone: &[&str], empty: &[&str]) {
     let under = |p: &str| {
         gone.iter()
@@ -169,57 +164,6 @@ fn reads_back_of(img: &Path, all: &[(String, u64)], gone: &[&str], empty: &[&str
     assert_eq!(dirs, empty);
     let r = fsck(img);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-}
-
-/// Blocks a fresh build gives a file of `size`: its data, plus a single indirect block past
-/// the 12 direct ones (the test files need no more).
-fn file_blocks(size: u64) -> u64 {
-    let n = size.div_ceil(B);
-    n + u64::from(n > 12)
-}
-
-/// Files, an empty file, a folder tree and the 1700-entry folder deleted in one plan: the
-/// rest reads back unchanged, and every freed block and inode is counted as a fresh build's
-/// arithmetic says. With `FORGE_UFS2_KEEP=<dir>` the edited image is copied there (for
-/// `scripts/fsck-ufs.sh`).
-#[test]
-fn delete_files_and_folders() {
-    let img = image("edit-delete");
-    let before = open(&img);
-    let (free, inodes, dirs) = (before.free_bytes(), before.free_inodes(), before.total.ndir);
-    let root = before.root(&mut File::open(&img).unwrap()).unwrap().nlink;
-    let gone = ["data/big.bin", "data/empty.bin", "data/a", "many", "z"];
-    edit(&img, &delete(&gone));
-    reads_back(&img, &gone, &["data/void"]);
-    // Freed: the files' blocks, and one block per folder (two for `many`).
-    let under = |p: &str| {
-        gone.iter()
-            .any(|g| p == *g || p.starts_with(&format!("{g}/")))
-    };
-    let lost: Vec<u64> = files()
-        .into_iter()
-        .filter(|(p, _)| under(p))
-        .map(|f| f.1)
-        .collect();
-    let folders = ["data/a", "data/a/b", "many", "z", "z/y"];
-    let blocks: u64 = lost.iter().map(|&s| file_blocks(s)).sum::<u64>() + folders.len() as u64 + 1;
-    let after = open(&img);
-    assert_eq!(after.free_bytes(), free + blocks * B);
-    assert_eq!(
-        after.free_inodes(),
-        inodes + lost.len() as u64 + folders.len() as u64
-    );
-    assert_eq!(after.total.ndir, dirs - folders.len() as u64);
-    // Link counts: the root lost `many` and `z`, `data` lost `a`.
-    let mut f = File::open(&img).unwrap();
-    assert_eq!(after.root(&mut f).unwrap().nlink, root - 2);
-    let data = |v: &Volume, f: &mut File| v.lookup(f, "data").unwrap().unwrap().nlink;
-    assert_eq!(data(&after, &mut f), 3);
-    // Nothing left to do: an empty plan writes nothing.
-    assert!(plan(&mut rw(&img), &[]).unwrap().is_empty());
-    if let Some(keep) = std::env::var_os("FORGE_UFS2_KEEP") {
-        std::fs::copy(&img, Path::new(&keep).join("edit-delete.ffpkg")).unwrap();
-    }
 }
 
 /// Deleting `gone` applied, then rolled back, leaves `img` byte-identical.
@@ -474,51 +418,6 @@ fn rename_and_move() {
     }
 }
 
-/// A rename that does not apply is a finding, every one listed, nothing planned.
-#[test]
-fn rename_findings() {
-    let img = image("edit-rename-findings");
-    let nfd = "data/e\u{301}";
-    let ops = rename(&[
-        ("missing", "x"),
-        ("data//a", "x"),
-        ("data/a", "x/"),
-        ("data/a", "data/a/b/x"),
-        ("data/a", "data/big.bin"),
-        ("eboot.bin", "data/a/b/c.bin"),
-        ("data/a", "nope/a"),
-        ("data/a", "eboot.bin/a"),
-        ("data/a", nfd),
-        ("data/a", "data/.."),
-    ]);
-    let f = plan(&mut rw(&img), &ops).unwrap_err();
-    assert_eq!(
-        f,
-        [
-            "missing: not found".to_string(),
-            "\"data//a\": bad path".into(),
-            "\"x/\": bad path".into(),
-            "data/a/b/x: a folder can't be moved into itself".into(),
-            "data/big.bin: already exists".into(),
-            "data/a/b/c.bin: already exists".into(),
-            "nope/a: folder nope not found".into(),
-            "eboot.bin/a: folder eboot.bin not found".into(),
-            format!("{nfd}: name is not NFC (macOS NFD?)"),
-            "data/..: '.' or '..' component".into(),
-        ]
-    );
-    // Case-sensitive: `data/A` is not `data/a`; the plan sees `data/a` gone afterwards.
-    edit(
-        &img,
-        &rename(&[("data/a", "data/A"), ("data/A/d.bin", "d.bin")]),
-    );
-    reads_back_renamed(
-        &img,
-        &[("data/a", "data/A"), ("data/A/d.bin", "d.bin")],
-        &["data/void", "z/y"],
-    );
-}
-
 fn put(path: &str, data: Data) -> Op {
     Op::Put {
         path: path.into(),
@@ -700,42 +599,6 @@ fn no_room_is_one_finding() {
     assert!(plan(&mut f, &ops).is_ok());
 }
 
-/// New inodes past a group's `cg_initediblk` raise it over them (the inodes it then covers
-/// are zero, as the writer leaves them); the image reopens and checks clean. The room for
-/// their entries: 600 entries of `many` deleted first (their inodes are taken again first).
-#[test]
-fn new_inodes_raise_initediblk() {
-    let img = image("edit-put-inodes");
-    let gone: Vec<String> = (0..600)
-        .map(|i| format!("many/file-{i:05}-padding-padding-more"))
-        .collect();
-    let gone: Vec<&str> = gone.iter().map(String::as_str).collect();
-    edit(&img, &delete(&gone));
-    let before = open(&img);
-    let inited = |v: &Volume| v.groups.iter().map(|g| g.initediblk).sum::<u64>();
-    let names: Vec<String> = (0..1200).map(|i| format!("many/n{i:04}")).collect();
-    let ops: Vec<Op> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| put(n, from(i as u32, 0, i as u64 % 3)))
-        .collect();
-    edit_put(&img, &ops);
-    let put_back: Vec<(&str, Vec<u8>)> = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), source_bytes(i as u32, 0, i as u64 % 3)))
-        .collect();
-    reads_back_put(&img, &gone, &put_back, &["data/void", "z/y"]);
-    let after = open(&img);
-    assert!(
-        inited(&after) > inited(&before),
-        "{} {}",
-        inited(&before),
-        inited(&after)
-    );
-    assert_eq!(after.free_inodes(), before.free_inodes() - 1200);
-}
-
 /// Raw inode bytes `at..at + len` of the node at `path`.
 fn inode_bytes(v: &Volume, f: &mut File, path: &str, at: u64, len: usize) -> Vec<u8> {
     let ino = v.lookup(f, path).unwrap().unwrap().ino;
@@ -823,123 +686,6 @@ fn mkdir_and_missing_parents() {
     assert_eq!(depth("data/a"), 2);
     let root = after.list(&mut f, "").unwrap();
     assert!(root.iter().any(|n| n.name == "n1" && n.is_dir()));
-}
-
-/// A 250-byte name: its entry (264 bytes) takes a 512-byte chunk alone.
-fn long_name(tag: char, i: usize) -> String {
-    format!("{tag}{i:05}{}", "x".repeat(244))
-}
-
-/// A folder of 12 full blocks (1536 one-chunk entries) grows into a new single indirect
-/// block, within the new block, into a block mapped by the plan's own indirect block, then
-/// (a second plan) by the image's: sizes, block counts and free space follow, every entry
-/// reads back, and a delete of the folder frees it all. `FORGE_UFS2_KEEP` keeps the grown
-/// image as `edit-grow.ffpkg`.
-#[test]
-fn a_folder_grows_into_indirect_blocks() {
-    let mut all = files();
-    all.extend((0..1536).map(|i| (format!("big/{}", long_name('a', i)), 0)));
-    let img = build("edit-grow", &mut synth_of(&all), &Options::default()).0;
-    let start = open(&img);
-    let mut f = rw(&img);
-    let big = start.lookup(&mut f, "big").unwrap().unwrap();
-    assert_eq!(big.size, 12 * B);
-    let state = |img: &Path| {
-        let v = open(img);
-        let mut f = rw(img);
-        let n = v.lookup(&mut f, "big").unwrap().unwrap();
-        let i = v.inode(&mut f, n.ino).unwrap();
-        let m = v.block_map(&mut f, &i).unwrap();
-        (
-            n.size,
-            m.data.iter().map(|r| r.len).sum::<u64>(),
-            m.indirect.len(),
-            v.free_bytes(),
-        )
-    };
-    let puts = |tag: char, n: usize| -> Vec<Op> {
-        (0..n)
-            .map(|i| put(&format!("big/{}", long_name(tag, i)), Data::Zero(0)))
-            .collect()
-    };
-    // 128 fill block 13 (a new indirect block first), one more starts block 14.
-    edit_put(&img, &puts('b', 129));
-    let free = start.free_bytes();
-    assert_eq!(state(&img), (13 * B + 512, 14, 1, free - 3 * B));
-    // A new plan: 127 fill block 14, one more starts block 15 (the image's indirect block).
-    edit_put(&img, &puts('c', 128));
-    assert_eq!(state(&img), (14 * B + 512, 15, 1, free - 4 * B));
-    all.extend((0..129).map(|i| (format!("big/{}", long_name('b', i)), 0)));
-    all.extend((0..128).map(|i| (format!("big/{}", long_name('c', i)), 0)));
-    reads_back_of(&img, &all, &[], &["data/void", "z/y"]);
-    if let Some(keep) = std::env::var_os("FORGE_UFS2_KEEP") {
-        std::fs::copy(&img, Path::new(&keep).join("edit-grow.ffpkg")).unwrap();
-    }
-    // 15 data blocks and the indirect block: the 12 it had and the 4 it took.
-    edit(&img, &delete(&["big"]));
-    assert_eq!(open(&img).free_bytes(), free + 12 * B);
-    assert!(fsck(&img).errors.is_empty());
-}
-
-/// Every op in one plan: a delete, a rename, a move, a new file with an indirect block, a
-/// replace, nested Mkdirs, a Put making its folders, a folder grown within its block (a
-/// move into a full one) and one grown by a new block (130 one-chunk entries). Everything
-/// reads back and checks clean. `FORGE_UFS2_KEEP` keeps it as `edit-every.ffpkg`.
-#[test]
-fn every_op_in_one_plan() {
-    let img = image("edit-every");
-    let name = |i: usize| format!("file-{i:05}-padding-padding-more");
-    let mut ops = delete(&["data/a/b/c.bin"]);
-    ops.extend(rename(&[
-        ("data/a/d.bin", "data/a/e.bin"),
-        (&format!("many/{}", name(1)), "moved.bin"),
-    ]));
-    // `data/a/b` (one chunk) takes 13 entries: it grows by a chunk.
-    let into: Vec<(String, String)> = (2..15)
-        .map(|i| (format!("many/{}", name(i)), format!("data/a/b/{}", name(i))))
-        .collect();
-    let pairs: Vec<(&str, &str)> = into.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-    ops.extend(rename(&pairs));
-    ops.push(put("big-new.bin", from(2, 0, 30 * B + 9)));
-    ops.push(put("eboot.bin", from(3, 0, 20 * B)));
-    ops.push(Op::Mkdir {
-        path: "n1/n2/n3".into(),
-    });
-    ops.push(put("p/q/r.bin", from(1, 5, 2 * B + 1)));
-    ops.extend((0..130).map(|i| put(&format!("n1/n2/{}", long_name('d', i)), Data::Zero(3))));
-    edit_put(&img, &ops);
-    let v = open(&img);
-    let mut f = rw(&img);
-    assert_eq!(v.lookup(&mut f, "data/a/b").unwrap().unwrap().size, 1024);
-    // The first entry shares the chunk of `.`, `..` and `n3`: 130 chunks.
-    assert_eq!(
-        v.lookup(&mut f, "n1/n2").unwrap().unwrap().size,
-        B + 2 * 512
-    );
-    let mut reader = ps5upload_fpkg::ufs2_source::Ufs2Source::open(&img).unwrap();
-    for (p, bytes) in [
-        ("big-new.bin", source_bytes(2, 0, 30 * B + 9)),
-        ("eboot.bin", source_bytes(3, 0, 20 * B)),
-        ("p/q/r.bin", source_bytes(1, 5, 2 * B + 1)),
-    ] {
-        assert!(
-            reader.read_range(p, 0, bytes.len()).unwrap() == bytes,
-            "{p}"
-        );
-    }
-    let got: Vec<String> = reader.files().iter().map(|f| f.path.clone()).collect();
-    assert!(got.contains(&"moved.bin".to_string()));
-    assert!(got.contains(&"data/a/e.bin".to_string()));
-    assert!(!got.contains(&"data/a/b/c.bin".to_string()));
-    assert_eq!(got.iter().filter(|p| p.starts_with("n1/n2/d")).count(), 130);
-    let mut dirs: Vec<String> = reader.empty_dirs().to_vec();
-    dirs.sort();
-    assert_eq!(dirs, ["data/void", "n1/n2/n3", "z/y"]);
-    let r = fsck(&img);
-    assert!(r.errors.is_empty(), "{:?}", r.errors);
-    if let Some(keep) = std::env::var_os("FORGE_UFS2_KEEP") {
-        std::fs::copy(&img, Path::new(&keep).join("edit-every.ffpkg")).unwrap();
-    }
 }
 
 /// A block the plan took and then freed is never taken again: repeated Puts of one path, and

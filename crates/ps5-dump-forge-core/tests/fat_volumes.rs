@@ -244,6 +244,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         replace: false,
         edit_rebuild: false,
         install: None,
+        delete_source: false,
         archive_password: None,
     }
 }

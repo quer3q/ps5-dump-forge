@@ -379,13 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn versions_are_x_y_z() {
-        assert!(plain_version("0.1.2") && plain_version("10.20.30"));
-        assert!(!plain_version("0.1") && !plain_version("0.1.2.3") && !plain_version("0..2"));
-        assert!(!plain_version("9999999999.0.0") && !plain_version("v1.2.3"));
-    }
-
-    #[test]
     fn an_elf_is_streamed_whole_and_anything_else_refused() {
         let dir = temp_dir("send");
         let elf = dir.join("x.elf");

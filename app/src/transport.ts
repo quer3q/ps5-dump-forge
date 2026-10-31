@@ -2,7 +2,7 @@
 // alias (vite.config.ts): transport-tauri.tsx (the app, `npm run build`) and
 // transport-http.tsx (the PS5 web UI, `npm run build:http`). Types only here.
 
-import type { JobId, PackageScan } from "./api";
+import type { JobId, PackageScan, SpeedTest } from "./api";
 
 export type Unlisten = () => void;
 
@@ -141,4 +141,13 @@ export interface Transport {
   /** Asks the paired PS5 `keyId` to install this device's `.pkg` at `path`: Tauri
    * `connect_install {keyId, path}`, `POST /api/connect/install {key_id, path}`; its job id there. */
   connectInstall(keyId: string, path: string): Promise<JobId>;
+  /** Times the link to the paired device `keyId` (256 MiB sent, then fetched, over FLINK's
+   * lanes; nothing on disk), `run` the UI's id for it: Tauri `connect_speed_test {keyId, run}`,
+   * `POST /api/connect/speed_test {key_id, run}`. Rejects with the backend's text (an older
+   * peer: "...is older: update it..."). */
+  connectSpeedTest(keyId: string, run: string): Promise<SpeedTest>;
+  /** Stops the speed test `run` with `keyId` (it rejects with "cancelled"; a run not started yet
+   * does so as it starts): Tauri `connect_speed_test_cancel {keyId, run}`,
+   * `POST /api/connect/speed_test_cancel {key_id, run}`. */
+  connectSpeedTestCancel(keyId: string, run: string): Promise<void>;
 }

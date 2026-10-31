@@ -13,6 +13,10 @@
 int sceAppInstUtilInitialize(void);
 int sceAppInstUtilTerminate(void);
 int sceAppInstUtilAppInstallAll(void *);
+/* installer.c: the one lock every sceAppInstUtil user holds; nonzero when an install keeps
+ * the library initialized. */
+int forge_appinst_begin(void);
+void forge_appinst_end(void);
 typedef int (*install_title_fn)(const char *title_id, const char *dir, void *reserved);
 
 int ps5_register_title(const char *title_id) {
@@ -27,7 +31,9 @@ int ps5_register_title(const char *title_id) {
     // title-specific function can't be resolved.
     const char *method = install_title ? "AppInstallTitleDir" : "AppInstallAll";
 
-    int result = sceAppInstUtilInitialize();
+    // Serialized with installs (installer.c); one an install initialized is used as it is.
+    int kept = forge_appinst_begin();
+    int result = kept ? 0 : sceAppInstUtilInitialize();
     if (result != 0) {
         printf("ps5-dump-forge serve: home-screen tile %s: sceAppInstUtilInitialize: 0x%x\n",
                title_id, (unsigned)result);
@@ -36,8 +42,9 @@ int ps5_register_title(const char *title_id) {
                                : sceAppInstUtilAppInstallAll(NULL);
         printf("ps5-dump-forge serve: home-screen tile %s: %s: 0x%x\n", title_id, method,
                (unsigned)result);
-        sceAppInstUtilTerminate();
+        if (!kept) sceAppInstUtilTerminate();
     }
+    forge_appinst_end();
     fflush(stdout);
     return result;
 }

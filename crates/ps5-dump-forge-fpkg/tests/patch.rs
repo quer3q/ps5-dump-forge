@@ -3,8 +3,8 @@
 
 mod common;
 
-use common::{BIG, assert_matches, build};
-use ps5_dump_forge_fpkg::{FpkgSource, is_patch};
+use common::{BIG, build};
+use ps5_dump_forge_fpkg::FpkgSource;
 use ps5upload_fpkg::BLOCK;
 use ps5upload_fpkg::source::SourceTree;
 
@@ -47,19 +47,6 @@ fn patch_of(pkg: &[u8], omit: &[usize]) -> Vec<u8> {
         out[at..at + 8].copy_from_slice(&v.to_le_bytes());
     }
     out
-}
-
-#[test]
-fn a_patch_with_every_block_reads_as_its_package() {
-    let built = build("patch-all", 0, |_| {});
-    let path = built.path.with_extension("patch.pkg");
-    std::fs::write(&path, patch_of(&built.package(), &[])).unwrap();
-    assert!(is_patch(&path) && !is_patch(&built.path));
-    let mut source = FpkgSource::open(&path, None).unwrap();
-    assert!(source.is_patch());
-    assert_matches(&mut source, &built);
-    let details = source.details().join("\n");
-    assert!(details.contains("patch package (LIH)"), "{details}");
 }
 
 #[test]

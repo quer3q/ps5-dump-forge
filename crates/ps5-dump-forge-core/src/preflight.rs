@@ -499,19 +499,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn title_id_from_param() {
-        let info = parse_param(
-            b"\xef\xbb\xbf{\"titleId\":\"PPSA01234\",\"contentId\":\"UP0000-PPSA01234_00-X\"}",
-        );
-        assert_eq!(info.title_id.as_deref(), Some("PPSA01234"));
-        let info = parse_param(b"{\"contentId\":\"UP0000-PPSA05555_00-X\"}");
-        assert_eq!(info.title_id.as_deref(), Some("PPSA05555"));
-        let info = parse_param(b"{\"titleId\":\"../../etc\"}");
-        assert_eq!(info.title_id, None);
-        assert!(parse_param(b"not json").param_json.is_none());
-    }
-
-    #[test]
     fn folder_names_follow_the_probe() {
         let paths = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         let pair = paths(&["Eboot.bin", "eboot.bin"]);

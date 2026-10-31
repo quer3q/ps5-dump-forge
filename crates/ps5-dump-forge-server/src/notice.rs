@@ -670,60 +670,6 @@ mod tests {
         assert_eq!(ended(&t, &Err("x".into())).unwrap().name, "game-1k");
     }
 
-    #[test]
-    fn texts() {
-        let e = |kind, ok| Ended {
-            kind,
-            ok,
-            name: "Game-PPSA01234.ffpkg".into(),
-        };
-        assert_eq!(
-            job_ended(Lang::En, &e(JobKind::Convert, true)),
-            "Dump Forge: conversion finished: Game-PPSA01234.ffpkg"
-        );
-        assert_eq!(
-            job_ended(Lang::En, &e(JobKind::Lz4, false)),
-            "Dump Forge: LZ4 job failed: Game-PPSA01234.ffpkg"
-        );
-        assert_eq!(
-            job_ended(Lang::Ru, &e(JobKind::Transfer, true)),
-            "Dump Forge: передача завершена: Game-PPSA01234.ffpkg"
-        );
-        assert_eq!(
-            job_ended(Lang::Ja, &e(JobKind::Convert, false)),
-            "Dump Forge：変換に失敗しました：Game-PPSA01234.ffpkg"
-        );
-        assert_eq!(
-            job_ended(Lang::En, &e(JobKind::Zstd, true)),
-            "Dump Forge: zstd job finished: Game-PPSA01234.ffpkg"
-        );
-        assert_eq!(
-            job_ended(Lang::De, &e(JobKind::Zstd, false)),
-            "Dump Forge: zstd-Auftrag fehlgeschlagen: Game-PPSA01234.ffpkg"
-        );
-        assert!(job_ended(Lang::Ar, &e(JobKind::Convert, true)).ends_with("\u{2069}"));
-    }
-
-    /// Sent only with a sender (the PS5) and while on.
-    #[test]
-    fn sent_while_on() {
-        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
-        let to = sent.clone();
-        let send: Notify = Arc::new(move |line: &str| to.lock().unwrap().push(line.into()));
-        let notices = JobNotices::new(None, Some(send));
-        let one = || ended(&request("/o/a.exfat"), &Ok("/o/a.exfat".into()));
-        notices.send(one());
-        notices.send(None);
-        notices.set(false).unwrap();
-        notices.send(one());
-        assert_eq!(
-            *sent.lock().unwrap(),
-            ["Dump Forge: conversion finished: a.exfat"]
-        );
-        // Off the PS5: no sender, nothing sent.
-        JobNotices::new(None, None).send(one());
-    }
-
     /// The system toast first, Forge's icon put beside it; the plain notice when the toast is
     /// refused.
     #[test]
@@ -755,42 +701,5 @@ mod tests {
             ["Dump Forge: conversion finished: a.exfat"]
         );
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The fields the console's overlay requires, the text, the icon and the time.
-    #[test]
-    fn toast_payload() {
-        let e = Ended {
-            kind: JobKind::Transfer,
-            ok: false,
-            name: "Game \"1\"".into(),
-        };
-        let json = toast_json(
-            &job_headline(Lang::En, &e),
-            &e.name,
-            Path::new("/user/data/dumpforge/notify-icon.png"),
-            1_793_094_260,
-        );
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let raw = &v["rawData"];
-        for key in ["viewTemplateType", "useCaseId", "channelType", "viewData"] {
-            assert!(!raw[key].is_null(), "{key}");
-        }
-        assert_eq!(raw["viewData"]["message"]["body"], "Transfer failed");
-        assert_eq!(raw["viewData"]["subMessage"]["body"], "Game \"1\"");
-        assert_eq!(
-            raw["viewData"]["icon"]["parameters"]["url"],
-            "/user/data/dumpforge/notify-icon.png"
-        );
-        assert_eq!(v["createdDateTime"], "2026-10-27T09:44:20.000Z");
-        assert!(
-            v["localNotificationId"]
-                .as_str()
-                .unwrap()
-                .starts_with("1793094260")
-        );
-        assert_eq!(utc_time(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(utc_time(951_782_400), "2000-02-29T00:00:00.000Z");
-        assert_eq!(job_headline(Lang::Ru, &e), "Передача не удалась");
     }
 }

@@ -403,6 +403,9 @@ const it: Messages = {
     inStep: (time) => `${time} in questo passaggio`,
     result: (bytes, n) => `${bytes}, ${num(n)} ${plural(n, FILES)} →`,
     outputPath: "Percorso di output",
+    sourceDeleted: (v) => `Sorgente eliminata: ${v}`,
+    sourceKept: (v) => `Sorgente mantenuta: ${v}`,
+    sourcePartlyDeleted: (v) => `Sorgente eliminata in parte: ${v}`,
     checks: "Controlli",
     verifiedPlain: (n) => `Verificato: ${num(n)} ${plural(n, { one: "controllo superato", many: "controlli superati", other: "controlli superati" })}`,
     verifiedFull: (n) => `Verifica completa superata: ${num(n)} ${plural(n, CHECKS)}`,
@@ -545,9 +548,8 @@ const it: Messages = {
           ? "Riscrive i pacchetti zstd come file normali."
           : "Impacchetta gli asset del gioco in volumi zstd."
         : packed
-          ? "Sperimentale. Riscrive i pacchetti LZ4 come file normali."
-          : "Sperimentale: alcuni giochi potrebbero non avviarsi. Impacchetta gli asset del gioco in volumi LZ4.",
-    chooseGame: "Scegli prima un gioco.",
+          ? "Riscrive i pacchetti LZ4 come file normali."
+          : "Alcuni giochi potrebbero non avviarsi. Impacchetta gli asset del gioco in volumi LZ4.",
     noAmprGame: (e) => `Questo gioco non usa AMPR, quindi i pacchetti ${e === "zstd" ? "zstd" : "LZ4"} non si possono usare.`,
     patch: "Un pacchetto di patch non si può impacchettare.",
     additionalContent: "Il contenuto aggiuntivo (senza eboot.bin) non si può impacchettare.",
@@ -596,8 +598,6 @@ const it: Messages = {
     already: (a, fmt) => a === "pack"
       ? <>Questo gioco è già in scrittura come <b>{fmt}</b>; impacchettandolo di nuovo ottieni una seconda copia.</>
       : <>Questo gioco è già in scrittura come <b>{fmt}</b>; spacchettandolo di nuovo ottieni una seconda copia.</>,
-    emptyTitle: "Scegli un gioco che usa AMPR",
-    experimental: "Sperimentale: conserva una copia del gioco originale.",
     source: "Sorgente",
   },
   // PackHelp.tsx
@@ -615,7 +615,7 @@ const it: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>Sperimentale</b>: alcuni giochi potrebbero non avviarsi. Conserva una copia.</li>
+          <li><b>Alcuni giochi potrebbero non avviarsi.</b> Conserva una copia.</li>
           <li>Impacchetta in volumi LZ4, in una cartella o in un'immagine: <b>Veloce</b> (LZ4), <b>Medio</b> (HC 9), <b>Massimo</b> (HC 12).</li>
           <li>Runtime: <b>ampr-emu-ng</b> (predefinito) o l'<b>ampr_emu</b> originale.</li>
           <li>Un gioco impacchettato mostra <b>Spacchetta</b>.</li>
@@ -812,6 +812,7 @@ const it: Messages = {
       },
     },
     innerFfpkg: { text: "Il file system della PS5 (UFS2)." },
+    innerExfat: { tone: "good", text: "Consigliato. L'immagine più stabile in un contenitore compresso." },
     level0: { text: "Nessuna compressione: ogni blocco viene salvato così com'è. Il file è grande quanto l'immagine." },
     levelDefault: {
       tone: "good",
@@ -850,6 +851,9 @@ const it: Messages = {
     compression: "Compressione",
     fullVerify: "Verifica completa",
     fullVerifyHint: "Rilegge ogni byte per controllare l'output. Richiede più tempo.",
+    deleteSource: "Elimina la sorgente",
+    deleteSourceHint: "Non si può annullare. La sorgente viene eliminata solo dopo una conversione riuscita.",
+    deleteSourceNas: "Un gioco su un NAS non si può eliminare da qui.",
     separator: "Un nome non può contenere un separatore di cartella; usa “Cambia” per la cartella.",
     badName: "Un nome non può essere vuoto, iniziare con un punto, finire con un punto o uno spazio, né contenere caratteri di controllo.",
     tooLong: (bytes, max, folder) =>
@@ -1013,6 +1017,13 @@ const it: Messages = {
       "“Trasferimento file” copia file e cartelle tra uno qualsiasi di essi. Un nome che esiste già lì viene sostituito solo dopo la tua conferma.",
     ],
     helpSecurity: "Niente di ciò che viene inviato tra i dispositivi è cifrato: chiunque sulla tua rete può leggerlo. La password salvata di un NAS resta su questo dispositivo non cifrata. Usa Connetti solo sulla rete di casa.",
+    helpSpeed: "“Test di velocità”, nella riga di un dispositivo abbinato o nei suoi dettagli, gli invia 128 MiB e ne riceve 128 MiB, senza scrivere nulla su disco, e mostra la velocità della rete in ciascuna direzione.",
+    speedTest: "Test di velocità",
+    speedTestWith: (name) => `Test di velocità con ${name}`,
+    speedTesting: "Test in corso",
+    speedResult: (up, down) => `Invio ${up} MB/s · Ricezione ${down} MB/s`,
+    speedFailed: "Test di velocità non riuscito:",
+    speedNote: "Invia 128 MiB e ne riceve 128 MiB; non viene scritto nulla su disco.",
     installTitle: "Dump Forge sulla PS5",
     ps5Address: "Indirizzo della PS5",
     install: "Installa sulla PS5",

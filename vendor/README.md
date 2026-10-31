@@ -58,7 +58,7 @@ descriptor bounds, `SourceTree: Send`, `.Trashes`, strict names, no silent UFS2 
 
 `ampr_emu/` (next to the vendored crates, not patched Rust) holds the unmodified `ampr_emu` 0.4.2.1 runtime binaries and source archive that `ps5-dump-forge-lz4` embeds; see its `README.md`.
 
-`ampr-emu-ng/` holds the unmodified ampr-emu-ng v0.1.0 release binaries (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`, `SHA256SUMS`) and the tagged source archive; nothing embeds them yet; see its `README.md`.
+`ampr-emu-ng/` holds the unmodified ampr-emu-ng v0.1.0 release binaries (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`, `SHA256SUMS`) and the tagged source archive; `ps5-dump-forge-lz4` embeds `libSceAmpr.sprx` (stored zstd-compressed by `crates/ps5-dump-forge-lz4/build.rs`, the path an upgrade changes; decoded by `runtime::zstd()`), the debug build is kept for reference; see its `README.md`.
 
 ## lzma-rust2
 

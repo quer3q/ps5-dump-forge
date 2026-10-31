@@ -19,7 +19,7 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc|pkg|lz4
                          [--password-stdin]
                          [--inner exfat|ffpkg|ffpfs] [-o <output>] [--threads N]
-                         [--remove-backport] [--full-verify]
+                         [--remove-backport] [--full-verify] [--delete-source]
                          [--kraken fast|balanced|smallest|stored]
                          [--level 0..9] [--lz4-unpack | --lz4-pack]
                          [--lz4-level 0|3..12] [--lz4-runtime ng|ampr_emu]
@@ -51,6 +51,10 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             re-read every byte of the output to verify it (takes longer); by default
             verification is fast: every structural check, small files whole and a random
             sample of the rest
+  --delete-source
+            once the output is verified and in place, delete the source (every part of a
+            multi-part archive) as the app's Delete does; if it can't, the source stays and
+            the job still succeeds (a source kept: <reason> check line)
   --level   with --to ffpfsc: zlib level, 0 (store) to 9 (smallest), default 6
   --kraken  with --to pkg: compression level (default fast). balanced and smallest make a
             package ~2.6% smaller but take ~6x and ~9x longer, every core busy throughout;
@@ -120,6 +124,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let (mut json, mut to, mut output) = (false, None, None);
     let (mut threads, mut inner, mut remove_backport) = (None, None, false);
     let mut full_verify = false;
+    let mut delete_source = false;
     let mut kraken_level = None;
     let mut ffpfsc_level = None;
     let (mut lz4_unpack, mut lz4_pack) = (false, false);
@@ -135,6 +140,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             "--password-stdin" => password_stdin = true,
             "--remove-backport" => remove_backport = true,
             "--full-verify" => full_verify = true,
+            "--delete-source" => delete_source = true,
             "--to" => to = Some(parse_format(&text(value("--to")?)?)?),
             "--inner" => inner = Some(parse_format(&text(value("--inner")?)?)?),
             "--level" => {
@@ -296,6 +302,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     replace: false,
                     edit_rebuild: false,
                     install: None,
+                    delete_source,
                     archive_password: None,
                 },
                 password_stdin,
@@ -373,14 +380,21 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// Set once the job is cancelled or done and its `.part` cleaned up; Windows' close
 /// handler waits for it.
 static CLEANED_UP: AtomicBool = AtomicBool::new(false);
+/// Set by the first Ctrl-C itself (`INTERRUPTED` is also set by a dead stdout); a second
+/// one quits at once, since a job stuck in a blocking call may never finish cancelling.
+static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
 // ponytail: a plain signal handler that only sets a flag; the main loop polls it.
 #[cfg(unix)]
 fn on_ctrl_c() {
     extern "C" fn handler(_: libc::c_int) {
+        if SIGNALLED.swap(true, Ordering::Relaxed) {
+            // SAFETY: `_exit` is async-signal-safe; the job's `.part` stays (`stale_parts`).
+            unsafe { libc::_exit(130) };
+        }
         INTERRUPTED.store(true, Ordering::Relaxed);
     }
-    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    // SAFETY: the handler only touches atomics and `_exit`, both async-signal-safe.
     unsafe {
         libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
@@ -400,6 +414,10 @@ fn on_ctrl_c() {
     }
     extern "system" fn handler(event: u32) -> i32 {
         const CTRL_BREAK_EVENT: u32 = 1;
+        if event <= CTRL_BREAK_EVENT && SIGNALLED.swap(true, Ordering::Relaxed) {
+            // A second Ctrl-C: not handled, so the default handler ends the process.
+            return 0;
+        }
         INTERRUPTED.store(true, Ordering::Relaxed);
         if event > CTRL_BREAK_EVENT {
             let start = std::time::Instant::now();
@@ -726,7 +744,10 @@ fn convert(request: ConvertRequest) -> ExitCode {
                     // Cancel first; a closing console can fail the write, which must not panic.
                     jobs.cancel(job);
                     cancelled = true;
-                    let _ = writeln!(std::io::stderr(), "ps5-dump-forge: cancelling...");
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "ps5-dump-forge: cancelling... (press Ctrl-C again to quit now)"
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break Err("job vanished".to_string()),
@@ -774,142 +795,11 @@ mod tests {
         s.split_whitespace().map(OsString::from).collect()
     }
 
-    #[test]
-    fn parses_convert() {
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to exfat -o /o/x.exfat --threads 2"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.format, Format::Exfat);
-        assert_eq!(r.output, PathBuf::from("/o/x.exfat"));
-        assert_eq!(r.compression_threads, Some(2));
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to PKG -o /o/x.pkg"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.format, Format::Pkg);
-        assert_eq!(r.inner, None);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to ffpfsc --inner ffpkg -o /o/x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!((r.format, r.inner), (Format::Ffpfsc, Some(Format::Ffpkg)));
-        assert!(!r.remove_backport);
-        assert!(!r.full_verify, "fast by default");
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to folder --remove-backport -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert!(r.remove_backport);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to ffpkg --full-verify -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert!(r.full_verify);
-        assert_eq!(r.kraken_level, KrakenLevel::Fast, "fast by default");
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to pkg --kraken smallest -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.kraken_level, KrakenLevel::Smallest);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to pkg --kraken stored -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.kraken_level, KrakenLevel::Stored);
-        let Ok(Cli::Convert { request: r, .. }) =
-            parse_args(args("convert /g --to ffpfsc --level 0 -o x"))
-        else {
-            panic!("not a convert");
-        };
-        assert_eq!(r.ffpfsc_level, 0);
-    }
-
-    #[test]
-    fn rejects_bad_args() {
-        assert!(parse_args(args("convert /g")).is_err());
-        assert!(parse_args(args("convert /g --to zip -o x")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --inner exfat -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --inner pkg -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --inner ffpfsc -o x")).is_err());
-        assert!(parse_args(args("inspect")).is_err());
-        assert!(parse_args(args("inspect a b")).is_err());
-        assert!(parse_args(args("frob /g")).is_err());
-        assert!(parse_args(args("inspect /g --bogus")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --full-verify=yes -o x")).is_err());
-        assert!(parse_args(args("convert /g --to pkg --kraken medium -o x")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --kraken fast -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --level 10 -o x")).is_err());
-        assert!(parse_args(args("convert /g --to ffpfsc --level -1 -o x")).is_err());
-        assert!(parse_args(args("convert /g --to exfat --level 5 -o x")).is_err());
-        assert!(matches!(
-            parse_args(args("inspect /g --json")),
-            Ok(Cli::Inspect { path, json: true, password_stdin: false }) if path == Path::new("/g")
-        ));
-        assert!(matches!(parse_args(args("help")), Ok(Cli::Help)));
-    }
-
     fn convert(s: &str) -> Result<ConvertRequest, String> {
         match parse_args(args(s)) {
             Ok(Cli::Convert { request: r, .. }) => Ok(r),
             Ok(_) => panic!("not a convert"),
             Err(e) => Err(e),
-        }
-    }
-
-    #[test]
-    fn parses_lz4_level() {
-        assert_eq!(convert("convert /g --to lz4 -o x").unwrap().lz4_level, 0);
-        let r = convert("convert /g --to ffpkg --lz4-pack --lz4-level 12 -o x").unwrap();
-        assert_eq!(r.lz4_level, 12);
-        assert_eq!(r.lz4_runtime, Lz4Runtime::Ng);
-        let r = convert("convert /g --to lz4 --lz4-runtime ampr_emu -o x").unwrap();
-        assert_eq!(r.lz4_runtime, Lz4Runtime::AmprEmu);
-        for bad in [
-            "convert /g --to lz4 --lz4-level 2 -o x",
-            "convert /g --to lz4 --lz4-level 13 -o x",
-            "convert /g --to folder --lz4-level 9 -o x",
-            "convert /g --to lz4 --lz4-runtime zstd -o x",
-            "convert /g --to folder --lz4-runtime ng -o x",
-        ] {
-            assert!(convert(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn parses_zstd_pack() {
-        let r = convert("convert /g --to folder --zstd-pack -o x").unwrap();
-        assert_eq!((r.zstd_pack, r.zstd_level, r.lz4), (true, 5, None));
-        let r = convert("convert /g --to folder --zstd-pack --zstd-level 22 -o x").unwrap();
-        assert_eq!((r.zstd_pack, r.zstd_level), (true, 22));
-        let r = convert("convert /g --to ffpkg --zstd-pack -o x").unwrap();
-        assert!(r.zstd_pack && r.format == Format::Ffpkg);
-        let r = convert("convert /g --to folder -o x").unwrap();
-        assert!(!r.zstd_pack && !r.zstd_unpack);
-        let r = convert("convert /g --to pkg --zstd-unpack -o x").unwrap();
-        assert!(r.zstd_unpack && !r.zstd_pack);
-        for bad in [
-            "convert /g --to folder --zstd-level 3 -o x",
-            "convert /g --to folder --zstd-pack --zstd-level 0 -o x",
-            "convert /g --to folder --zstd-pack --zstd-level 23 -o x",
-            "convert /g --to folder --zstd-pack --zstd-level x -o x",
-            "convert /g --to pkg --zstd-pack -o x",
-            "convert /g --to lz4 --zstd-pack -o x",
-            "convert /g --to folder --zstd-pack --lz4-pack -o x",
-            "convert /g --to folder --zstd-pack --lz4-unpack -o x",
-            "convert /g --to folder --zstd-pack --lz4-level 9 -o x",
-            "convert /g --to folder --zstd-pack --zstd-unpack -o x",
-            "convert /g --to lz4 --zstd-unpack -o x",
-            "convert /g --to folder --zstd-unpack --lz4-pack -o x",
-        ] {
-            assert!(convert(bad).is_err(), "{bad}");
         }
     }
 

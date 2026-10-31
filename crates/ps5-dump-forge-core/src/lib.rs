@@ -105,10 +105,10 @@ pub enum Lz4Mode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lz4Runtime {
-    /// ampr-emu-ng (`runtime::ZSTD`): reads LZ4 and zstd packs.
+    /// ampr-emu-ng (`runtime::zstd()`): reads LZ4 and zstd packs.
     #[default]
     Ng,
-    /// The bundled upstream ampr_emu release build (`runtime::RELEASE`).
+    /// The bundled upstream ampr_emu release build (`runtime::release()`).
     AmprEmu,
 }
 
@@ -250,6 +250,14 @@ pub struct ConvertRequest {
     /// preflight, and off the PS5 it fails preflight). It runs in the transfer slot.
     #[serde(default)]
     pub install: Option<PathBuf>,
+    /// For a conversion or an LZ4/zstd pack or unpack: once the job is done (verified, its
+    /// output in place), delete the source (every part of a multi-part archive) as
+    /// [`Jobs::delete_path`] deletes, with the [`Jobs::set_protected`] list. The job stays done
+    /// either way: a line `source deleted: <path>` or `source kept: <reason>` joins
+    /// [`JobReport::checks`] and the log. With edits, an extract, a transfer or an install it
+    /// fails preflight.
+    #[serde(default)]
+    pub delete_source: bool,
     /// For an archive source that needs one. Never serialized.
     #[serde(default, skip_serializing)]
     pub archive_password: Option<ArchivePassword>,
@@ -592,9 +600,10 @@ pub struct Lz4Facts {
     /// The ampr_emu version the game's own runtime names itself with, when it does.
     pub runtime_version: Option<String>,
     /// What a plain conversion does to the runtime (by user decision): `install` (none there),
-    /// `replace` (Forge's trace runtime, an older ampr_emu or one naming no version: the
-    /// bundled release runtime goes in) or `keep` (Forge's release runtime, or ampr_emu at
-    /// [`Lz4Facts::shipped_runtime_version`] or newer). `None` for a non-AMPR title.
+    /// `replace` (Forge's trace runtime, ampr-emu-ng, an older ampr_emu or one naming no
+    /// version: the bundled release runtime goes in) or `keep` (Forge's release runtime, or
+    /// ampr_emu at [`Lz4Facts::shipped_runtime_version`] or newer). A zstd-packed game keeps
+    /// ampr-emu-ng (installed where missing, any other replaced). `None` for a non-AMPR title.
     pub runtime_action: Option<&'static str>,
     /// The same for the LZ4 tab's Unpack (a packed source) or Pack with
     /// [`Lz4Runtime::AmprEmu`] (an unpacked one), which also replaces a not-older runtime that

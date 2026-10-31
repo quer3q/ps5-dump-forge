@@ -75,6 +75,7 @@ struct Session {
     cancel: Arc<AtomicBool>,
     /// What the last chunk had left over.
     pending: Vec<u8>,
+    pending_at: usize,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -296,6 +297,7 @@ impl Reader {
             head: Vec::new(),
             cancel: self.cancel.clone(),
             pending: Vec::new(),
+            pending_at: 0,
             thread: Some(thread),
         });
         Ok(())
@@ -314,10 +316,13 @@ impl Session {
     ) -> Result<bool, ArchiveError> {
         while out.len() < len && !self.ended {
             check(&self.cancel)?;
-            if self.pending.is_empty() {
+            if self.pending_at == self.pending.len() {
                 let data = self.data.as_ref().expect("an open session");
                 match data.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Msg::Chunk(b)) => self.pending = b,
+                    Ok(Msg::Chunk(b)) => {
+                        self.pending = b;
+                        self.pending_at = 0;
+                    }
                     Ok(Msg::End) => {
                         self.ended = true;
                         // A short entry whole, now that the archive has checked it.
@@ -334,17 +339,18 @@ impl Session {
                 }
                 continue;
             }
-            let n = (len - out.len()).min(self.pending.len());
-            out.extend_from_slice(&self.pending[..n]);
+            let bytes = &self.pending[self.pending_at..];
+            let n = (len - out.len()).min(bytes.len());
+            out.extend_from_slice(&bytes[..n]);
             if self.head.len() < HEAD && self.at == self.head.len() as u64 {
                 let k = n.min(HEAD - self.head.len());
-                self.head.extend_from_slice(&self.pending[..k]);
+                self.head.extend_from_slice(&bytes[..k]);
                 // Bytes short of the entry's end need no check of it to be served again.
                 if self.size > HEAD as u64 {
                     heads.insert(self.current.clone(), self.head.clone());
                 }
             }
-            self.pending.drain(..n);
+            self.pending_at += n;
             self.at += n as u64;
         }
         Ok(true)

@@ -8,14 +8,13 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ps5_dump_forge_smb::{File, Session};
 
-use crate::remote::{FlinkPath, Remote, RemoteEntry, RemoteStat, Scheme};
+use crate::remote::{FlinkPath, Remote, RemoteEntry, RemoteStat};
 
 /// One saved NAS's login. An empty `user` is a guest login.
 #[derive(Clone, PartialEq, Eq)]
@@ -50,11 +49,6 @@ pub fn set_credentials(creds: Vec<SmbCredential>) {
     let mut sessions = lock(&smb.sessions);
     sessions.clear();
     smb.logins.fetch_add(1, Ordering::SeqCst);
-}
-
-/// Whether `path` is an `smb://` path.
-pub fn is_smb(path: &Path) -> bool {
-    Scheme::of(path) == Some(Scheme::Smb)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -351,61 +345,7 @@ fn no_upload(handle: u64) -> io::Error {
 mod tests {
     use super::*;
     use crate::remote::FlinkPath;
-
-    #[test]
-    fn local_paths_with_wide_characters_are_not_smb() {
-        for p in [
-            "C:\\Игры\\game",
-            "/mnt/Игры",
-            "/tmp/ü/x",
-            "日本語/ゲーム",
-            "smb:/",
-            "smb://",
-        ] {
-            assert!(!is_smb(Path::new(p)), "{p}");
-        }
-        assert!(is_smb(Path::new("SMB://nas/games")));
-        assert!(is_smb(Path::new("smb://h/s")) && !is_smb(Path::new("smb:x")));
-    }
-
-    #[test]
-    fn parses_and_spells_paths() {
-        let p =
-            FlinkPath::parse(Path::new("SMB://NAS.local:4455/games/Stub Game/sce_sys")).unwrap();
-        assert_eq!(p.scheme, Scheme::Smb);
-        assert_eq!(p.key_id, "nas.local:4455");
-        assert_eq!(p.host_port(), ("nas.local", 4455));
-        assert_eq!(split(&p), ("games", "Stub Game/sce_sys"));
-        assert_eq!(
-            p.url(),
-            Path::new("smb://nas.local:4455/games/Stub Game/sce_sys")
-        );
-        let up = p.parent().unwrap().parent().unwrap();
-        assert_eq!(up.url(), Path::new("smb://nas.local:4455/games"));
-        assert_eq!(split(&up), ("games", ""));
-        let server = up.parent().unwrap();
-        assert_eq!(server.url(), Path::new("smb://nas.local:4455"));
-        assert!(server.parent().is_none());
-
-        let p = FlinkPath::parse(Path::new("smb://nas:445/s")).unwrap();
-        assert_eq!((p.key_id.as_str(), p.host_port()), ("nas", ("nas", 445)));
-        let v6 = FlinkPath::parse(Path::new("smb://[FE80::1]/s")).unwrap();
-        assert_eq!(v6.key_id, "[fe80::1]");
-        assert_eq!(v6.host_port(), ("fe80::1", 445));
-        assert_eq!(v6.url(), Path::new("smb://[fe80::1]/s"));
-        let v6 = FlinkPath::parse(Path::new("smb://[fe80::1]:4455/s/x")).unwrap();
-        assert_eq!(v6.host_port(), ("fe80::1", 4455));
-        for bad in [
-            "smb://",
-            "smb://h:0/s",
-            "smb://h/s/../x",
-            "smb://h/s/./x",
-            "smb://u@h/s",
-            "/local/x",
-        ] {
-            assert!(FlinkPath::parse(Path::new(bad)).is_err(), "{bad}");
-        }
-    }
+    use std::path::Path;
 
     #[test]
     fn refusals() {

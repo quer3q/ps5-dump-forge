@@ -4,7 +4,7 @@
 
 import { useSyncExternalStore } from "react";
 
-import { connect, errorText, type ConnectState } from "./api";
+import { connect, errorText, type ConnectState, type RemoteJob } from "./api";
 import { setDevices } from "./peers";
 
 interface Snapshot {
@@ -19,8 +19,37 @@ let timer: ReturnType<typeof setTimeout> | undefined;
 let generation = 0;
 let epoch = 0;
 
+/** Peers' jobs, kept by identity until their text changes: `App` re-renders on a change only,
+ * not on every poll (`devices[].last_seen` moves each one while a peer is online). */
+const NO_REMOTE: RemoteJob[] = [];
+let remoteJobs = NO_REMOTE;
+let remoteText = "[]";
+
+/** Saved devices' names and addresses (what paths and backend text are shown with), kept by
+ * identity until one of those changes; kept while the service is unreachable, as `setDevices`. */
+export interface SavedNames {
+  devices: ConnectState["devices"];
+  nas: ConnectState["nas"];
+}
+let names: SavedNames = { devices: [], nas: [] };
+let namesText = "";
+
 function publish(next: Snapshot) {
   snapshot = next;
+  if (next.state) {
+    const { devices, nas } = next.state;
+    const text = JSON.stringify([devices.map((d) => [d.key_id, d.name]), nas.map((n) => [n.name, n.host, n.port, n.protocol])]);
+    if (text !== namesText) {
+      namesText = text;
+      names = { devices, nas };
+    }
+  }
+  const list = next.state?.remote_jobs ?? NO_REMOTE;
+  const text = JSON.stringify(list);
+  if (text !== remoteText) {
+    remoteText = text;
+    remoteJobs = list.length === 0 ? NO_REMOTE : list;
+  }
   // Kept while the service is unreachable: old errors still name the devices.
   if (next.state) setDevices(next.state.devices, next.state.nas);
   listeners.forEach((l) => l());
@@ -62,8 +91,23 @@ export function useConnectState(): Snapshot {
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
-/** Saved devices online right now, paired peers and NAS devices (the header's Connected). */
-export function useOnlineCount(): number {
-  const s = useConnectState().state;
+/** Saved devices online right now, paired peers and NAS devices (the header's Connected). A
+ * number, so a poll that changes nothing else re-renders nothing. */
+const onlineCount = () => {
+  const s = snapshot.state;
   return (s?.devices.filter((d) => d.online).length ?? 0) + (s?.nas.filter((n) => n.online).length ?? 0);
+};
+
+export function useOnlineCount(): number {
+  return useSyncExternalStore(subscribe, onlineCount);
+}
+
+/** Saved devices' names: re-renders only when a name or address changes, not on every poll. */
+export function useSavedNames(): SavedNames {
+  return useSyncExternalStore(subscribe, () => names);
+}
+
+/** Paired peers' jobs that use this device's files, the same array until one changes. */
+export function useRemoteJobs(): RemoteJob[] {
+  return useSyncExternalStore(subscribe, () => remoteJobs);
 }

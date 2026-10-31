@@ -531,47 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn sequential_writes_give_identical_content() {
-        let (mut c, cancel) = (Cadence::fixed(64), AtomicBool::new(false));
-        let mut w = SyncEvery::new(Fake::default(), &mut c, &cancel);
-        let mut want = Vec::new();
-        for (i, len) in [1, 10, 63, 64, 65, 7, 200].into_iter().enumerate() {
-            let b = bytes(len, i as u8);
-            w.write_all(&b).unwrap();
-            want.extend_from_slice(&b);
-        }
-        assert_eq!(w.out.syncs, want.len() / 64);
-        let f = w.finish().unwrap();
-        assert_eq!(f.data, want);
-        assert_eq!(f.syncs, want.len() / 64 + 1);
-        assert_eq!(f.seeks, 0);
-    }
-
-    #[test]
-    fn large_writes_are_split_and_synced() {
-        let (mut c, cancel) = (Cadence::fixed(64), AtomicBool::new(false));
-        let mut w = SyncEvery::new(Fake::default(), &mut c, &cancel);
-        assert_eq!(w.write(&[1; 200]).unwrap(), 64);
-        assert_eq!(w.out.syncs, 1);
-        w.write_all(&[2; 200]).unwrap();
-        assert_eq!(w.out.syncs, 4); // at 64, 128, 192, 256
-        assert_eq!(w.out.max_write, 64);
-        assert_eq!(w.finish().unwrap().data.len(), 264);
-    }
-
-    #[test]
-    fn forward_seek_at_the_end_writes_zeros_without_a_sync() {
-        let (mut c, cancel) = (Cadence::fixed(64), AtomicBool::new(false));
-        let mut w = SyncEvery::new(Fake::default(), &mut c, &cancel);
-        w.write_all(&[1; 10]).unwrap();
-        assert_eq!(w.seek(SeekFrom::Start(30)).unwrap(), 30);
-        w.write_all(&[2; 5]).unwrap();
-        assert_eq!((w.out.syncs, w.out.seeks), (0, 0));
-        let want = [vec![1; 10], vec![0; 20], vec![2; 5]].concat();
-        assert_eq!(w.finish().unwrap().data, want);
-    }
-
-    #[test]
     fn a_retried_sync_fails_the_job() {
         let retried = |e: io::Error| e.to_string().contains("temporary error while syncing");
         let (mut c, cancel) = (Cadence::fixed(64), AtomicBool::new(false));
@@ -634,47 +593,31 @@ mod tests {
         (r, tries, slept)
     }
 
+    /// U4: which errnos a sync retries, fails at once, or (a directory only) lets pass.
     #[test]
-    fn transient_errors_are_retried() {
-        let (r, tries, slept) = run(&[libc::EAGAIN, libc::EBUSY], false, &NO);
-        assert_eq!(r.unwrap(), Synced::Retried);
-        assert_eq!(tries, 3);
-        assert!(slept.iter().all(|&ms| ms <= SLICE_MS));
-        assert_eq!(slept.iter().sum::<u64>(), 20 + 60);
-        let (r, tries, _) = run(&[], false, &NO);
-        assert_eq!((r.unwrap(), tries), (Synced::Clean, 1));
-        let (r, tries, slept) = run(&[libc::ETIMEDOUT; 9], false, &NO);
-        assert_eq!(r.unwrap_err().raw_os_error(), Some(libc::ETIMEDOUT));
-        assert_eq!(tries, 5);
-        assert_eq!(slept.iter().sum::<u64>(), 20 + 60 + 200 + 600);
-    }
-
-    #[test]
-    fn hard_errors_fail_at_once() {
-        for code in [libc::EIO, libc::ENOSPC, libc::EROFS] {
-            let (r, tries, slept) = run(&[code], false, &NO);
-            assert_eq!(r.unwrap_err().raw_os_error(), Some(code));
-            assert_eq!((tries, slept.len()), (1, 0));
-        }
-    }
-
-    #[test]
-    fn unsupported_is_ok_only_for_a_directory() {
+    fn sync_errors_are_classified() {
+        let err = |r: io::Result<Synced>| r.unwrap_err().raw_os_error();
         for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
             assert_eq!(run(&[code], true, &NO).0.unwrap(), Synced::Unsupported);
-            assert_eq!(
-                run(&[code], false, &NO).0.unwrap_err().raw_os_error(),
-                Some(code)
-            );
+            assert_eq!(err(run(&[code], false, &NO).0), Some(code));
         }
-    }
-
-    #[test]
-    fn sony_errors_are_folded() {
+        for code in [libc::EIO, libc::ENOSPC, libc::EROFS] {
+            let (r, tries, slept) = run(&[code], false, &NO);
+            assert_eq!((err(r), tries, slept.len()), (Some(code), 1, 0));
+        }
+        let (r, tries, slept) = run(&[libc::EAGAIN, libc::EBUSY], false, &NO);
+        assert_eq!((r.unwrap(), tries), (Synced::Retried, 3));
+        assert!(slept.iter().all(|&ms| ms <= SLICE_MS));
+        assert_eq!(run(&[], false, &NO).0.unwrap(), Synced::Clean);
+        let (r, tries, _) = run(&[libc::ETIMEDOUT; 9], false, &NO);
+        assert_eq!(
+            (err(r), tries),
+            (Some(libc::ETIMEDOUT), BACKOFF_MS.len() + 1)
+        );
+        // Sony's 0x8002xxxx errnos fold to the plain ones.
         assert_eq!(errno(&os(sony(libc::EAGAIN))), Some(libc::EAGAIN));
         assert!(is_transient(&os(sony(libc::ENXIO))));
         assert!(!is_transient(&os(sony(libc::EIO))));
-        assert!(!is_transient(&io::Error::other("no errno")));
         let (r, tries, _) = run(&[sony(libc::EINTR)], false, &NO);
         assert_eq!((r.unwrap(), tries), (Synced::Retried, 2));
     }

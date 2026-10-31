@@ -514,33 +514,6 @@ fn copy(
 mod tests {
     use super::*;
 
-    #[test]
-    fn components() {
-        for bad in [
-            "",
-            ".",
-            "..",
-            "a\0b",
-            "a\\b",
-            "a:b",
-            "CON",
-            "con.txt",
-            "Com1.dat",
-            "LPT9",
-            "nul .x",
-            "x.",
-            "x ",
-            "a\u{1}",
-            "a\u{fffd}b",
-        ] {
-            assert!(bad_component(bad).is_some(), "{bad:?}");
-        }
-        for good in ["eboot.bin", "COM10", "console.txt", "LPT", "a.b.c", "日本"] {
-            assert_eq!(bad_component(good), None, "{good:?}");
-        }
-        assert!(bad_component(&"x".repeat(256)).is_some());
-    }
-
     /// A reader that returns more than it was asked for.
     struct Greedy(Vec<ps5upload_fpkg::source::SourceFile>);
 

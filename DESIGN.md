@@ -14,7 +14,7 @@ gradient notice bar) and the app icon (a blue portal-and-anvil emblem with an or
   darker `.tile`: a muted label above a large value.
 - **Colour never works alone.** A format has its hue *and* its label; a rating its tint *and* an icon
   (✓ – ✕) *and* text; a selected segment is tinted *and* ringed *and* bold.
-- **Contrast.** Text is at least 4.5:1 on its ground, the hero glow and the alert bar included. The
+- **Contrast.** Text is at least 4.5:1 on its ground, the hero glow included. The
   CSS comments give the measured ratio wherever a pair is tight.
 - **Fits the window.** Default 1200×820, minimum 900×620 (`main.rs`); the web build down to 320px
   wide. No horizontal page scroll; long lists scroll inside their own box, except the job list,
@@ -35,7 +35,7 @@ gradient notice bar) and the app icon (a blue portal-and-anvil emblem with an or
 | `--fg` / `--fg-2` | `#f2f2f7` / `#d2d2dc` | Text / secondary text (paths, checks) |
 | `--muted` | `#9a9aae` | Labels, meta, unselected segments (≥ 4.5:1 on every ground) |
 | `--accent` / `--accent-ink` | `#3d6bff` / `#9db6ff` | Switch on, progress fill, range inputs / link text, empty-state and folder icons, the info finding icon, a job's current step |
-| `--orange` | `#ff7a2f` | The glow's orange (logo shadow, hero and alert-bar edge, written there as `rgba(255, 122, 47, …)`), never text |
+| `--orange` | `#ff7a2f` | The glow's orange (logo shadow, hero edge, written there as `rgba(255, 122, 47, …)`), never text |
 | `--good` / `--bad` / `--warn` | `#2fd27a` / `#ff6b6b` / `#ffb547` | Status icons and text |
 | `--focus` | `#9db6ff` | 2px focus ring on every control (`:focus-visible`) |
 | `--sans` | `-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif` | Body text; placeholders and the Naming text inside mono boxes |
@@ -133,7 +133,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     are plain muted text. Segments are sized by their labels, then share the spare width. A refused
     format is dimmed (38%), its reason read out with its label and in its tooltip.
   - Smaller pickers of the same kind (`.seg.formats.inner`): the image inside an ffpfsc (shown only for
-    that target) and the fpkg Compression picker (Fast / Balanced / Smallest / Stored, 15px bolt, scale,
+    that target; exfat the default, its line a green "Recommended" lead) and the fpkg Compression picker (Fast / Balanced / Smallest / Stored, 15px bolt, scale,
     compress and file icons, the fpkg tint), each with one line under it on what the choice costs.
   - The ffpfsc Compression level is a native range (`.range`, `accent-color`, 0–9, default 6) with its
     value in the label row (`.range-value`, tabular) and a line under it on what the level costs.
@@ -159,8 +159,12 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     are saved) and "N of M online" muted. The list (`.dev-list`, at most 9): online first, then Forge
     peers before NAS devices; a row (`.dev-row`, an inset tile, no border) is the `.online-dot`, the
     name (600) with its kind `.tag` (Forge; SMB, FTP, NFS), a muted facts line (platform, the address in
-    mono `--fg-2`, a NAS's user or Guest, Online or "Offline · seen: 5 hours ago"), then **Send** (online
-    only: File Transfer with the picker opening on that device) and a ⋯ icon button for the details dialog.
+    mono `--fg-2`, a NAS's user or Guest, Online or "Offline · seen: 5 hours ago"), then **Install pkg** (online
+    PS5 only), **Send** (online only: File Transfer with the picker opening on that device) and a ⋯ icon
+    button (`ChooseMenu`): **Details** first, always (info icon, the details dialog; a NAS row's only item),
+    then **Speed test** (online Forge only, bolt icon; "Testing" with `Dots` while it runs, `aria-disabled`,
+    every other Speed test off; also a button in the details dialog, before File Transfer). The last result stays as a muted
+    `.dev-sub` line under the facts (`.note-line.good` in the details).
     Under 480px the actions wrap under the text. No saved device: the `.empty` panel ("No saved devices
     yet", its hint, a primary **Autodiscovery**) and the head keeps only File Transfer (secondary).
   - **Nearby** (`.nearby`, under the list or the empty panel): Autodiscovery's finds not saved here yet
@@ -198,7 +202,6 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   | Secondary | default | Dark. Choose, Change, Show in Finder (Explorer, folder), download links (`a.button`). |
   | Danger | `.danger` | Red tint. Stop job (a running job's Cancel, second click), Stop jobs and quit, the trash buttons, Yes, delete, Forget, Discard all, Replace. |
   | Small | `.small` | Job rows; `.small.icon-only` is a 30px round icon button. |
-  | Pack | `.lz4-btn` | Yellow tint, ring and ink: the Pack tab's Choose source. |
   | Link | `.link` | Quiet text action (the crumbs). |
 
   Touch (`pointer: coarse`, a phone or tablet): every button, menu item, input, fold summary,
@@ -232,8 +235,9 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   own words (`lang` set), so it holds any number of languages.
 - **Switch** (`.switch`): a native checkbox drawn as a switch, blue when on. Disabled, only the track
   dims; the reason sits under it as a `.note-line.warn`. Remove backport (only for a source with
-  backport libraries) and Full verification (off by default) each sit in their own inset box
-  (`.field.backport`, `.field.verify`: `--inset`, `--line` border, 12px radius). Generate name based
+  backport libraries), Full verification (off by default) and, under it, Delete the source (its hint: no
+  undo, deleted only after a successful conversion; off by default; off and disabled with a `.note-line.warn` for a NAS source)
+  each sit in their own inset box (`.field.backport`, `.field.verify`, `.field.verify.delete-source`: `--inset`, `--line` border, 12px radius). Generate name based
   on content sits in the build row beside Build (off, it shows the name pattern in muted mono). A
   combination core would refuse disables Build with the reason in a `.note-line.block` under it
   (`.build-notes`). For an AMPR game,
@@ -245,12 +249,13 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   damaged or missing `ampr_emu.index` is written afresh (for fpkg, the package always gets a fresh one). A
   game that doesn't use AMPR gets none.
 - **Pack tab** (`Pack.tsx`): a Source card, then a "Pack" card whose head holds a plain `.small` **How pack
-  works** (info icon, as Convert's Compare formats; `PackHelp.tsx`). The empty Source is `.empty.lz4`
-  (yellow icon and glow): "Choose a game that uses AMPR", an experimental lead and one `.lz4-btn` **Choose
-  source** with a Folder / Image/Archive menu.
+  works** (info icon, as Convert's Compare formats; `PackHelp.tsx`). The empty Source is SourceCard's
+  shared one, as on Convert and Edit ("Choose a game folder, image or archive", the format chips, **Pick**).
+  How pack works opens its LZ4 list with "**Some games may not start.** Keep a copy.".
   - The kind picker is a full-width `.seg.formats` in Pack yellow (`.lz4-y`: unselected `--lz4-soft`, chosen
     tint and ring, no icons): **zstd** (the default) | **LZ4**, with one line under it on what the job does
-    (LZ4's an amber experimental lead). Before a source one muted line asks for one; a game the kind can't
+    (LZ4, an unpacked game: a warn "Some games may not start. ..."; a packed one: plain "Writes the LZ4
+    packs back as plain files."). Before a source the settings side shows nothing; a game the kind can't
     take (a patch package, additional content, a title that doesn't use AMPR) gets one `.note-line.warn`
     (`p.lz4-why`) instead of the settings. A game already packed by the kind chosen gets **Unpack**.
   - Then the Target picker (`.target-label`): **Pack** Folder (the default, the LZ4 packed folder shown as
@@ -342,9 +347,6 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   shows: static green and cyan straps over `--inset`, a `--pk-line` ring with a faint `--pk-glow`, the
   state in `--pk-ink` (`--pk-ink` 10.4:1, `--fg` 12.5:1, `--muted` 5.0:1 on the brightest strap); damaged
   packs (`.tile.damaged`) get no straps and the state in `--warn`.
-- **Alert bar** (`.alert-bar`): one line of notice on a blue-to-orange gradient kept dark under the
-  text, orange only as a glow at the right edge. `.alert-bar.warn` is amber: the fpkg firmware limit
-  (`PkgWarning`), today the bar's only use.
 - **Findings** (`ul.findings`): `li` warns (amber), `li.block` fails every target (red), `li.info` is
   good news (blue). Under Build, `.note-line` (`.warn`, `.block`, `.good`, `.muted` with an info icon)
   says why it is off or what to expect.
@@ -399,6 +401,8 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   `.card.compact` of its own (plain selectable text, no links).
 - **Empty state** (`.empty`): an inset well with a round blue icon (`.empty-icon`; `.bad` red for an
   error), a 16px title, one line of help, the accepted kinds as tags, and its buttons.
+  Pack's (`.empty.lz4`) is yellow: a yellow glow, the compress icon on `--lz4-tint`, and a yellow **Pick**
+  (`button.lz4-btn`).
   - **Source pickers** (`PickButtons` in `common.tsx`): **Folder** (primary, folder icon) and
     **Image/Archive** (secondary, archive icon; one file dialog for images, packages and archives,
     `.001`/`.z01` first parts included); no NAS button (removed by user request: a saved NAS online is a
@@ -558,13 +562,13 @@ The web build names the product "Dump Forge" (the PS5 tile's name); the desktop 
   server's root excepted). The next browse opens where the last one ended. A failed listing shows
   `.bad.pick-error` (`role="alert"`) with the reason, and its last crumb stays a button that tries
   again. Without device tabs each saved NAS is a root after the drives (drive icon, its name muted).
-  The desktop app uses this modal too whenever device tabs show (its local roots: the home folder and
-  the volume folders); it has no NAS source button (removed by user request: a NAS is browsed on its
+  The desktop app always uses this modal (no system dialog; its local roots: the home folder and the
+  volume folders, on Windows each drive C: to Z: that lists); it has no NAS source button (removed by user request: a NAS is browsed on its
   tab while it is online).
   While a paired peer or saved NAS is online the same modal, in both builds, leads with device tabs
   (`.seg.pick-tabs`: the view switch's size, wraps; `TabList`, arrow keys): This device, then each online
   device; each tab's list in a `.pick-panel`. A remote tab starts at its root (the device name as the
-  crumb). The desktop's local tab adds **System dialog** (`.pick-native`, left in the footer).
+  crumb).
 - **Show path** (instead of Show in Finder on a finished job): the output path in an `.out-box`
   (`.path-shown`), focused and selected, to copy by hand (plain HTTP has no clipboard API).
 

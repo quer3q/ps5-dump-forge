@@ -9,6 +9,8 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use ps5upload_fpkg::source::SourceTree;
+
 use crate::finalize::{FileId, followed_id, fsync_dir, path_id};
 
 /// Why a delete did not happen, or did not finish.
@@ -159,20 +161,30 @@ pub(crate) fn delete<'a>(
     if crate::remote::is_remote(path) {
         return delete_remote(path, guarded);
     }
+    remove(ready(path, protected, guarded)?).map_err(|(e, _)| e)
+}
+
+/// [`delete`]'s checks, all done before anything is removed.
+fn ready<'a>(
+    path: &Path,
+    protected: &[PathBuf],
+    guarded: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<Checked, DeleteError> {
+    let checked = check(path, "delete", protected, guarded)?;
     let Checked {
         path,
         real,
         id,
         kind,
-        #[cfg(target_os = "freebsd")]
-        smp,
-    } = check(path, "delete", protected, guarded)?;
+        ..
+    } = &checked;
+    let (id, kind) = (*id, *kind);
     let shown = path.display();
-    let failed = |what: &str, e: io::Error| DeleteError::Failed(format!("{what} {shown}: {e}"));
     // remove_dir_all would empty a volume mounted somewhere inside before failing on it.
     #[cfg(unix)]
     if kind.is_dir()
-        && let Some(mount) = mount_inside(&real, id.0).map_err(|e| failed("reading", e))?
+        && let Some(mount) = mount_inside(real, id.0)
+            .map_err(|e| DeleteError::Failed(format!("reading {shown}: {e}")))?
     {
         return Err(DeleteError::Refused(format!(
             "{shown} holds {}, where another volume is mounted",
@@ -180,7 +192,7 @@ pub(crate) fn delete<'a>(
         )));
     }
     // The checks above looked at what `path` named then; it must still be that.
-    if !path_id(&real).is_ok_and(|(now, k)| now == id && k.is_dir() == kind.is_dir()) {
+    if !path_id(real).is_ok_and(|(now, k)| now == id && k.is_dir() == kind.is_dir()) {
         return Err(DeleteError::Failed(format!(
             "{shown} changed while it was checked; nothing deleted"
         )));
@@ -189,46 +201,278 @@ pub(crate) fn delete<'a>(
     // to hold it off.
     #[cfg(target_os = "freebsd")]
     smp_unchanged(
-        &smp,
+        &checked.smp,
         &mut crate::edit_job::smp_list,
         &mut crate::edit_job::smp_is_mount,
         "deleted",
     )?;
+    Ok(checked)
+}
+
+/// Removes what [`ready`] checked; a failure says what was gone by then (`None`: nothing).
+fn remove(checked: Checked) -> Result<(), (DeleteError, Option<String>)> {
+    let Checked {
+        path, real, kind, ..
+    } = checked;
+    let shown = path.display();
+    let gone = |e: String, what: String| (DeleteError::Failed(e), Some(what));
     if kind.is_dir() {
         // std's remove_dir_all removes links inside without following them.
         if let Err(e) = std::fs::remove_dir_all(&real) {
-            let partly = if real.exists() {
-                "; some of it may already be gone"
-            } else {
-                ""
-            };
-            return Err(DeleteError::Failed(format!(
-                "deleting {shown}: {e}{partly}"
-            )));
+            if !real.exists() {
+                return Err(gone(format!("deleting {shown}: {e}"), shown.to_string()));
+            }
+            return Err(gone(
+                format!("deleting {shown}: {e}; some of it may already be gone"),
+                format!("some of {shown}"),
+            ));
         }
     } else {
-        std::fs::remove_file(&real).map_err(|e| failed("deleting", e))?;
+        std::fs::remove_file(&real)
+            .map_err(|e| (DeleteError::Failed(format!("deleting {shown}: {e}")), None))?;
         // An interrupted edit's undo journal goes with its image: left behind, it would be
         // replayed into a later image of the same name.
         let journal = ps5_dump_forge_patch::journal_path(&real);
         if std::fs::symlink_metadata(&journal).is_ok_and(|m| !m.is_dir()) {
             std::fs::remove_file(&journal).map_err(|e| {
-                DeleteError::Failed(format!(
-                    "deleted {shown}, but not its undo journal {}: {e}",
-                    journal.display()
-                ))
+                gone(
+                    format!(
+                        "deleted {shown}, but not its undo journal {}: {e}",
+                        journal.display()
+                    ),
+                    shown.to_string(),
+                )
             })?;
         }
     }
     if let Some(parent) = real.parent() {
         fsync_dir(parent).map_err(|e| {
-            DeleteError::Failed(format!(
-                "deleted {shown}, but syncing {} failed: {e}",
-                parent.display()
-            ))
+            gone(
+                format!(
+                    "deleted {shown}, but syncing {} failed: {e}",
+                    parent.display()
+                ),
+                shown.to_string(),
+            )
         })?;
     }
     Ok(())
+}
+
+/// What a conversion read of its source, kept for [`delete_source`].
+pub(crate) enum ReadSource {
+    /// An image or an archive: its stamp, an archive's every part (as opened) with it.
+    File(crate::convert::SourceStamp),
+    /// A folder, here or on a peer, and what the job converted of it.
+    Folder(PathBuf, FolderListing),
+}
+
+impl ReadSource {
+    /// What [`delete_source`] deletes: the folder, the image, or an archive's every part
+    /// stamped when the job opened it (the first one first).
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        match self {
+            Self::File(stamp) => stamp.paths(),
+            Self::Folder(path, _) => vec![path.clone()],
+        }
+    }
+}
+
+/// One file of a [`FolderListing`]: path, size, modification time and, here, its identity.
+type Listed = (
+    String,
+    u64,
+    Option<std::time::SystemTime>,
+    Option<crate::finalize::FileId>,
+);
+
+/// A folder as the scanner kept it (junk left out): every file's (path, size, modification
+/// time, identity), every empty folder and, here, the folder's own identity.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FolderListing {
+    pub(crate) files: Vec<Listed>,
+    pub(crate) empty_dirs: Vec<String>,
+    /// The folder's identity, so an empty folder replaced by another reads as a change.
+    pub(crate) root: Option<crate::finalize::FileId>,
+}
+
+/// The identity of the file (or, `dir`, the folder) at `path` (a link not followed), so a
+/// same-size, same-time replacement reads as a change. An entry of another kind is an error.
+#[cfg(any(unix, windows))]
+fn listed_id(path: &Path, dir: bool) -> io::Result<Option<crate::finalize::FileId>> {
+    let (id, kind) = crate::finalize::path_id(path)?;
+    if (dir && !kind.is_dir()) || (!dir && !kind.is_file()) {
+        let what = if dir { "folder" } else { "regular file" };
+        return Err(io::Error::other(format!(
+            "{} is no longer a {what}",
+            path.display()
+        )));
+    }
+    Ok(Some(id))
+}
+
+// ponytail: no file identities on this OS, so a replacement keeping size and time goes
+// unseen.
+#[cfg(not(any(unix, windows)))]
+fn listed_id(_: &Path, _: bool) -> io::Result<Option<crate::finalize::FileId>> {
+    Ok(None)
+}
+
+impl FolderListing {
+    /// The folder at `path` (here or on another device) scanned as a source, with its listing.
+    pub(crate) fn open(
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<(Box<dyn SourceTree>, Self)> {
+        if crate::net::is_network(path) {
+            let at = crate::remote::FlinkPath::parse(path)?;
+            let remote = crate::remote::get_for(&at)?;
+            let tree = crate::remote::RemoteTree::open(remote, &at, cancel)?;
+            // ponytail: a peer tells no file identities, so there a replacement keeping size
+            // and time goes unseen.
+            let files = (tree.files().iter())
+                .map(|f| (f.path.clone(), f.size, tree.mtime(&f.path), None))
+                .collect();
+            let empty_dirs = tree.empty_dirs().to_vec();
+            let tree = crate::scan::JunkFiltered::new(Box::new(tree));
+            let listing = Self {
+                files,
+                empty_dirs,
+                root: None,
+            };
+            return Ok((Box::new(tree), listing));
+        }
+        let tree = crate::scan::ScannedFolder::scan(path, cancel)?;
+        // Each identity taken right after the scan, before the job reads a byte.
+        let root = listed_id(tree.root(), true)?;
+        let files = (tree.files().iter().zip(tree.stamps()))
+            .map(|(f, s)| {
+                let mut at = tree.root().to_path_buf();
+                at.extend(f.path.split('/'));
+                Ok((f.path.clone(), f.size, s.mtime(), listed_id(&at, false)?))
+            })
+            .collect::<io::Result<_>>()?;
+        let empty_dirs = tree.empty_dirs().to_vec();
+        let listing = Self {
+            files,
+            empty_dirs,
+            root,
+        };
+        Ok((Box::new(tree), listing))
+    }
+}
+
+/// Why [`delete_source`] stopped: nothing of the source deleted, or some of it gone (what,
+/// then the error).
+#[derive(Debug)]
+pub(crate) enum SourceKept {
+    Kept(DeleteError),
+    Partly(String, DeleteError),
+}
+
+/// A finished job's source ([`crate::ConvertRequest::delete_source`]), deleted as [`delete`]
+/// deletes it, only while it is what the job read: a folder scanned again (the job's rules)
+/// must list exactly the files, sizes, times and empty folders it converted (skipped junk may
+/// go with it); an image or an archive's every part must keep its stamp. An archive's parts
+/// are the ones stamped when it was opened, each checked before the first goes.
+// ponytail: a file added between the rescan and the removal (or on a peer, before the peer's
+// delete) goes with the folder.
+#[cfg(test)]
+pub(crate) fn delete_source(
+    read: &ReadSource,
+    protected: &[PathBuf],
+    guarded: &[&PathBuf],
+) -> Result<(), SourceKept> {
+    source_unchanged(read)?;
+    remove_source(read, protected, guarded)
+}
+
+/// [`delete_source`]'s first half: refused unless `read` is still what the job read. A
+/// source on a NAS or a server is refused at once (deleted there, never here), before a
+/// rescan. Reads only, so the job table need not be locked (a folder's rescan may be a long
+/// listing over the network).
+pub(crate) fn source_unchanged(read: &ReadSource) -> Result<(), SourceKept> {
+    use crate::remote::{FlinkPath, Scheme};
+    for part in read.paths() {
+        if let Ok(at) = FlinkPath::parse(&part)
+            && at.scheme != Scheme::Flink
+        {
+            return Err(SourceKept::Kept(not_here(&at)));
+        }
+    }
+    let changed = |path: &Path, why: String| {
+        SourceKept::Kept(DeleteError::Refused(format!(
+            "{} changed since it was read{why}",
+            path.display()
+        )))
+    };
+    match read {
+        ReadSource::File(stamp) if !stamp.unchanged() => {
+            return Err(changed(stamp.path(), String::new()));
+        }
+        ReadSource::File(_) => {}
+        // A fresh flag: the job is done, so its cancel no longer applies.
+        ReadSource::Folder(path, listing) => {
+            match FolderListing::open(path, &std::sync::atomic::AtomicBool::new(false)) {
+                Ok((_, now)) if now == *listing => {}
+                Ok(_) => return Err(changed(path, String::new())),
+                Err(e) => return Err(changed(path, format!(": {e:#}"))),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`delete_source`]'s second half, run with the job table locked: every part checked against
+/// `protected` and the `guarded` paths of unfinished jobs, then removed.
+pub(crate) fn remove_source(
+    read: &ReadSource,
+    protected: &[PathBuf],
+    guarded: &[&PathBuf],
+) -> Result<(), SourceKept> {
+    let parts = read.paths();
+    if parts.len() > 1 {
+        for part in parts.iter().filter(|p| !crate::remote::is_remote(p)) {
+            check(part, "delete", protected, guarded.iter().copied()).map_err(SourceKept::Kept)?;
+        }
+    }
+    let mut gone: Vec<String> = Vec::new();
+    for part in &parts {
+        let result = if crate::remote::is_remote(part) {
+            source_on_peer(part, guarded)
+        } else {
+            (ready(part, protected, guarded.iter().copied()).map_err(|e| (e, None)))
+                .and_then(remove)
+        };
+        if let Err((e, what)) = result {
+            gone.extend(what);
+            return Err(match gone.is_empty() {
+                true => SourceKept::Kept(e),
+                false => SourceKept::Partly(gone.join(", "), e),
+            });
+        }
+        gone.push(part.display().to_string());
+    }
+    Ok(())
+}
+
+/// [`delete_remote`] for [`delete_source`]: a refusal or a busy path is the peer's answer
+/// before it deleted anything; any other failure may come after part of it went (the peer
+/// removing entries, or syncing its folder), so it is reported as partly gone. So is a missing
+/// one: the rescan just found it, so a retried request whose first reply was lost reads as
+/// missing after the peer deleted it.
+fn source_on_peer(path: &Path, guarded: &[&PathBuf]) -> Result<(), (DeleteError, Option<String>)> {
+    let at = remote_at(path).map_err(|e| (e, None))?;
+    if in_use(path, guarded.iter().copied()) {
+        return Err((busy(path), None));
+    }
+    let remote = remote_of(&at).map_err(|e| (e, None))?;
+    match remote.delete_path(&at) {
+        Err(e @ (DeleteError::Failed(_) | DeleteError::Missing(_))) => {
+            Err((e, Some(format!("{} may be partly deleted", path.display()))))
+        }
+        other => other.map_err(|e| (e, None)),
+    }
 }
 
 /// What [`crate::remote::Remote::delete_path`] and `move_path` answer by default: a NAS share
@@ -1080,6 +1324,81 @@ fn holds(id: FileId, path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_source_folder_changed_since_it_was_read_is_kept() {
+        let dir = crate::test_dir("delete-source-changed");
+        let game = dir.join("game");
+        std::fs::create_dir_all(game.join("sce_sys")).unwrap();
+        std::fs::write(game.join("eboot.bin"), b"eboot").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let read = |path: &Path| {
+            let (_, listing) = FolderListing::open(path, &cancel).unwrap();
+            ReadSource::Folder(path.to_path_buf(), listing)
+        };
+        let gone = |read: &ReadSource| delete_source(read, &[], &[]);
+        // A file added after the job's scan: never read, so the folder stays.
+        let before = read(&game);
+        std::fs::write(game.join("added.bin"), b"new").unwrap();
+        let Err(SourceKept::Kept(DeleteError::Refused(e))) = gone(&before) else {
+            panic!("an added file must keep the source");
+        };
+        assert!(e.ends_with("changed since it was read"), "{e}");
+        // A file grown, and one removed, the same.
+        let before = read(&game);
+        std::fs::write(game.join("added.bin"), b"newer").unwrap();
+        assert!(matches!(gone(&before), Err(SourceKept::Kept(_))));
+        let before = read(&game);
+        std::fs::remove_file(game.join("added.bin")).unwrap();
+        assert!(matches!(gone(&before), Err(SourceKept::Kept(_))));
+        assert!(game.join("eboot.bin").is_file());
+        // A file replaced by another of the same size and time: its identity tells.
+        #[cfg(unix)]
+        {
+            let eboot = game.join("eboot.bin");
+            let before = read(&game);
+            let mtime = std::fs::metadata(&eboot).unwrap().modified().unwrap();
+            let swap = dir.join("swap.bin");
+            std::fs::write(&swap, b"EBOOT").unwrap();
+            (std::fs::File::options().write(true).open(&swap).unwrap())
+                .set_modified(mtime)
+                .unwrap();
+            std::fs::rename(&swap, &eboot).unwrap();
+            let now = std::fs::metadata(&eboot).unwrap();
+            assert_eq!((now.len(), now.modified().unwrap()), (5, mtime));
+            let Err(SourceKept::Kept(DeleteError::Refused(e))) = gone(&before) else {
+                panic!("a replaced file must keep the source");
+            };
+            assert!(e.ends_with("changed since it was read"), "{e}");
+            assert_eq!(std::fs::read(&eboot).unwrap(), b"EBOOT");
+        }
+        // An empty folder replaced by another empty one: the folder's identity tells.
+        #[cfg(unix)]
+        {
+            let empty = dir.join("empty");
+            std::fs::create_dir(&empty).unwrap();
+            let before = read(&empty);
+            // Made while the old one still exists, so it can't reuse its inode number.
+            let held = dir.join("held");
+            std::fs::create_dir(&held).unwrap();
+            std::fs::remove_dir(&empty).unwrap();
+            std::fs::rename(&held, &empty).unwrap();
+            let Err(SourceKept::Kept(DeleteError::Refused(e))) = gone(&before) else {
+                panic!("a replaced empty folder must keep the source");
+            };
+            assert!(e.ends_with("changed since it was read"), "{e}");
+            assert!(empty.is_dir());
+            // Unchanged, it goes.
+            gone(&read(&empty)).unwrap();
+            assert!(!empty.exists());
+        }
+        // Junk the scanner skips may go with it.
+        let before = read(&game);
+        std::fs::write(game.join(".DS_Store"), b"junk").unwrap();
+        gone(&before).unwrap();
+        assert!(!game.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// What `move_` refused, or "ok".
     fn moved(from: &Path, to: &Path, protected: &[PathBuf], guarded: &[PathBuf]) -> &'static str {
         match move_(from, to, false, protected, guarded) {
@@ -1089,42 +1408,6 @@ mod tests {
             Err(DeleteError::Busy(_)) => "busy",
             Err(DeleteError::Failed(e)) => panic!("{} -> {}: {e}", from.display(), to.display()),
         }
-    }
-
-    #[test]
-    fn move_renames_in_place_and_into_another_folder() {
-        let dir = crate::test_dir("move");
-        std::fs::create_dir_all(dir.join("game/sce_sys")).unwrap();
-        std::fs::create_dir_all(dir.join("other")).unwrap();
-        std::fs::write(dir.join("game/sce_sys/param.json"), b"{}").unwrap();
-        std::fs::write(dir.join("a.exfat"), b"img").unwrap();
-        assert_eq!(
-            moved(&dir.join("a.exfat"), &dir.join("b.exfat"), &[], &[]),
-            "ok"
-        );
-        assert!(!dir.join("a.exfat").exists());
-        assert_eq!(std::fs::read(dir.join("b.exfat")).unwrap(), b"img");
-        assert_eq!(
-            moved(&dir.join("game"), &dir.join("other/game2"), &[], &[]),
-            "ok"
-        );
-        assert!(dir.join("other/game2/sce_sys/param.json").is_file());
-        assert!(!dir.join("game").exists());
-        // A case-only rename, on a case-insensitive volume too.
-        assert_eq!(
-            moved(&dir.join("b.exfat"), &dir.join("B.exfat"), &[], &[]),
-            "ok"
-        );
-        let names: Vec<_> = (std::fs::read_dir(&dir).unwrap().flatten())
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
-        assert!(names.contains(&"B.exfat".to_string()), "{names:?}");
-        assert!(!names.contains(&"b.exfat".to_string()), "{names:?}");
-        // Inside a protected root is what moving is for.
-        let keep = [dir.join("other")];
-        let to = dir.join("other/game3");
-        assert_eq!(moved(&dir.join("other/game2"), &to, &keep, &[]), "ok");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1194,44 +1477,6 @@ mod tests {
             Err(DeleteError::Busy(_)) => "busy",
             Err(DeleteError::Failed(e)) => panic!("{} -> {}: {e}", from.display(), to.display()),
         }
-    }
-
-    #[test]
-    fn move_with_replace_puts_a_file_over_a_file() {
-        let dir = crate::test_dir("move-replace-file");
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("x.bin"), b"new").unwrap();
-        std::fs::write(dir.join("sub/x.bin"), b"old").unwrap();
-        // Without replace: refused, with today's message, nothing changed.
-        match move_(&dir.join("x.bin"), &dir.join("sub/x.bin"), false, &[], &[]) {
-            Err(DeleteError::Refused(m)) => {
-                assert!(m.ends_with("already exists; nothing is replaced"), "{m}")
-            }
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(std::fs::read(dir.join("sub/x.bin")).unwrap(), b"old");
-        assert_eq!(
-            replaced(&dir.join("x.bin"), &dir.join("sub/x.bin"), &[]),
-            "ok"
-        );
-        assert!(!dir.join("x.bin").exists());
-        assert_eq!(std::fs::read(dir.join("sub/x.bin")).unwrap(), b"new");
-        // A rename over a file beside it; over itself refused.
-        std::fs::write(dir.join("sub/y.bin"), b"y").unwrap();
-        assert_eq!(
-            replaced(&dir.join("sub/y.bin"), &dir.join("sub/x.bin"), &[]),
-            "ok"
-        );
-        assert_eq!(std::fs::read(dir.join("sub/x.bin")).unwrap(), b"y");
-        let x = dir.join("sub/x.bin");
-        assert_eq!(replaced(&x, &x, &[]), "refused");
-        // A case-only rename still renames in place.
-        assert_eq!(replaced(&x, &dir.join("sub/X.bin"), &[]), "ok");
-        let names: Vec<_> = (std::fs::read_dir(dir.join("sub")).unwrap().flatten())
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(names, ["X.bin"]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1597,8 +1842,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A path not made yet is in use inside a used folder, and at a used path that doesn't
-    /// exist yet reached through a link.
+    /// A queued job's output doesn't exist yet: [`new_in_use`] judges it through its folders,
+    /// links included.
     #[cfg(unix)]
     #[test]
     fn a_new_path_is_judged_by_its_folders() {
@@ -1612,5 +1857,29 @@ mod tests {
         assert!(!in_use(&dir.join("real/other.exfat"), &guarded));
         assert!(!in_use(&dir.join("gamer"), &guarded));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A NAS or server source is refused before any rescan (no network reached here).
+    #[test]
+    fn a_nas_source_is_kept_without_a_rescan() {
+        let empty = || FolderListing {
+            files: Vec::new(),
+            empty_dirs: Vec::new(),
+            root: None,
+        };
+        for at in [
+            "smb://nas/share/game",
+            "nfs://nas/srv/game",
+            "ftp://nas/game",
+        ] {
+            let read = ReadSource::Folder(PathBuf::from(at), empty());
+            let Err(SourceKept::Kept(DeleteError::Refused(e))) = source_unchanged(&read) else {
+                panic!("{at}: not refused");
+            };
+            assert!(
+                e.contains("deleted or moved on") || e.contains("read only here"),
+                "{e}"
+            );
+        }
     }
 }

@@ -35,17 +35,30 @@ pub(crate) fn write_temp(
     name: &str,
     fill: &mut dyn FnMut(&mut File) -> io::Result<()>,
 ) -> anyhow::Result<()> {
-    write_temp_as(dir, name, fill, &|tmp, target| std::fs::rename(tmp, target))
+    write_temp_as(dir, name, fill, sync, &|tmp, target| {
+        std::fs::rename(tmp, target)
+    })
 }
 
 /// [`write_temp`] that never replaces: the rename fails with `AlreadyExists` when the target
 /// exists ([`crate::finalize::rename_no_replace`]), and the temporary file is deleted.
+///
+/// On macOS the file gets a plain fsync, not F_FULLFSYNC ([`crate::extract::sync_file`]): no
+/// old file is lost by the rename, and the caller ends with one F_FULLFSYNC (a folder's
+/// [`crate::finalize::fsync_dir`]) as the barrier for every file before it. [`write_temp`]
+/// keeps the full sync, since its rename drops the file it replaces.
 pub(crate) fn write_temp_new(
     dir: &Path,
     name: &str,
     fill: &mut dyn FnMut(&mut File) -> io::Result<()>,
 ) -> anyhow::Result<()> {
-    write_temp_as(dir, name, fill, &crate::finalize::rename_no_replace)
+    write_temp_as(
+        dir,
+        name,
+        fill,
+        sync_new,
+        &crate::finalize::rename_no_replace,
+    )
 }
 
 /// A temporary name of this attempt for `name` (`.<name>.forge-<pid>-<n>.tmp`).
@@ -69,6 +82,7 @@ fn write_temp_as(
     dir: &Path,
     name: &str,
     fill: &mut dyn FnMut(&mut File) -> io::Result<()>,
+    sync: fn(&File) -> io::Result<()>,
     rename: &dyn Fn(&Path, &Path) -> io::Result<()>,
 ) -> anyhow::Result<()> {
     let target = dir.join(name);
@@ -111,3 +125,9 @@ fn sync(file: &File) -> io::Result<()> {
 fn sync(file: &File) -> io::Result<()> {
     file.sync_all()
 }
+
+#[cfg(target_os = "freebsd")]
+use sync as sync_new;
+
+#[cfg(not(target_os = "freebsd"))]
+use crate::extract::sync_file as sync_new;

@@ -92,6 +92,7 @@ fn request(source: &Path, format: Format, output: &Path, inner: Option<Format>) 
         replace: false,
         edit_rebuild: false,
         install: None,
+        delete_source: false,
         archive_password: None,
     }
 }

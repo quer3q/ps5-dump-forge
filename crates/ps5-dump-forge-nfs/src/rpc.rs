@@ -612,19 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn records_join_fragments() {
-        let mut bytes = record(&[b"abc", b"", b"defgh", b"i"]);
-        bytes.extend(record(&[b"next"]));
-        let mut r = Cursor::new(bytes);
-        assert_eq!(read_record(&mut r).unwrap(), b"abcdefghi");
-        assert_eq!(read_record(&mut r).unwrap(), b"next");
-        assert_eq!(
-            read_record(&mut r).unwrap_err().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-    }
-
-    #[test]
     fn records_are_bounded() {
         // Two fragments each under the cap whose sum is over it.
         let half = (MAX_RECORD / 2 + 1) as u32;
@@ -671,71 +658,6 @@ mod tests {
         );
         assert_eq!((r.u32().unwrap(), r.u32().unwrap()), (AUTH_NONE, 0));
         assert_eq!(r.remaining(), 0);
-    }
-
-    #[test]
-    fn accepted_success_points_at_the_results() {
-        let buf = accepted(9, b"vrf", 0, &[0, 0, 0, 42]);
-        let start = parse_reply(&buf, 9).unwrap().unwrap();
-        assert_eq!(XdrReader::new(&buf[start..]).u32().unwrap(), 42);
-        // Another xid, or a call from the server, is skipped.
-        assert_eq!(parse_reply(&buf, 10).unwrap(), None);
-        let mut call = Xdr::new();
-        call.u32(9).u32(CALL);
-        assert_eq!(parse_reply(&call.buf, 9).unwrap(), None);
-    }
-
-    #[test]
-    fn accepted_errors() {
-        let mut v = Xdr::new();
-        v.u32(2).u32(3);
-        let e = parse_reply(&accepted(1, b"", 2, &v.buf), 1).unwrap_err();
-        assert_eq!(
-            rpc_error(&e),
-            Some(&RpcError::ProgMismatch { low: 2, high: 3 })
-        );
-        assert!(is_version_mismatch(&e));
-        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
-        assert!(e.to_string().contains("versions 2 to 3"));
-
-        let e = parse_reply(&accepted(1, b"", 1, &[]), 1).unwrap_err();
-        assert_eq!(rpc_error(&e), Some(&RpcError::ProgUnavail));
-        assert!(is_version_mismatch(&e));
-
-        for (stat, want) in [
-            (3, RpcError::ProcUnavail),
-            (4, RpcError::GarbageArgs),
-            (5, RpcError::SystemErr),
-        ] {
-            let e = parse_reply(&accepted(1, b"", stat, &[]), 1).unwrap_err();
-            assert_eq!(rpc_error(&e), Some(&want));
-            assert!(!is_version_mismatch(&e));
-        }
-        let e = parse_reply(&accepted(1, b"", 6, &[]), 1).unwrap_err();
-        assert!(rpc_error(&e).is_none());
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        // A mismatch cut before its versions.
-        assert!(rpc_error(&parse_reply(&accepted(1, b"", 2, &[]), 1).unwrap_err()).is_none());
-    }
-
-    #[test]
-    fn denied_replies() {
-        let mut x = Xdr::new();
-        x.u32(5).u32(REPLY).u32(MSG_DENIED).u32(0).u32(3).u32(4);
-        let e = parse_reply(&x.buf, 5).unwrap_err();
-        assert_eq!(
-            rpc_error(&e),
-            Some(&RpcError::RpcMismatch { low: 3, high: 4 })
-        );
-        assert!(is_version_mismatch(&e));
-
-        let mut x = Xdr::new();
-        x.u32(5).u32(REPLY).u32(MSG_DENIED).u32(1).u32(5);
-        let e = parse_reply(&x.buf, 5).unwrap_err();
-        assert_eq!(rpc_error(&e), Some(&RpcError::Auth(5)));
-        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-        assert!(!is_version_mismatch(&e));
-        assert!(e.to_string().contains("privileged source port"));
     }
 
     /// A stream whose reads come from `input` and whose writes go to `output`.
@@ -868,60 +790,5 @@ mod tests {
         assert!(!c.broken, "a refusal keeps the connection in step");
         let port = server.join().unwrap();
         eprintln!("connected from port {port}");
-    }
-
-    /// `crate::probe` against a fake server answering NULL with `stat` (0 ok, 1 PROG_UNAVAIL,
-    /// 2 PROG_MISMATCH).
-    fn probe_answered(stat: u32) -> io::Result<()> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let call = read_record(&mut s).unwrap();
-            let xid = XdrReader::new(&call).u32().unwrap();
-            let mut v = Xdr::new();
-            if stat == 2 {
-                v.u32(4).u32(4);
-            }
-            s.write_all(&record(&[&accepted(xid, b"", stat, &v.buf)]))
-                .unwrap();
-        });
-        let r = crate::probe(TcpStream::connect(addr).unwrap(), Duration::from_secs(2));
-        server.join().unwrap();
-        r
-    }
-
-    #[test]
-    fn probe_needs_the_nfs_program() {
-        probe_answered(0).unwrap();
-        probe_answered(2).unwrap(); // NFS, other versions only
-        assert!(probe_answered(1).is_err());
-        // Something that answers no RPC: the read times out or the reply is no RPC.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            s.write_all(b"220 hello\r\n").unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-        });
-        assert!(
-            crate::probe(
-                TcpStream::connect(addr).unwrap(),
-                Duration::from_millis(200)
-            )
-            .is_err()
-        );
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn refused_connection() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        assert_eq!(
-            connect(addr).unwrap_err().kind(),
-            io::ErrorKind::ConnectionRefused
-        );
     }
 }

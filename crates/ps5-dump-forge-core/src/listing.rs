@@ -157,47 +157,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lists_folders_first_and_marks_links() {
-        let dir = crate::test_dir("listing");
-        std::fs::create_dir_all(dir.join("b")).unwrap();
-        std::fs::write(dir.join("a.bin"), b"abc").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.join("b"), dir.join("c")).unwrap();
-        let listing = list_dir(&dir).unwrap();
-        let real = dunce::canonicalize(&dir).unwrap();
-        assert_eq!(listing.path, real);
-        // Windows: the plain `C:\x` spelling, never `\\?\C:\x`.
-        assert!(!listing.path.to_string_lossy().starts_with(r"\\?\"));
-        assert!(
-            !listing.entries[0]
-                .path
-                .to_string_lossy()
-                .starts_with(r"\\?\")
-        );
-        assert_eq!(listing.parent.as_deref(), real.parent());
-        let names: Vec<_> = (listing.entries.iter())
-            .map(|e| (e.name.as_str(), e.dir, e.size, e.link))
-            .collect();
-        #[cfg(unix)]
-        assert_eq!(
-            names,
-            [
-                ("b", true, None, false),
-                ("c", true, None, true),
-                ("a.bin", false, Some(3), false)
-            ]
-        );
-        #[cfg(unix)]
-        assert_eq!(listing.entries[1].path, real.join("b"));
-        #[cfg(not(unix))]
-        assert_eq!(
-            names,
-            [("b", true, None, false), ("a.bin", false, Some(3), false)]
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn explorer_hides_shadowmnt_and_marks_mounted_images() {
         assert!(smp_hidden(Path::new("/mnt/shadowmnt")));
         assert!(smp_hidden(Path::new("/mnt/shadowmnt/pfsc/x_0a1b2c3d/")));

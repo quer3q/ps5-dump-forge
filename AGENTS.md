@@ -17,8 +17,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   more than the cancel), `catch_unwind`), `.part` + atomic no-replace
   rename (`finalize.rs`; macOS exFAT, Linux NFS and FUSE have none: check, then rename; FreeBSD: hard link where the folder has
   them, U3), `awake.rs` (`awake()`: one refcounted U8 guard for jobs, paired peers and browser
-  uploads/downloads), BLAKE3 verification (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads, fast sample
-  or full), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
+  uploads/downloads), BLAKE3 verification (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads (hashed inline if none starts),
+  at most 64 files and 64 MiB of partial slices held at once, past that a file hashed by a second read; fast
+  sample or full), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
   generated output names), `prefetch.rs` (read-ahead thread), `delete.rs` (Edit's and Storage's delete,
   Storage's move; `in_use`, the job-path guard; a `flink://` path handed to its peer, `delete_remote`/`move_remote`), `listing.rs` (`list_dir`; `list_explorer`, the PS5 explorer's ShadowMount+ rule), `library_roots.rs` (PS5 filesystem classifier, the chosen-folder refusal
   list) and `library.rs` (`scan_library`, `library_cover`; `scan_packages`, the Package installer's `.pkg` walk).
@@ -28,7 +29,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   format editor's `patch::Op`s), `edit_job.rs` (an image edit job in place: scan, preflight, apply through
   the undo journal, verify, commit or roll back; the rebuild dispatch and `edit_check`'s two halves),
   `edit_folder.rs` (a folder edit job, applied directly), `temp_file.rs` (a file written through an
-  exclusive `.<name>.forge-<pid>-<n>.tmp`, synced, renamed over or onto its target), `host_tree.rs` (`host_tree`: a host file or
+  exclusive `.<name>.forge-<pid>-<n>.tmp`, synced, renamed over or onto its target; `write_temp_new` syncs as
+  `extract::sync_file` (on macOS a plain fsync, the caller's folder F_FULLFSYNC the barrier), `write_temp`
+  (replace) fully), `host_tree.rs` (`host_tree`: a host file or
   folder as `Edited` will scan it, for the UI's preview), `extract_paths.rs` (an Extract job: chosen
   files and folders of any source copied out; `existing_targets`, `replace_findings`), `remote.rs` (every path on another device: the `Remote`
   trait (stat, list, read_at, read_checked, put_new, mkdir, create, write_at, sync, close,
@@ -76,18 +79,20 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
 - `crates/ps5-dump-forge-lz4`: ampr_emu asset packs: AMPRPAK4 manifest + AMPRDAT3 volume writer and
   reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, pack rules (`rules.rs`), LZ4 blocks through
   the C liblz4 (`block.rs`, `lz4-sys`: `LZ4_compress_default` at level 0, `LZ4_compress_HC` at 3..=12,
-  `LZ4_decompress_safe`), the embedded runtimes (`runtime.rs`: the release runtime and ampr-emu-ng; the old
-  trace build only recognized by its pinned SHA-256). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
+  `LZ4_decompress_safe`), the embedded runtimes (`runtime.rs`: the release runtime `runtime::release()` and ampr-emu-ng
+  v0.1.0 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
+  once on first use into a `OnceLock`; sizes and SHA-256 pinned (`pinned_sizes_and_hashes`); `classify` also recognizes by pinned
+  SHA-256 the old trace build and the old local ng build (`OLD_ZSTD_SHA256`), neither shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
   runtime swap). `tree.rs` is `PackedTree`, the packs served as a `SourceTree` from a `writer::measure` pass.
-  `vendor/ampr_emu/`: the upstream 0.4.2.1 release `.sprx` + the source archive, and ampr-emu-ng
-  `libSceAmpr-zstd.sprx` (see its README). `vendor/ampr-emu-ng/`: the ampr-emu-ng v0.1.0 release
-  (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`, `SHA256SUMS`) + its source archive, not embedded yet.
+  `vendor/ampr_emu/`: the upstream 0.4.2.1 release `.sprx` + the source archive. `vendor/ampr-emu-ng/`: the
+  ampr-emu-ng v0.1.0 release (`libSceAmpr.sprx`, embedded as `runtime::zstd()`; `libSceAmpr-debug.sprx`, never
+  embedded; `SHA256SUMS`) + its source archive.
 - `crates/ps5-dump-forge-zstd`: zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak` volumes of at most 4 GiB -
   64 KiB, 256 KiB chunks, one zstd frame or raw each): the format (encode + validating decode), the
   writer (`writer::pack_with`; `writer::measure` + `tree::PackedTree`, the packs made on demand for an
   image, as LZ4's) and the reader (`reader::detect`, `reader::unpack`: the index and every
   volume header checked, then the logical files served as a `SourceTree`, 8 chunks per volume read decoded
-  in parallel); spec in `docs/PAK.md`. Without its default `std` feature the crate is `no_std` and keeps
+  in parallel; a loose file found by a binary search of the sorted listing, `Unpacked::listed`); spec in `docs/PAK.md`. Without its default `std` feature the crate is `no_std` and keeps
   only the convention (magics, layout, names, `Chunk`, the volume header): ampr-emu-ng builds against
   that. Glue in `core/src/zstd_pack.rs` (the pack job's tree, plan, packing,
   checks).
@@ -125,20 +130,30 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   absolute server paths). Glue: `core/src/nfs.rs`. ponytail: one connection per session, requests
   serialized, no reconnect; cached handles live 3 s; an idle v4.1 session may expire (dropped, reconnected).
 - `crates/ps5-dump-forge-cli`: binary `ps5-dump-forge` (`inspect`, `convert`, `serve`), JSON-lines events.
+  A second Ctrl-C quits at once (unix `_exit(130)`; Windows the default handler), the first prints
+  "cancelling... (press Ctrl-C again to quit now)"; the `.part` stays (`stale_parts`).
 - `crates/ps5-dump-forge-ps5`: the payload's global allocator (`Pool`, installed by the CLI only for
   the PS5): freed blocks of 64 B..4 MiB kept in power-of-two classes, since the PS5 libc serializes
   every malloc across threads (a `.pkg`'s Kraken pool: 12.7 → 49.3 MB/s at 4 threads).
 - `crates/ps5-dump-forge-server`: `serve`, std-only HTTP/1.1 (`http.rs`), routes mirroring the Tauri commands
   (`api.rs`), job table for polling (`table.rs`), roots (`paths.rs`), PS5 tile (`tile.rs`), self copy
-  (`self_copy.rs`), `debug.rs` (PS5 only, with `FORGE_DEBUG_API`). `build.rs` embeds `app/dist-http` and the
-  self copy. `POST /api/edit_upload` and `POST /api/connect/upload` are the routes whose body is streamed
+  (`self_copy.rs`), `debug.rs` (PS5 only, with `FORGE_DEBUG_API`). `build.rs` embeds `app/dist-http` (an
+  `assets/` file that gzip shrinks by 5% or more stored gzipped, `ASSETS: &[(&str, bool, &[u8])]`; `index.html`
+  and `forge.appcache` plain; sent with `Content-Encoding: gzip` when `Accept-Encoding` takes it, else decoded
+  per request, `Response::gzip_asset`; both with `Vary: Accept-Encoding`) and the self copy (`PDFGSELF`,
+  lengths, SHA-256, one zstd frame at level 22; `zstd` a dependency on the PS5 only, `flate2` a build one).
+  Past `MAX_HANDLERS` (16) the accept thread answers 503, shuts its write side and drains the request
+  for up to 20 ms, so the close sends no reset. `POST /api/edit_upload` and `POST /api/connect/upload` are the routes whose body is streamed
   (no 1 MiB cap; `BodyReader` in `http.rs`). Connect: the `ps5-dump-forge-flink` crate (below),
   `connect.rs` (`Connect`: identity (`node.key`),
   approvals (`Approvals`, `Outgoing`), `peers.json`, the TCP 9883 listener, pair/forget/devices, liveness, `snapshot`,
   a peer's `install` RPC (`set_install`, the PS5's server only; `Connect::install` asks a PS5);
   also used by the Tauri app), `connect_fs.rs` (a peer's files over FLINK: the peer side's RPCs and lanes,
   `ConnectRemote`, core's `Remote` on this side; the busy hooks both ways; `set_delete_move`, a peer's Delete and
-  Move to here), `discovery.rs` (Forge on UDP 8094), `probe.rs` (Add a device: what answers at an address), `payload.rs` (elfldr's address as Install on PS5 and Send a payload take it, port 9021 by default), `mdns.rs` (NAS: smb/ftp/nfs; `merge`), `wsd.rs` (Windows PCs by WS-Discovery),
+  Move to here; the speed test, `speed_test`, `serve_speed`: the `speed` RPC, then `speed_up`/`speed_down` lanes,
+  nothing on disk), `discovery.rs` (Forge on UDP 8094; a socket error other
+  than WouldBlock logged once, `discovery: <e> (retrying every second)`, and retried every second, so the
+  responder outlives a network down/up or rest mode; ponytail: the sockets are never bound again), `probe.rs` (Add a device: what answers at an address), `payload.rs` (elfldr's address as Install on PS5 and Send a payload take it, port 9021 by default), `mdns.rs` (NAS: smb/ftp/nfs; `merge`), `wsd.rs` (Windows PCs by WS-Discovery),
   `nas.rs` (saved NAS devices: `nas.json`, one entry per host + port, `protocol` smb/ftp/nfs, credentials;
   `publish` hands SMB logins to `core::smb::set_credentials`, FTP ones to `core::ftp::set_logins`).
 - `crates/ps5-dump-forge-updater`: the PS5's ELF loader (elfldr, port 9021) from here (one `lib.rs`): `download`
@@ -150,11 +165,17 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   rustls (ring, webpki roots; + `libc` on unix for `O_NOFOLLOW`), by user decision: elfldr can't follow GitHub's
   302, so it is never handed a URL. ponytail: TLS authenticates GitHub; no signature or version check.
 - `crates/ps5-dump-forge-flink`: FLINK v2, Connect's protocol (one `lib.rs`: 16 B frames with CRC-32,
-  BLAKE3 MACs, the Hello/Pair handshake, RPC, data lanes, `tune_buffers`); std + blake3 + crc32fast + serde_json + x25519-dalek + getrandom.
+  BLAKE3 MACs, the Hello/Pair handshake, RPC, data lanes, `tune_buffers`; the listening side's handshake
+  and a lane's Join bounded in total by `HANDSHAKE_WAIT` (15 s, `Conn::set_deadline`), `PAIR_WAIT` more once
+  a `Pair` is in, so a peer dripping bytes can't hold one of the 64 conn slots; `Conn::send_data` MACs a
+  `Data` frame's head and bytes as parts, never building one body, and `read_frame` fills a body as it reads,
+  never zeroed first); std + blake3 + crc32fast + serde_json + x25519-dalek + getrandom.
 - `ps5/`: the payload's Docker harness: `Dockerfile`, `build.sh`, `linker.sh`, `entry.c` (launch modes,
   logs, `ps5_notify`), `compat.c` (statfs symvers; `cpuset_getaffinity` answered per thread, so std sees the 5 CPUs
   a payload may use, not 16), `launcher.c` (tile registration), `installer.c` (`forge_pkg_install`:
-  `sceAppInstUtilInstallByPackage` under the SYSTEM install authid), `icon0.png`,
+  `sceAppInstUtilInstallByPackage` under the SYSTEM install authid; `forge_appinst_begin`/`end`, the one lock
+  every sceAppInstUtil user holds, `launcher.c`'s tile registration included; the library an install
+  initialized is never terminated), `icon0.png`,
   `test-entry.sh`; `shim/` + `x86_64-ps5-freebsd.json` + `prepare-rust-std.py` are ps5-ai-cli's, byte-identical.
 - `app/`: React/TS/Vite UI; `app/src-tauri` is the `ps5-dump-forge-gui` crate (binary `Forge`,
   bundled as "PS5 Dump Forge" via `mainBinaryName`; Linux's `tauri.linux.conf.json` names it
@@ -174,12 +195,16 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   Devices list (peers and NAS) with its filter and Nearby (Autodiscovery's finds); device and NAS
   details, the pairing wait, Add SMB / FTP / NFS), `ConnectHelp.tsx` (How to connect), `Transfer.tsx` (File
   Transfer: Send as a transfer job, the browser's upload and download), `useConnectState.ts` (polls
-  `connect_state`; the online count). `Picker.tsx`: the tabbed picker (a tab per online device);
+  `connect_state`; selectors `useOnlineCount`, `useRemoteJobs` (kept until its JSON text changes) and
+  `useSavedNames` (kept until a name or address changes); `common.tsx`'s `usePeerPath`/`useDeviceName` read
+  names only, so a poll that changes nothing re-renders nothing). `Picker.tsx`: the tabbed picker (a tab per online device);
   `JobList.tsx` the job list (`JobsCard`; `App.tsx` renders one per tab, that tab's jobs).
   `app/scripts/*.mjs`: plain-node checks (`check-paths`, `check-poller`, `check-launcher`, `check-update`,
   `check-upload` (the upload URL's encoding against the server's decoder, `upload` over a mocked XHR),
-  `check-explorer` (`explorer.ts`: the fold mirrors core's `edit.rs` tests), `check-shoulders` (`shoulders.ts`: L2/R2 keys, tab order), `check-peers` (`peers.ts`: saved
-  devices' names in paths and backend text), `smoke`).
+  `check-explorer` (`explorer.ts`: the fold mirrors core's `Edited` rules; the folder-merge case is checked
+  only there), `check-shoulders` (`shoulders.ts`: L2/R2 keys, tab order), `check-peers` (`peers.ts`: saved
+  devices' names in paths and backend text), `smoke`); run by hand (`node scripts/<name>.mjs`; no npm
+  script, not in CI).
 - `vendor/ps5upload-{fpkg,pkg}`: ps5upload v7.0.22 crates (readers, FPKG builder, verify) plus a
   local patch series in `vendor/patches/`; see `vendor/README.md`. Edition 2021 on purpose.
   `vendor/lzma-rust2`: crates.io 0.22.0 + patch 0021 (bounded multithreaded LZMA2 decode, which
@@ -241,19 +266,21 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   fast/full policy. Pack needs a title whose `eboot.bin` imports `libSceAmpr`. Compression is the C liblz4
   (`block.rs`, by user decision): `lz4_level` 0 (Fast, `LZ4_compress_default`, the default) or an HC level
   3..=12 (Medium 9, Max 12), any other value a finding; CLI `--lz4-level`. The runtime is `lz4_runtime`
-  (`Lz4Runtime`, `ng` default | `ampr_emu`; CLI `--lz4-runtime`): ampr-emu-ng (`runtime::ZSTD`) or the
+  (`Lz4Runtime`, `ng` default | `ampr_emu`; CLI `--lz4-runtime`): ampr-emu-ng (`runtime::zstd()`) or the
   release build; `runtime::WARNING` is logged only for `ampr_emu`. By user decision: no traces and no
   profiles; the rules are the built-in guess (below).
 - zstd packs (`core/src/zstd_pack.rs`, `ps5-dump-forge-zstd`; spec `docs/PAK.md`; named zstd, files on disk AMPR
   style, by user decision: `ampr_zstd.index` (`AMPRZPK1`) + `ampr_zstd-NNN.pak` (`AMPRZDT1`, from 000)): volumes
-  (zstd, 256 KiB chunks, a chunk kept raw when zstd doesn't shrink it) that ampr-emu-ng (`runtime::ZSTD`,
-  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr_emu/libSceAmpr-zstd.sprx`; the user's runtime, which reads LZ4
-  packs too; its hash computed at run time, not pinned) reads.
+  (zstd, 256 KiB chunks, a chunk kept raw when zstd doesn't shrink it) that ampr-emu-ng (`runtime::zstd()`,
+  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.1.0 release, size and SHA-256
+  pinned (`ZSTD_SHA256`); the user's runtime, which reads LZ4 packs too; the old local build (`OLD_ZSTD_SHA256`,
+  file removed) is still recognized by its hash, so a game carrying it keeps it, and any other build holding the
+  `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng too) reads.
   Pack (`zstd_pack`, `zstd_level` 1..=22, default 5; CLI `--zstd-pack [--zstd-level N]`): into a `folder` or
   straight into an `.exfat`/`.ffpkg`/`.ffpfs`/`.ffpfsc` (`.pkg` refused), no LZ4 option, an AMPR title (`eboot.bin` imports libSceAmpr), no source file named like a pack file;
   else preflight findings. `zstd_pack::prepare`: ampr-emu-ng at `fakelib/libSceAmpr.sprx` (installed or
   replacing any), journal, logs and old index left out, a fresh `ampr_emu.index` (the job's `mtime`) listing
-  every file written, loose and packed. The packed set is LZ4's: the built-in guess (`Selection::Fallback`:
+  every file written, loose and packed. The packed set is LZ4's: the built-in guess (`rules::select`:
   root files and the keep-loose list stay loose) or, for an LZ4-packed source, the files its packs held; never
   `zstd_pack::loose` (`always_loose`, the pack files, the index); no auto-loose. A folder: stages scan, preflight,
   write, pack, verify, finalize. An image: two passes as LZ4's (`writer::measure`, then the image written from
@@ -272,8 +299,12 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   shown wherever the LZ4 one is: the source card's **zstd** tile (`ZstdTile`, in the LZ4 tile's place:
   Packed, "a conversion keeps them", the runtime), the Library's **zstd** chip and card/row badge.
   UI (by user decision): the **Pack** tab (`app/src/Pack.tsx`, after Edit; **How pack works** in `PackHelp.tsx`)
-  with a kind selector **zstd** (default) / **LZ4** (experimental); the action is **Unpack** for a game packed
-  by the kind chosen, else **Pack**. Blocked (a note in place of the settings): a patch package, additional
+  with a kind selector **zstd** (default) / **LZ4**; the action is **Unpack** for a game packed
+  by the kind chosen, else **Pack**. Its empty source card (`PackEmpty`, by user request) is the shared one's text ("Choose a game folder,
+  image or archive", format chips, **Pick**) in Pack's yellow (`.empty.lz4`, compress icon, `button.lz4-btn`); before a source the settings side shows
+  nothing. LZ4's line under the selector: an unpacked game a warn "Some games may not start. ...", a packed one
+  plain "Writes the LZ4 packs back as plain files."; How pack works opens its LZ4 list with "**Some games may
+  not start.** Keep a copy.". Blocked (a note in place of the settings): a patch package, additional
   content, a game packed by the other kind ("unpack it under <kind> first"), a game that doesn't use AMPR
   (`pack.noAmprGame`). Pack's targets (a UI limit; core and CLI keep `.ffpfsc`): zstd folder (default)/
   `.exfat`/`.ffpkg`/`.ffpfs`, LZ4 packed folder (default)/`.exfat`/`.ffpkg`/`.ffpfs`, an image with the muted
@@ -284,12 +315,14 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   reads zstd and LZ4 packs) or **ampr_emu <version>** (upstream). A Pack that installs ampr-emu-ng (every zstd
   Pack, LZ4 with `ng`) shows the warning `pack.ngNote`: turn off ShadowMount+'s fakelib update, or it replaces
   the runtime. LZ4 Unpack, or Pack with ampr_emu: the runtime action from `Lz4Facts.pack_runtime_action`
-  (install, replace or keep, naming an `other` build's version); LZ4 Pack: a non-ok index written afresh
+  (install, replace or keep, naming an `other` build's version; a game's ampr-emu-ng replaced:
+  `convert.amprNgReplaced`); LZ4 Pack: a non-ok index written afresh
   (`pack.freshIndex`). Job rows: `jobType` `pack`, a tag `LZ4 pack · <level>`, `zstd pack · <level>` (the
   preset's name, else `level N`), `LZ4 unpack` or `zstd unpack`.
   Convert always sends `lz4: null` (by user decision: no Update AMPR switch, nothing to choose); under Build, for an
   AMPR game only, muted `info` notes say what the conversion does by itself: the runtime action
-  (`Lz4Facts.runtime_action`: install, replace, keep with the version; `convert.amprRuntime`) and the index (a
+  (`Lz4Facts.runtime_action`: install, replace, keep with the version; `convert.amprRuntime`, a game's
+  ampr-emu-ng `convert.amprNgReplaced`) and the index (a
   non-ok one written afresh, `amprIndex`, an ok one counted stale while Remove backport is on; for an fpkg target
   always `amprPkgIndex`: the builder writes it; none for a packed game). The Edit tab's
   LZ4 tile (its Game facts fold) names install/replace (keep only for an `other` build with a version) and a non-ok index, and shows for
@@ -302,8 +335,11 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   `not_older`), one naming no version or unreadable, and Forge's old trace runtime (recognized by its pinned
   SHA-256, on any title); `Keep` Forge's release runtime and another ampr_emu at the bundled version or newer (by
   user decision), except into an output holding LZ4 packs (LZ4 Pack, an LZ4-packed source as it is), which also
-  needs `runtime::reads_packs` (upstream's no-pack build is replaced); ampr-emu-ng is kept (LZ4 packs included:
-  it reads them), replaced only by a zstd unpack and an LZ4 Pack with `ampr_emu`; `Untouched` for a non-AMPR
+  needs `runtime::reads_packs` (upstream's no-pack build is replaced); ampr-emu-ng goes into a game only by
+  packing (by user decision: zstd Pack always, LZ4 Pack with `ng`), so every other job replaces it with the
+  release build (`runtime::release()`, no option: a plain conversion, an LZ4-packed source as it is, LZ4 and
+  zstd Unpack; log "replacing ampr-emu-ng at ... with the bundled ampr_emu <v>"), except a zstd-packed source
+  converted as it is (`zstd_action`, below: only it reads zstd packs); `Untouched` for a non-AMPR
   title. LZ4 Pack follows `pack_action(lz4_runtime)`: `ng` keeps ampr-emu-ng, else installs it; `ampr_emu`
   replaces ampr-emu-ng, else `action(true, true)`. zstd Pack always writes ampr-emu-ng. `Lz4Facts.runtime` names it
   (`forge_release`/`forge_trace`/`zstd` (ampr-emu-ng)/`other`/`none`). `Lz4Facts.runtime_action` (plain convert) and `pack_runtime_action` (Pack/Unpack) name it
@@ -333,13 +369,15 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   spread block indices, `writer::sample` = the writer's `encode`) and kept loose when it saves < 5% or
   ≥ 90% of the blocks stay RAW; one log line `auto-loose: N large files kept loose (incompressible samples): …`.
 - Never touch the source: junk (`.DS_Store`, `._*`, `.fseventsd`, ...) is filtered, not deleted.
-  Two exceptions, by user decision, both explicit requests:
+  Three exceptions, by user decision, each an explicit request:
   1. Deleting the Edit tab's source, a Library entry or a File explorer row (the trash button of the Edit
      card, of a Library card/row or of an explorer row, or its Delete key; one **No** / **Yes, delete**
      dialog and one route; core `Jobs::delete_path(path, protected)`
      → `DeleteError` `Refused`/`Missing`/`Busy`/`Failed`, `core/src/delete.rs`; server
      `POST /api/delete_path` `{path}` → `null`, 400/404/409/500, 409 also while stopping; Tauri
-     `delete_path` `{path}`). A file (`remove_file`) or folder (`remove_dir_all`: links inside removed, not
+     `delete_path` `{path}`; the server's admission is held only to admit it, the removal runs counted
+     (`deleting`): meanwhile `quit {"if_idle"}` and `self_update` answer 409 "a game is being deleted", a stop
+     doesn't wait, `finish` waits for it before exiting; core's job table stays locked through the removal). A file (`remove_file`) or folder (`remove_dir_all`: links inside removed, not
      followed), then its folder synced; no Trash, no undo, and a folder that fails part way may be partly
      gone (the error says so). Refused: an empty path, a link itself, a special file, a volume root or
      mount point, a folder with another volume mounted inside (unix, by `st_dev`; a same-filesystem Linux
@@ -370,6 +408,44 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
      the source, folder synced, the backup removed). Any failure leaves the source byte-identical and the
      `.part` deleted (where putting the original back fails, the error names its `*.orig.part` backup).
      The server's stale-part filter takes an edit job's `.part` from its source.
+  3. Delete the source after a successful job (opt-in; `ConvertRequest.delete_source`, CLI
+     `--delete-source`): a conversion or an LZ4/zstd pack or unpack only (with an edit, extract, transfer or
+     install a preflight finding). The job records what it read (`delete::ReadSource` in `Ctx.read`, handed
+     back to `Inner::run`): a folder's `FolderListing` (every file's path, size, mtime and identity
+     (`finalize::path_id`: unix dev + ino, Windows volume serial + file index) and every empty folder, as the
+     job's scanner kept them), or an image's or archive's `SourceStamp` (an archive's every part as stamped
+     when opened; parts are never looked for again after the job). Once the result is Ok (verified, output in
+     place), `jobs.rs` `Inner::delete_source` checks it first, outside the job-table lock
+     (`delete::source_unchanged`; a source on a NAS or server, `smb://`/`nfs://`/`ftp://`, kept at once with no
+     rescan), then drops the job's own paths and removes it with the table locked (`delete::remove_source`:
+     the protected, guard and in-use checks, then the removal; no job admitted between; a peer source is deleted
+     with the table unlocked, the job's own paths kept in it as the reservation, since the peer's delete takes its
+     own table and two devices deleting on each other at once would deadlock): a folder scanned again by the
+     same rules must list exactly the same files, sizes, mtimes, identities, empty folders and (local) the
+     folder's own identity (skipped junk,
+     `.DS_Store`, `._*`, goes with it, by design), an image or every archive part must keep its stamp, else
+     `source kept: <path> changed since it was read`; each local part of a multi-part archive `check`ed before
+     the first goes, then `delete::delete` per part with the `Jobs::set_protected` list and every other
+     unfinished job's paths guarded; a source holding the output is refused; a peer source goes to the peer's
+     own Delete (`source_on_peer`: refused or busy means nothing went; any other failure, a not-found answer
+     too (the rescan just found it: a retried request whose first reply was lost), is "<path> may be partly
+     deleted"), a NAS is refused. By user decision the job stays Ok either way: one line in
+     `JobReport.checks` and the log, `source deleted: <path>`, `source kept: <reason>`, or `source partly
+     deleted: <what is gone>; <error>` when something went before a failure (a later archive part, a folder
+     whose removal stopped part way, a sync after the removal). ponytail: a peer folder (and an OS without
+     file identities) is compared by size + mtime only; a file added between the rescan and the removal (on a
+     peer, before its own delete) goes with the folder. UI (Convert and Pack): **Delete the source** (by user request)
+     (`target.tsx` `DeleteSourceSwitch`, `.field.verify.delete-source` under Full verification), off by
+     default, in memory only (kept across sources), a muted hint ("No undo. The source is deleted only
+     after a successful conversion."); for a NAS source off and disabled with a `.note-line.warn` (`target.deleteSourceNas`), and
+     `delete_source` never sent for a NAS path; hidden for a patch package, in Pack shown only with its
+     settings. Job rows (`JobList.tsx` `sourceLine`, matched by the backend's English prefix, left out of the
+     Verified fold): `jobs.sourceDeleted` as a muted `.note-line`, `jobs.sourceKept` and
+     `jobs.sourcePartlyDeleted` as a `.note-line.warn`. A job whose checks carry `source deleted:` makes
+     `App.tsx` call `notifyDeleted` from its Done event and, in the web build, when the poller restores it
+     already finished (`jobs://restore`: a reload, another viewer's job); not a peer's mirrored job; the
+     notified job ids are kept in memory, so each is heard once (ponytail: by id only, so a payload restart
+     reusing a notified id isn't heard).
 - Replace after confirmation (by user decision): File Transfer jobs, the phone upload
   (`/api/connect/upload`), Edit's Extract and the File explorer's Rename and Move to refuse a name
   already there, as before; once the user confirms, they put the new one in its place. Opt-in per request
@@ -461,7 +537,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
     filesystem uses is the original's; free space may keep the new, unreferenced data. Every open for
     editing (job, rebuild scan, `edit_check` under the job-table lock unless a job uses the image) runs
     `patch::recover` after the ShadowMount+ check: a complete journal is restored then deleted, one cut
-    short is deleted (nothing live was written), a damaged one is kept with an error ("keep both files").
+    short is deleted (nothing live was written; the image isn't opened, so a missing or read-only one doesn't
+    block it), a damaged one is kept with an error ("keep both files").
     `Inspection.interrupted_edit` (a journal beside the image) is noted on the card. Room for the journal
     beside the image is a preflight finding (`undo journal:`).
   - **Refused** (preflight findings, nothing written; every offender listed): any LZ4 or zstd option,
@@ -536,7 +613,11 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
     `/mnt/shadowmnt`, names the destination
     can't hold, no room (+ 1 MiB), an edit, `edit_rebuild`, `lz4`, `zstd_pack` or `zstd_unpack`. Stages `scan`, `preflight`, `write`, `verify`;
     each file streamed in 8 MiB reads through an exclusive temporary name beside it, synced, renamed
-    without replacing (over the file it replaces); BLAKE3 while writing; verify checks sizes (full: re-reads and re-hashes). No
+    without replacing (over the file it replaces); the source read one range ahead on its own thread
+    (`extract_paths::read_ahead`, core's `Prefetch`; the next file too when the selection is in `files()`
+    order); on macOS each new file a plain fsync and each selection's root folder one F_FULLFSYNC as the
+    barrier (a replaced file keeps its full sync); BLAKE3 while writing; verify checks sizes (onto a peer or
+    NAS in fast mode from one listing per written folder; full: re-reads and re-hashes). No
     rollback (ponytail): a failure or cancel deletes this job's temporary files and says "N of M files were
     extracted before it and stay" (none finished: "<folder> was created and stays"). It reads the source as it is on disk; with changes pending a muted line
     says so. Job row: tag **Extract**, error box "Can't extract:". Server and Tauri: `start_job`, and `existing_targets`
@@ -789,7 +870,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   saved by IP moves to the one host a search finds with its protocol and a similar name (same letters
   and digits, any case; none saved there yet; `NasList::migrate`, run as every search ends, the one at
   start included), keeping its login; online = a TCP
-  connect to its port each probe round (ponytail: an NFSv3 server reached only through its portmapper reads
+  connect to its port each probe round (`nas::reachable`: the name looked up within 3 s and every address tried
+  at once, so one NAS holds a round up for at most 6 s; ponytail: a lookup past that reads offline and none
+  starts again for that host + port while it runs; an NFSv3 server reached only through its portmapper reads
   offline unless its nfsd port is saved). The Devices list shows online devices first, peers before NAS devices, at most 9 in
   all, each with a kind tag (Forge, SMB, FTP, NFS), its facts (a peer's platform and address, a NAS's
   `host[:port]` and user or Guest, none for NFS) and **Online**, else "Offline · seen: 5 hours ago"
@@ -825,8 +908,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   device, this device first, then each online peer (`flink://<key_id>`) and each online saved NAS
   (`smb://`, `ftp://`, `nfs://<host>[:port]`, `nasRoot`), for sources and outputs alike; Edit's Add lists
   peers only (`peersOnly`). No system dialog on any platform (by user decision; `tauri-plugin-dialog`
-  removed): the desktop's local tab lists Tauri `list_dir` (home and mounted volumes; Windows each drive C:
-  to Z: that lists). A source is one **[disc] Pick** button (by user request; Convert, Edit, Pack) in the
+  removed): the desktop's local tab lists Tauri `local_roots` (home and the volume folders, Windows C: to Z:,
+  that open and that `list_dir` doesn't refuse; existence only, one thread each, 1.5 s for all; ponytail: a
+  stalled root's thread is left running), a root listed only when opened. A source is one **[disc] Pick** button (by user request; Convert, Edit, Pack) in the
   `folderToo` mode: a file click picks an image or archive, "Choose this folder" a game folder, told apart
   by extension. Rows: at most 2,000 shown, one Tab stop, arrows move; multi-select's button reads
   "Choose N files"; a picker starts where the last browse ended (kept until the page closes).
@@ -858,11 +942,14 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   user request, the File explorer's device tabs): core's `Jobs::delete_path`/`move_path` refuse it while one
   of this device's unfinished jobs uses it, a move across devices ("a move stays on one device") or between
   here and a peer (a transfer), then hand it to the peer (`Remote::delete_path`/`move_path`, the
-  `delete_path`/`move_path` RPCs; ponytail: under the job-table lock, so a slow peer holds off this device's
-  jobs; a broken session is tried once more, so a delete done before the break reads as missing), which
+  `delete_path`/`move_path` RPCs, each on a control session of its own (`ConnectRemote::alone`), never the
+  device's shared one, so a long delete doesn't hold up a transfer's per-file calls; listings (`fs_list`) stay
+  on the shared cached session; ponytail: under the job-table lock, so a slow peer holds off this device's jobs;
+  no retry: a link that breaks mid-delete fails the request, the peer may have finished), which
   confines both paths as every RPC's, refuses its share root itself, and runs its own `Jobs::delete_path`/
   `move_path` with its protected paths (`Connect::set_delete_move`: the server's keep list, the app's home
-  folder; refused until set, and while it stops or quits); the error's kind comes back by its lead
+  folder; refused until set, and while it stops or quits; on the server admitted as the local routes are,
+  `admit_delete()`, counted in `deleting`, no admission held through it); the error's kind comes back by its lead
   (`refused: `, `busy: `, not found); an older peer answers `unknown method` ("that device's Dump Forge is
   older: update it ..."). Tauri's `delete_path`/`move_path` skip `folder_refusal` for a network path (the peer
   judges it; a NAS is refused by core). Peer side (`connect_fs.rs`): RPCs `stat`, `fs_list`, `read_open`/`read_close`, `mkdir`, `create`,
@@ -909,6 +996,33 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   uploads and downloads: `sceSystemServicePowerTick` at once, then every 30 s),
   `quit {"if_idle": true}` answers 409 "Dump Forge is busy: a paired device is reading or writing files
   here", and the desktop app's close asks first as for its own jobs (`QuitHeld`, `peerBusy`).
+  **Speed test** (user request; by user decision nothing written to disk, both directions, on the data lanes
+  as transfers): `Connect::speed_test(key_id)` -> `SpeedTest {up_bytes_per_s, down_bytes_per_s, bytes}`: the
+  `speed` RPC first (an older peer answers `unknown method`: `SPEED_OLDER`, "that device's Dump Forge is older:
+  update it to run a speed test"), then `SPEED_BYTES` (128 MiB) sent and then fetched in 8 MiB chunks dealt
+  round robin to 8 lanes (`speed_up {offset, len}` + `Data`, BLAKE3-checked and dropped, answered `DataOk`;
+  `speed_down {offset, len}` answered by a `Data` of zeros), each direction timed from its first request to
+  its last answer (lanes joined before the clock starts). The serving side (`serve_speed`): a speed lane takes
+  only `speed_up`/`speed_down` (else refused), `len` 1..=`CHUNK` (0 is "bad speed test"); a paired device's
+  lanes together at most `SPEED_PEER_LANES` (8) and `SPEED_BUDGET` (2 x `SPEED_BYTES`, 256 MiB, both
+  directions) at once, reserved per request in `SpeedLane` (`SPEED_OPEN`, by key id) and released as each
+  lane ends; past either a refusal ("at most 8 speed lanes at once", "a device's speed tests carry at most N
+  bytes at once"). `SPEED_MAX` (the `speed` RPC's `max`, the client's clamp) is `SPEED_BYTES` per direction.
+  Both sides share one static `CHUNK` of zeros and its hash (`speed_zeros`).
+  Holds `awake()` on the testing side (ponytail: the peer's lanes don't count as `peers_active`). Routes:
+  Tauri `connect_speed_test {keyId, run}`, server `POST /api/connect/speed_test {key_id, run}` (409 while
+  stopping, 400 with the error text); transport `connectSpeedTest`, `connect.speedTest(keyId, run)`.
+  Cancel (by user request), by run id: the UI makes one id per test (`<count>-<random>`; no
+  `crypto.randomUUID` on a plain-HTTP page) and sends it with the test and its cancel (server `POST
+  /api/connect/speed_test_cancel {key_id, run}` -> `null`, Tauri `connect_speed_test_cancel {keyId, run}`,
+  `connect.speedTestCancel`). `Connect.speed` (`SpeedRuns`): running tests by (key id, run) ->
+  `connect_fs::SpeedCancel` (the flag + a clone of each lane's socket); a cancel shuts those sockets, so a
+  lane blocked on its answer ends at once, and every lane checks the flag before each chunk; the test ends
+  `SPEED_CANCELLED` ("cancelled"). A cancel for a run not started yet is remembered (the last 16, for 60 s,
+  used up by that run, which then ends `cancelled` at once); a cancel never touches another run. Stop ends the
+  setup too: the test dials a control connection of its own (`session_with(key, Some(&cancel))`, never the
+  shared cached session), its socket in `SpeedCancel` from the TCP connect on, so a cancel shuts the handshake
+  and the `speed` RPC, and no further address is tried (ponytail: the 3 s TCP connect itself isn't cut).
   **Jobs mirrored** (`connect_jobs.rs`): a job using a paired peer's files (any `flink://<key_id>` among its
   source, output, transfer or added files) is pushed to that peer every 2 s (`jobs` RPC, each
   peer on its own thread, with the run's `instance`: job ids restart at 1, so another run's cancel marks go; this
@@ -967,7 +1081,19 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   with Pair or Save, "Searching this network" and Stop while it runs; "No new devices found"). Details:
   a Forge's address, key ID, last seen and status with File Transfer (online only), Forget and Close; a
   NAS's address, user and password saved or not (not NFS) and status with Edit, Forget and Close; either
-  closes once the device is forgotten elsewhere. "Loading" until the service first answers; a failed poll
+  closes once the device is forgotten elsewhere. **Speed test** (by user request; bolt icon): an online
+  paired Forge's row (by user request an item of its ⋯ menu, `ChooseMenu`, after Details, which is always first; a NAS row's
+  menu holds Details only) and its details (a button before File Transfer); no NAS. One test at a time (a module
+  store in `Connect.tsx`, `runSpeedTest`/`useSpeed`): the running button or menu item reads "Testing"
+  with `Dots`, `aria-disabled` + `aria-busy` (focus kept), every other Speed test button and item off. The result stays in memory
+  until the page closes, under the row (`.dev-sub`) and in the details (`.note-line.good`): "Upload N MB/s ·
+  Download M MB/s" (decimal MB, `num`, one decimal under 10); a failure an error line led by "Speed test
+  failed:" (`connectError`, `peers.ts` `readable`). A test runs in a modal (by user request; `SpeedDialog`,
+  opened by `runSpeedTest(keyId, name)`): "Speed test with <device>", "Testing" with `Dots`, the muted
+  `connect.speedNote`, Stop focused; the cancel is the overlay's `onClosed`, so every close while it runs (Stop,
+  Escape, a click outside, the quit prompt's `closeOverlays`) stops it and keeps no result or error
+  (`speedStopped`); once it ends the dialog shows the result line or the error with Close. How to connect has
+  one paragraph on it (`connect.helpSpeed`). "Loading" until the service first answers; a failed poll
   keeps the last good state (the pairing prompt too, at most its 60 s); with none, "Connect isn't
   available: <error>". The header's indicator, on every
   platform (it replaced the address button and the How to connect modal): grey **Disconnected** or green
@@ -988,6 +1114,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   `canRetry`): it starts the same request again as a new job; not for a cancelled one, a peer's mirrored job
   or an edit (Edit's Apply keeps the changes after a failure); an Extract or a transfer asks about names
   already there again first (`askReplace`, Replace above), since a failed copy leaves files behind.
+  `App.tsx` renders the tabs memoized (`ConvertScreen`, ..., `ConnectScreen`) with stable handlers;
+  Convert/Edit/Pack get `useSettled(jobs)`, the list kept by identity until a job's id, request or result
+  changes, so progress and log events re-render only the job lists (`JobCard` is `memo`).
 - Names are never renamed: bad names (non-NFC, exFAT/PFS case collisions, forbidden chars, non-ASCII
   in PFS) fail preflight with every offender listed.
 - `.pkg` is built with `BuildRequest::production` only (plaintext `PPRPLAIN-NOAUTH!`, Kraken);
@@ -1047,7 +1176,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   storage falls back to the system languages) and the PS5 About notification switch (kept by the server
   on the console as `notifications.off`; by user decision). Defaults: Convert's target
   fpkg (`.pkg`), exfat for a `.pkg` source (by user decision; picker order Folder, fpkg, exfat, ffpkg, ffpfsc,
-  ffpfs), ffpkg inside a `.ffpfsc` (by user decision), at zlib
+  ffpfs), exfat inside a `.ffpfsc` in the UI (by user decision; core and CLI keep ffpkg; under the inner picker
+  exfat shows `target.innerExfat`, Recommended, and ffpkg `innerFfpkg`), at zlib
   level 6, all cores for compression (`serve`: cores − 1; PS5: its 5 CPUs − 2), `.pkg` Kraken level `fast` (also `balanced`,
   `smallest`, and `stored`: every block raw, the fallback for a console that won't start a compressed
   package; tests use `fast` only), no extra free space beyond each format's built-in spare, output next
@@ -1142,7 +1272,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   data is contiguous. Files are stored uncompressed (per-file PFSC passes verify but the console misreads it).
   Names: ASCII only, no case collisions, every offender listed.
 - `.ffpfsc`: a single-file PFS (MkPFS `pack file` layout) whose one file is a zlib PFSC container of 64 KiB
-  blocks around a nested `.exfat`/`.ffpkg`/`.ffpfs` named `<TITLE_ID>.<ext>` (default `.ffpkg`, by user decision;
+  blocks around a nested `.exfat`/`.ffpkg`/`.ffpfs` named `<TITLE_ID>.<ext>` (default `.ffpkg`, by user decision; the UI defaults to exfat;
   exFAT is MkPFS's most stable). Always PFSC, zlib level 0–9 as zlib numbers them (the slider, `--level`, `ffpfsc_level`;
   default 6; 0 stores every block raw); a block is kept compressed only if it saves ≥ 5%; a block with
   near-8-bit byte entropy that level 1 shrinks < 2% skips the level's search (stored raw). zlib from
@@ -1190,7 +1320,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
 - zstd packs (`docs/PAK.md`): `ampr_zstd.index` (`AMPRZPK1`, version 1, 128-byte header, file, chunk and volume
   records, FNV-1a 64 path hashes, CRC-32 over header and tables) and `ampr_zstd-NNN.pak` volumes (`AMPRZDT1`, from 000; 64-byte header with
   the index's archive id, at most 4 GiB - 64 KiB, at most 4,096); 256 KiB chunks, each one zstd frame or raw
-  when zstd doesn't shrink it. Only ampr-emu-ng (`libSceAmpr-zstd.sprx`) reads them. Not an SMP image, as LZ4 packs.
+  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.1.0, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
 
 ## Commands
 ```sh
@@ -1214,7 +1344,7 @@ scripts/release-linux.sh                       # Linux: x86-64 or arm64 tarball 
 cargo run -p ps5-dump-forge-cli -- serve --root <dir>   # the web UI on this computer (cd app && npm run build:http first)
 ps5/build.sh                                   # PS5 payload in Docker: target/ps5/ps5-dump-forge.elf
 ps5/test-entry.sh                              # host check of entry.c
-scripts/release-ps5.sh                         # dist/ps5-dump-forge-<ver>-ps5.elf, checked (SKIP_BUILD=1: check only)
+scripts/release-ps5.sh                         # dist/ps5-dump-forge-<ver>-ps5.elf, checked (SKIP_BUILD=1: check only; needs the zstd CLI)
 scripts/test-freebsd.sh                        # core + server tests on FreeBSD UFS/FAT32/nullfs (VM; long)
 FORGE_DEBUG_API=1 ps5/build.sh                 # bring-up build with POST /api/debug, GET /probe, /api/debug_input; never released
 ```
@@ -1227,3 +1357,4 @@ FORGE_DEBUG_API=1 ps5/build.sh                 # bring-up build with POST /api/d
   the ceiling of a deliberate shortcut).
 - Changes to `vendor/` go into a new numbered patch in `vendor/patches/` and `vendor/README.md`.
   Don't replace `vendor/` with our own code unless asked.
+- Tests are kept to the critical ones (round trips, byte pins, journal recover, corruption and safety refusals, FLINK auth); add a test only for one of those.

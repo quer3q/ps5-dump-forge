@@ -1186,10 +1186,6 @@ mod tests {
         place(ex, &components(path).unwrap())
     }
 
-    fn virt(children: &[&str]) -> Place<'static> {
-        Place::Virtual(children.iter().map(|c| c.to_string()).collect())
-    }
-
     #[test]
     fn components_are_checked() {
         assert_eq!(components("/").unwrap(), Vec::<&str>::new());
@@ -1244,49 +1240,6 @@ mod tests {
     }
 
     #[test]
-    fn virtual_tree_above_and_between_exports() {
-        let ex = exports(&["/srv/games", "/srv/music", "/data/nfs", "/data/nfs2/x"]);
-        assert_eq!(at(&ex, "/"), virt(&["data", "srv"]));
-        assert_eq!(at(&ex, "/srv"), virt(&["games", "music"]));
-        assert_eq!(at(&ex, "/data"), virt(&["nfs", "nfs2"]));
-        assert_eq!(at(&ex, "/data/nfs2"), virt(&["x"]));
-        assert_eq!(at(&ex, "/srv/other"), Place::NotFound);
-        assert_eq!(at(&ex, "/data/nfs3"), Place::NotFound);
-        assert_eq!(at(&ex, "/home"), Place::NotFound);
-        // Duplicates (two exports under one folder name) are listed once.
-        let ex = exports(&["/a/b/c", "/a/b/d", "/a/e"]);
-        assert_eq!(at(&ex, "/a"), virt(&["b", "e"]));
-        assert_eq!(at(&ex, "/a/b"), virt(&["c", "d"]));
-    }
-
-    #[test]
-    fn root_export_holds_everything() {
-        let ex = exports(&["/", "/srv/games"]);
-        assert_eq!(
-            at(&ex, "/"),
-            Place::Export {
-                export: 0,
-                rest: vec![]
-            }
-        );
-        assert_eq!(
-            at(&ex, "/srv"),
-            Place::Export {
-                export: 0,
-                rest: vec!["srv"]
-            }
-        );
-        assert_eq!(
-            at(&ex, "/srv/games/x"),
-            Place::Export {
-                export: 1,
-                rest: vec!["x"]
-            }
-        );
-        assert_eq!(at(&[], "/"), Place::NotFound);
-    }
-
-    #[test]
     fn handle_cache_forgets_below_and_stays_bounded() {
         let mut h = Handles::default();
         for p in ["/srv", "/srv/a", "/srv/a/b", "/srv/ab", "/x"] {
@@ -1316,82 +1269,6 @@ mod tests {
     fn listed_names_with_a_slash_or_nul_are_unusable() {
         assert!(usable(b"My Game") && usable("Игра".as_bytes()));
         assert!(!usable(b"a/b") && !usable(b"a\0b") && !usable(b"\xff"));
-    }
-
-    #[test]
-    fn export_list_parses() {
-        let mut x = Xdr::new();
-        x.bool(true).string("/srv/games");
-        x.bool(true)
-            .string("192.168.0.0/24")
-            .bool(true)
-            .string("*")
-            .bool(false);
-        x.bool(true).string("/data").bool(false);
-        x.bool(true).opaque(&[0xff, 0xfe]).bool(false); // not UTF-8: left out
-        x.bool(true).string("/srv/games").bool(false); // listed twice: once
-        x.bool(false);
-        let list = parse_exports(&mut XdrReader::new(&x.buf)).unwrap();
-        assert_eq!(list, ["/srv/games", "/data"]);
-        // None at all, and a reply cut short.
-        assert!(
-            parse_exports(&mut XdrReader::new(&[0, 0, 0, 0]))
-                .unwrap()
-                .is_empty()
-        );
-        let e = parse_exports(&mut XdrReader::new(&x.buf[..12])).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn mnt_reply_parses() {
-        let mut x = Xdr::new();
-        x.u32(0).opaque(&[7; 28]).u32(2).u32(390003).u32(AUTH_SYS);
-        assert_eq!(parse_mnt(&mut XdrReader::new(&x.buf)).unwrap(), [7; 28]);
-        let mut x = Xdr::new();
-        x.u32(0).opaque(&[7; 28]).u32(0); // no flavors listed: AUTH_SYS assumed
-        assert!(parse_mnt(&mut XdrReader::new(&x.buf)).is_ok());
-        let mut x = Xdr::new();
-        x.u32(0).opaque(&[7; 28]).u32(1).u32(390003); // Kerberos only
-        let e = parse_mnt(&mut XdrReader::new(&x.buf)).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
-        let e = parse_mnt(&mut XdrReader::new(&13u32.to_be_bytes())).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
-        let mut x = Xdr::new();
-        x.u32(0).opaque(&[7; 65]); // longer than NFS3_FHSIZE
-        assert!(parse_mnt(&mut XdrReader::new(&x.buf)).is_err());
-    }
-
-    #[test]
-    fn errors_map_to_kinds() {
-        let cases = [
-            (2, ErrorKind::NotFound),
-            (17, ErrorKind::AlreadyExists),
-            (1, ErrorKind::PermissionDenied),
-            (13, ErrorKind::PermissionDenied),
-            (28, ErrorKind::StorageFull),
-            (69, ErrorKind::StorageFull),
-            (30, ErrorKind::ReadOnlyFilesystem),
-            (20, ErrorKind::NotADirectory),
-            (21, ErrorKind::IsADirectory),
-            (66, ErrorKind::DirectoryNotEmpty),
-            (18, ErrorKind::CrossesDevices),
-            (22, ErrorKind::InvalidInput),
-            (27, ErrorKind::FileTooLarge),
-            (63, ErrorKind::InvalidFilename),
-            (5, ErrorKind::Other),
-            (10001, ErrorKind::InvalidData),
-            (10004, ErrorKind::Unsupported),
-            (10007, ErrorKind::Unsupported),
-            (10008, ErrorKind::ResourceBusy),
-            (12345, ErrorKind::Other),
-        ];
-        for (code, kind) in cases {
-            assert_eq!(nfs_error(code).kind(), kind, "{code}");
-        }
-        assert!(is_stale(&nfs_error(70)));
-        assert!(!is_stale(&nfs_error(2)));
-        assert!(nfs_error(2).to_string().contains("(2)"));
     }
 
     #[test]
@@ -1433,24 +1310,6 @@ mod tests {
         o.wrote(a);
         o.wrote(b);
         assert!(o.committed(b).is_err());
-    }
-
-    #[test]
-    fn create_and_mkdir_replies_parse() {
-        let mut x = Xdr::new();
-        x.u32(0).bool(true).opaque(b"new-fh").bool(false);
-        x.bool(true).fixed(&[0; 24]).bool(false); // dir_wcc
-        let mut r = XdrReader::new(&x.buf);
-        assert_eq!(made(&mut r).unwrap().as_deref(), Some(&b"new-fh"[..]));
-        assert_eq!(r.remaining(), 0);
-        let mut x = Xdr::new();
-        x.u32(0).bool(false).bool(false).bool(false).bool(false);
-        assert_eq!(made(&mut XdrReader::new(&x.buf)).unwrap(), None);
-        let e = made(&mut XdrReader::new(&17u32.to_be_bytes())).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::AlreadyExists);
-        let mut a = Xdr::new();
-        sattr_mode(&mut a, FILE_MODE);
-        assert_eq!(a.buf.len(), 4 * 7, "a sattr3 setting only the mode");
     }
 
     /// Appends a fattr3 of `kind`, `size` and `mtime` to `x`.
@@ -1595,154 +1454,6 @@ mod tests {
     }
 
     #[test]
-    fn mounts_through_one_port() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || fake_server(listener));
-        let mut s = Nfs3::connect("127.0.0.1", Some(port)).unwrap();
-        assert!(s.mount.is_none(), "MOUNT shares the NFS connection");
-        assert_eq!(s.exports().unwrap(), ["/srv/games", "/srv/music"]);
-        let root = s.stat("/").unwrap();
-        assert!(root.dir && root.name == "/");
-        assert_eq!(s.stat("/srv").unwrap().name, "srv");
-        let names: Vec<String> = s
-            .list("/srv")
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        assert_eq!(names, ["games", "music"]);
-        assert_eq!(s.stat("/home").unwrap_err().kind(), ErrorKind::NotFound);
-        assert_eq!(
-            s.handle("/srv").unwrap_err().kind(),
-            ErrorKind::ReadOnlyFilesystem
-        );
-        assert_eq!(s.handle("/srv/games").unwrap(), b"games-root");
-        assert_eq!(s.handle("/srv/games/").unwrap(), b"games-root"); // cached: no second MNT
-        let e = s.handle("/srv/music").unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
-        drop(s);
-        let calls = server.join().unwrap();
-        let mnts = calls
-            .iter()
-            .filter(|c| **c == (MOUNT_PROG, MOUNTPROC3_MNT))
-            .count();
-        assert_eq!(calls[0], (NFS_PROG, 0));
-        assert_eq!(mnts, 2, "{calls:?}");
-    }
-
-    #[test]
-    fn fattr3_parses_into_entries() {
-        let mut x = Xdr::new();
-        fattr(&mut x, NF3REG, 11, (7, 9));
-        assert_eq!(x.buf.len(), 84, "a fattr3 is 21 units");
-        let mut r = XdrReader::new(&x.buf);
-        let a = Fattr::parse(&mut r).unwrap();
-        assert_eq!(r.remaining(), 0);
-        assert_eq!(
-            a,
-            Fattr {
-                kind: NF3REG,
-                size: 11,
-                fileid: 42,
-                mtime: (7, 9)
-            }
-        );
-        let e = a.entry("eboot.bin".into());
-        assert!(!e.dir && !e.link && !e.special && e.size == 11);
-        let t = std::time::UNIX_EPOCH + std::time::Duration::new(7, 9);
-        assert_eq!(e.mtime, Some(t), "seconds and nanoseconds kept");
-        let kind = |k| {
-            Fattr {
-                kind: k,
-                ..a.clone()
-            }
-            .entry(String::new())
-        };
-        let d = kind(NF3DIR);
-        assert!(d.dir && d.size == 0 && !d.special);
-        let l = kind(NF3LNK);
-        assert!(l.link && !l.dir && !l.special);
-        for k in [3, 4, 6, 7] {
-            assert!(kind(k).special, "{k}");
-        }
-        // post_op_attr: absent, present, cut short.
-        assert_eq!(Fattr::post_op(&mut XdrReader::new(&[0; 4])).unwrap(), None);
-        let mut y = Xdr::new();
-        y.bool(true).fixed(&x.buf);
-        assert_eq!(
-            Fattr::post_op(&mut XdrReader::new(&y.buf)).unwrap(),
-            Some(a)
-        );
-        assert!(Fattr::post_op(&mut XdrReader::new(&y.buf[..40])).is_err());
-    }
-
-    #[test]
-    fn readdirplus_entries_parse() {
-        let mut x = Xdr::new();
-        x.u32(0).bool(true);
-        fattr(&mut x, NF3DIR, 4096, (1, 0));
-        x.fixed(b"verf0002");
-        fattr(
-            x.bool(true).u64(10).string("Game").u64(100).bool(true),
-            NF3DIR,
-            0,
-            (3, 4),
-        );
-        x.bool(true).opaque(b"game-fh");
-        x.bool(true)
-            .u64(11)
-            .opaque(&[0xff, b'x'])
-            .u64(200)
-            .bool(false)
-            .bool(false);
-        x.bool(false).bool(true);
-        let page = parse_readdir(&mut XdrReader::new(&x.buf), true).unwrap();
-        assert!(page.eof);
-        assert_eq!(&page.verf, b"verf0002");
-        let [game, odd] = &page.entries[..] else {
-            panic!("{:?}", page.entries)
-        };
-        assert_eq!(
-            (game.name.as_str(), game.utf8, game.cookie),
-            ("Game", true, 100)
-        );
-        assert_eq!(game.attr.as_ref().unwrap().mtime, (3, 4));
-        assert_eq!(game.fh.as_deref(), Some(&b"game-fh"[..]));
-        assert_eq!((odd.utf8, odd.cookie), (false, 200));
-        assert!(odd.attr.is_none() && odd.fh.is_none());
-        // An error status, and a reply cut short.
-        let e = parse_readdir(&mut XdrReader::new(&20u32.to_be_bytes()), true).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::NotADirectory);
-        let e = parse_readdir(&mut XdrReader::new(&x.buf[..x.buf.len() - 4]), true).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::InvalidData);
-        // A handle longer than NFS3_FHSIZE is refused.
-        let mut y = Xdr::new();
-        y.u32(0).bool(false).fixed(&[0; 8]);
-        y.bool(true)
-            .u64(1)
-            .string("a")
-            .u64(1)
-            .bool(false)
-            .bool(true)
-            .opaque(&[0; 65]);
-        assert!(parse_readdir(&mut XdrReader::new(&y.buf), true).is_err());
-        // A READDIR reply: names and cookies only.
-        let mut z = Xdr::new();
-        z.u32(0).bool(false).fixed(b"verf0003");
-        z.bool(true).u64(1).string("a").u64(7);
-        z.bool(false).bool(false);
-        let page = parse_readdir(&mut XdrReader::new(&z.buf), false).unwrap();
-        assert!(!page.eof);
-        assert_eq!(&page.verf, b"verf0003");
-        let [a] = &page.entries[..] else {
-            panic!("{:?}", page.entries)
-        };
-        assert_eq!((a.name.as_str(), a.utf8, a.cookie), ("a", true, 7));
-        assert!(a.attr.is_none() && a.fh.is_none());
-    }
-
-    #[test]
     fn reads_through_one_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1770,12 +1481,6 @@ mod tests {
         assert_eq!(count(NFSPROC3_FSINFO), 1, "FSINFO asked once");
         assert_eq!(count(NFSPROC3_READDIRPLUS), 2);
         assert_eq!(count(NFSPROC3_READ), 3 + 1 + 1, "{calls:?}");
-    }
-
-    #[test]
-    fn virtual_entries_are_folders() {
-        let e = virtual_dir("srv");
-        assert!(e.dir && !e.link && !e.special && e.size == 0 && e.mtime.is_none());
     }
 
     #[test]

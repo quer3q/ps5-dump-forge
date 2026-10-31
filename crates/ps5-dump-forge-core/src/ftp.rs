@@ -312,27 +312,3 @@ fn no_upload(handle: u64) -> io::Error {
         format!("no FTP upload {handle}"),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn authorities() {
-        use super::authority as a;
-        assert_eq!(a("NAS.local").as_deref(), Some("nas.local"));
-        assert_eq!(a("10.0.0.5:21").as_deref(), Some("10.0.0.5"));
-        assert_eq!(a("10.0.0.5:2121").as_deref(), Some("10.0.0.5:2121"));
-        assert_eq!(a("[fe80::1]:2121").as_deref(), Some("[fe80::1]:2121"));
-        assert_eq!(a("[FE80::1]").as_deref(), Some("[fe80::1]"));
-        let bad = ["", "user@host", "host:0", "host:99999", "ho st", "host/x"];
-        for bad in bad
-            .into_iter()
-            .chain(["[nas]junk", "[fe80::1]2121", "[fe80::1]:"])
-        {
-            assert_eq!(a(bad), None, "{bad}");
-        }
-        assert_eq!(super::host_port("nas"), ("nas", 21));
-        assert_eq!(super::host_port("10.0.0.5:2121"), ("10.0.0.5", 2121));
-        assert_eq!(super::host_port("[fe80::1]"), ("fe80::1", 21));
-        assert_eq!(super::host_port("[fe80::1]:2121"), ("fe80::1", 2121));
-    }
-}

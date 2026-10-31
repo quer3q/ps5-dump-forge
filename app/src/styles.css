@@ -456,10 +456,6 @@ p.lz4-why { margin: 6px 0 0; } /* p: over .hint's 2px, which comes later */
 
 .build-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
 .build-row .primary { height: 38px; padding: 0 22px; margin-inline-start: auto; }
-/* The Pack empty Source's Choose source: yellow tint, ring and ink. */
-button.lz4-btn { background: var(--lz4-tint); color: var(--lz4-ink); border-color: var(--lz4-line); font-weight: 600; }
-button.lz4-btn:hover:not(:disabled, [aria-disabled="true"]) { background: var(--lz4-tint-hi); }
-.menu-wrap > button.lz4-btn > .icon:first-child { width: 18px; height: 18px; margin: 0; }
 .desc { margin-top: 9px; font-size: 13px; }
 /* A note's leading "Recommended" / "Experimental" (Lead in target.tsx): text colour only,
    >= 9:1 on --card and --inset. */
@@ -486,27 +482,6 @@ button.link .icon { width: 15px; height: 15px; }
 .tag.orange { background: rgba(255, 122, 47, 0.16); color: #ffad7a; }
 .tag.violet { background: rgba(160, 110, 255, 0.17); color: #c9b1ff; }
 
-/* The notice bar: the blue-to-orange gradient of the reference, kept dark under the text
-   (white text stays >= 7:1 everywhere); the orange is only a glow at the right edge. */
-.alert-bar {
-  display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 7px 0 7px; padding-inline-start: 12px; padding-inline-end: 16px;
-  border-radius: 20px; border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #fff; font-size: 13px; font-weight: 500;
-  background-color: #15163a;
-  background-image:
-    radial-gradient(45% 160% at 100% 50%, rgba(255, 122, 47, 0.42), transparent 70%),
-    linear-gradient(90deg, rgba(61, 90, 255, 0.55), rgba(90, 60, 190, 0.3) 45%, rgba(21, 22, 58, 0) 80%);
-}
-.alert-bar .icon { flex: none; }
-/* The warning kind (the .fpkg firmware limit): amber, dark under the text (white >= 10:1). */
-.alert-bar.warn {
-  color: #fff6e6; background-color: #1d1810; border-color: rgba(255, 181, 71, 0.22);
-  background-image:
-    radial-gradient(45% 160% at 100% 50%, rgba(255, 122, 47, 0.3), transparent 70%),
-    linear-gradient(90deg, rgba(255, 181, 71, 0.2), rgba(255, 181, 71, 0.06) 55%, transparent 85%);
-}
-.alert-bar.warn .icon { color: var(--warn); }
-
 /* ---------- Source ---------- */
 .empty {
   display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center;
@@ -523,10 +498,6 @@ button.link .icon { width: 15px; height: 15px; }
 .empty-icon .icon { width: 22px; height: 22px; }
 .empty-title { font-size: 16px; font-weight: 600; }
 .empty .muted { max-width: 380px; font-size: 13px; }
-/* The Pack tab's empty Source: yellow. */
-.empty.lz4 { background: var(--inset) radial-gradient(60% 80% at 50% 0%, rgba(255, 210, 40, 0.08), transparent 70%); }
-.empty.lz4 .empty-icon { background: var(--lz4-tint); color: var(--lz4-ink); }
-.empty.lz4 .row { margin-top: 8px; }
 .kinds { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 6px 0 12px; }
 /* An archive left locked (its password dialog cancelled): the reason and Enter password…. */
 .row.locked { margin-top: 12px; }
@@ -1510,3 +1481,10 @@ body.files-dragging, body.files-dragging * { cursor: grabbing !important; user-s
 /* The upload status stays mounted (so it is announced); empty, it takes no room. */
 .transfer-browser > .note[role="status"]:empty { margin-top: -6px; }
 .transfer-actions { flex: none; margin-inline-start: auto; }
+
+/* Pack: its yellow empty source card and Pick button. */
+button.lz4-btn { background: var(--lz4-tint); color: var(--lz4-ink); border-color: var(--lz4-line); font-weight: 600; }
+button.lz4-btn:hover:not(:disabled, [aria-disabled="true"]) { background: var(--lz4-tint-hi); }
+.empty.lz4 { background: var(--inset) radial-gradient(60% 80% at 50% 0%, rgba(255, 210, 40, 0.08), transparent 70%); }
+.empty.lz4 .empty-icon { background: var(--lz4-tint); color: var(--lz4-ink); }
+.empty.lz4 .row { margin-top: 8px; }

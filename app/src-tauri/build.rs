@@ -18,6 +18,7 @@ const COMMANDS: &[&str] = &[
     "move_path",
     "list_dir",
     "home_folder",
+    "local_roots",
     "reveal",
     "open_repo",
     "update_target",
@@ -41,6 +42,8 @@ const COMMANDS: &[&str] = &[
     "connect_install",
     "connect_payload_install",
     "connect_payload_send",
+    "connect_speed_test",
+    "connect_speed_test_cancel",
 ];
 
 fn main() {

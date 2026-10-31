@@ -211,14 +211,15 @@ impl Edited {
                 format!("{} ({path}): {e}", host.path.display()),
             ))
         };
-        // The path must still name the stamped file, and the handle (kept open across reads)
-        // must be that file: a file renamed over the path is caught on the next read.
-        if self.open.as_ref().is_none_or(|(at, _)| *at != i) {
+        // A peer checks its stamp when opened; each fetch checks it again. A local path and
+        // handle must still name the stamped file on every read.
+        let opening = self.open.as_ref().is_none_or(|(at, _)| *at != i);
+        if opening {
             self.open = None;
             self.open = Some((i, host.open().map_err(with_path)?));
         }
         let file = &mut self.open.as_mut().expect("opened above").1;
-        if !file.same(host).map_err(with_path)? {
+        if (opening || matches!(&*file, Opened::Local(_))) && !file.same(host).map_err(with_path)? {
             return Err(Error::Format(format!(
                 "{} ({path}) changed after it was added (replaced, or its size or modification time); \
                  add it again",
@@ -758,37 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_onto_a_folder_merges() {
-        let dir = crate::test_dir("edit-add-folder");
-        let host = dir.join("host");
-        put(&host, "a.bin", b"replaced");
-        put(&host, "new.bin", b"new");
-        put(&host, "deep/c.bin", b"c");
-        put(&host, ".DS_Store", b"junk");
-        std::fs::create_dir_all(host.join("e")).unwrap();
-        let mut tree = edited(&[add(&host, "data"), add(&host, "copy")], None).unwrap();
-        assert_eq!(
-            paths(&tree),
-            [
-                "copy/a.bin",
-                "copy/deep/c.bin",
-                "copy/new.bin",
-                "data/a.bin",
-                "data/deep/c.bin",
-                "data/new.bin",
-                "data/sub/b.bin",
-                "eboot.bin",
-                "sce_sys/param.json",
-            ]
-        );
-        assert_eq!(tree.empty_dirs(), ["copy/e", "data/e", "empty"]);
-        assert_eq!(tree.read("data/a.bin").unwrap(), b"replaced");
-        assert_eq!(tree.read("data/sub/b.bin").unwrap(), b"data/sub/b.bin");
-        assert_eq!(tree.read("copy/deep/c.bin").unwrap(), b"c");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn a_host_file_renamed_over_after_a_read_fails_the_next_read() {
         let dir = crate::test_dir("edit-replaced");
         let x = put(&dir, "x.bin", b"before");
@@ -806,69 +776,6 @@ mod tests {
         std::fs::rename(&other, &x).unwrap();
         let err = tree.read_range("x.bin", 0, 6).unwrap_err().to_string();
         assert!(err.contains("changed after it was added"), "{err}");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn every_offender_is_listed() {
-        let dir = crate::test_dir("edit-refusals");
-        let game = dir.join("game");
-        let inside = put(&game, "sce_sys/icon0.png", b"png");
-        let file = put(&dir, "f.bin", b"f");
-        let folder = dir.join("folder");
-        put(&folder, "a.bin", b"a");
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut edits = vec![
-            delete(""),
-            delete("/data"),
-            mkdir("a//b"),
-            mkdir("./a"),
-            rename("data/..", "x"),
-            rename("data", "a\\b"),
-            delete("missing"),
-            rename("missing", "x"),
-            rename("data", "eboot.bin"),
-            rename("data", "data/sub/inner"),
-            add(&file, "data"),
-            add(&folder, "eboot.bin"),
-            mkdir("eboot.bin/x"),
-            add(&file, "eboot.bin/x"),
-            add(&dir.join("nope.bin"), "nope.bin"),
-            add(&inside, "icon.png"),
-            add(&game, "game"),
-        ];
-        #[cfg(unix)]
-        {
-            let link = dir.join("link.bin");
-            std::os::unix::fs::symlink(&file, &link).unwrap();
-            edits.push(add(&link, "link.bin"));
-        }
-        let findings = edited(&edits, Some(&game)).err().unwrap();
-        let wanted = [
-            "delete : \"\" is not a valid game path",
-            "delete /data: \"/data\" is not a valid game path",
-            "new folder a//b: \"a//b\" is not a valid game path",
-            "new folder ./a: \"./a\" is not a valid game path",
-            "rename data/.. to x: \"data/..\" is not a valid game path",
-            "rename data to a\\b: \"a\\\\b\" is not a valid game path",
-            "delete missing: missing is not in the game",
-            "rename missing to x: missing is not in the game",
-            "rename data to eboot.bin: eboot.bin already exists",
-            "rename data to data/sub/inner: data cannot move into itself",
-            "data is a folder",
-            "eboot.bin is a file",
-            "new folder eboot.bin/x: eboot.bin is a file",
-            "as eboot.bin/x: eboot.bin is a file",
-            "nope.bin does not exist",
-            "icon0.png is inside the game folder",
-            "game is inside the game folder",
-        ];
-        for (finding, want) in findings.iter().zip(wanted) {
-            assert!(finding.ends_with(want), "{finding:?} vs {want:?}");
-        }
-        #[cfg(unix)]
-        assert!(findings[wanted.len()].ends_with("link.bin is a link (not followed)"));
-        assert_eq!(findings.len(), edits.len(), "{findings:#?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

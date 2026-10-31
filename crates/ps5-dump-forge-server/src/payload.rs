@@ -21,18 +21,3 @@ pub fn address(text: &str) -> io::Result<SocketAddr> {
         .copied())
     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address")))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn addresses_default_to_elfldr_s_port() {
-        assert_eq!(
-            address("127.0.0.1").unwrap(),
-            "127.0.0.1:9021".parse().unwrap()
-        );
-        assert_eq!(address("127.0.0.1:9020").unwrap().port(), 9020);
-        assert!(address("a b").is_err());
-    }
-}

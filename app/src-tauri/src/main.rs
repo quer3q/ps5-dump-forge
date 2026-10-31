@@ -338,6 +338,49 @@ fn home_folder() -> Option<PathBuf> {
     std::env::home_dir().map(|h| dunce::simplified(&h).to_path_buf())
 }
 
+/// The picker's volume roots (Windows: drives C: to Z:; ponytail: A: and B: are left out, a
+/// floppy probe can stall) that open and that `list_dir` doesn't refuse. Existence only: each
+/// root is opened, not read, on a thread of its own, 1.5 s for all, so a stale mapped drive or
+/// an optical drive without a disc is left out instead of holding the picker.
+// ponytail: a root still stalled at the deadline leaves its thread running.
+#[tauri::command]
+async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
+    blocking(app, |_, _| {
+        let candidates: Vec<PathBuf> = if cfg!(windows) {
+            ('C'..='Z')
+                .map(|d| PathBuf::from(format!("{d}:\\")))
+                .collect()
+        } else {
+            ["/Volumes", "/media", "/run/media", "/mnt", "/"]
+                .map(PathBuf::from)
+                .into()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, path) in candidates.iter().cloned().enumerate() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let refused = path.parent().is_some() && folder_refusal(&path).is_some();
+                let _ = tx.send((i, !refused && std::fs::read_dir(&path).is_ok()));
+            });
+        }
+        drop(tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut opens = vec![false; candidates.len()];
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok((i, ok)) => opens[i] = ok,
+                Err(_) => break,
+            }
+        }
+        Ok(candidates
+            .into_iter()
+            .zip(opens)
+            .filter_map(|(p, ok)| ok.then_some(p))
+            .collect())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn cancel_job(app: AppHandle, id: JobId) -> Result<(), String> {
     blocking(app, move |_, state| {
@@ -882,6 +925,35 @@ async fn connect_install(app: AppHandle, key_id: String, path: PathBuf) -> Resul
     blocking(app, move |_, state| connect(state)?.install(&key_id, &path)).await
 }
 
+/// Times the link to the paired device `key_id`: 256 MiB sent, then fetched, over FLINK's
+/// lanes, nothing written to disk on either side. `run` is the UI's id for this test.
+#[tauri::command]
+async fn connect_speed_test(
+    app: AppHandle,
+    key_id: String,
+    run: String,
+) -> Result<ps5_dump_forge_server::connect_fs::SpeedTest, String> {
+    blocking(app, move |_, state| {
+        connect(state)?.speed_test(&key_id, &run)
+    })
+    .await
+}
+
+/// Stops the speed test `run` with the paired device `key_id` (it ends `cancelled`; a run not
+/// started yet ends so as it starts).
+#[tauri::command]
+async fn connect_speed_test_cancel(
+    app: AppHandle,
+    key_id: String,
+    run: String,
+) -> Result<(), String> {
+    blocking(app, move |_, state| {
+        connect(state)?.speed_test_cancel(&key_id, &run);
+        Ok(())
+    })
+    .await
+}
+
 /// Asks the device at `address` to pair; `connect_state`'s `outgoing` follows it.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_pair(app: AppHandle, address: String) -> Result<(), String> {
@@ -1151,6 +1223,7 @@ fn main() {
             move_path,
             list_dir,
             home_folder,
+            local_roots,
             reveal,
             open_repo,
             update_target,
@@ -1168,6 +1241,8 @@ fn main() {
             connect_nas_forget,
             connect_cancel_job,
             connect_install,
+            connect_speed_test,
+            connect_speed_test_cancel,
             connect_payload_install,
             connect_payload_send,
         ])

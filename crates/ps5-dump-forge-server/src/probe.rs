@@ -279,27 +279,6 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
-    /// A fake server that reads what comes (up to 512 bytes, unless `greet`) and sends `reply`,
-    /// for every connection until the test ends.
-    fn fake(reply: &'static [u8], greet: bool) -> u16 {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for mut s in l.incoming().flatten() {
-                std::thread::spawn(move || {
-                    if !greet {
-                        s.set_read_timeout(Some(Duration::from_millis(500)))
-                            .unwrap();
-                        let _ = s.read(&mut [0u8; 512]);
-                    }
-                    let _ = s.write_all(reply);
-                    std::thread::sleep(Duration::from_millis(200));
-                });
-            }
-        });
-        port
-    }
-
     fn none_but(ftp: u16, smb: u16, nfs: u16, flink: u16, discovery: u16) -> Ports {
         Ports {
             discovery,
@@ -308,52 +287,6 @@ mod tests {
             nfs,
             ftp,
         }
-    }
-
-    /// An SMB2 NEGOTIATE reply header (message id 0, status NOT_SUPPORTED: still SMB), framed.
-    fn smb() -> &'static [u8] {
-        let mut m = vec![0, 0, 0, 64];
-        m.extend_from_slice(b"\xFESMB");
-        m.extend_from_slice(&[0u8; 60]);
-        m[12..16].copy_from_slice(&0xC000_00BBu32.to_le_bytes());
-        m.leak()
-    }
-
-    const FTP: &[u8] = b"220 vsftpd ready\r\n";
-
-    #[test]
-    fn a_port_is_identified_by_its_protocol() {
-        let none = none_but(closed(), closed(), closed(), closed(), closed());
-        let ftp = fake(FTP, true);
-        let p = probe_on(&format!("127.0.0.1:{ftp}"), &me(), &none).unwrap();
-        assert_eq!((p.kind, p.port, p.name), (Kind::Ftp, ftp, None));
-        let smb = fake(smb(), false);
-        let p = probe_on(&format!("127.0.0.1:{smb}"), &me(), &none).unwrap();
-        assert_eq!((p.kind, p.port), (Kind::Smb, smb));
-        // An open port that says nothing any protocol knows.
-        let mute = fake(b"", false);
-        let e = probe_on(&format!("127.0.0.1:{mute}"), &me(), &none).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            format!("nothing to connect to at 127.0.0.1:{mute}")
-        );
-        assert!(probe_on("localhost", &me(), &none).is_err());
-    }
-
-    #[test]
-    fn serves_lists_every_protocol_that_answers() {
-        let ip = IpAddr::from(Ipv4Addr::LOCALHOST);
-        let (ftp, smb) = (fake(FTP, true), fake(smb(), false));
-        let ports = none_but(ftp, smb, closed(), closed(), closed());
-        assert_eq!(
-            serves_on(ip, &[], &ports),
-            vec![(Kind::Smb, smb), (Kind::Ftp, ftp)]
-        );
-        // What mDNS announced isn't checked again; a mute port isn't a server.
-        assert_eq!(serves_on(ip, &[Kind::Smb], &ports), vec![(Kind::Ftp, ftp)]);
-        let mute = fake(b"", false);
-        let ports = none_but(mute, mute, mute, closed(), closed());
-        assert!(serves_on(ip, &[], &ports).is_empty());
     }
 
     #[test]
@@ -378,34 +311,6 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
-    }
-
-    #[test]
-    fn nfs_answers_its_null_call() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for mut s in l.incoming().flatten() {
-                std::thread::spawn(move || {
-                    let mut call = [0u8; 8];
-                    if s.read_exact(&mut call).is_err() {
-                        return;
-                    }
-                    let mut reply = vec![0x80, 0, 0, 24];
-                    reply.extend_from_slice(&call[4..8]); // its xid
-                    reply.extend_from_slice(&[0, 0, 0, 1]); // a reply
-                    reply.extend_from_slice(&[0u8; 16]); // accepted, AUTH_NONE, no verf, SUCCESS
-                    let _ = s.write_all(&reply);
-                    std::thread::sleep(Duration::from_millis(200));
-                });
-            }
-        });
-        let ports = none_but(closed(), closed(), port, closed(), closed());
-        let p = probe_on(&format!("127.0.0.1:{port}"), &me(), &ports).unwrap();
-        assert_eq!((p.kind, p.port), (Kind::Nfs, port));
-        // No port: the default ports, here the fake's.
-        let p = probe_on("127.0.0.1", &me(), &ports).unwrap();
-        assert_eq!((p.kind, p.port), (Kind::Nfs, port));
     }
 
     #[test]

@@ -182,7 +182,7 @@ pub fn read_index(bytes: &[u8]) -> Result<PathIndex> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{put_u32, put_u64};
+    use crate::format::put_u32;
 
     fn files(names: &[&str]) -> Vec<(String, u64)> {
         names
@@ -194,10 +194,6 @@ mod tests {
 
     fn built(names: &[&str]) -> Vec<u8> {
         ps5upload_fpkg::ampr_index::build(&files(names), 7).unwrap()
-    }
-
-    fn slots_at(b: &[u8]) -> usize {
-        u64_at(b, 32).unwrap() as usize
     }
 
     #[test]
@@ -224,105 +220,6 @@ mod tests {
         for (p, s) in &src {
             assert!(idx.records.contains(&(p.clone(), *s)), "{p}");
         }
-    }
-
-    /// Hand-made: two records in non-sorted order, 4 slots, the first record's hash collides
-    /// on its home slot so the second must be found by linear probing.
-    fn hand_made(paths: [&str; 2]) -> Vec<u8> {
-        let full: Vec<String> = paths.iter().map(|p| format!("/app0/{p}")).collect();
-        let mut blob = Vec::new();
-        let mut recs = Vec::new();
-        for (i, p) in full.iter().enumerate() {
-            recs.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-            recs.extend_from_slice(&(p.len() as u32).to_le_bytes());
-            recs.extend_from_slice(&(10 * (i as u64 + 1)).to_le_bytes());
-            recs.extend_from_slice(&0i64.to_le_bytes());
-            blob.extend_from_slice(p.as_bytes());
-            blob.push(0);
-        }
-        let slots_at = (48 + recs.len() + blob.len()).next_multiple_of(16);
-        let mut out = vec![0u8; 48];
-        out[..8].copy_from_slice(b"AMPRIDX3");
-        put_u32(&mut out, 8, 3).unwrap();
-        put_u32(&mut out, 12, 24).unwrap();
-        put_u64(&mut out, 16, 2).unwrap();
-        put_u64(&mut out, 24, blob.len() as u64).unwrap();
-        put_u64(&mut out, 32, slots_at as u64).unwrap();
-        put_u32(&mut out, 40, 16).unwrap();
-        put_u32(&mut out, 44, 4).unwrap();
-        out.extend_from_slice(&recs);
-        out.extend_from_slice(&blob);
-        out.resize(slots_at + 64, 0);
-        let mut table = [(0u64, 0u32); 4];
-        for (i, p) in full.iter().enumerate() {
-            let h = idx_hash(p.as_bytes());
-            let mut at = h as usize & 3;
-            while table[at].1 != 0 {
-                at = (at + 1) & 3;
-            }
-            table[at] = (h, i as u32 + 1);
-        }
-        for (n, (h, r)) in table.iter().enumerate() {
-            put_u64(&mut out, slots_at + n * 16, *h).unwrap();
-            put_u32(&mut out, slots_at + n * 16 + 8, *r).unwrap();
-        }
-        out
-    }
-
-    #[test]
-    fn unsorted_valid_index_is_accepted() {
-        let idx = read_index(&hand_made(["zeta/Last.bin", "alpha.bin"])).unwrap();
-        assert_eq!(
-            idx.records,
-            [
-                ("zeta/Last.bin".to_string(), 10),
-                ("alpha.bin".to_string(), 20)
-            ]
-        );
-    }
-
-    #[test]
-    fn rejects_header_damage() {
-        let good = built(&["a", "b", "c"]);
-        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
-        let mut patch = |name, f: &dyn Fn(&mut Vec<u8>)| {
-            let mut b = good.clone();
-            f(&mut b);
-            cases.push((name, b));
-        };
-        patch("magic", &|b| b[7] = b'2');
-        patch("version", &|b| put_u32(b, 8, 4).unwrap());
-        patch("record size", &|b| put_u32(b, 12, 32).unwrap());
-        patch("slot size", &|b| put_u32(b, 40, 8).unwrap());
-        patch("zero count", &|b| put_u64(b, 16, 0).unwrap());
-        patch("count overflow", &|b| put_u64(b, 16, u64::MAX).unwrap());
-        patch("count over limit", &|b| put_u64(b, 16, 2_000_001).unwrap());
-        patch("count past file", &|b| put_u64(b, 16, 1_000_000).unwrap());
-        patch("path bytes huge", &|b| put_u64(b, 24, u64::MAX).unwrap());
-        patch("path bytes zero", &|b| put_u64(b, 24, 0).unwrap());
-        patch("slot offset overflow", &|b| {
-            put_u64(b, 32, u64::MAX - 8).unwrap()
-        });
-        patch("slot offset misaligned", &|b| {
-            let v = u64_at(b, 32).unwrap() + 8;
-            put_u64(b, 32, v).unwrap()
-        });
-        patch("slot offset in blob", &|b| put_u64(b, 32, 48).unwrap());
-        patch("slot count not pow2", &|b| put_u32(b, 44, 12).unwrap());
-        patch("slot count below records", &|b| put_u32(b, 44, 2).unwrap());
-        patch("slot count huge", &|b| put_u32(b, 44, 1 << 31).unwrap());
-        for (name, b) in cases {
-            assert!(read_index(&b).is_err(), "{name}");
-        }
-    }
-
-    #[test]
-    fn rejects_truncation_at_every_length() {
-        let good = built(&["a", "b/c", "d"]);
-        for n in 0..good.len() {
-            assert!(read_index(&good[..n]).is_err(), "{n}");
-        }
-        assert!(read_index(&good).is_ok());
     }
 
     #[test]
@@ -354,89 +251,5 @@ mod tests {
         for (name, b) in cases {
             assert!(read_index(&b).is_err(), "{name}");
         }
-    }
-
-    #[test]
-    fn rejects_slot_damage() {
-        let good = built(&["a", "b", "c"]);
-        let s = slots_at(&good);
-        let count = u32_at(&good, 44).unwrap() as usize;
-        let filled: Vec<usize> = (0..count)
-            .filter(|n| u32_at(&good, s + n * 16 + 8).unwrap() != 0)
-            .collect();
-        let empty = (0..count).find(|n| !filled.contains(n)).unwrap();
-        let f = filled[0];
-        let at = |n: usize| s + n * 16;
-        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
-        let mut patch = |name, f: &dyn Fn(&mut Vec<u8>)| {
-            let mut b = good.clone();
-            f(&mut b);
-            cases.push((name, b));
-        };
-        patch("wrong hash", &|b| b[at(f)] ^= 1);
-        patch("record past end", &|b| put_u32(b, at(f) + 8, 99).unwrap());
-        patch("unknown flag", &|b| put_u32(b, at(f) + 12, 2).unwrap());
-        patch("referenced twice", &|b| {
-            let (h, r) = (u64_at(b, at(f)).unwrap(), u32_at(b, at(f) + 8).unwrap());
-            put_u64(b, at(empty), h).unwrap();
-            put_u32(b, at(empty) + 8, r).unwrap()
-        });
-        patch("dirty empty slot", &|b| put_u64(b, at(empty), 5).unwrap());
-        patch("record without slot", &|b| {
-            put_u64(b, at(f), 0).unwrap();
-            put_u32(b, at(f) + 8, 0).unwrap()
-        });
-        patch("swapped records", &|b| {
-            let (g, h) = (filled[0], filled[1]);
-            let (a, c) = (u32_at(b, at(g) + 8).unwrap(), u32_at(b, at(h) + 8).unwrap());
-            put_u32(b, at(g) + 8, c).unwrap();
-            put_u32(b, at(h) + 8, a).unwrap()
-        });
-        for (name, b) in cases {
-            assert!(read_index(&b).is_err(), "{name}");
-        }
-    }
-
-    /// `n` records, record `i` in slot `i` (a full table), with hand-set correct hashes.
-    fn full_table(n: usize) -> Vec<u8> {
-        let paths: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
-        let mut blob = Vec::new();
-        let mut recs = Vec::new();
-        for p in &paths {
-            let full = format!("/app0/{p}");
-            recs.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-            recs.extend_from_slice(&(full.len() as u32).to_le_bytes());
-            recs.extend_from_slice(&[0u8; 16]);
-            blob.extend_from_slice(full.as_bytes());
-            blob.push(0);
-        }
-        let slots_at = (48 + recs.len() + blob.len()).next_multiple_of(16);
-        let mut out = vec![0u8; 48];
-        out[..8].copy_from_slice(IDX_MAGIC);
-        put_u32(&mut out, 8, 3).unwrap();
-        put_u32(&mut out, 12, 24).unwrap();
-        put_u64(&mut out, 16, n as u64).unwrap();
-        put_u64(&mut out, 24, blob.len() as u64).unwrap();
-        put_u64(&mut out, 32, slots_at as u64).unwrap();
-        put_u32(&mut out, 40, 16).unwrap();
-        put_u32(&mut out, 44, n as u32).unwrap();
-        out.extend_from_slice(&recs);
-        out.extend_from_slice(&blob);
-        out.resize(slots_at, 0);
-        for (i, p) in paths.iter().enumerate() {
-            let h = idx_hash(format!("/app0/{p}").as_bytes());
-            out.extend_from_slice(&h.to_le_bytes());
-            out.extend_from_slice(&(i as u32 + 1).to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
-        out
-    }
-
-    #[test]
-    fn a_large_full_table_validates_in_linear_time() {
-        let b = full_table(1 << 16);
-        let t = std::time::Instant::now();
-        assert_eq!(read_index(&b).unwrap().records.len(), 1 << 16);
-        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
     }
 }

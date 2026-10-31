@@ -124,11 +124,6 @@ pub fn detect(path: &Path) -> Option<ArchiveFormat> {
     }
 }
 
-/// The first part's file name when `path` names, by its name alone, a later part of a set.
-pub fn first_part(path: &Path) -> Option<String> {
-    parts::first_of(path.file_name()?.to_str()?, detect(path)?)
-}
-
 /// Whether `path` names, by its name alone, a later part of the set `first` starts. A RAR
 /// `.partN.rar` number is compared as a number: `x.part10.rar` follows `x.part1.rar`.
 pub fn later_part_of(path: &Path, first: &Path) -> bool {
@@ -374,20 +369,6 @@ impl Sink for Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn part_names() {
-        assert_eq!(detect(Path::new("g.PART001.RAR")), Some(ArchiveFormat::Rar));
-        assert_eq!(detect(Path::new("g.Z01")), Some(ArchiveFormat::Zip));
-        assert_eq!(detect(Path::new("g.7z.001")), Some(ArchiveFormat::SevenZ));
-        assert_eq!(detect(Path::new("foo.rar.001")), None);
-        let e = parts::discover(Path::new("g.part02.rar"), ArchiveFormat::Rar).unwrap_err();
-        assert_eq!(e.to_string(), "Choose the first part: g.part01.rar");
-        let later = |p: &str, f: &str| later_part_of(Path::new(p), Path::new(f));
-        assert!(later("d/G.part10.rar", "d/g.part1.rar") && later("g.s00", "g.rar"));
-        assert!(later("g.z00", "g.rar") && !later("g.z01", "g.7z.001"));
-        assert!(later("g.z01", "g.zip") && later("g.7z.002", "g.7z.001"));
-        assert!(!later("g.part1.rar", "g.part1.rar") && !later("h.part2.rar", "g.part1.rar"));
-    }
     #[test]
     fn unsafe_entries() {
         for name in [

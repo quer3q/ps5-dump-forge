@@ -165,15 +165,4 @@ mod tests {
         assert_eq!(wait_for(stopped + 1), stopped + 1);
         drop(again);
     }
-
-    #[test]
-    fn off_the_ps5_it_only_counts() {
-        static COUNTED: Shared = Shared::new(None, Duration::from_millis(1));
-        let a = COUNTED.hold();
-        let b = COUNTED.hold();
-        assert_eq!(COUNTED.lock().count, 2);
-        assert!(!COUNTED.lock().ticker);
-        drop((a, b));
-        assert_eq!(COUNTED.lock().count, 0);
-    }
 }

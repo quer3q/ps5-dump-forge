@@ -380,6 +380,9 @@ const ko: Messages = {
     inStep: (time) => `이 단계에서 ${time} 경과`,
     result: (bytes, n) => `${bytes}, 파일 ${num(n)}개 →`,
     outputPath: "출력 경로",
+    sourceDeleted: (v) => `소스 삭제됨: ${v}`,
+    sourceKept: (v) => `소스 유지됨: ${v}`,
+    sourcePartlyDeleted: (v) => `소스 일부 삭제됨: ${v}`,
     checks: "확인 항목",
     verifiedPlain: (n) => `검증 완료: 확인 항목 ${num(n)}개 통과`,
     verifiedFull: (n) => `전체 검증 통과: 확인 항목 ${num(n)}개`,
@@ -515,9 +518,8 @@ const ko: Messages = {
           ? "zstd 팩을 일반 파일로 되돌립니다."
           : "게임 에셋을 zstd 볼륨으로 패킹합니다."
         : packed
-          ? "실험적 기능. LZ4 팩을 일반 파일로 되돌립니다."
-          : "실험적 기능: 일부 게임은 시작되지 않을 수 있습니다. 게임 에셋을 LZ4 볼륨으로 패킹합니다.",
-    chooseGame: "먼저 게임을 선택하세요.",
+          ? "LZ4 팩을 일반 파일로 되돌립니다."
+          : "일부 게임은 시작되지 않을 수 있습니다. 게임 에셋을 LZ4 볼륨으로 패킹합니다.",
     noAmprGame: (e) => `이 게임은 AMPR을 사용하지 않으므로 ${e === "zstd" ? "zstd" : "LZ4"} 팩을 쓸 수 없습니다.`,
     patch: "패치 패키지는 패킹할 수 없습니다.",
     additionalContent: "추가 콘텐츠(eboot.bin 없음)는 패킹할 수 없습니다.",
@@ -567,8 +569,6 @@ const ko: Messages = {
     already: (a, fmt) => a === "pack"
       ? <>이 게임을 이미 <b>{fmt}</b> 형식으로 쓰고 있습니다. 다시 패킹하면 사본이 하나 더 만들어집니다.</>
       : <>이 게임을 이미 <b>{fmt}</b> 형식으로 쓰고 있습니다. 다시 언패킹하면 사본이 하나 더 만들어집니다.</>,
-    emptyTitle: "AMPR을 사용하는 게임을 선택하세요",
-    experimental: "실험적 기능: 원본 게임의 사본을 보관하세요.",
     source: "소스",
   },
   // PackHelp.tsx
@@ -586,7 +586,7 @@ const ko: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>실험적 기능</b>: 일부 게임은 시작되지 않을 수 있습니다. 사본을 보관하세요.</li>
+          <li><b>일부 게임은 시작되지 않을 수 있습니다.</b> 사본을 보관하세요.</li>
           <li>LZ4 볼륨으로 패킹해 폴더나 이미지에 씁니다: <b>빠름</b>(LZ4), <b>보통</b>(HC 9), <b>최대</b>(HC 12).</li>
           <li>런타임: <b>ampr-emu-ng</b>(기본값) 또는 업스트림 <b>ampr_emu</b>.</li>
           <li>패킹된 게임에는 <b>언패킹</b>이 표시됩니다.</li>
@@ -783,6 +783,7 @@ const ko: Messages = {
       },
     },
     innerFfpkg: { text: "PS5 고유의 파일 시스템(UFS2)입니다." },
+    innerExfat: { tone: "good", text: "권장. 압축 컨테이너 안에서 가장 안정적인 이미지입니다." },
     level0: { text: "압축 없음: 모든 블록을 그대로 저장합니다. 파일 크기가 이미지와 같습니다." },
     levelDefault: {
       tone: "good",
@@ -821,6 +822,9 @@ const ko: Messages = {
     compression: "압축",
     fullVerify: "전체 검증",
     fullVerifyHint: "모든 바이트를 다시 읽어 출력을 확인합니다. 시간이 더 걸립니다.",
+    deleteSource: "소스 삭제",
+    deleteSourceHint: "되돌릴 수 없습니다. 소스는 변환에 성공한 뒤에만 삭제됩니다.",
+    deleteSourceNas: "NAS에 있는 게임은 여기서 삭제할 수 없습니다.",
     separator: "이름에는 폴더 구분자를 넣을 수 없습니다. 폴더는 ‘변경’으로 바꾸세요.",
     badName: "이름은 비워 둘 수 없으며, 점으로 시작하거나 점이나 공백으로 끝나거나 제어 문자를 포함할 수 없습니다.",
     tooLong: (bytes, max, folder) =>
@@ -981,6 +985,13 @@ const ko: Messages = {
       "‘파일 전송’은 이들 사이에서 파일과 폴더를 복사합니다. 대상에 같은 이름이 이미 있으면 확인한 뒤에만 교체됩니다.",
     ],
     helpSecurity: "기기 사이에 보내는 내용은 암호화되지 않으므로 같은 네트워크의 누구나 읽을 수 있습니다. 저장된 NAS 비밀번호는 암호화되지 않은 채 이 기기에 보관됩니다. ‘연결’은 집 네트워크에서만 사용하세요.",
+    helpSpeed: "페어링된 기기의 행이나 세부 정보에 있는 ‘속도 테스트’는 그 기기로 128 MiB를 보내고 128 MiB를 받아 오며(디스크에는 아무것도 쓰지 않음), 방향별 네트워크 속도를 보여 줍니다.",
+    speedTest: "속도 테스트",
+    speedTestWith: (name) => `${name} 속도 테스트`,
+    speedTesting: "테스트 중",
+    speedResult: (up, down) => `업로드 ${up} MB/s · 다운로드 ${down} MB/s`,
+    speedFailed: "속도 테스트 실패:",
+    speedNote: "128 MiB를 보내고 128 MiB를 받아 옵니다. 디스크에는 아무것도 쓰지 않습니다.",
     installTitle: "PS5의 Dump Forge",
     ps5Address: "PS5 주소",
     install: "PS5에 설치",

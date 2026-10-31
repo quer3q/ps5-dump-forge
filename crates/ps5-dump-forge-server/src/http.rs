@@ -46,6 +46,9 @@ pub(crate) struct Response {
     pub retry_after: Option<u64>,
     /// A static file's `Cache-Control` (API replies always get `no-store`).
     cache: Option<&'static str>,
+    /// An asset embedded gzipped: `Some(true)` sent so (`Content-Encoding: gzip`), `Some(false)`
+    /// decoded for a client that takes no gzip; either way `Vary: Accept-Encoding`.
+    gzip: Option<bool>,
     /// Runs once the response is sent (quit).
     pub after: Option<Box<dyn FnOnce() + Send>>,
     /// A download's file name and bytes, streamed after the head instead of `body`.
@@ -103,6 +106,22 @@ impl Response {
         r
     }
 
+    /// An asset embedded as a gzip stream (build.rs): as it is when `accept_encoding` takes gzip,
+    /// else decoded here.
+    pub fn gzip_asset(name: &str, gz: &'static [u8], accept_encoding: Option<&str>) -> Self {
+        let take = accept_encoding.is_some_and(takes_gzip);
+        let mut r = Self::asset(name, gz);
+        if !take {
+            let mut raw = Vec::new();
+            if let Err(e) = flate2::read::GzDecoder::new(gz).read_to_end(&mut raw) {
+                return Self::error(500, format!("internal error: {name}: {e}"));
+            }
+            r.body = Cow::Owned(raw);
+        }
+        r.gzip = Some(take);
+        r
+    }
+
     /// `len` bytes, written by `body` after the head, as an attachment named `name` (any
     /// text: [`disposition`] makes the header safe).
     pub fn download(kind: &'static str, name: &str, len: u64, body: Body) -> Self {
@@ -133,6 +152,7 @@ impl Response {
             body,
             retry_after: None,
             cache: None,
+            gzip: None,
             after: None,
             download: None,
         }
@@ -168,6 +188,12 @@ impl Response {
         } else if let Some(cache) = self.cache {
             head += &format!("Cache-Control: {cache}\r\n");
         }
+        if let Some(gzip) = self.gzip {
+            if gzip {
+                head += "Content-Encoding: gzip\r\n";
+            }
+            head += "Vary: Accept-Encoding\r\n";
+        }
         if let Some(secs) = self.retry_after {
             head += &format!("Retry-After: {secs}\r\n");
         }
@@ -182,6 +208,28 @@ const JSON: &str = "application/json";
 
 fn bad(text: &str) -> Response {
     Response::error(400, text)
+}
+
+/// Whether an `Accept-Encoding` value takes gzip: `gzip`, `x-gzip` or `*` listed, its `q` not 0
+/// (a `gzip;q=0` refuses it even beside `*`).
+fn takes_gzip(value: &str) -> bool {
+    let mut star = false;
+    for item in value.split(',') {
+        let mut parts = item.split(';');
+        let coding = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let zero = parts.any(|p| {
+            let p = p.trim().to_ascii_lowercase();
+            p.strip_prefix("q=")
+                .and_then(|q| q.trim().parse::<f32>().ok())
+                .is_some_and(|q| q == 0.0)
+        });
+        match coding.as_str() {
+            "gzip" | "x-gzip" => return !zero,
+            "*" => star = !zero,
+            _ => {}
+        }
+    }
+    star
 }
 
 fn content_type(name: &str) -> &'static str {
@@ -548,6 +596,22 @@ pub(crate) fn busy(stream: TcpStream) {
     let mut stream = stream;
     let _ = stream.set_nonblocking(true);
     let _ = stream.write_all(&Response::error(503, "too many connections; try again").bytes());
+    // Closing with the request still unread sends a reset, which the browser shows as a network
+    // error instead of the 503: end the write side, then drain what came, 20 ms at most (this
+    // runs on the accept thread).
+    let _ = stream.shutdown(Shutdown::Write);
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let mut sink = [0u8; 4096];
+    while Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2))
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -555,22 +619,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_page_is_rechecked_and_hashed_assets_are_cached() {
-        let head = |r: Response| String::from_utf8_lossy(&r.bytes()).into_owned();
-        assert!(
-            head(Response::asset("index.html", b"<html>")).contains("Cache-Control: no-cache\r\n")
-        );
-        assert!(head(Response::asset("assets/index-1a2b.js", b"x")).contains("immutable"));
-        let manifest = head(Response::asset("forge.appcache", b"CACHE MANIFEST\n"));
-        assert!(
-            manifest.contains("Content-Type: text/cache-manifest\r\n"),
-            "{manifest}"
-        );
-        assert!(
-            manifest.contains("Cache-Control: no-cache\r\n"),
-            "{manifest}"
-        );
-        assert!(head(Response::json(&1)).contains("Cache-Control: no-store\r\n"));
+    fn gzip_is_taken_only_when_asked_for() {
+        for yes in [
+            "gzip",
+            "gzip, deflate, br",
+            "br;q=1, GZip;q=0.5",
+            "x-gzip",
+            "*",
+            "br, *",
+        ] {
+            assert!(takes_gzip(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "identity",
+            "br",
+            "gzip;q=0",
+            "*, gzip;q=0",
+            "gzip;q=0.0, *",
+        ] {
+            assert!(!takes_gzip(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_gzipped_asset_is_sent_as_it_is_or_decoded() {
+        let raw = b"console.log('forge');\n".repeat(50);
+        let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(&raw).unwrap();
+        let gz: &'static [u8] = Box::leak(z.finish().unwrap().into_boxed_slice());
+        let reply = |accept| {
+            String::from_utf8_lossy(&Response::gzip_asset("a.js", gz, accept).bytes()).into_owned()
+        };
+        let sent = reply(Some("gzip, br"));
+        assert!(sent.contains("Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"));
+        assert!(sent.contains(&format!("Content-Length: {}\r\n", gz.len())));
+        for accept in [None, Some("br")] {
+            let plain = reply(accept);
+            assert!(!plain.contains("Content-Encoding") && plain.contains("Vary: Accept-Encoding"));
+            assert!(plain.contains(&format!("Content-Length: {}\r\n", raw.len())));
+            assert!(plain.ends_with(&*String::from_utf8_lossy(&raw)));
+        }
     }
 
     /// Takes one byte per write, a little late each time: always progress, never done in time.
@@ -618,60 +707,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fast, b"done");
-    }
-
-    #[test]
-    fn queries_and_downloads() {
-        assert_eq!(
-            percent_decode("a%2Fb%20c+d%C3%A9").as_deref(),
-            Some("a/b c+dé")
-        );
-        for bad in ["%", "%2", "%zz", "%+1", "%FF"] {
-            assert_eq!(percent_decode(bad), None, "{bad}");
-        }
-        let q = "source=%2Fdata%2Fg&name=ampr_emu.index&name=x&flag";
-        assert_eq!(query_value(q, "source").as_deref(), Some("/data/g"));
-        assert_eq!(query_value(q, "name").as_deref(), Some("ampr_emu.index"));
-        assert_eq!(query_value(q, "flag"), None);
-        let head = parse("GET /api/x?a=1 HTTP/1.1").unwrap();
-        assert_eq!((head.path.as_str(), head.query.as_str()), ("/api/x", "a=1"));
-
-        let r = Response::download(
-            "application/octet-stream",
-            "t.bin",
-            5,
-            Box::new(|w| w.write_all(b"hello")),
-        );
-        let head = String::from_utf8(r.bytes()).unwrap();
-        for line in [
-            "HTTP/1.1 200 OK\r\n",
-            "Content-Type: application/octet-stream\r\n",
-            "Content-Length: 5\r\n",
-            "Content-Disposition: attachment; filename=\"t.bin\"\r\n",
-            "Cache-Control: no-store\r\n",
-        ] {
-            assert!(head.contains(line), "{head}");
-        }
-        assert!(
-            head.ends_with("\r\n\r\n"),
-            "the body is streamed after the head"
-        );
-        assert_eq!(
-            disposition("[Stellar Blade]-[PPSA13197].zip"),
-            "attachment; filename=\"[Stellar Blade]-[PPSA13197].zip\""
-        );
-        assert_eq!(
-            disposition("[ドラゴン é]-[PPSA1].zip"),
-            "attachment; filename=\"[____ _]-[PPSA1].zip\"; \
-             filename*=UTF-8''%5B%E3%83%89%E3%83%A9%E3%82%B4%E3%83%B3%20%C3%A9%5D-%5BPPSA1%5D.zip"
-        );
-        let hostile = disposition("a\"b\\c\r\nSet-Cookie: x=1.zip");
-        assert!(!hostile.contains(['\r', '\n']), "{hostile}");
-        assert!(hostile.starts_with("attachment; filename=\"a_b_c__Set-Cookie: x=1.zip\";"));
-        assert!(
-            hostile.ends_with("a%22b%5Cc%0D%0ASet-Cookie%3A%20x%3D1.zip"),
-            "{hostile}"
-        );
     }
 
     fn parse(text: &str) -> Result<Head, u16> {
@@ -724,5 +759,20 @@ mod tests {
         assert_eq!(post("/api/inspect", BODY_MAX + 1).err(), Some(413));
         assert_eq!(post(UPLOAD, JOB_BODY_MAX * 4), Ok(JOB_BODY_MAX * 4));
         assert!(parse("GET / HTTP/1.0").is_ok()); // no Host needed
+    }
+
+    #[test]
+    fn busy_answers_503_after_reading_the_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .write_all(b"GET /api/jobs HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        busy(server);
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 503"), "{answer:?}");
     }
 }

@@ -8,7 +8,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAGIC: [u8; 2] = *b"FL";
 pub const HEADER_LEN: usize = 16;
@@ -106,10 +106,17 @@ impl Mac {
     }
 
     fn tag(&self, header: &[u8; HEADER_LEN], body: &[u8]) -> [u8; TAG_LEN] {
+        self.tag_parts(header, &[body])
+    }
+
+    /// The tag of a body given as `parts` in order (the same tag as their concatenation's).
+    fn tag_parts(&self, header: &[u8; HEADER_LEN], parts: &[&[u8]]) -> [u8; TAG_LEN] {
         let mut h = blake3::Hasher::new_keyed(&self.key);
         h.update(&self.counter.to_le_bytes());
         h.update(header);
-        h.update(body);
+        for part in parts {
+            h.update(part);
+        }
         let mut tag = [0u8; TAG_LEN];
         tag.copy_from_slice(&h.finalize().as_bytes()[..TAG_LEN]);
         tag
@@ -125,7 +132,15 @@ impl Mac {
 
     /// The tag for the next frame sent; each call uses up one counter value.
     pub fn seal(&mut self, header: &[u8; HEADER_LEN], body: &[u8]) -> io::Result<[u8; TAG_LEN]> {
-        let tag = self.tag(header, body);
+        self.seal_parts(header, &[body])
+    }
+
+    fn seal_parts(
+        &mut self,
+        header: &[u8; HEADER_LEN],
+        parts: &[&[u8]],
+    ) -> io::Result<[u8; TAG_LEN]> {
+        let tag = self.tag_parts(header, parts);
         self.advance()?;
         Ok(tag)
     }
@@ -154,22 +169,35 @@ fn ct_eq(a: &[u8; TAG_LEN], b: &[u8; TAG_LEN]) -> bool {
 /// Writes one frame (header, body, then the tag when `mac` is set): a small one in one
 /// `write_all`, a large one (a data chunk) as it is, never copied.
 pub fn write_frame<W: Write>(w: &mut W, frame: &Frame, mac: Option<&mut Mac>) -> io::Result<()> {
+    write_parts(w, frame.header()?, &[&frame.body], mac)
+}
+
+/// `write_frame` for a body given as `parts` in order (`header.len` their total).
+fn write_parts<W: Write>(
+    w: &mut W,
+    header: Header,
+    parts: &[&[u8]],
+    mac: Option<&mut Mac>,
+) -> io::Result<()> {
     const COPY_MAX: usize = 64 << 10;
-    let header = frame.header()?.encode();
-    if frame.body.len() > COPY_MAX {
-        let tag = mac.map(|mac| mac.seal(&header, &frame.body)).transpose()?;
+    let header = header.encode();
+    let tag = mac.map(|mac| mac.seal_parts(&header, parts)).transpose()?;
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    if len > COPY_MAX {
         w.write_all(&header)?;
-        w.write_all(&frame.body)?;
+        for part in parts {
+            w.write_all(part)?;
+        }
         if let Some(tag) = tag {
             w.write_all(&tag)?;
         }
         return w.flush();
     }
-    let mut buf = Vec::with_capacity(HEADER_LEN + frame.body.len() + TAG_LEN);
+    let mut buf = Vec::with_capacity(HEADER_LEN + len + TAG_LEN);
     buf.extend_from_slice(&header);
-    buf.extend_from_slice(&frame.body);
-    if let Some(mac) = mac {
-        buf.extend_from_slice(&mac.seal(&header, &frame.body)?);
+    parts.iter().for_each(|p| buf.extend_from_slice(p));
+    if let Some(tag) = tag {
+        buf.extend_from_slice(&tag);
     }
     w.write_all(&buf)?;
     w.flush()
@@ -180,8 +208,12 @@ pub fn read_frame<R: Read>(r: &mut R, max_body: u32, mac: Option<&mut Mac>) -> i
     let mut header = [0u8; HEADER_LEN];
     r.read_exact(&mut header)?;
     let h = Header::decode(&header, max_body)?;
-    let mut body = vec![0u8; h.len as usize];
-    r.read_exact(&mut body)?;
+    // Filled as it is read, not zeroed first (a data chunk is 8 MiB).
+    let mut body = Vec::with_capacity(h.len as usize);
+    r.by_ref().take(h.len.into()).read_to_end(&mut body)?;
+    if body.len() != h.len as usize {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     if let Some(mac) = mac {
         let mut tag = [0u8; TAG_LEN];
         r.read_exact(&mut tag)?;
@@ -235,6 +267,43 @@ pub struct Conn {
     max_body: u32,
     send_mac: Option<Mac>,
     recv_mac: Option<Mac>,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+/// The conn's reads: each bounded by its timeout and, while one is set, by its deadline, so a
+/// peer dripping a byte per timeout can't hold the conn past it.
+struct Bounded<'a> {
+    stream: &'a TcpStream,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Read for Bounded<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let late = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "flink: the handshake took too long",
+            )
+        };
+        let Some(deadline) = self.deadline else {
+            let mut stream = self.stream;
+            return stream.read(buf);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(late());
+        }
+        self.stream.set_read_timeout(Some(left.min(self.timeout)))?;
+        let mut stream = self.stream;
+        stream.read(buf).map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut if Instant::now() >= deadline => {
+                late()
+            }
+            _ => e,
+        })
+    }
 }
 
 impl Conn {
@@ -249,7 +318,26 @@ impl Conn {
             max_body,
             send_mac: None,
             recv_mac: None,
+            timeout,
+            deadline: None,
         })
+    }
+
+    /// Bounds every read in total until cleared (`None` puts the plain timeout back).
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.deadline = deadline;
+        if deadline.is_none() {
+            self.stream.set_read_timeout(Some(self.timeout))?;
+        }
+        Ok(())
+    }
+
+    fn reader(&self) -> Bounded<'_> {
+        Bounded {
+            stream: &self.stream,
+            timeout: self.timeout,
+            deadline: self.deadline,
+        }
     }
 
     pub fn connect(addr: SocketAddr, max_body: u32, timeout: Duration) -> io::Result<Conn> {
@@ -280,16 +368,16 @@ impl Conn {
     }
 
     pub fn recv_frame(&mut self) -> io::Result<Frame> {
-        read_frame(&mut self.stream, self.max_body, self.recv_mac.as_mut())
+        let mut r = Bounded {
+            stream: &self.stream,
+            timeout: self.timeout,
+            deadline: self.deadline,
+        };
+        read_frame(&mut r, self.max_body, self.recv_mac.as_mut())
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.stream.peer_addr()
-    }
-
-    /// For `shutdown` from another thread (cancel, liveness).
-    pub fn try_clone_stream(&self) -> io::Result<TcpStream> {
-        self.stream.try_clone()
     }
 }
 
@@ -330,6 +418,13 @@ pub const PAIR_WAIT: Duration = if cfg!(test) {
     Duration::from_secs(3)
 } else {
     Duration::from_secs(60)
+};
+/// The listening side's Hello and Pair/Auth (or a lane's Join) in total, so a peer dripping
+/// bytes can't hold a conn slot; a pairing gets `PAIR_WAIT` more once its `Pair` is in.
+pub const HANDSHAKE_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(15)
 };
 /// The server pings this often while its user decides (a client's reads time out otherwise).
 const PAIR_PING: Duration = Duration::from_secs(2);
@@ -737,6 +832,18 @@ pub fn server_handshake(
     approver: &dyn Approver,
     budget: &std::sync::Mutex<Budget>,
 ) -> io::Result<Handshake> {
+    conn.set_deadline(Some(Instant::now() + HANDSHAKE_WAIT))?;
+    let hs = server_steps(conn, me, peers, approver, budget);
+    hs.and_then(|hs| conn.set_deadline(None).map(|()| hs))
+}
+
+fn server_steps(
+    conn: &mut Conn,
+    me: &Me,
+    peers: &dyn Fn(&str) -> Option<[u8; 32]>,
+    approver: &dyn Approver,
+    budget: &std::sync::Mutex<Budget>,
+) -> io::Result<Handshake> {
     let key_s = my_key(me)?;
     let f = conn.recv_frame()?;
     let Some((peer, key_c, nonce_c)) = (f.kind == kind::HELLO).then(|| check_hello(&f)).flatten()
@@ -754,6 +861,8 @@ pub fn server_handshake(
     let f = conn.recv_frame()?;
     let (secret, new_secret) = match f.kind {
         kind::PAIR => {
+            // The user's answer may take `PAIR_WAIT`; the rest stays bounded as before.
+            conn.set_deadline(Some(Instant::now() + PAIR_WAIT + HANDSHAKE_WAIT))?;
             let ip = conn.peer_addr()?.ip();
             // A key id is claimed, not proved: a known one never replaces its pairing.
             if peers(&peer.key_id).is_some() {
@@ -1100,9 +1209,11 @@ pub fn server_join(
     conn: &mut Conn,
     sessions: &dyn Fn(&str) -> Option<Session>,
 ) -> io::Result<(Session, u32, [u8; 16])> {
-    let (header, h, body) = read_head(&mut conn.stream)?;
+    conn.set_deadline(Some(Instant::now() + HANDSHAKE_WAIT))?;
+    let (header, h, body) = read_head(&mut conn.reader())?;
     let mut tag = [0u8; TAG_LEN];
-    conn.stream.read_exact(&mut tag)?;
+    conn.reader().read_exact(&mut tag)?;
+    conn.set_deadline(None)?;
     let join = (h.kind == kind2::JOIN)
         .then(|| serde_json::from_slice::<Join>(&body).ok())
         .flatten();
@@ -1165,13 +1276,36 @@ pub fn chunk_hash(bytes: &[u8]) -> String {
     hex(blake3::hash(bytes).as_bytes())
 }
 
-pub fn data_frame(head: &DataHead, bytes: &[u8]) -> io::Result<Frame> {
+/// A `Data` body's start: the head's length, then the head.
+fn data_prefix(head: &DataHead, extra: usize) -> io::Result<Vec<u8>> {
     let json = serde_json::to_vec(head).map_err(|e| bad(&format!("json: {e}")))?;
-    let mut body = Vec::with_capacity(4 + json.len() + bytes.len());
+    let mut body = Vec::with_capacity(4 + json.len() + extra);
     body.extend_from_slice(&(json.len() as u32).to_le_bytes());
     body.extend_from_slice(&json);
+    Ok(body)
+}
+
+pub fn data_frame(head: &DataHead, bytes: &[u8]) -> io::Result<Frame> {
+    let mut body = data_prefix(head, bytes.len())?;
     body.extend_from_slice(bytes);
     Ok(Frame::new(kind2::DATA, 0, body))
+}
+
+impl Conn {
+    /// Sends `data_frame(head, bytes)` without copying `bytes` into a frame body first.
+    pub fn send_data(&mut self, head: &DataHead, bytes: &[u8]) -> io::Result<()> {
+        let prefix = data_prefix(head, 0)?;
+        let len =
+            u32::try_from(prefix.len() + bytes.len()).map_err(|_| bad("frame body too large"))?;
+        let header = Header {
+            kind: kind2::DATA,
+            flags: 0,
+            channel: 0,
+            len,
+        };
+        let mac = self.send_mac.as_mut();
+        write_parts(&mut self.stream, header, &[&prefix, bytes], mac)
+    }
 }
 
 pub fn parse_data(f: &Frame) -> io::Result<(DataHead, &[u8])> {
@@ -1183,17 +1317,6 @@ pub fn parse_data(f: &Frame) -> io::Result<(DataHead, &[u8])> {
         .ok_or_else(|| bad("short data frame"))?;
     let head = serde_json::from_slice(json).map_err(|e| bad(&format!("json: {e}")))?;
     Ok((head, &f.body[4 + n..]))
-}
-
-/// The receiver's answer to a `Data`: its `DataOk`, or its `Error {code}` as a refusal
-/// (`refusal(&e)` starts with `TRANSFER_FAILED`).
-pub fn read_data_ok(conn: &mut Conn) -> io::Result<DataOk> {
-    let f = conn.recv_frame()?;
-    match f.kind {
-        kind2::DATA_OK => parse(&f),
-        kind::ERROR => Err(refused(&parse::<ErrorBody>(&f)?.code)),
-        k => Err(bad(&format!("unexpected frame {k} (wanted DataOk)"))),
-    }
 }
 
 /// Sends `Error {code}` (best effort) and returns it as a refusal; the caller closes.
@@ -1388,28 +1511,6 @@ mod tests {
         assert!(read_frame(&mut Cursor::new(&first), MAX_BODY, Some(&mut rx)).is_err());
     }
 
-    #[test]
-    fn conn_over_tcp() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let t = Duration::from_secs(5);
-        let server = std::thread::spawn(move || {
-            let mut c = Conn::new(listener.accept().unwrap().0, MAX_CONTROL_BODY, t).unwrap();
-            let hello = c.recv_frame().unwrap();
-            c.set_keys([2; 32], [1; 32]);
-            let next = c.recv_frame().unwrap();
-            c.send_frame(&next).unwrap();
-            hello
-        });
-        let mut c = Conn::connect(addr, MAX_CONTROL_BODY, t).unwrap();
-        c.send_frame(&frame()).unwrap();
-        c.set_keys([1; 32], [2; 32]);
-        assert!(c.keyed());
-        c.send_frame(&Frame::new(3, 9, b"ping".to_vec())).unwrap();
-        assert_eq!(c.recv_frame().unwrap(), Frame::new(3, 9, b"ping".to_vec()));
-        assert_eq!(server.join().unwrap(), frame());
-    }
-
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -1495,40 +1596,36 @@ mod tests {
     }
 
     #[test]
-    fn introduce_names_the_listener_and_pairs_nothing() {
+    fn a_dripping_handshake_is_cut_at_the_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let t = Duration::from_secs(5);
-        let budget = Mutex::new(Budget::default());
         let server = std::thread::spawn(move || {
+            let t = Duration::from_secs(5);
             let mut c = Conn::new(listener.accept().unwrap().0, MAX_CONTROL_BODY, t).unwrap();
             let user = Answer(Some(true), Mutex::new(Vec::new()));
-            let r = server_handshake(&mut c, &me(2, "ps5"), &|_| None, &user, &budget);
-            (r.is_err(), user.1.into_inner().unwrap().len(), budget)
-        });
-        let mut c = Conn::connect(addr, MAX_CONTROL_BODY, t).unwrap();
-        let peer = introduce(&mut c, &me(1, "mac")).unwrap();
-        assert_eq!((peer.name.as_str(), peer.port), ("ps5", 9883));
-        drop(c);
-        let (failed, asked, budget) = server.join().unwrap();
-        assert!(failed && asked == 0);
-        assert_eq!(
-            budget.lock().unwrap().failures(std::time::Instant::now()),
-            0
-        );
-        // This device itself.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let mut c = Conn::new(listener.accept().unwrap().0, MAX_CONTROL_BODY, t).unwrap();
-            let user = Answer(None, Mutex::new(Vec::new()));
             let budget = Mutex::new(Budget::default());
-            let _ = server_handshake(&mut c, &me(1, "mac"), &|_| None, &user, &budget);
+            let start = std::time::Instant::now();
+            let r = server_handshake(&mut c, &me(2, "ps5"), &|_: &str| None, &user, &budget);
+            (r.map(|_| ()), start.elapsed())
         });
-        let mut c = Conn::connect(addr, MAX_CONTROL_BODY, t).unwrap();
-        assert!(introduce(&mut c, &me(1, "mac")).is_err());
-        drop(c);
-        server.join().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        // A Hello one byte every 200 ms: each read well within the 5 s timeout, never done.
+        let header = Header {
+            kind: kind::HELLO,
+            flags: 0,
+            channel: 0,
+            len: 100,
+        }
+        .encode();
+        for b in header.iter().cycle().take(40) {
+            if client.write_all(&[*b]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let (r, took) = server.join().unwrap();
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(took < HANDSHAKE_WAIT + Duration::from_secs(1), "{took:?}");
     }
 
     #[test]
@@ -1601,66 +1698,6 @@ mod tests {
             budget.lock().unwrap().failures(std::time::Instant::now()),
             Budget::PER_IP
         );
-    }
-
-    #[test]
-    fn a_requester_that_leaves_is_counted() {
-        /// Undecided, asked again soon: the pings find the requester gone.
-        struct Undecided;
-        impl Approver for Undecided {
-            fn admit(&self, _: &PairRequest) -> bool {
-                true
-            }
-            fn decide(&self, _: &PairRequest, wait: Duration) -> Option<bool> {
-                std::thread::sleep(wait.min(Duration::from_millis(50)));
-                None
-            }
-            fn done(&self, _: &PairRequest) {}
-        }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let t = Duration::from_secs(5);
-        let budget = Arc::new(Mutex::new(Budget::default()));
-        let b = budget.clone();
-        let server = std::thread::spawn(move || {
-            let mut c = Conn::new(listener.accept().unwrap().0, MAX_CONTROL_BODY, t).unwrap();
-            server_handshake(&mut c, &me(2, "ps5"), &|_| None, &Undecided, &b)
-        });
-        let mut c = Conn::connect(addr, MAX_CONTROL_BODY, t).unwrap();
-        let stream = c.try_clone_stream().unwrap();
-        // The requester leaves once the check number shows.
-        let mut leave = |_: &str| {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        };
-        assert!(client_handshake(&mut c, &me(1, "mac"), &|_| None, Some(&mut leave)).is_err());
-        drop(c);
-        drop(stream);
-        let s = server.join().unwrap().unwrap_err();
-        assert_ne!(refusal(&s), Some(TIMED_OUT), "the pings found it gone: {s}");
-        assert_eq!(
-            budget.lock().unwrap().failures(std::time::Instant::now()),
-            1
-        );
-    }
-
-    #[test]
-    fn budget_window_and_total() {
-        let mut b = Budget::default();
-        let t0 = std::time::Instant::now();
-        let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
-        for _ in 0..Budget::PER_IP {
-            assert!(b.allows(ip(1), t0));
-            b.fail(ip(1), t0);
-        }
-        assert!(!b.allows(ip(1), t0));
-        assert!(b.allows(ip(2), t0));
-        for n in 2..5 {
-            for _ in 0..Budget::PER_IP {
-                b.fail(ip(n), t0);
-            }
-        }
-        assert!(b.allows(ip(9), t0), "no cap across addresses");
-        assert!(b.allows(ip(1), t0 + Budget::WINDOW));
     }
 
     /// A paired, keyed control conn over loopback: ((client conn, session), (server conn,

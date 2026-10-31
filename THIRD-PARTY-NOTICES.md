@@ -160,11 +160,12 @@ SUCH DAMAGE.
 `vendor/ampr_emu/` holds the unmodified upstream 0.4.2.1 release binary `libSceAmpr.sprx`, which Forge
 embeds and installs into AMPR games (and on LZ4 Pack with runtime `ampr_emu`), and the tagged source archive
 `ampr_emu-0.4.2.1-src.tar.gz`, kept there as its corresponding source (the exact compile-time options of
-the release binary are not recorded; this is no claim of reproducibility). It also holds
-`libSceAmpr-zstd.sprx`, ampr-emu-ng, built locally from `ampr-emu zstd` (a Rust rewrite of ampr_emu,
-GPL-3.0-or-later) that reads zstd and LZ4 packs, which Forge embeds and installs on zstd Pack and LZ4
-Pack (runtime `ng`, the default); it compiles in libzstd (through `zstd-sys`) and the `no_std` part of
-`crates/ps5-dump-forge-zstd` (the pack convention).
+the release binary are not recorded; this is no claim of reproducibility). `vendor/ampr-emu-ng/` holds
+the ampr-emu-ng v0.1.0 release binaries (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`) and the tagged source
+archive `ampr-emu-ng-0.1.0-src.tar.gz` (https://github.com/quer3q/ampr-emu-ng, a Rust hard fork of
+ampr_emu, GPL-3.0) that reads zstd and LZ4 packs; Forge embeds the release `libSceAmpr.sprx` and installs it
+on zstd Pack and LZ4 Pack (runtime `ng`, the default); it compiles in libzstd (`zstd-sys` 2.1.2,
+BSD-3-Clause or GPL-2.0), `lz4_flex` 0.14.0 (MIT) and `crc32fast` 1.5.3 (MIT or Apache-2.0).
 Forge's pack format code is written from the documented format and checked against upstream's Python
 tools (`scripts/check-lz4.sh`); no ampr_emu code is compiled into Forge.
 

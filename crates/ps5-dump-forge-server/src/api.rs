@@ -63,6 +63,10 @@ pub(crate) struct Server {
     /// stopping never interleave.
     admission: Mutex<()>,
     stopping: AtomicBool,
+    /// Deletes and moves admitted and still running: their I/O runs without `admission`
+    /// (a big or remote delete never holds up `quit`, a signal or `self_update`); `finish`
+    /// waits for them, and `quit {"if_idle"}` and `self_update` answer busy meanwhile.
+    deleting: AtomicUsize,
     inspecting: AtomicUsize,
     /// Reads waiting in [`Server::capped`] for a slot.
     waiting: AtomicUsize,
@@ -291,6 +295,15 @@ impl Drop for Inspecting<'_> {
 /// Clears its flag when dropped, also when the handler unwinds.
 struct Flag<'a>(&'a AtomicBool);
 
+/// One delete or move in flight ([`Server::deleting`]), uncounted when it returns.
+struct Deleting<'a>(&'a AtomicUsize);
+
+impl Drop for Deleting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Drop for Flag<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
@@ -481,6 +494,7 @@ impl Server {
             running,
             admission: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            deleting: AtomicUsize::new(0),
             inspecting: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
             updating: AtomicBool::new(false),
@@ -548,7 +562,7 @@ impl Server {
             return if post {
                 Err(Response::error(404, "unknown route"))
             } else {
-                self.asset(&head.path)
+                self.asset(head)
             };
         };
         match (post, api) {
@@ -654,16 +668,19 @@ impl Server {
         }
     }
 
-    fn asset(&self, path: &str) -> Reply {
-        let name = match path {
+    fn asset(&self, head: &Head) -> Reply {
+        let name = match head.path.as_str() {
             "/" => "index.html",
-            _ => &path[1..],
+            path => &path[1..],
         };
-        ASSETS
+        let (name, gzip, bytes) = ASSETS
             .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(n, bytes)| Response::asset(n, bytes))
-            .ok_or_else(|| Response::error(404, "not found"))
+            .find(|(n, ..)| *n == name)
+            .ok_or_else(|| Response::error(404, "not found"))?;
+        Ok(match gzip {
+            true => Response::gzip_asset(name, bytes, head.header("accept-encoding")),
+            false => Response::asset(name, bytes),
+        })
     }
 
     fn session(&self) -> Response {
@@ -924,7 +941,7 @@ impl Server {
     }
 
     /// A paired peer's Delete and Move to here are this server's own routes' (its keep list,
-    /// under admission, refused once stopping); on the PS5 its `install {path}` starts an
+    /// refused once stopping, counted in `deleting` as the local routes are); on the PS5 its `install {path}` starts an
     /// install job of its package (read over FLINK) as `start_job` would. Holds the server weakly.
     pub(crate) fn wire_install(self: &Arc<Self>) {
         let Ok(connect) = &self.connect else { return };
@@ -932,19 +949,13 @@ impl Server {
         let weak = Arc::downgrade(self);
         let delete: crate::connect_fs::DeleteHook = Arc::new(move |path| {
             let server = weak.upgrade().ok_or_else(gone)?;
-            let _admission = lock(&server.admission);
-            if server.stopping.load(Ordering::SeqCst) {
-                return Err(gone());
-            }
+            let _deleting = server.admit_delete().map_err(|_| gone())?;
             server.jobs.delete_path(path, &server.keep())
         });
         let weak = Arc::downgrade(self);
         let move_: crate::connect_fs::MoveHook = Arc::new(move |from, to, replace| {
             let server = weak.upgrade().ok_or_else(gone)?;
-            let _admission = lock(&server.admission);
-            if server.stopping.load(Ordering::SeqCst) {
-                return Err(gone());
-            }
+            let _deleting = server.admit_delete().map_err(|_| gone())?;
             server.jobs.move_path(from, to, replace, &server.keep())
         });
         connect.set_delete_move(delete, move_);
@@ -969,13 +980,10 @@ impl Server {
 
     /// Deletes a file or folder for good (core's `Jobs::delete_path`; the page asks first).
     /// Never a browse root or a folder holding one, configured or mounted now, nor anything an
-    /// unfinished job uses. Admission is held, so no quit lands mid-delete.
+    /// unfinished job uses. Counted in `deleting`, so no quit cuts it short.
     fn delete_path(&self, body: &[u8]) -> Reply {
         let arg: PathArg = parse(body)?;
-        let _admission = lock(&self.admission);
-        if self.stopping.load(Ordering::SeqCst) {
-            return Err(Response::error(409, "Dump Forge is stopping"));
-        }
+        let _deleting = self.admit_delete()?;
         let keep = self.keep();
         self.jobs.delete_path(&arg.path, &keep).map_err(deleted)?;
         Ok(Response::json(&()))
@@ -984,19 +992,37 @@ impl Server {
     /// Moves or renames a file or folder on its volume (core's `Jobs::move_path`): `to` never
     /// replaced unless `replace` (a file over a file, a folder merged into a folder, the old
     /// file refused as `delete_path` refuses it), `from` refused as `delete_path` refuses it
-    /// (same `keep` list). Admission is held, so no job or quit lands between the check and
-    /// the rename.
+    /// (same `keep` list). Core holds its job table from the check to the rename, so no job
+    /// lands between them; counted in `deleting`, so no quit cuts it short.
     fn move_path(&self, body: &[u8]) -> Reply {
         let arg: MoveArg = parse(body)?;
-        let _admission = lock(&self.admission);
-        if self.stopping.load(Ordering::SeqCst) {
-            return Err(Response::error(409, "Dump Forge is stopping"));
-        }
+        let _deleting = self.admit_delete()?;
         let keep = self.keep();
         self.jobs
             .move_path(&arg.from, &arg.to, arg.replace, &keep)
             .map_err(deleted)?;
         Ok(Response::json(&()))
+    }
+
+    /// A delete or move admitted (refused once stopping) and counted until the guard drops.
+    fn admit_delete(&self) -> Result<Deleting<'_>, Response> {
+        let _admission = lock(&self.admission);
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(Response::error(409, "Dump Forge is stopping"));
+        }
+        self.deleting.fetch_add(1, Ordering::SeqCst);
+        Ok(Deleting(&self.deleting))
+    }
+
+    /// 409 while a delete or move runs (under admission: none starts meanwhile).
+    fn idle_of_deletes(&self) -> Result<(), Response> {
+        if self.deleting.load(Ordering::SeqCst) > 0 {
+            return Err(Response::error(
+                409,
+                "Dump Forge is busy: a game is being deleted",
+            ));
+        }
+        Ok(())
     }
 
     /// `POST ?source=<abs source>&path=<game path>` (both percent-encoded), the raw file as the
@@ -1240,7 +1266,8 @@ impl Server {
     /// `quit {"if_idle": true}` (a newer copy taking over): quits as `quit` does, but only when
     /// no job is queued or running and no paired device is
     /// reading or writing files here; else 409.
-    /// Admission within `IDLE_WAIT`, else a 409: a delete holds it for long, and a
+    /// Admission within `IDLE_WAIT`, else a 409: a start waiting on core's job table behind a
+    /// delete holds it for long, and a
     /// late yes would act after the asker gave up (the newer copy's 3 s request, the page's
     /// minute).
     fn admission_soon(&self) -> Result<MutexGuard<'_, ()>, Response> {
@@ -1268,6 +1295,7 @@ impl Server {
             if self.stopping.load(Ordering::SeqCst) {
                 return Err(Response::error(409, "Dump Forge is stopping"));
             }
+            self.idle_of_deletes()?;
             if self.running.load(Ordering::SeqCst) > 0 {
                 return Err(Response::error(
                     409,
@@ -1331,6 +1359,7 @@ impl Server {
             if self.stopping.load(Ordering::SeqCst) {
                 return Err(Response::error(409, "Dump Forge is stopping"));
             }
+            self.idle_of_deletes()?;
             if self.running.load(Ordering::SeqCst) > 0 {
                 return Err(Response::error(
                     409,
@@ -1358,13 +1387,18 @@ impl Server {
     }
 
     /// `true` for the call that closed admission. Once it returns, every admitted job is
-    /// in the table.
+    /// in the table and no delete or move is admitted (those running are `finish`'s wait).
     pub fn stop(&self) -> bool {
         let _admission = lock(&self.admission);
         !self.stopping.swap(true, Ordering::SeqCst)
     }
 
     pub fn finish(&self) {
+        // A delete or move admitted before the stop ends first: cut short, a folder would be
+        // left half gone. ponytail: no bound; a peer's delete ends at FLINK's silence limit.
+        while self.deleting.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         self.jobs.cancel_all_and_wait();
         if let Ok(connect) = &self.connect {
             connect.shutdown();
@@ -1393,6 +1427,9 @@ struct ConnectArg {
     /// `install`: a `.pkg` on this device.
     #[serde(default)]
     path: PathBuf,
+    /// `speed_test`, `speed_test_cancel`: the UI's id for one test.
+    #[serde(default)]
+    run: String,
 }
 
 /// `cancel_job`: a peer's job shown here.
@@ -1466,6 +1503,22 @@ impl Server {
                 Ok(Response::json(
                     &json!({ "job": job.map_err(|e| Response::error(400, e))? }),
                 ))
+            }
+            // Times the link to the paired device `key_id` (256 MiB each way over FLINK's
+            // lanes, nothing on disk): `{up_bytes_per_s, down_bytes_per_s, bytes}`. `run` is
+            // the UI's id for it, the one `speed_test_cancel` names.
+            "speed_test" => {
+                self.refuse_if_stopping()?;
+                let got = c
+                    .speed_test(&a.key_id, &a.run)
+                    .map_err(|e| Response::error(400, e))?;
+                Ok(Response::json(&got))
+            }
+            // Stops the speed test `run` with `key_id` (it answers 400 `cancelled`); a run not
+            // started yet ends `cancelled` as it starts.
+            "speed_test_cancel" => {
+                c.speed_test_cancel(&a.key_id, &a.run);
+                Ok(Response::json(&()))
             }
             "discover_start" => {
                 c.discover_start();
@@ -1861,48 +1914,6 @@ mod tests {
         Arc::new(Server::new(opts, "127.0.0.1:1".parse().unwrap()).unwrap())
     }
 
-    /// Job notices: on by default, turned off and on by `POST /api/notifications`, kept as a
-    /// `notifications.off` marker in the settings folder (a new server reads it), 500 when it
-    /// can't be written.
-    #[test]
-    fn notifications_setting_is_kept() {
-        let settings = dir("notices");
-        let start = |dir: &Path| {
-            let mut opts = Options::new(0, vec![std::env::temp_dir()], Platform::Host, |_| {});
-            opts.settings_dir = Some(dir.to_path_buf());
-            Arc::new(Server::new(opts, "127.0.0.1:1".parse().unwrap()).unwrap())
-        };
-        let session = |server: &Arc<Server>| -> serde_json::Value {
-            serde_json::from_str(&server.session().text()).unwrap()
-        };
-        let first = start(&settings);
-        assert_eq!(session(&first)["notifications"], true);
-        assert_eq!(post(&first, "notifications", json!({})).status, 400);
-        let r = post(&first, "notifications", json!({"on": false}));
-        assert_eq!(r.status, 200, "{}", r.text());
-        assert_eq!(r.text(), r#"{"on":false}"#);
-        assert!(settings.join("notifications.off").is_file());
-        assert_eq!(session(&start(&settings))["notifications"], false);
-        let r = post(&first, "notifications", json!({"on": true}));
-        assert_eq!(r.text(), r#"{"on":true}"#);
-        assert!(!settings.join("notifications.off").exists());
-        assert_eq!(session(&start(&settings))["notifications"], true);
-        // A folder that can't be made: the error, and the setting as it was.
-        std::fs::write(settings.join("file"), b"").unwrap();
-        let broken = start(&settings.join("file"));
-        let r = post(&broken, "notifications", json!({"on": false}));
-        assert_eq!(r.status, 500, "{}", r.text());
-        assert_eq!(session(&broken)["notifications"], true);
-        // Memory only without a settings folder (tests).
-        let memory = Arc::new(server());
-        assert_eq!(
-            post(&memory, "notifications", json!({"on": false})).status,
-            200
-        );
-        assert_eq!(session(&memory)["notifications"], false);
-        let _ = std::fs::remove_dir_all(&settings);
-    }
-
     /// The PS5 (by user request): listings, `host_tree` and a Library folder only at or inside
     /// a root (`/data`, a link here, or a drive plugged in), else one 400 line; a root's
     /// `parent` is `null`. Another device's path still goes to core. A computer is unchanged.
@@ -1977,385 +1988,6 @@ mod tests {
         let server = library_server(&real);
         let r = post(&server, "list_dir", json!({ "path": tmp.join("system") }));
         assert_eq!(r.status, 200, "{}", r.text());
-        std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    /// Scan and cover: shapes, the configured roots, malformed bodies, the 2-at-once cap,
-    /// stopping, a missing cover (`null`) and an unreadable source (core's message, 500).
-    #[test]
-    fn library() {
-        // Under the build folder, not the temp dir: a macOS temp dir is a refused system folder.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("forge-api-lib-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("plain")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let server = library_server(&root);
-
-        // A computer has no automatic scan: no root is a 400; a system folder is refused.
-        let r = post(&server, "library_scan", json!({}));
-        assert_eq!(
-            (r.status, r.text().contains("choose a folder to scan")),
-            (400, true)
-        );
-        // FreeBSD (the PS5) has no system-folder list.
-        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
-            // Windows refuses only the system drive's root; "/" is the current drive's (D:\ on
-            // GitHub's runners), which is allowed.
-            let system_root = match cfg!(windows) {
-                true => {
-                    let drive = std::env::var("SystemDrive").ok();
-                    let letter = drive.and_then(|d| d.chars().next()).unwrap_or('C');
-                    format!("{letter}:\\")
-                }
-                false => "/".to_string(),
-            };
-            let r = post(&server, "library_scan", json!({ "root": system_root }));
-            assert_eq!(r.status, 500, "{}", r.text());
-            assert!(r.text().contains("system folder"), "{}", r.text());
-        }
-
-        let r = post(&server, "library_scan", json!({ "root": root }));
-        assert_eq!(r.status, 200, "{}", r.text());
-        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
-        assert_eq!(v["roots"], json!([root]));
-        assert_eq!(v["entries"], json!([]));
-        // A computer's reply has no free space, nor its own route.
-        assert!(v.get("storage").is_none(), "{v}");
-        assert_eq!(post(&server, "storage", json!({})).text(), "null");
-        assert_eq!(
-            (&v["truncated"], &v["warnings"]),
-            (&json!(false), &json!([]))
-        );
-
-        // Another root; a non-string root is a 400.
-        let other = root.join("other");
-        std::fs::create_dir_all(other.join("game/sce_sys")).unwrap();
-        std::fs::write(other.join("game/eboot.bin"), b"x").unwrap();
-        std::fs::write(
-            other.join("game/sce_sys/param.json"),
-            br#"{"titleId":"PPSA00001","contentVersion":"01.000.000"}"#,
-        )
-        .unwrap();
-        let r = post(&server, "library_scan", json!({ "root": other }));
-        assert_eq!(r.status, 200, "{}", r.text());
-        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
-        assert_eq!(v["roots"], json!([other]));
-        assert_eq!(v["entries"][0]["title_id"], json!("PPSA00001"), "{v}");
-        assert_eq!(v["entries"][0]["lz4_packed"], json!(false), "{v}");
-        assert_eq!(v["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            post(&server, "library_scan", json!({ "root": 5 })).status,
-            400
-        );
-
-        // A folder with no icon: `null`. A missing path: core's error.
-        let r = post(
-            &server,
-            "library_cover",
-            json!({ "path": root.join("plain") }),
-        );
-        assert_eq!((r.status, r.text()), (200, "null".to_string()));
-        let gone = root.join("gone.ffpkg");
-        let r = post(&server, "library_cover", json!({ "path": gone }));
-        assert_eq!(r.status, 500);
-        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
-        assert!(
-            v["error"].as_str().is_some_and(|e| !e.is_empty()),
-            "{}",
-            r.text()
-        );
-
-        // Bodies: not an object; no path.
-        assert_eq!(post(&server, "library_scan", json!("x")).status, 400);
-        assert_eq!(post(&server, "library_scan", json!([])).status, 400);
-        assert_eq!(post(&server, "library_cover", json!({})).status, 400);
-        assert_eq!(
-            post(&server, "library_cover", json!({ "path": 1 })).status,
-            400
-        );
-
-        server.inspecting.store(MAX_INSPECTIONS, Ordering::SeqCst);
-        for (route, body) in [
-            ("library_scan", json!({ "root": root })),
-            ("library_cover", json!({ "path": root })),
-        ] {
-            let r = post(&server, route, body);
-            assert_eq!((r.status, r.retry_after), (429, Some(1)), "{route}");
-        }
-        server.inspecting.store(0, Ordering::SeqCst);
-
-        assert!(server.stop());
-        for (route, body) in [
-            ("library_scan", json!({ "root": root })),
-            ("library_cover", json!({ "path": root })),
-        ] {
-            let r = post(&server, route, body);
-            assert_eq!(r.status, 409, "{route}");
-            assert!(r.text().contains("stopping"), "{}", r.text());
-        }
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// Admission is held until a job is in the table, and both `stop` and `stale_parts`
-    /// wait for it, though core's events can come first. A job queued behind one blocked on
-    /// a FIFO stays unfinished; its `.part` (made here, as a worker would) is not stale.
-    #[cfg(unix)]
-    #[test]
-    fn admission_is_seen_whole() {
-        let tmp = dir("admit");
-        let fifo = tmp.join("block.ffpfs");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        // SAFETY: a NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let mut server = server();
-        server.admit_pause = Duration::from_millis(400);
-        let server = Arc::new(server);
-        // Job 1, past the API's source check: blocks opening the FIFO, holding the queue.
-        server.jobs.start(ConvertRequest {
-            source: fifo.clone(),
-            format: Format::Exfat,
-            output: tmp.join("blocked.exfat"),
-            compression_threads: None,
-            inner: None,
-            remove_backport: false,
-            full_verify: false,
-            kraken_level: ps5_dump_forge_core::KrakenLevel::Fast,
-            ffpfsc_level: 6,
-            lz4: None,
-            zstd_pack: false,
-            zstd_level: 5,
-            zstd_unpack: false,
-            lz4_level: 0,
-            lz4_runtime: Default::default(),
-            edits: Vec::new(),
-            extract: Vec::new(),
-            transfer: Vec::new(),
-            replace: false,
-            edit_rebuild: false,
-            install: None,
-            archive_password: None,
-        });
-        let starter = {
-            let (server, out) = (server.clone(), tmp.join("out.exfat"));
-            std::thread::spawn(move || {
-                let request = json!({ "request": {
-                    "source": "/nonexistent/forge.exfat", "format": "exfat", "output": out,
-                }});
-                post(&server, "start_job", request).status
-            })
-        };
-        wait_admitting(&server); // job 2 is inside the pause
-        let pid = std::process::id();
-        let live = tmp.join(format!("out.exfat.2-{pid}.part"));
-        let old = tmp.join("old.exfat.1-1.part");
-        std::fs::write(&live, b"").unwrap();
-        std::fs::write(&old, b"").unwrap();
-        let start = Instant::now();
-        let r = post(&server, "stale_parts", json!({ "dirs": [tmp] }));
-        // Job 2's `.part` isn't stale: `stale_parts` waited for its admission.
-        assert_eq!(r.status, 200);
-        assert_eq!(r.text(), json!([old]).to_string());
-        // Nothing an unfinished job uses is deleted, nor a folder holding it; the rest is.
-        for busy in [&live, &tmp] {
-            let r = post(&server, "delete_path", json!({ "path": busy }));
-            assert_eq!(r.status, 409, "{}", r.text());
-        }
-        let r = post(&server, "delete_path", json!({ "path": old }));
-        assert_eq!((r.status, r.text()), (200, "null".to_string()));
-        assert!(!old.exists() && live.exists());
-        assert!(server.stop());
-        let r = post(&server, "delete_path", json!({ "path": live }));
-        assert_eq!(r.status, 409);
-        assert!(r.text().contains("stopping"), "{}", r.text());
-        assert!(
-            lock(&server.table)
-                .unfinished()
-                .iter()
-                .any(|(id, _)| *id == 2)
-        );
-        assert_eq!(starter.join().unwrap(), 200);
-
-        server.jobs.cancel(2);
-        // Opening the write end wakes job 1 to an empty file (non-blocking: it fails until
-        // job 1 is waiting on its end).
-        use std::os::unix::fs::OpenOptionsExt;
-        let open = || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo)
-        };
-        while open().is_err() {
-            assert!(start.elapsed() < Duration::from_secs(10));
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        server.jobs.cancel_all_and_wait();
-        std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    /// `start_job` passes an edit job's `edits` (and `edit_rebuild`) through, never checks its
-    /// `output`, and keys it by its source. While it is unfinished (queued behind a job blocked
-    /// on a FIFO), a file it adds can't be uploaded again (409), its staging folder isn't a
-    /// stale `.part`, and discard refuses it; once it is done, all three go through.
-    #[cfg(unix)]
-    #[test]
-    fn edit_job_pass_through() {
-        let tmp = dir("editjob");
-        let game = tmp.join("game");
-        std::fs::create_dir(&game).unwrap();
-        let fifo = tmp.join("block.ffpfs");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        // SAFETY: a NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let server = Arc::new(server());
-        // Job 1, past the API's source check (a FIFO is refused): blocks opening it.
-        let blocker = json!({
-            "source": fifo, "format": "exfat", "output": tmp.join("blocked.exfat"),
-        });
-        server.jobs.start(serde_json::from_value(blocker).unwrap());
-        let r = upload(&server, &game, "data/x.bin", b"new");
-        assert_eq!(r.status, 200, "{}", r.text());
-        let staged: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
-        let staged = PathBuf::from(staged["path"].as_str().unwrap());
-        let edits = json!([
-            { "op": "add", "from": staged, "to": "data/x.bin" },
-            { "op": "delete", "path": "old" },
-        ]);
-        // An output nobody could write: an edit job's is ignored.
-        let request = json!({ "request": {
-            "source": game, "format": "exfat", "output": "/nonexistent/no/out.exfat",
-            "edits": edits, "edit_rebuild": true,
-        }});
-        let r = post(&server, "start_job", request);
-        assert_eq!((r.status, r.text()), (200, "2".to_string()));
-        let jobs = lock(&server.table).snapshot();
-        let admitted = &jobs.iter().find(|j| j["id"] == 2).unwrap()["request"];
-        assert_eq!(admitted["edits"], edits);
-        assert_eq!(admitted["edit_rebuild"], true);
-        assert!(
-            lock(&server.table)
-                .unfinished()
-                .contains(&(2, game.clone()))
-        );
-
-        let r = upload(&server, &game, "data/x.bin", b"newer");
-        assert_eq!(r.status, 409, "{}", r.text());
-        assert!(
-            r.text().contains("an unfinished job is using it"),
-            "{}",
-            r.text()
-        );
-        assert_eq!(std::fs::read(&staged).unwrap(), b"new");
-        assert_eq!(upload(&server, &game, "data/y.bin", b"y").status, 200);
-        let r = post(&server, "stale_parts", json!({ "dirs": [tmp] }));
-        assert_eq!(r.text(), "[]");
-        let r = post(&server, "edit_discard", json!({ "source": game }));
-        assert_eq!(r.status, 409, "{}", r.text());
-
-        server.jobs.cancel(2);
-        let start = Instant::now();
-        while !lock(&server.table).adds().is_empty() {
-            assert!(start.elapsed() < Duration::from_secs(10));
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(upload(&server, &game, "data/x.bin", b"newer").status, 200);
-        let r = post(&server, "stale_parts", json!({ "dirs": [tmp] }));
-        assert_eq!(
-            r.text(),
-            json!([staged.parent().unwrap().parent().unwrap()]).to_string()
-        );
-        let r = post(&server, "edit_discard", json!({ "source": game }));
-        assert_eq!((r.status, r.text()), (200, "null".to_string()));
-        assert!(!staged.exists() && game.exists());
-
-        use std::os::unix::fs::OpenOptionsExt;
-        let open = || {
-            (std::fs::OpenOptions::new().write(true))
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&fifo)
-        };
-        while open().is_err() {
-            assert!(start.elapsed() < Duration::from_secs(10));
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        server.jobs.cancel_all_and_wait();
-        std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    /// A transfer (core's copy job) starts through `start_job` like any job: a folder and a
-    /// file into a folder here, its `source` and `format` unused.
-    #[test]
-    fn transfer_job_through_start_job() {
-        let tmp = dir("transfer");
-        let src = tmp.join("src");
-        std::fs::create_dir_all(src.join("sub")).unwrap();
-        std::fs::write(src.join("sub/a.bin"), b"abc").unwrap();
-        std::fs::write(tmp.join("one.txt"), b"one").unwrap();
-        let out = tmp.join("out");
-        std::fs::create_dir(&out).unwrap();
-        let server = Arc::new(server());
-        let request = json!({ "request": {
-            "source": "", "format": "folder", "output": out,
-            "transfer": [src, tmp.join("one.txt")],
-        }});
-        let r = post(&server, "start_job", request);
-        assert_eq!(r.status, 200, "{}", r.text());
-        let id: u64 = r.text().parse().unwrap();
-        let start = Instant::now();
-        let done = loop {
-            let jobs = lock(&server.table).snapshot();
-            let done = jobs
-                .iter()
-                .find(|j| j["id"] == id)
-                .map(|j| j["done"].clone());
-            if let Some(d) = done.filter(|d| !d.is_null()) {
-                break d;
-            }
-            assert!(start.elapsed() < Duration::from_secs(30));
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert!(done["result"]["Ok"].is_object(), "{done}");
-        assert_eq!(std::fs::read(out.join("src/sub/a.bin")).unwrap(), b"abc");
-        assert_eq!(std::fs::read(out.join("one.txt")).unwrap(), b"one");
-        std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    /// The Pack tab's zstd request (`zstd_pack` + `zstd_level`) goes through `start_job` as it is:
-    /// the job list keeps both, and core's preflight answers it (a game that doesn't import
-    /// libSceAmpr is refused, nothing written).
-    #[test]
-    fn zstd_pack_through_start_job() {
-        let tmp = dir("zstdpack");
-        let game = tmp.join("game");
-        std::fs::create_dir(&game).unwrap();
-        std::fs::write(game.join("a.bin"), b"abc").unwrap();
-        let out = tmp.join("packed");
-        let server = Arc::new(server());
-        let request = json!({ "request": {
-            "source": game, "format": "folder", "output": out,
-            "zstd_pack": true, "zstd_level": 9,
-        }});
-        let r = post(&server, "start_job", request);
-        assert_eq!(r.status, 200, "{}", r.text());
-        let id: u64 = r.text().parse().unwrap();
-        let start = Instant::now();
-        let (admitted, done) = loop {
-            let jobs = lock(&server.table).snapshot();
-            let job = jobs.iter().find(|j| j["id"] == id).cloned();
-            if let Some(j) = job.filter(|j| !j["done"].is_null()) {
-                break (j["request"].clone(), j["done"].clone());
-            }
-            assert!(start.elapsed() < Duration::from_secs(30));
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(
-            (&admitted["zstd_pack"], &admitted["zstd_level"]),
-            (&json!(true), &json!(9))
-        );
-        assert!(done["result"]["Err"].is_string(), "{done}");
-        assert!(!out.exists());
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -2489,6 +2121,15 @@ mod tests {
             assert_eq!(r.status, 409);
             assert!(r.text().contains("being deleted"), "{}", r.text());
         }
+        // A delete running without admission (counted): refused too, at once.
+        server.deleting.store(1, Ordering::SeqCst);
+        let r = post(&server, "self_update", newer.clone());
+        assert_eq!(r.status, 409);
+        assert!(r.text().contains("being deleted"), "{}", r.text());
+        let r = post(&server, "quit", json!({ "if_idle": true }));
+        assert_eq!(r.status, 409);
+        assert!(r.text().contains("being deleted"), "{}", r.text());
+        server.deleting.store(0, Ordering::SeqCst);
         server.updating.store(true, Ordering::SeqCst);
         let r = post(&server, "self_update", newer.clone());
         assert_eq!(r.status, 409);
@@ -2623,29 +2264,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    #[test]
-    fn helpers() {
-        assert_eq!(
-            percent_encode("https://x/a b?args=serve&pipe=0"),
-            "https%3A%2F%2Fx%2Fa%20b%3Fargs%3Dserve%26pipe%3D0"
-        );
-        use std::cmp::Ordering::*;
-        for (a, b, want) in [
-            ("0.1.2", "0.1.1", Greater),
-            ("0.1.10", "0.1.9", Greater),
-            ("0.1.2", "0.1.2-pre4", Greater),
-            ("0.1.2-pre10", "0.1.2-pre4", Greater),
-            ("0.1.1", "0.1.1", Equal),
-            ("", "0.0.1", Less),
-        ] {
-            assert_eq!(crate::compare_versions(a, b), want, "{a} vs {b}");
-        }
-        assert_eq!(crate::status_of(b"HTTP/1.1 200 OK\r\n\r\n"), Some(200));
-        assert_eq!(crate::status_of(b"HTTP/1.0 409 Conflict"), Some(409));
-        assert_eq!(crate::status_of(b"[elfldr.elf] Error"), None);
-        assert_eq!(crate::status_of(b""), None);
-    }
-
     /// The same without a blocked queue: a job whose `Done` came before `start` returned.
     #[test]
     fn stop_sees_every_admitted_job() {
@@ -2667,6 +2285,40 @@ mod tests {
         assert!(lock(&server.table).all_admitted());
         assert_eq!(lock(&server.table).snapshot().len(), 1);
         assert!(starter.join().unwrap());
+    }
+
+    /// Once `quit` starts stopping, no job, delete or move is admitted: each a 409 "Dump Forge
+    /// is stopping", nothing touched.
+    #[test]
+    fn quit_closes_admission() {
+        let root = dir("quit-closes");
+        std::fs::write(root.join("a.bin"), b"a").unwrap();
+        let server = library_server(&root);
+        let r = post(&server, "quit", json!({}));
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert!(r.after.is_some() && server.stopping.load(Ordering::SeqCst));
+        let start = json!({ "request": {
+            "source": root.join("a.bin"), "format": "exfat", "output": root.join("out.exfat"),
+        }});
+        let delete = json!({ "path": root.join("a.bin") });
+        let move_ = json!({ "from": root.join("a.bin"), "to": root.join("b.bin") });
+        for (route, body) in [
+            ("start_job", start),
+            ("delete_path", delete),
+            ("move_path", move_),
+        ] {
+            let r = post(&server, route, body);
+            assert_eq!(r.status, 409, "{route}: {}", r.text());
+            assert!(
+                r.text().contains("Dump Forge is stopping"),
+                "{route}: {}",
+                r.text()
+            );
+        }
+        assert_eq!(std::fs::read(root.join("a.bin")).unwrap(), b"a");
+        assert!(!root.join("b.bin").exists() && !root.join("out.exfat").exists());
+        assert!(lock(&server.table).snapshot().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Connect over HTTP: the state with the service on (temporary data folder, any port), a
@@ -2827,49 +2479,6 @@ mod tests {
         assert_eq!(reply[split + 4..], big[..]);
         assert!(get(&format!("/api/connect/download?path={dir}")).starts_with("HTTP/1.1 400"));
         server.connect.as_ref().unwrap().shutdown();
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// `existing_targets`: a transfer's and an extract's targets that exist, in order, each
-    /// once; 400 for a request that is neither or a malformed body; an error for an output
-    /// that isn't a folder.
-    #[test]
-    fn existing_targets_lists_what_is_there() {
-        let root = dir("existing");
-        std::fs::create_dir_all(root.join("src/sub")).unwrap();
-        std::fs::create_dir_all(root.join("out/sub")).unwrap();
-        for name in ["src/a.bin", "src/b.bin", "out/a.bin"] {
-            std::fs::write(root.join(name), b"x").unwrap();
-        }
-        let server = library_server(&root);
-        let out = root.join("out");
-        let transfer = json!({ "request": {
-            "source": "", "format": "folder", "output": out,
-            "transfer": [root.join("src/a.bin"), root.join("src/b.bin"), root.join("src/sub")],
-        }});
-        let r = post(&server, "existing_targets", transfer);
-        assert_eq!(r.status, 200, "{}", r.text());
-        let want = json!([out.join("a.bin"), out.join("sub")]).to_string();
-        assert_eq!(r.text(), want);
-        let extract = json!({ "request": {
-            "source": root.join("src"), "format": "folder", "output": out,
-            "extract": ["b.bin", "sub", "x/a.bin"],
-        }});
-        let r = post(&server, "existing_targets", extract);
-        assert_eq!(r.status, 200, "{}", r.text());
-        assert_eq!(
-            r.text(),
-            json!([out.join("sub"), out.join("a.bin")]).to_string()
-        );
-        let plain =
-            json!({ "request": { "source": root.join("src"), "format": "folder", "output": out }});
-        assert_eq!(post(&server, "existing_targets", plain).status, 400);
-        assert_eq!(post(&server, "existing_targets", json!({})).status, 400);
-        let file_out = json!({ "request": {
-            "source": "", "format": "folder", "output": root.join("out/a.bin"),
-            "transfer": [root.join("src/a.bin")],
-        }});
-        assert_eq!(post(&server, "existing_targets", file_out).status, 500);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

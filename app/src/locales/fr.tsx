@@ -401,6 +401,9 @@ const fr: Messages = {
     inStep: (time) => `${time} dans cette étape`,
     result: (bytes, n) => `${bytes}, ${num(n)} ${plural(n, FILES)} →`,
     outputPath: "Chemin de sortie",
+    sourceDeleted: (v) => `Source supprimée : ${v}`,
+    sourceKept: (v) => `Source conservée : ${v}`,
+    sourcePartlyDeleted: (v) => `Source supprimée en partie : ${v}`,
     checks: "Contrôles",
     verifiedPlain: (n) => `Vérifié : ${num(n)} ${plural(n, CHECKS)} ${plural(n, { one: "réussi", many: "réussis", other: "réussis" })}`,
     verifiedFull: (n) => `Vérification complète réussie : ${num(n)} ${plural(n, CHECKS)}`,
@@ -543,9 +546,8 @@ const fr: Messages = {
           ? "Réécrit les paquets zstd sous forme de fichiers ordinaires."
           : "Empaquette les ressources du jeu dans des volumes zstd."
         : packed
-          ? "Expérimental. Réécrit les paquets LZ4 sous forme de fichiers ordinaires."
-          : "Expérimental : certains jeux risquent de ne pas démarrer. Empaquette les ressources du jeu dans des volumes LZ4.",
-    chooseGame: "Choisissez d’abord un jeu.",
+          ? "Réécrit les paquets LZ4 sous forme de fichiers ordinaires."
+          : "Certains jeux risquent de ne pas démarrer. Empaquette les ressources du jeu dans des volumes LZ4.",
     noAmprGame: (e) => `Ce jeu n’utilise pas AMPR, donc les paquets ${e === "zstd" ? "zstd" : "LZ4"} ne peuvent pas servir.`,
     patch: "Un paquet de correctif ne peut pas être empaqueté.",
     additionalContent: "Un contenu additionnel (sans eboot.bin) ne peut pas être empaqueté.",
@@ -590,8 +592,6 @@ const fr: Messages = {
     already: (a, fmt) => <>
       Ce jeu est déjà en cours d’écriture en <b>{fmt}</b> ; relancer « {a === "pack" ? "Empaqueter" : "Dépaqueter"} » en fait une seconde copie.
     </>,
-    emptyTitle: "Choisissez un jeu qui utilise AMPR",
-    experimental: "Expérimental : gardez une copie du jeu d’origine.",
     source: "Source",
   },
   // PackHelp.tsx
@@ -609,7 +609,7 @@ const fr: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>Expérimental</b> : certains jeux risquent de ne pas démarrer. Gardez une copie.</li>
+          <li><b>Certains jeux risquent de ne pas démarrer.</b> Gardez une copie.</li>
           <li>Empaquette dans des volumes LZ4, dans un dossier ou une image : <b>Rapide</b> (LZ4), <b>Moyen</b> (HC 9), <b>Maximum</b> (HC 12).</li>
           <li>Runtime : <b>ampr-emu-ng</b> (par défaut) ou l’<b>ampr_emu</b> d’origine.</li>
           <li>Un jeu empaqueté propose <b>Dépaqueter</b>.</li>
@@ -806,6 +806,7 @@ const fr: Messages = {
       },
     },
     innerFfpkg: { text: "Le système de fichiers natif de la PS5 (UFS2)." },
+    innerExfat: { tone: "good", text: "Recommandé. L’image la plus stable dans un conteneur compressé." },
     level0: { text: "Sans compression : chaque bloc est stocké tel quel. Le fichier a la taille de l’image." },
     levelDefault: {
       tone: "good",
@@ -844,6 +845,9 @@ const fr: Messages = {
     compression: "Compression",
     fullVerify: "Vérification complète",
     fullVerifyHint: "Relit chaque octet pour contrôler la sortie. Plus long.",
+    deleteSource: "Supprimer la source",
+    deleteSourceHint: "Irréversible. La source n'est supprimée qu'après une conversion réussie.",
+    deleteSourceNas: "Un jeu sur un NAS ne peut pas être supprimé d'ici.",
     separator: "Un nom ne peut pas contenir de séparateur de dossiers ; utilisez « Modifier » pour le dossier.",
     badName: "Un nom ne peut pas être vide, commencer par un point, finir par un point ou une espace, ni contenir de caractères de contrôle.",
     tooLong: (bytes, max, folder) =>
@@ -1008,6 +1012,13 @@ const fr: Messages = {
       "« Transfert de fichiers » copie des fichiers et des dossiers entre eux. Un nom qui existe déjà à destination n’est remplacé qu’après votre confirmation.",
     ],
     helpSecurity: "Rien de ce qui est envoyé entre les appareils n’est chiffré : n’importe qui sur votre réseau peut le lire. Le mot de passe enregistré d’un NAS reste sur cet appareil, non chiffré. Utilisez Connexion uniquement sur votre réseau domestique.",
+    helpSpeed: "« Test de débit », dans la ligne d’un appareil associé ou dans ses détails, lui envoie 128 MiB puis en récupère 128 MiB, sans rien écrire sur le disque, et affiche le débit du réseau dans chaque sens.",
+    speedTest: "Test de débit",
+    speedTestWith: (name) => `Test de débit avec ${name}`,
+    speedTesting: "Test en cours",
+    speedResult: (up, down) => `Envoi ${up} MB/s · Réception ${down} MB/s`,
+    speedFailed: "Le test de débit a échoué :",
+    speedNote: "Envoie 128 MiB puis en récupère 128 MiB ; rien n’est écrit sur le disque.",
     installTitle: "Dump Forge sur la PS5",
     ps5Address: "Adresse de la PS5",
     install: "Installer sur la PS5",

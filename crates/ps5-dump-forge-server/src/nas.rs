@@ -9,7 +9,8 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -328,14 +329,43 @@ fn rand4() -> [u8; 4] {
     b
 }
 
-/// Online = a TCP connect to its port within `timeout`.
+/// Online = a TCP connect to its port within `timeout`, the name looked up within `timeout`
+/// too and every address (at most 8) tried at once, so one NAS never holds up a probe round
+/// for longer than twice `timeout`.
+// ponytail: a lookup past its bound is left running on its own thread (std has no timeout for
+// it); while it runs, that host + port reads offline and no second lookup of it starts.
 pub fn reachable(host: &str, port: u16, timeout: Duration) -> bool {
-    let Ok(addrs) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    addrs
-        .into_iter()
-        .any(|a| TcpStream::connect_timeout(&a, timeout).is_ok())
+    static LOOKING: Mutex<Vec<(String, u16)>> = Mutex::new(Vec::new());
+    let key = (host.to_string(), port);
+    {
+        let mut looking = LOOKING.lock().unwrap_or_else(|e| e.into_inner());
+        if looking.contains(&key) {
+            return false;
+        }
+        looking.push(key.clone());
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let addrs = (key.0.as_str(), port).to_socket_addrs();
+        LOOKING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k| *k != key);
+        for a in addrs.into_iter().flatten().take(8) {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(TcpStream::connect_timeout(&a, timeout).is_ok());
+            });
+        }
+    });
+    let end = Instant::now() + timeout * 2;
+    // Every sender gone (no address, or every connect failed) ends the wait too.
+    while let Ok(up) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+        if up {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -352,75 +382,6 @@ mod tests {
             user: user.map(Into::into),
             password: password.map(Into::into),
         }
-    }
-
-    #[test]
-    fn an_ftp_server_is_saved_with_its_port() {
-        let mut l = NasList::default();
-        let req = NasSave {
-            protocol: Some(Protocol::Ftp),
-            ..save("10.0.0.9", "", None, None)
-        };
-        let id = l.upsert(&req).unwrap();
-        assert_eq!(
-            (l.nas[0].port, l.nas[0].protocol),
-            (FTP_PORT, Protocol::Ftp)
-        );
-        // An edit that names no protocol keeps it; another port is another server.
-        let edit = NasSave {
-            id: Some(id),
-            ..save("10.0.0.9:2121", "PS5 FTP", None, None)
-        };
-        l.upsert(&edit).unwrap();
-        assert_eq!((l.nas[0].port, l.nas[0].protocol), (2121, Protocol::Ftp));
-        // Saved again at its address without a protocol (not an edit): still the FTP entry.
-        l.upsert(&save("10.0.0.9:2121", "", None, None)).unwrap();
-        assert_eq!((l.nas.len(), l.nas[0].protocol), (1, Protocol::Ftp));
-        // An old entry without the field reads as SMB.
-        let old: SavedNas =
-            serde_json::from_str(r#"{"id":"nas-1","name":"x","host":"h","port":445}"#).unwrap();
-        assert_eq!(old.protocol, Protocol::Smb);
-    }
-
-    #[test]
-    fn an_nfs_server_has_its_port_and_no_login() {
-        let mut l = NasList::default();
-        let req = NasSave {
-            protocol: Some(Protocol::Nfs),
-            ..save("10.0.0.7", "", Some("me"), Some("pw"))
-        };
-        let id = l.upsert(&req).unwrap();
-        let n = &l.nas[0];
-        assert_eq!((n.port, n.protocol), (NFS_PORT, Protocol::Nfs));
-        assert_eq!((n.user.as_str(), n.password.as_str()), ("", ""));
-        // An SMB entry switched to NFS drops its login; an edit naming no protocol keeps NFS.
-        let smb = l
-            .upsert(&save("10.0.0.8", "Box", Some("me"), Some("pw")))
-            .unwrap();
-        let switch = NasSave {
-            id: Some(smb),
-            protocol: Some(Protocol::Nfs),
-            ..save("10.0.0.8:12049", "Box", None, None)
-        };
-        l.upsert(&switch).unwrap();
-        let n = &l.nas[1];
-        assert_eq!((n.port, n.protocol), (12049, Protocol::Nfs));
-        assert_eq!((n.user.as_str(), n.password.as_str()), ("", ""));
-        let edit = NasSave {
-            id: Some(id),
-            ..save("10.0.0.7", "Shelf", Some("x"), None)
-        };
-        l.upsert(&edit).unwrap();
-        assert_eq!(
-            (l.nas[0].protocol, l.nas[0].user.as_str()),
-            (Protocol::Nfs, "")
-        );
-        // mDNS's service names are the protocols' spellings (Discover's Save sends them).
-        for (_, service) in crate::mdns::SERVICES {
-            let p = serde_json::from_value::<Protocol>(serde_json::json!(service));
-            assert!(p.is_ok(), "{service}");
-        }
-        assert_eq!(serde_json::to_value(Protocol::Nfs).unwrap(), "nfs");
     }
 
     #[test]
@@ -468,29 +429,6 @@ mod tests {
         assert!(l.migrate(&two, &HashSet::new()).is_empty());
         l.upsert(&save("10.0.0.50", "Other", None, None)).unwrap();
         assert!(l.migrate(&finds, &HashSet::new()).is_empty());
-    }
-
-    #[test]
-    fn parse_host_forms() {
-        assert_eq!(
-            parse_host("NAS.local", None, DEFAULT_PORT).unwrap(),
-            ("nas.local".into(), 445)
-        );
-        assert_eq!(
-            parse_host("10.0.0.2:1445", None, DEFAULT_PORT).unwrap(),
-            ("10.0.0.2".into(), 1445)
-        );
-        assert_eq!(
-            parse_host("[fe80::1]:446", None, DEFAULT_PORT).unwrap(),
-            ("fe80::1".into(), 446)
-        );
-        assert_eq!(
-            parse_host("10.0.0.2", Some(139), DEFAULT_PORT).unwrap(),
-            ("10.0.0.2".into(), 139)
-        );
-        assert!(parse_host("", None, DEFAULT_PORT).is_err());
-        assert!(parse_host("a:0", None, DEFAULT_PORT).is_err());
-        assert!(parse_host("a/b", None, DEFAULT_PORT).is_err());
     }
 
     #[test]

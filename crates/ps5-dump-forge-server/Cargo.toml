@@ -9,6 +9,8 @@ rust-version.workspace = true
 blake3.workspace = true
 # Roots spelled `C:\x` on Windows, as core's `list_dir` spells the folders it lists.
 dunce = "1.0.5"
+# The web UI is embedded gzipped (build.rs); a client that takes no gzip gets it decoded.
+flate2 = "1"
 getrandom.workspace = true
 libc.workspace = true
 # `GET /api/qr`: the page's address for a phone; no image/svg features (api.rs draws the SVG).
@@ -25,17 +27,18 @@ ps5-dump-forge-updater.workspace = true
 
 # The self copy (src/self_copy.rs): only the PS5 payload unpacks it, only tests on a host.
 [target.'cfg(target_env = "ps5")'.dependencies]
-flate2 = "1"
 sha2 = "0.11"
+zstd = { version = "0.13.3", default-features = false }
 
 [dev-dependencies]
-flate2 = "1"
 ps5upload-fpkg.workspace = true
 sha2 = "0.11"
+zstd = { version = "0.13.3", default-features = false }
 
 [build-dependencies]
 flate2 = "1"
 sha2 = "0.11"
+zstd = { version = "0.13.3", default-features = false }
 
 [lints.rust]
 # `ps5/x86_64-ps5-freebsd.json` sets `env: ps5` (ps5/README.md).
