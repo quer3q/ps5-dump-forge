@@ -1066,6 +1066,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn run(roots: &[&Path], limits: &Limits) -> LibraryScan {
         let roots: Vec<PathBuf> = roots.iter().map(|r| r.to_path_buf()).collect();
         scan(&roots, limits, &|_| Ok(()))
