@@ -180,11 +180,11 @@ fn ready<'a>(
     } = &checked;
     let (id, kind) = (*id, *kind);
     let shown = path.display();
-    let failed = |what: &str, e: io::Error| DeleteError::Failed(format!("{what} {shown}: {e}"));
     // remove_dir_all would empty a volume mounted somewhere inside before failing on it.
     #[cfg(unix)]
     if kind.is_dir()
-        && let Some(mount) = mount_inside(real, id.0).map_err(|e| failed("reading", e))?
+        && let Some(mount) = mount_inside(real, id.0)
+            .map_err(|e| DeleteError::Failed(format!("reading {shown}: {e}")))?
     {
         return Err(DeleteError::Refused(format!(
             "{shown} holds {}, where another volume is mounted",
