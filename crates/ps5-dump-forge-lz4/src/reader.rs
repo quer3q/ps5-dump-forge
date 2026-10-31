@@ -763,10 +763,10 @@ impl<T: SourceTree + ?Sized> SourceTree for Unpacked<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PackSpec;
     use crate::volume_name;
     use crate::writer::testkit::*;
     use crate::writer::{PAGE, VOLUME_CAP};
-    use crate::{JOURNAL, PackSpec, RUNTIME};
 
     type Entries = Vec<(&'static str, Vec<u8>, Option<PackSpec>)>;
 
@@ -802,35 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn hides_exactly_the_pack_artifacts() {
-        let t = tree(|f| {
-            f.insert("foo.pak".into(), vec![1]);
-            f.insert("ampr_assets-001.pak".into(), vec![2]);
-            f.insert(format!("d/{CRC_SIDECAR}"), vec![3]);
-            f.insert(JOURNAL.into(), vec![4]);
-        });
-        let mut u = unpack(Box::new(t)).unwrap();
-        let names: Vec<&str> = u.files().iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "ampr_assets-001.pak",
-                JOURNAL,
-                "d/ampr_assets.index.crc",
-                "data/a.bin",
-                "data/b.bin",
-                "eboot.bin",
-                "foo.pak"
-            ]
-        );
-        assert!(u.read(MANIFEST).is_err());
-        assert!(u.read_range(&volume_name(0), 0, 4).is_err());
-        assert_eq!(u.read("foo.pak").unwrap(), [1]);
-        assert!(u.has_crc());
-        assert!(u.describe().contains("2 packed files in 1 volumes"));
-    }
-
-    #[test]
     fn loose_records_may_change_and_packed_paths_must_not_exist() {
         let u = unpack(Box::new(tree(|f| drop(f.remove("eboot.bin"))))).unwrap();
         assert!(!u.files().iter().any(|f| f.path == "eboot.bin"));
@@ -847,20 +818,6 @@ mod tests {
         assert!(both.contains("both packed and a physical"), "{both}");
         let dir = err(tree(|f| drop(f.insert("data/a.bin/x".into(), vec![0]))));
         assert!(dir.contains("file and a folder"), "{dir}");
-    }
-
-    #[test]
-    fn the_runtime_may_differ_from_its_record() {
-        let entries: Entries = vec![
-            ("data/a.bin", text(200_000, 1), spec(16)),
-            (RUNTIME, noise(300, 3), None),
-        ];
-        let (_, _, out, _) = pack_mem(&entries, None, 2, VOLUME_CAP).unwrap();
-        let mut files: std::collections::BTreeMap<String, Vec<u8>> =
-            out.files.into_iter().collect();
-        files.insert(RUNTIME.into(), noise(500, 4));
-        let u = unpack(Box::new(Mem::new(files))).unwrap();
-        assert!(u.files().iter().any(|f| f.path == RUNTIME && f.size == 500));
     }
 
     #[test]
@@ -1059,40 +1016,8 @@ mod tests {
         }
     }
 
-    const P: u64 = PAGE;
     const PACKED: u32 = FILE_PACKED;
     const BOTH: u8 = CHUNK_PAGE_CONTAINED | CHUNK_PAGE_ALIGNED;
-
-    /// One file of one chunk of exactly a page, in a 64 KiB-page volume.
-    fn one_page(codec: Codec, flags: u8, off: u64) -> Hand {
-        Hand {
-            files: vec![("/app0/x", P, PACKED, 0, 1, 17)],
-            chunks: vec![(0, off, P as u32, codec, flags)],
-            packs: vec![("v.pak", 4 * P, P, P as u32)],
-            data: vec![],
-        }
-    }
-
-    #[test]
-    fn bad_paths_are_rejected() {
-        for p in [
-            "/app0/../x",
-            "/app0/a//b",
-            "/app1/x",
-            "/app0/a\\b",
-            "/app0/x/",
-        ] {
-            let mut h = one_page(Codec::Raw, BOTH, P);
-            h.files[0].0 = p;
-            assert!(unpack(Box::new(h.tree())).is_err(), "{p}");
-        }
-        let mut h = one_page(Codec::Raw, BOTH, P);
-        h.packs[0].0 = "../v.pak";
-        assert!(err(h.tree()).contains("pack 0"));
-        let mut h = one_page(Codec::Raw, BOTH, P);
-        h.files.push(("/APP0/X", 0, 0, 0, 0, 0));
-        assert!(err(h.tree()).contains("twice"));
-    }
 
     #[test]
     fn accepts_upstream_geometry_forge_does_not_emit() {

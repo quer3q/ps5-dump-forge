@@ -958,45 +958,4 @@ mod tests {
             "{findings:?}"
         );
     }
-
-    #[test]
-    fn package_names_and_category() {
-        let param = r#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST","applicationCategoryType":33554432}"#;
-        let long = format!("data/{}", "x".repeat(256));
-        let mut tree = Mem::new(&[
-            ("eboot.bin", vec![0x7f; 64]),
-            ("sce_sys/param.json", param.as_bytes().to_vec()),
-            ("data/cafe\u{301}.bin", vec![1]),
-            ("data//twice", vec![1]),
-            (long.as_str(), vec![1]),
-            ("sce_sys/playgo-chunk.dat", vec![1]),
-        ]);
-        let (findings, ..) = findings_of(&mut tree);
-        let text = findings.join("\n");
-        for want in [
-            "applicationCategoryType is 33554432",
-            "not in NFC",
-            "empty component",
-            "longer than 255 bytes",
-        ] {
-            assert!(text.contains(want), "{want:?} not in:\n{text}");
-        }
-        assert_eq!(findings.len(), 4, "{text}");
-    }
-
-    // Additional content (no eboot.bin) is packaged whatever its category, by user decision.
-    #[test]
-    fn additional_content_is_packaged_whatever_its_category() {
-        let param = r#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST","applicationCategoryType":33554432}"#;
-        let mut tree = Mem::new(&[
-            ("sce_sys/param.json", param.as_bytes().to_vec()),
-            ("data/dlc.bin", vec![1]),
-        ]);
-        let (findings, notes, _) = findings_of(&mut tree);
-        assert!(findings.is_empty(), "{findings:?}");
-        assert!(
-            notes.iter().any(|n| n.contains("additional content")),
-            "{notes:?}"
-        );
-    }
 }

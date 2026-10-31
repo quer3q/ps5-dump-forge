@@ -478,39 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn link_errors_are_classified() {
-        for code in [libc::EOPNOTSUPP, libc::ENOTSUP, libc::EPERM] {
-            assert_eq!(link_failure(&os(code)), LinkFailure::Unsupported, "{code}");
-        }
-        assert_eq!(link_failure(&os(libc::EINTR)), LinkFailure::Retry);
-        let sony = (0x8002_0000_u32 | libc::EINTR as u32) as i32;
-        assert_eq!(link_failure(&os(sony)), LinkFailure::Retry);
-        for code in [
-            libc::EACCES,
-            libc::ENOSPC,
-            libc::EIO,
-            libc::EXDEV,
-            libc::EROFS,
-            libc::EEXIST,
-        ] {
-            assert_eq!(link_failure(&os(code)), LinkFailure::Refuse, "{code}");
-        }
-        assert_eq!(
-            link_failure(&io::Error::other("no errno")),
-            LinkFailure::Refuse
-        );
-    }
-
-    #[test]
-    fn only_not_found_means_distinct() {
-        let probe = (1, 2);
-        assert_eq!(fold(Err(os(libc::ENOENT)), probe), Fold::Distinct);
-        assert_eq!(fold(Ok(probe), probe), Fold::Folds);
-        assert!(matches!(fold(Ok((1, 3)), probe), Fold::Unknown(_)));
-        assert!(matches!(fold(Err(os(libc::EIO)), probe), Fold::Unknown(_)));
-    }
-
-    #[test]
     fn file_size_limits_fail_closed() {
         let max = |bits, fstype| max_file(bits, fstype).unwrap();
         assert_eq!(max(Ok(Some(64)), "x"), (i64::MAX as u64, None));

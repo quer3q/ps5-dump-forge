@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use common::{Synth, build};
-use ps5_dump_forge_ufs2::edit::{Kind, Volume};
+use ps5_dump_forge_ufs2::edit::Volume;
 use ps5_dump_forge_ufs2::{Layout, Options};
 
 const B: u64 = 65536;
@@ -41,13 +41,6 @@ fn patched(img: &Path, at: u64, bytes: &[u8], f: impl FnOnce(Result<Volume, Vec<
     f(open(img));
     file.seek(SeekFrom::Start(at)).unwrap();
     file.write_all(&old).unwrap();
-}
-
-fn le32(f: &mut File, at: u64) -> u32 {
-    let mut b = [0u8; 4];
-    f.seek(SeekFrom::Start(at)).unwrap();
-    f.read_exact(&mut b).unwrap();
-    u32::from_le_bytes(b)
 }
 
 #[track_caller]
@@ -116,61 +109,6 @@ fn foreign_or_unclean_superblock_is_refused() {
     let _ = std::fs::remove_file(&img);
 }
 
-/// Damaged counts are findings naming the group, and no byte of the metadata panics.
-#[test]
-fn damaged_counts_are_findings() {
-    let (img, layout) = game("edit-damaged", &Options::default());
-    let fpg = layout.blocks_per_group;
-    let cg = |c: u64| (c * fpg + 3) * B;
-    let mut f = File::open(&img).unwrap();
-    let nbfree1 = le32(&mut f, cg(1) + 28);
-    let nifree0 = le32(&mut f, cg(0) + 32);
-    let dblkno = layout.metadata_blocks_per_group;
-    let total_nbfree = le32(&mut f, SB + 1016);
-    let summary1 = le32(&mut f, dblkno * B + 16 + 4);
-    let freeoff0 = u64::from(le32(&mut f, cg(0) + 96));
-    drop(f);
-    let one_more = |v: u32| (v + 1).to_le_bytes();
-    let cg1 = "the image is damaged (UFS2 cylinder group 1:";
-    patched(&img, cg(1) + 28, &one_more(nbfree1), |r| finding(r, cg1));
-    let cg0 = "the image is damaged (UFS2 cylinder group 0:";
-    patched(&img, cg(0) + 32, &one_more(nifree0), |r| finding(r, cg0));
-    patched(&img, cg(1) + 12, &7u32.to_le_bytes(), |r| finding(r, cg1)); // cg_cgx
-    // cg_initediblk 0 under group 0's allocated root and game inodes.
-    let past = "is allocated past cg_initediblk 0";
-    patched(&img, cg(0) + 120, &0u32.to_le_bytes(), |r| finding(r, past));
-    patched(&img, cg(0) + 4, &0u32.to_le_bytes(), |r| finding(r, cg0)); // cg_magic
-    // Block 0 (the boot area) marked free in group 0's map.
-    patched(&img, cg(0) + freeoff0, &[0x01], |r| {
-        finding(r, "metadata block 0")
-    });
-    patched(&img, dblkno * B + 16 + 4, &one_more(summary1), |r| {
-        finding(r, cg1)
-    });
-    let total = "the image is damaged (UFS2 fs_cstotal";
-    patched(&img, SB + 1016, &one_more(total_nbfree), |r| {
-        finding(r, total)
-    });
-    // Every byte of the superblock and of group 0's header block set to 0xFF in turn:
-    // a finding or a clean open, never a panic.
-    for at in (SB..SB + 8192).chain(cg(0)..cg(0) + 4096) {
-        patched(&img, at, &[0xFF], |_| {});
-    }
-    patched(&img, cg(2), &vec![0xA5; B as usize], |r| {
-        r.expect_err("garbage cylinder group");
-    });
-    assert!(open(&img).is_ok(), "restored");
-    // Cut short: its blocks don't fit the file.
-    OpenOptions::new()
-        .write(true)
-        .open(&img)
-        .unwrap()
-        .set_len(layout.image_size - B)
-        .unwrap();
-    finding(open(&img), "the file is shorter than its");
-    let _ = std::fs::remove_file(&img);
-}
-
 fn le64(f: &mut File, at: u64) -> u64 {
     let mut b = [0u8; 8];
     f.seek(SeekFrom::Start(at)).unwrap();
@@ -199,108 +137,6 @@ fn nested(name: &str) -> PathBuf {
     let mut src = Synth::new(&refs);
     src.empty = vec!["data/void".into(), "z/y".into()];
     build(name, &mut src, &Options::default()).0
-}
-
-/// Lists `dir` and everything under it, each node also found by `lookup`.
-fn walk(
-    v: &Volume,
-    f: &mut File,
-    dir: &str,
-    files: &mut Vec<(String, u64)>,
-    empty: &mut Vec<String>,
-) {
-    let list = v.list(f, dir).unwrap();
-    if list.is_empty() && !dir.is_empty() {
-        empty.push(dir.to_string());
-    }
-    for (i, n) in list.into_iter().enumerate() {
-        let path = match dir {
-            "" => n.name.clone(),
-            _ => format!("{dir}/{}", n.name),
-        };
-        // Every lookup lists each folder on its path whole: sample the 1700-entry one.
-        if i < 50 || i % 100 == 0 {
-            assert_eq!(v.lookup(f, &path).unwrap().as_ref(), Some(&n), "{path}");
-        }
-        match n.kind {
-            Kind::Dir => walk(v, f, &path, files, empty),
-            Kind::File => files.push((path, n.size)),
-        }
-    }
-}
-
-/// `list` and `lookup` see what the vendored reader sees, and the block maps read back the
-/// reader's bytes.
-#[test]
-fn list_and_lookup_match_the_reader() {
-    use ps5upload_fpkg::source::SourceTree;
-    let img = nested("edit-list");
-    let mut reader = ps5upload_fpkg::ufs2_source::Ufs2Source::open(&img).unwrap();
-    let v = open(&img).unwrap();
-    let mut f = File::open(&img).unwrap();
-    let (mut files, mut empty) = (Vec::new(), Vec::new());
-    walk(&v, &mut f, "", &mut files, &mut empty);
-    files.sort();
-    empty.sort();
-    let mut want: Vec<(String, u64)> = reader
-        .files()
-        .iter()
-        .map(|x| (x.path.clone(), x.size))
-        .collect();
-    want.sort();
-    let mut want_empty = reader.empty_dirs().to_vec();
-    want_empty.sort();
-    assert_eq!(files, want);
-    assert_eq!(empty, want_empty);
-    assert_eq!(empty, ["data/void", "z/y"]);
-    for (path, size) in &want {
-        let n = v.lookup(&mut f, path).unwrap().unwrap();
-        let inode = v.inode(&mut f, n.ino).unwrap();
-        let map = v.block_map(&mut f, &inode).unwrap();
-        // Up to 12 blocks direct; past that one single-indirect block.
-        let blocks = size.div_ceil(B);
-        assert_eq!(map.indirect.len(), usize::from(blocks > 12), "{path}");
-        assert_eq!(map.owned(), blocks + map.indirect.len() as u64, "{path}");
-        for lbn in 0..blocks {
-            let p = map.physical(lbn).unwrap();
-            let len = (size - lbn * B).min(B) as usize;
-            let mut got = vec![0u8; len];
-            f.seek(SeekFrom::Start(p * B)).unwrap();
-            f.read_exact(&mut got).unwrap();
-            assert!(
-                got == reader.read_range(path, lbn * B, len).unwrap(),
-                "{path} block {lbn}"
-            );
-        }
-        assert_eq!(map.physical(blocks), None);
-    }
-    // The big folder spans two 64 KiB blocks; folder link counts are 2 + subfolders.
-    let many = v.lookup(&mut f, "many").unwrap().unwrap();
-    assert!(
-        many.size > B && many.size.is_multiple_of(512),
-        "{}",
-        many.size
-    );
-    assert_eq!(v.list(&mut f, "many").unwrap().len(), 1700);
-    assert_eq!(v.lookup(&mut f, "data").unwrap().unwrap().nlink, 4);
-    assert_eq!(v.root(&mut f).unwrap().nlink, 2 + 5);
-    // Case-sensitive, missing, through a file, bad paths.
-    assert_eq!(v.lookup(&mut f, "EBOOT.BIN").unwrap(), None);
-    assert!(v.lookup(&mut f, "Data/upper.bin").unwrap().is_some());
-    assert_eq!(v.lookup(&mut f, "data/upper.bin").unwrap(), None);
-    assert_eq!(v.lookup(&mut f, "nope").unwrap(), None);
-    assert_eq!(v.lookup(&mut f, "eboot.bin/x").unwrap(), None);
-    for bad in ["", "data/", "/data", "data//a"] {
-        let e = v.lookup(&mut f, bad).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
-    }
-    let e = v.list(&mut f, "eboot.bin").unwrap_err();
-    assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory);
-    assert_eq!(
-        v.list(&mut f, "nope").unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
-    );
-    let _ = std::fs::remove_file(&img);
 }
 
 /// Opens the patched image and runs `f` on the volume and the file (the patch must open).

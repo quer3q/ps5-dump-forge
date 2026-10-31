@@ -151,7 +151,8 @@ const file = (size) => ({ kind: "file", size });
   assert.equal(node(h.tree, "eboot.bin").mark, "new");
 }
 
-// a_folder_onto_a_folder_merges (contents known: a browser drop, junk already left out).
+// A folder onto a folder merges, as core's fold does (contents known: a browser drop, junk already
+// left out). Core keeps no test of its own for it: this is the check.
 {
   const host = { kind: "dir", files: [{ path: "a.bin", size: 8 }, { path: "new.bin", size: 3 }, { path: "deep/c.bin", size: 1 }], emptyDirs: ["e"] };
   const f = folded([add("data", host), add("copy", host)]);
@@ -181,7 +182,7 @@ const file = (size) => ({ kind: "file", size });
   assert.equal(node(f.tree, "data").mark, undefined);
 }
 
-// every_offender_is_listed (the paths core finds the same way; host-side refusals are core's).
+// Every offender is listed (the paths core finds the same way; host-side refusals are core's).
 {
   const one = { kind: "dir", files: [{ path: "a.bin", size: 1 }], emptyDirs: [] };
   const changes = [

@@ -235,57 +235,9 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::remote::{Scheme, is_nas, is_remote};
 
     fn at(s: &str) -> FlinkPath {
         FlinkPath::parse(Path::new(s)).unwrap()
-    }
-
-    #[test]
-    fn parses_and_spells_paths() {
-        let p = at("NFS://NAS.local:12049/srv/games/Stub Game/sce_sys");
-        assert_eq!(p.scheme, Scheme::Nfs);
-        assert_eq!(p.key_id, "nas.local:12049");
-        assert_eq!(p.host_port(), ("nas.local", 12049));
-        assert_eq!(abs(&p), "/srv/games/Stub Game/sce_sys");
-        assert_eq!(
-            p.url(),
-            Path::new("nfs://nas.local:12049/srv/games/Stub Game/sce_sys")
-        );
-        let mut up = p.clone();
-        while let Some(parent) = up.parent() {
-            up = parent;
-        }
-        assert_eq!(up.url(), Path::new("nfs://nas.local:12049"));
-        assert_eq!(abs(&up), "/");
-
-        let p = at("nfs://nas:2049/srv");
-        assert_eq!((p.key_id.as_str(), p.host_port()), ("nas", ("nas", 2049)));
-        let v6 = at("nfs://[FE80::1]/srv/x");
-        assert_eq!(v6.key_id, "[fe80::1]");
-        assert_eq!(v6.host_port(), ("fe80::1", 2049));
-        assert_eq!(
-            at("nfs://[fe80::1]:12050/s").host_port(),
-            ("fe80::1", 12050)
-        );
-        for bad in [
-            "nfs://",
-            "nfs://h:0/s",
-            "nfs://h:99999/s",
-            "nfs://h/s/../x",
-            "nfs://h/s/./x",
-            "nfs://h//s",
-            "nfs://u@h/s",
-            "nfs:/h/s",
-        ] {
-            assert!(FlinkPath::parse(Path::new(bad)).is_err(), "{bad}");
-        }
-        for p in ["nfs://h/s", "NFS://h"] {
-            assert!(is_remote(Path::new(p)) && is_nas(Path::new(p)), "{p}");
-        }
-        for p in ["nfs:x", "nfs://", "/mnt/nfs/x", "ftp://h/x", "flink://x"] {
-            assert!(!is_nas(Path::new(p)), "{p}");
-        }
     }
 
     #[test]

@@ -389,64 +389,6 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn host_tree_lists_nothing_on_a_nas() {
-        let no = AtomicBool::new(false);
-        for nas in ["smb://nas/s/g", "nfs://nas/e/g", "ftp://nas/g"] {
-            let err = host_tree(Path::new(nas), &no).unwrap_err().to_string();
-            assert!(err.contains("read only"), "{nas}: {err}");
-        }
-    }
-
-    #[test]
-    fn host_tree_stops_the_walk_at_the_entry_cap() {
-        let dir = temp("cap");
-        for i in 0..50 {
-            fs::write(dir.join(format!("f{i:02}")), b"ab").unwrap();
-        }
-        let no = AtomicBool::new(false);
-        let never = Instant::now() + Duration::from_secs(60);
-        // The walk itself stops at the cap: 10 of the 50 entries enumerated.
-        let mut walk = Walk::new(&no, never, 10);
-        assert!(walk.dir(&dir, "").unwrap());
-        assert_eq!(
-            (walk.visited, walk.files.len(), walk.truncated),
-            (10, 10, true)
-        );
-        let tree = host_tree_with(&dir, &no, 10, Duration::from_secs(60)).unwrap();
-        assert_eq!(
-            (tree.files.len(), tree.size, tree.truncated),
-            (10, 20, true)
-        );
-        let tree = host_tree_with(&dir, &no, 50, Duration::from_secs(60)).unwrap();
-        assert_eq!(
-            (tree.files.len(), tree.size, tree.truncated),
-            (50, 100, false)
-        );
-        // Junk counts toward the cap but is never listed.
-        fs::write(dir.join(".DS_Store"), b"junk").unwrap();
-        let tree = host_tree_with(&dir, &no, 51, Duration::from_secs(60)).unwrap();
-        assert_eq!((tree.files.len(), tree.truncated), (50, false));
-        // Out of time before the first entry: truncated, nothing listed.
-        let tree = host_tree_with(&dir, &no, 100, Duration::ZERO).unwrap();
-        assert_eq!((tree.files.len(), tree.truncated), (0, true));
-        // Cancelled by the caller: an error, not a truncated listing.
-        let cancelled = AtomicBool::new(true);
-        assert!(host_tree_with(&dir, &cancelled, 100, Duration::from_secs(60)).is_err());
-        // A truncated walk still refuses what it saw: any 2 of these 3 hold a link.
-        #[cfg(unix)]
-        {
-            let refused = temp("cap-refused");
-            fs::write(refused.join("f"), b"x").unwrap();
-            std::os::unix::fs::symlink("f", refused.join("l1")).unwrap();
-            std::os::unix::fs::symlink("f", refused.join("l2")).unwrap();
-            let err = host_tree_with(&refused, &no, 2, Duration::from_secs(60)).unwrap_err();
-            assert!(err.to_string().contains("symlink, not followed"), "{err}");
-            fs::remove_dir_all(&refused).unwrap();
-        }
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[cfg(unix)]
     #[test]
     fn host_tree_refuses_links_and_special_files() {

@@ -3,11 +3,11 @@
 // "Stop Dump Forge" to the header (there's no window to close) and rebuilds the job list
 // from the server's.
 
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 
-import { api, APP_NAME, debugBuild, errorText, events, prettyDuration, runtimePlatform, useOffline, web, type RuntimePlatform } from "./api";
+import { api, APP_NAME, debugBuild, errorText, events, prettyDuration, runtimePlatform, useOffline, web, type DoneEvent, type RuntimePlatform } from "./api";
 import logo from "./assets/logo.png";
-import { closeOverlays, dirname, isNetwork, Modal, panelId, tabId, TabList, usePeerPath, type SourceSelection } from "./common";
+import { closeOverlays, dirname, isNetwork, Modal, notifyDeleted, panelId, tabId, TabList, usePeerPath, type SourceSelection } from "./common";
 import { Connect, PairPrompt } from "./Connect";
 import { Convert } from "./Convert";
 import { Formats } from "./Formats";
@@ -19,9 +19,9 @@ import { Pack } from "./Pack";
 import { Storage } from "./Storage";
 import { stepTab, watchShoulders, type Step } from "./shoulders";
 import { UpdateToast } from "./UpdateToast";
-import { jobName, JobsCard } from "./JobList";
+import { jobName, JobsCard, sourceLine } from "./JobList";
 import { jobsReducer, jobType, remoteJobs, type Job, type JobType } from "./jobs";
-import { useConnectState, useOnlineCount } from "./useConnectState";
+import { useOnlineCount, useRemoteJobs } from "./useConnectState";
 
 // Tabs: [Convert Edit] | Pack | Storage | Connect | About (the dividers are drawn only).
 type Tab = "convert" | "storage" | "pack" | "edit" | "connect" | "formats";
@@ -38,17 +38,40 @@ const tabOf = (j: Job): Tab | null => {
   return type === "install" && j.remote ? "connect" : TAB_JOBS[type];
 };
 
+// The screens re-render only when their props change: a progress or log event, or a Connect
+// poll, reaches the job lists and the header, not the explorers and grids kept mounted.
+const ConvertScreen = memo(Convert);
+const EditScreen = memo(Edit);
+const PackScreen = memo(Pack);
+const StorageScreen = memo(Storage);
+const ConnectScreen = memo(Connect);
+
+/** `jobs` as the screens read it (id, request, result): the same array until one of those
+ * changes, so progress and log events don't re-render them. */
+function useSettled(jobs: Job[]): Job[] {
+  const ref = useRef(jobs);
+  const prev = ref.current;
+  if (
+    prev !== jobs &&
+    (prev.length !== jobs.length ||
+      jobs.some((j, i) => j.id !== prev[i].id || j.request !== prev[i].request || j.result !== prev[i].result))
+  )
+    ref.current = jobs;
+  return ref.current;
+}
+
 export function App() {
   const t = useMessages().app;
   // A phone that scanned the Connect card's QR lands on `#connect`.
   const [tab, setTab] = useState<Tab>(() => (location.hash === "#connect" ? "connect" : "convert"));
   const online = useOnlineCount();
   const [jobs, dispatch] = useReducer(jobsReducer, []);
+  const settled = useSettled(jobs);
   // Paired peers' jobs that use this device's files (Connect's poll): listed and counted in their
   // tab like this device's, never in the quit prompt (they don't stop with this device).
-  const remoteList = useConnectState().state?.remote_jobs;
+  const remoteList = useRemoteJobs();
   const remoteRef = useRef<Job[]>([]);
-  const remote = useMemo(() => (remoteRef.current = remoteJobs(remoteList ?? [], remoteRef.current, Date.now())), [remoteList]);
+  const remote = useMemo(() => (remoteRef.current = remoteJobs(remoteList, remoteRef.current, Date.now())), [remoteList]);
   const [closing, setClosing] = useState<"ask" | "stopping" | "stopped" | "failed" | null>(null);
   // The app's last close request: a paired device was reading or writing files here.
   const [peerBusy, setPeerBusy] = useState(false);
@@ -56,15 +79,24 @@ export function App() {
   const [editSel, setEditSel] = useState<SourceSelection | null>(null);
   const [convertSel, setConvertSel] = useState<SourceSelection | null>(null);
   const selId = useRef(0);
-  const goTo = (to: Tab) => {
+  const goTo = useCallback((to: Tab) => {
     setTab(to);
     document.getElementById(tabId("screen", to))?.focus();
-  };
-  const handOff = (to: "edit" | "convert", e: { path: string; kind: SourceSelection["kind"] }) => {
-    const sel = { id: ++selId.current, path: e.path, kind: e.kind };
-    (to === "edit" ? setEditSel : setConvertSel)(sel);
-    goTo(to);
-  };
+  }, []);
+  const handOff = useCallback(
+    (to: "edit" | "convert", e: { path: string; kind: SourceSelection["kind"] }) => {
+      const sel = { id: ++selId.current, path: e.path, kind: e.kind };
+      (to === "edit" ? setEditSel : setConvertSel)(sel);
+      goTo(to);
+    },
+    [goTo],
+  );
+  // Stable handlers, so the memoized screens keep their props.
+  const editPkg = useCallback((path: string) => handOff("edit", { path, kind: "pkg" }), [handOff]);
+  const editEntry = useCallback((e: { path: string; kind: SourceSelection["kind"] }) => handOff("edit", e), [handOff]);
+  const convertEntry = useCallback((e: { path: string; kind: SourceSelection["kind"] }) => handOff("convert", e), [handOff]);
+  const openConnect = useCallback(() => goTo("connect"), [goTo]);
+  const openFormats = useCallback(() => goTo("formats"), [goTo]);
   // http build: the payload on a PS5 (its tile starts it again), or `serve` on a computer;
   // null until the server answers (asked again each time the server is back online).
   const [platform, setPlatform] = useState<RuntimePlatform | null>(null);
@@ -78,11 +110,23 @@ export function App() {
   const shoulders = platform === "ps5";
 
   useEffect(() => {
+    // A job that deleted its source: Library, File explorer and Edit drop it. Heard from its
+    // done event, or (http poller) from a restored job that had already finished; once per job.
+    const notified = new Set<number>();
+    const deleted = (d: DoneEvent) => {
+      const gone = "Ok" in d.result ? sourceLine(d.result.Ok.checks) : null;
+      if (!gone?.deleted || notified.has(d.job)) return;
+      notified.add(d.job);
+      notifyDeleted(gone.text);
+    };
     const subs = [
       events.progress((e) => dispatch({ type: "progress", e, at: Date.now() })),
       events.stages((e) => dispatch({ type: "stages", e })),
       events.log((e) => dispatch({ type: "log", e })),
-      events.done((e) => dispatch({ type: "done", e })),
+      events.done((e) => {
+        dispatch({ type: "done", e });
+        deleted(e);
+      }),
       // The quit prompt never opens behind a dialog (help, delete): those close as cancelled.
       events.closeRequested((peer) => {
         if (!wasClosing.current && document.activeElement instanceof HTMLElement) quitOpener.current = document.activeElement;
@@ -90,7 +134,10 @@ export function App() {
         closeOverlays();
         setClosing((c) => c ?? "ask");
       }),
-      events.restore((e) => dispatch({ type: "restore", e, at: Date.now() })),
+      events.restore((e) => {
+        dispatch({ type: "restore", e, at: Date.now() });
+        for (const j of e.jobs) if (j.done) deleted(j.done);
+      }),
     ];
     return () => {
       subs.forEach((p) => p.then((unlisten) => unlisten()));
@@ -191,10 +238,10 @@ export function App() {
   useEffect(() => {
     setOutputDirs((prev) => {
       const next = new Set(prev);
-      for (const j of jobs) if (j.request && !isNetwork(j.request.output)) next.add(dirname(j.request.output));
+      for (const j of settled) if (j.request && !isNetwork(j.request.output)) next.add(dirname(j.request.output));
       return next.size === prev.length ? prev : [...next];
     });
-  }, [jobs]);
+  }, [settled]);
 
   return (
     <div className="app">
@@ -267,17 +314,8 @@ export function App() {
             aria-labelledby={tabId("screen", "convert")}
             hidden={tab !== "convert"}
           >
-            <Convert
-              selection={convertSel}
-              onEdit={(path) => handOff("edit", { path, kind: "pkg" })}
-              jobs={jobs}
-              dispatch={dispatch}
-              onCompare={() => {
-                setTab("formats");
-                // The link goes away with its screen: focus the tab that now shows.
-                document.getElementById(tabId("screen", "formats"))?.focus();
-              }}
-            />
+            {/* onCompare: the link goes away with its screen, so focus moves to the tab now shown. */}
+            <ConvertScreen selection={convertSel} onEdit={editPkg} jobs={settled} dispatch={dispatch} onCompare={openFormats} />
             {jobsOf("convert")}
           </div>
           <div
@@ -286,12 +324,12 @@ export function App() {
             aria-labelledby={tabId("screen", "storage")}
             hidden={tab !== "storage"}
           >
-            <Storage
+            <StorageScreen
               visible={tab === "storage"}
-              onEdit={(e) => handOff("edit", e)}
-              onConvert={(e) => handOff("convert", e)}
+              onEdit={editEntry}
+              onConvert={convertEntry}
               dispatch={dispatch}
-              onConnect={() => goTo("connect")}
+              onConnect={openConnect}
             />
             {jobsOf("storage")}
           </div>
@@ -301,7 +339,7 @@ export function App() {
             aria-labelledby={tabId("screen", "pack")}
             hidden={tab !== "pack"}
           >
-            <Pack jobs={jobs} dispatch={dispatch} />
+            <PackScreen jobs={settled} dispatch={dispatch} />
             {jobsOf("pack")}
           </div>
           <div
@@ -310,7 +348,7 @@ export function App() {
             aria-labelledby={tabId("screen", "edit")}
             hidden={tab !== "edit"}
           >
-            <Edit outputDirs={outputDirs} visible={tab === "edit"} selection={editSel} jobs={jobs} dispatch={dispatch} />
+            <EditScreen outputDirs={outputDirs} visible={tab === "edit"} selection={editSel} jobs={settled} dispatch={dispatch} />
             {jobsOf("edit")}
           </div>
           <div
@@ -319,7 +357,7 @@ export function App() {
             aria-labelledby={tabId("screen", "connect")}
             hidden={tab !== "connect"}
           >
-            <Connect dispatch={dispatch} />
+            <ConnectScreen dispatch={dispatch} />
             {jobsOf("connect")}
           </div>
           <div

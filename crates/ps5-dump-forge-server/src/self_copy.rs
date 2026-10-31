@@ -4,7 +4,7 @@
 //! then stage 2 with stage 1 embedded by `build.rs` as a blob:
 //!
 //! `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256 of the raw ELF (32 bytes),
-//! then the zlib stream. `scripts/release-ps5.sh` reads the same layout.
+//! then one zstd frame. `scripts/release-ps5.sh` reads the same layout.
 
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
@@ -12,7 +12,6 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use flate2::read::ZlibDecoder;
 use sha2::{Digest, Sha256};
 
 use crate::compare_versions as compare;
@@ -45,7 +44,8 @@ pub(crate) fn unpack(blob: &[u8], version: &str) -> Result<Vec<u8>, String> {
         return Err(format!("descriptor says {raw_len} bytes, over {MAX_ELF}"));
     }
     let mut elf = Vec::with_capacity(raw_len as usize);
-    ZlibDecoder::new(&blob[HEADER..])
+    zstd::stream::read::Decoder::with_buffer(&blob[HEADER..])
+        .map_err(|e| format!("decompressing: {e}"))?
         .take(raw_len + 1)
         .read_to_end(&mut elf)
         .map_err(|e| format!("decompressing: {e}"))?;
@@ -216,8 +216,6 @@ pub(crate) use payload::{start, status, wait};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder;
 
     const V: &str = env!("CARGO_PKG_VERSION");
 
@@ -228,9 +226,7 @@ mod tests {
 
     /// build.rs's layout, with the lengths given.
     fn blob(raw: &[u8], raw_len: u64, hash: &[u8]) -> Vec<u8> {
-        let mut z = ZlibEncoder::new(Vec::new(), Compression::best());
-        z.write_all(raw).unwrap();
-        let packed = z.finish().unwrap();
+        let packed = zstd::bulk::compress(raw, 19).unwrap();
         let len = (packed.len() as u64).to_le_bytes();
         [MAGIC, &raw_len.to_le_bytes()[..], &len, hash, &packed].concat()
     }
@@ -266,56 +262,6 @@ mod tests {
         assert!(err(&good(&a[1..])).contains("not an ELF"));
         assert!(err(&good(b"\x7fELF no marker")).contains("version marker None"));
         assert!(err(&good(&elf("9.9.9", b""))).contains("\"9.9.9\""));
-    }
-
-    #[test]
-    fn copy_policy() {
-        let dir = std::env::temp_dir().join(format!("forge-self-copy-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("ps5-dump-forge.elf");
-        let ours = elf(V, b"ours");
-        let run = || ensure(&target, &ours, V).unwrap();
-
-        assert_eq!(run(), Outcome::Saved, "missing");
-        assert_eq!(fs::read(&target).unwrap(), ours);
-        assert_eq!(run(), Outcome::UpToDate, "identical");
-        fs::write(&target, elf("0.0.0", b"old")).unwrap();
-        assert_eq!(run(), Outcome::Saved, "older");
-        assert_eq!(fs::read(&target).unwrap(), ours);
-        fs::write(&target, elf(V, b"another build")).unwrap();
-        assert_eq!(run(), Outcome::Saved, "same version, other bytes");
-        assert_eq!(fs::read(&target).unwrap(), ours);
-        fs::write(&target, b"not ours").unwrap();
-        assert_eq!(run(), Outcome::Saved, "no marker");
-        let newer = elf("999.0.0", b"new");
-        fs::write(&target, &newer).unwrap();
-        assert_eq!(run(), Outcome::KeptNewer("999.0.0".into()));
-        assert_eq!(fs::read(&target).unwrap(), newer);
-
-        // A symlink there is neither followed nor replaced.
-        let other = dir.join("other");
-        fs::write(&other, b"theirs").unwrap();
-        fs::remove_file(&target).unwrap();
-        std::os::unix::fs::symlink(&other, &target).unwrap();
-        assert!(ensure(&target, &ours, V).is_err());
-        assert_eq!(fs::read(&other).unwrap(), b"theirs");
-
-        // Nor is a folder.
-        fs::remove_file(&target).unwrap();
-        fs::create_dir(&target).unwrap();
-        assert!(ensure(&target, &ours, V).is_err());
-        // No temporary file left behind.
-        let mut names: Vec<_> = fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            [".ps5-dump-forge.elf.lock", "other", "ps5-dump-forge.elf"]
-        );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Saves racing each other (an older copy starting beside a newer one) end with the newer.

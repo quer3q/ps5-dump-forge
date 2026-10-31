@@ -1,5 +1,5 @@
-// Pack: game packs for a title that uses AMPR, by one of two kinds: zstd (the default) or LZ4
-// (experimental); ampr-emu-ng reads both, LZ4 may run on upstream ampr_emu instead. A source
+// Pack: game packs for a title that uses AMPR, by one of two kinds: zstd (the default) or LZ4;
+// ampr-emu-ng reads both, LZ4 may run on upstream ampr_emu instead. A source
 // already packed by the kind chosen gets Unpack instead. Jobs join the list below.
 
 import { useEffect, useRef, useState } from "react";
@@ -8,11 +8,15 @@ import { msg, useMessages } from "./i18n";
 
 import { api, errorText, type ConvertRequest, type Format, type Inspection, type JobId, type Lz4Runtime } from "./api";
 import {
+  ARCHIVE_KINDS,
   CardHead,
   classify,
   Dots,
   FormatPicker,
+  FormatPill,
+  isNas,
   isWithin,
+  KINDS,
   kindLabel,
   onDeleted,
   pickSource as openPicker,
@@ -22,7 +26,7 @@ import { Icon, type IconName } from "./icons";
 import { inspectSource as readSource } from "./password";
 import { jobType, type Action, type Job } from "./jobs";
 import { openPackHelp } from "./PackHelp";
-import { formatInfo, GenerateSwitch, Lead, OutputField, useOutput, VerifySwitch } from "./target";
+import { DeleteSourceSwitch, formatInfo, GenerateSwitch, Lead, OutputField, useOutput, VerifySwitch } from "./target";
 
 /** The kind of packs: zstd or LZ4 (ampr_emu). */
 export type Engine = "zstd" | "lz4";
@@ -85,6 +89,8 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
   const [lz4UnpackFormat, setLz4UnpackFormat] = useState<Format>("folder");
   const [zstdUnpackFormat, setZstdUnpackFormat] = useState<Format>("folder");
   const [fullVerify, setFullVerify] = useState(false);
+  /** Delete the source once the job is Ok; off by default, kept across sources. */
+  const [deleteSource, setDeleteSource] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
@@ -211,6 +217,8 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
       inner: null,
       remove_backport: false,
       full_verify: fullVerify,
+      // A NAS's game can't be deleted from here.
+      ...(deleteSource && !isNas(src) && { delete_source: true }),
       lz4: null,
       ...(password !== null && { archive_password: password }),
     };
@@ -288,8 +296,8 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
           error={insError}
           ins={ins}
           prefix="p"
-          empty={<PackEmpty onPick={(p) => void pickSource(p)} />}
           onUnlock={() => source && void pickSource(source)}
+          empty={<PackEmpty onPick={(p) => void pickSource(p)} />}
         />
 
         <section className="card" aria-labelledby="p-pack">
@@ -301,17 +309,13 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
           </CardHead>
           <SegPicker name="p-engine" label={t.engine} options={ENGINES} labels={t.engines} value={engine} onChange={chooseEngine} />
           <p className="muted desc">
-            <Lead note={engine === "lz4" ? { tone: "warn", text: t.info(engine, packed) } : { text: t.info(engine, packed) }} />
+            <Lead note={engine === "lz4" && !packed ? { tone: "warn", text: t.info(engine, packed) } : { text: t.info(engine, packed) }} />
           </p>
-          {!source ? (
-            <p className="muted hint lz4-why">{t.chooseGame}</p>
-          ) : (
-            notForGame && (
-              <p className="note-line warn lz4-why">
-                <Icon name="warn" />
-                <span>{notForGame}</span>
-              </p>
-            )
+          {source && notForGame && (
+            <p className="note-line warn lz4-why">
+              <Icon name="warn" />
+              <span>{notForGame}</span>
+            </p>
           )}
           {usable && (
             <>
@@ -353,6 +357,7 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                 </p>
               )}
               <VerifySwitch checked={fullVerify} onChange={setFullVerify} />
+              <DeleteSourceSwitch checked={deleteSource} onChange={setDeleteSource} nas={isNas(source)} />
               <OutputField out={out} source={source} prefix="p" />
               <div className="build-row">
                 <GenerateSwitch out={out} source={source} />
@@ -510,20 +515,20 @@ function RuntimeField(props: { value: Lz4Runtime; onChange: (r: Lz4Runtime) => v
   );
 }
 
-/** The Pack tab's empty Source: one yellow Pick (a game folder, an image or an archive, in one
- * picker) and what to expect. */
+/** Pack's empty source card: the shared prompt and accepted formats in Pack's yellow. */
 function PackEmpty({ onPick }: { onPick: (path: string) => void }) {
-  const t = useMessages().pack;
   const c = useMessages().common;
   return (
     <div className="empty lz4">
       <span className="empty-icon">
         <Icon name="compress" />
       </span>
-      <p className="empty-title">{t.emptyTitle}</p>
-      <p className="muted">
-        <Lead note={{ tone: "warn", text: t.experimental }} />
-      </p>
+      <p className="empty-title">{c.emptyTitle}</p>
+      <div className="kinds" role="group" aria-label={c.accepted}>
+        {[...KINDS, ...ARCHIVE_KINDS].map((k) => (
+          <FormatPill key={k} kind={k} />
+        ))}
+      </div>
       <div className="row center">
         <button type="button" id="p-choose-source" className="lz4-btn" onClick={() => void openPicker((p) => onPick(p))}>
           <Icon name="disc" />

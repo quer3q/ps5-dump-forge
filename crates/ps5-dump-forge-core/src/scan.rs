@@ -44,6 +44,10 @@ impl Stamp {
         Self { size, mtime }
     }
 
+    pub(crate) fn mtime(&self) -> Option<SystemTime> {
+        self.mtime
+    }
+
     pub(crate) fn of(meta: &Metadata) -> Self {
         Self {
             size: meta.len(),

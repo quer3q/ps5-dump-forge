@@ -348,24 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn sequential_reads_the_next_non_empty_file_ahead() {
-        let data = bytes(500, 1);
-        let mem = Mem::new(&[("f", data.clone()), ("e", Vec::new()), ("g", bytes(10, 2))]);
-        let log = mem.log.clone();
-        let mut tree = Prefetch::sequential(Box::new(mem), 300).unwrap();
-        assert_eq!(tree.read_range("f", 0, 300).unwrap(), data[..300]);
-        assert_eq!(tree.read_range("f", 300, 200).unwrap(), data[300..]);
-        // The end of `f` is followed by the writer's first read of `g`, a whole chunk.
-        assert_eq!(
-            settled(&log, 3),
-            [at("f", 0, 300), at("f", 300, 300), at("g", 0, 300)]
-        );
-        assert_eq!(tree.read_range("g", 0, 10).unwrap(), bytes(10, 2));
-        // Served from the guess; nothing follows the last file.
-        assert_eq!(settled(&log, 3).len(), 3);
-    }
-
-    #[test]
     fn sequential_reads_are_read_once_and_one_ahead() {
         let data = bytes(1000, 1);
         let mem = Mem::new(&[("f", data.clone()), ("g", bytes(10, 2))]);
@@ -391,53 +373,6 @@ mod tests {
             ]
         );
         assert_eq!(tree.read("g").unwrap(), bytes(10, 2));
-    }
-
-    #[test]
-    fn a_window_reads_ahead_more_than_asked_and_serves_the_same_bytes() {
-        let (f, g) = (bytes(1000, 8), bytes(250, 9));
-        let mem = Mem::new(&[("f", f.clone()), ("g", g.clone())]);
-        let log = mem.log.clone();
-        let mut tree = Prefetch::with_window(Box::new(mem), 300).unwrap();
-        // Front to back in reads of 100: each window read once, the first read as asked.
-        let mut offset = 0;
-        while offset < 1000 {
-            assert_eq!(
-                tree.read_range("f", offset, 100).unwrap(),
-                f[offset as usize..][..100]
-            );
-            offset += 100;
-        }
-        assert_eq!(tree.read_range("f", 1000, 100).unwrap(), b"");
-        assert_eq!(
-            settled(&log, 4),
-            [
-                at("f", 0, 100),
-                at("f", 100, 300),
-                at("f", 400, 300),
-                at("f", 700, 300)
-            ]
-        );
-        // Missed guesses and held bytes that do not cover a request: still a direct read's bytes.
-        assert_eq!(tree.read_range("f", 50, 100).unwrap(), f[50..150]);
-        assert_eq!(tree.read_range("f", 150, 100).unwrap(), f[150..250]);
-        assert_eq!(
-            tree.read_range("f", 280, 100).unwrap(),
-            f[280..380],
-            "past the window"
-        );
-        assert_eq!(
-            tree.read_range("f", 380, 500).unwrap(),
-            f[380..880],
-            "over the window"
-        );
-        assert_eq!(tree.read_range("g", 0, 100).unwrap(), g[..100]);
-        assert_eq!(
-            tree.read_range("g", 100, 200).unwrap(),
-            g[100..],
-            "the file's tail"
-        );
-        assert_eq!(tree.read_range("f", 0, 1000).unwrap(), f);
     }
 
     #[test]

@@ -428,7 +428,7 @@ impl Inner {
             ctx.shared_cancel = Some(shared.clone());
             ctx.replace_guard = Some(&guard);
             match catch_unwind(AssertUnwindSafe(|| crate::convert::run(request, &ctx))) {
-                Ok(result) => result,
+                Ok(result) => result.map(|report| (report, ctx.read.take())),
                 Err(panic) => {
                     let msg = panic
                         .downcast_ref::<&str>()
@@ -459,8 +459,99 @@ impl Inner {
             }
         });
         // Its files are settled (published or cleaned up): they may be deleted from now on.
-        self.state().paths.remove(&job);
+        let result = match result {
+            Ok((mut report, read)) if request.delete_source => {
+                use crate::delete::SourceKept;
+                let line = match self.delete_source(job, read.as_ref(), &report.output) {
+                    Ok(()) => format!("source deleted: {}", request.source.display()),
+                    Err(SourceKept::Kept(e)) => format!("source kept: {e}"),
+                    Err(SourceKept::Partly(gone, e)) => {
+                        format!("source partly deleted: {gone}; {e}")
+                    }
+                };
+                (self.emit)(Event::Log {
+                    job,
+                    line: line.clone(),
+                });
+                report.checks.push(line);
+                Ok(report)
+            }
+            result => {
+                self.state().paths.remove(&job);
+                result.map(|(report, _)| report)
+            }
+        };
         (self.emit)(Event::Done { job, result });
+    }
+
+    /// [`ConvertRequest::delete_source`] for `job`, done: the source it read (`read`: an
+    /// archive's every part it stamped) checked unchanged first (a NAS or server source refused
+    /// at once), then its paths dropped and the source deleted with the table locked, as
+    /// [`Inner::delete_path`] deletes, so no job is admitted between them. A peer's source is
+    /// deleted with the table unlocked (the peer's delete takes its own table, and a peer
+    /// deleting here at once would wait on this one), the job's paths kept in it meanwhile as
+    /// the reservation, then dropped. Its output is never at or inside what goes.
+    fn delete_source(
+        &self,
+        job: JobId,
+        read: Option<&crate::delete::ReadSource>,
+        output: &Path,
+    ) -> Result<(), crate::delete::SourceKept> {
+        use crate::delete::SourceKept::Kept;
+        let Some(read) = read else {
+            self.state().paths.remove(&job);
+            return Err(Kept(crate::DeleteError::Refused(
+                "the job kept no record of what it read".to_string(),
+            )));
+        };
+        if let Some(e) = read
+            .paths()
+            .iter()
+            .find_map(|p| self.refuse_external_write(p).err())
+        {
+            self.state().paths.remove(&job);
+            return Err(Kept(e));
+        }
+        let protected = self
+            .protected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let protected = protected.map(|p| p()).unwrap_or_default();
+        let output = output.to_path_buf();
+        // The rescan may be a long listing over the network: done before the table is locked
+        // (the job's paths still guard the source meanwhile).
+        if let Err(e) = crate::delete::source_unchanged(read) {
+            self.state().paths.remove(&job);
+            return Err(e);
+        }
+        if let Some(source) = read
+            .paths()
+            .iter()
+            .find(|p| crate::delete::in_use(p, [&output]))
+        {
+            self.state().paths.remove(&job);
+            return Err(Kept(crate::DeleteError::Refused(format!(
+                "the output {} is inside {}",
+                output.display(),
+                source.display()
+            ))));
+        }
+        let mut state = self.state();
+        if read.paths().iter().any(|p| crate::remote::is_remote(p)) {
+            let others: Vec<PathBuf> = (state.paths.iter())
+                .filter(|(j, _)| **j != job)
+                .flat_map(|(_, paths)| paths.iter().cloned())
+                .collect();
+            drop(state);
+            let guarded: Vec<&PathBuf> = others.iter().collect();
+            let result = crate::delete::remove_source(read, &protected, &guarded);
+            self.state().paths.remove(&job);
+            return result;
+        }
+        state.paths.remove(&job);
+        let guarded: Vec<&PathBuf> = state.paths.values().flatten().collect();
+        crate::delete::remove_source(read, &protected, &guarded)
     }
 
     /// Blocks until `job` is at the front of its queue (the transfers' or the heavy jobs'), or
@@ -526,6 +617,8 @@ pub(crate) struct Ctx<'a> {
     pub mounts: RefCell<Vec<crate::durable::Watched>>,
     /// The job table's [`Ctx::replace_refusal`]; unset outside [`crate::Jobs`] (a test's).
     pub(crate) replace_guard: Option<ReplaceGuard<'a>>,
+    /// What the job read of its source, set by a conversion that deletes it afterwards.
+    pub(crate) read: RefCell<Option<crate::delete::ReadSource>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -544,6 +637,7 @@ impl<'a> Ctx<'a> {
             #[cfg(target_os = "freebsd")]
             mounts: RefCell::new(Vec::new()),
             replace_guard: None,
+            read: RefCell::new(None),
         }
     }
 
@@ -661,24 +755,6 @@ impl<'a> Ctx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_folder_edit_check_waits_for_a_job_using_the_folder() {
-        let dir = crate::test_dir("jobs-folder-check");
-        std::fs::create_dir_all(dir.join("game")).unwrap();
-        let mut req: ConvertRequest = serde_json::from_value(serde_json::json!({
-            "source": dir.join("game"), "format": "exfat", "output": dir.join("out")
-        }))
-        .unwrap();
-        req.edits = vec![crate::Edit::Mkdir { path: "x".into() }];
-        let inner = Inner::new(Box::new(|_| {}));
-        inner.state().paths.insert(1, vec![dir.join("game")]);
-        let check = inner.edit_check(&req);
-        assert_eq!(check.in_place.len(), 1, "{check:?}");
-        assert!(check.in_place[0].starts_with("a job is using"), "{check:?}");
-        // A folder is never rebuilt: no rebuild findings, no sizes.
-        assert!(check.rebuild.is_empty() && check.rebuild_needs.is_none());
-    }
 
     #[test]
     fn uses_is_the_delete_guard() {

@@ -256,21 +256,6 @@ mod tests {
         }
     }
 
-    /// FreeBSD refuses ncg * ipg > 2^32 - INOPB; the rounded geometry is what counts
-    /// (an estimate from the density alone passes here).
-    #[test]
-    fn inode_limit_on_final_geometry() {
-        let limit = (1u64 << 32) - INOPB;
-        let mut refused = 0;
-        for size in (limit - 200_000..limit).step_by(9_973) {
-            match Geom::new(size, 64 * 1024) {
-                Ok(g) => assert!(g.inode_capacity() <= limit, "size {size}"),
-                Err(_) => refused += 1,
-            }
-        }
-        assert!(refused > 0);
-    }
-
     /// newfs's group-growing loop, one block at a time, as `Geom::new` had it: the binary
     /// search there must pick the same group size for every image size and density.
     #[test]

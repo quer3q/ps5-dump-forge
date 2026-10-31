@@ -414,6 +414,9 @@ const en = {
     inStep: (time: string) => `${time} in this step`,
     result: (bytes: string, n: number) => `${bytes}, ${num(n)} ${plural(n, { one: "file", other: "files" })} →`,
     outputPath: "Output path",
+    sourceDeleted: (v: string) => `Source deleted: ${v}`,
+    sourceKept: (v: string) => `Source kept: ${v}`,
+    sourcePartlyDeleted: (v: string) => `Source partly deleted: ${v}`,
     checks: "Checks",
     verifiedPlain: (n: number) => `Verified: ${num(n)} ${plural(n, { one: "check", other: "checks" })} passed`,
     verifiedFull: (n: number) => `Full verification passed: ${num(n)} ${plural(n, { one: "check", other: "checks" })}`,
@@ -556,9 +559,8 @@ const en = {
           ? "Writes the zstd packs back as plain files."
           : "Packs the game's assets into zstd volumes."
         : packed
-          ? "Experimental. Writes the LZ4 packs back as plain files."
-          : "Experimental: some games may not start. Packs the game's assets into LZ4 volumes.",
-    chooseGame: "Choose a game first.",
+          ? "Writes the LZ4 packs back as plain files."
+          : "Some games may not start. Packs the game's assets into LZ4 volumes.",
     noAmprGame: (e: Engine) => `This game doesn't use AMPR, so ${e === "zstd" ? "zstd" : "LZ4"} packs can't be used.`,
     patch: "A patch package can't be packed.",
     additionalContent: "Additional content (no eboot.bin) can't be packed.",
@@ -602,8 +604,6 @@ const en = {
     already: (a: PackAction, fmt: string): ReactNode => <>
       Already writing this game as <b>{fmt}</b>; {a === "pack" ? "Pack" : "Unpack"} again makes a second copy.
     </>,
-    emptyTitle: "Choose a game that uses AMPR",
-    experimental: "Experimental: keep a copy of the original game.",
     source: "Source",
   },
   // PackHelp.tsx
@@ -621,7 +621,7 @@ const en = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>Experimental</b>: some games may not start. Keep a copy.</li>
+          <li><b>Some games may not start.</b> Keep a copy.</li>
           <li>Packs into LZ4 volumes, into a folder or an image: <b>Fast</b> (LZ4), <b>Medium</b> (HC 9), <b>Max</b> (HC 12).</li>
           <li>Runtime: <b>ampr-emu-ng</b> (default) or upstream <b>ampr_emu</b>.</li>
           <li>A packed game shows <b>Unpack</b>.</li>
@@ -822,6 +822,7 @@ const en = {
     } satisfies Record<Format, Note>,
     /** The inner `.ffpkg`'s line: the format's own, less what a read-only `.ffpfsc` doesn't give. */
     innerFfpkg: { text: "The PS5's own file system (UFS2)." } as Note,
+    innerExfat: { tone: "good", text: "Recommended. The most stable image inside a compressed container." } as Note,
     level0: { text: "No compression: every block stored as it is. The file is as large as the image." } as Note,
     levelDefault: {
       tone: "good",
@@ -860,6 +861,9 @@ const en = {
     compression: "Compression",
     fullVerify: "Full verification",
     fullVerifyHint: "Re-reads every byte to check the output. Takes longer.",
+    deleteSource: "Delete the source",
+    deleteSourceHint: "No undo. The source is deleted only after a successful conversion.",
+    deleteSourceNas: "A game on a NAS can't be deleted from here.",
     separator: "A name can't contain a folder separator; use Change for the folder.",
     badName: "A name can't be blank, start with a dot, end with a dot or a space, or hold control characters.",
     tooLong: (bytes: number, max: number, folder: boolean) =>
@@ -1025,6 +1029,13 @@ const en = {
       "File Transfer copies files and folders between any of them. A name that already exists there is replaced only after you confirm.",
     ] as string[],
     helpSecurity: "Nothing sent between devices is encrypted: anyone on your network can read it. A saved NAS password is kept on this device unencrypted. Use Connect on your home network only.",
+    helpSpeed: "Speed test, in a paired device's row or its details, sends 128 MiB to it and fetches 128 MiB back, nothing written to disk, and shows the network's speed each way.",
+    speedTest: "Speed test",
+    speedTestWith: (name: string) => `Speed test with ${name}`,
+    speedTesting: "Testing",
+    speedResult: (up: string, down: string) => `Upload ${up} MB/s · Download ${down} MB/s`,
+    speedFailed: "Speed test failed:",
+    speedNote: "Sends 128 MiB and fetches 128 MiB back; nothing is written to disk.",
     installTitle: "Dump Forge on PS5",
     ps5Address: "PS5 address",
     install: "Install on PS5",

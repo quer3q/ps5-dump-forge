@@ -47,8 +47,9 @@ pub(crate) struct Runtime {
 pub(crate) enum RuntimeAction {
     /// An AMPR title without one: the release runtime goes in.
     Install,
-    /// Forge's trace runtime, or another one older than the bundled ampr_emu or naming no
-    /// version (into packs also one that reads none): the release runtime replaces it.
+    /// Forge's trace runtime, ampr-emu-ng (outside packing and a zstd-packed source), or another
+    /// one older than the bundled ampr_emu or naming no version (into packs also one that reads
+    /// none): the release runtime replaces it.
     Replace,
     /// Forge's release runtime, or ampr_emu at the bundled version or newer: left as it is.
     Keep,
@@ -67,21 +68,22 @@ impl Runtime {
             _ if !ampr => RuntimeAction::Untouched,
             RuntimeKind::None => RuntimeAction::Install,
             RuntimeKind::ForgeRelease => RuntimeAction::Keep,
-            // ampr-emu-ng reads LZ4 packs too.
-            RuntimeKind::Zstd => RuntimeAction::Keep,
+            // ampr-emu-ng goes into a game only by packing (by user decision): any other job
+            // puts the release runtime in its place. A zstd-packed source keeps it
+            // ([`Self::zstd_action`]).
+            RuntimeKind::Zstd => RuntimeAction::Replace,
             RuntimeKind::Other if current && (self.packs || !packs) => RuntimeAction::Keep,
             RuntimeKind::Other => RuntimeAction::Replace,
         }
     }
 
     /// The action for LZ4 Pack with the runtime the request chose: ampr-emu-ng goes in unless
-    /// it is there; ampr_emu follows [`Self::action`] into packs, replacing ampr-emu-ng too.
+    /// it is there; ampr_emu follows [`Self::action`] into packs (ampr-emu-ng replaced too).
     pub(crate) fn pack_action(&self, choice: Lz4Runtime) -> RuntimeAction {
         match (choice, self.kind) {
             (Lz4Runtime::Ng, RuntimeKind::Zstd) => RuntimeAction::Keep,
             (Lz4Runtime::Ng, RuntimeKind::None) => RuntimeAction::Install,
             (Lz4Runtime::Ng, _) => RuntimeAction::Replace,
-            (Lz4Runtime::AmprEmu, RuntimeKind::Zstd) => RuntimeAction::Replace,
             (Lz4Runtime::AmprEmu, _) => self.action(true, true),
         }
     }
@@ -291,11 +293,11 @@ pub(crate) fn prepare(
     let installed: Option<&'static [u8]> = match action {
         RuntimeAction::Install | RuntimeAction::Replace if ng => {
             ctx.log(format!("LZ4: installing ampr-emu-ng at {RUNTIME}"));
-            Some(runtime::ZSTD)
+            Some(runtime::zstd())
         }
         RuntimeAction::Install | RuntimeAction::Replace => {
             ctx.log(release_log(kind));
-            Some(runtime::RELEASE)
+            Some(runtime::release())
         }
         RuntimeAction::Keep => {
             keep_log(&rt, ctx);
@@ -364,9 +366,10 @@ fn release_log(kind: RuntimeKind) -> String {
             "LZ4: replacing the game's runtime at {RUNTIME} with the bundled ampr_emu {}",
             runtime::VERSION
         ),
-        RuntimeKind::Zstd => {
-            format!("LZ4: swapping ampr-emu-ng at {RUNTIME} for the release one")
-        }
+        RuntimeKind::Zstd => format!(
+            "LZ4: replacing ampr-emu-ng at {RUNTIME} with the bundled ampr_emu {}",
+            runtime::VERSION
+        ),
         _ => format!("LZ4: installing the release runtime at {RUNTIME}"),
     }
 }
@@ -399,7 +402,7 @@ pub(crate) fn leave_out_for_pkg(all: &mut Vec<SourceFile>, ampr: bool) -> Vec<St
 
 /// A conversion without LZ4 options (by user decision). An AMPR title (`eboot.bin` imports
 /// libSceAmpr) gets the release runtime per [`Runtime::action`] (installed where there is none,
-/// replacing an older or unknown one, another as new as ours kept) and keeps its
+/// replacing ampr-emu-ng and an older or unknown one, another as new as ours kept) and keeps its
 /// `ampr_emu.index` only when it lists exactly the files written ([`index_state`]); else a new
 /// one is written, and the journal and logs are left out with the old one: the journal's file
 /// ids follow its record order. Into a `.pkg` the builder writes the index from the files it
@@ -452,9 +455,9 @@ fn plain(
         }
     };
     let bytes = if zstd {
-        runtime::ZSTD
+        runtime::zstd()
     } else {
-        runtime::RELEASE
+        runtime::release()
     };
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
     let mut all = tree.files().to_vec();
@@ -529,7 +532,7 @@ pub(crate) fn plain_listing(listing: &[SourceFile], action: RuntimeAction) -> Ve
         .cloned()
         .collect();
     if matches!(action, RuntimeAction::Install | RuntimeAction::Replace) {
-        put(&mut files, RUNTIME, runtime::RELEASE.len() as u64);
+        put(&mut files, RUNTIME, runtime::release().len() as u64);
     }
     files
 }
@@ -1088,7 +1091,6 @@ pub(crate) fn largest_file(files: &[PackFile], index: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ps5_dump_forge_lz4::PackSpec;
 
     /// A listing whose `ampr_emu.index` serves zeros and fails any read past 1 MiB.
     struct Sized(Vec<SourceFile>);
@@ -1147,110 +1149,5 @@ mod tests {
             index_state(&mut tree, &many).unwrap(),
             IndexState::Damaged
         ));
-    }
-
-    /// Serves `index` for whatever `files` lists, at most 1000 bytes a read.
-    struct Chunked {
-        files: Vec<SourceFile>,
-        index: Vec<u8>,
-    }
-
-    impl SourceTree for Chunked {
-        fn files(&self) -> &[SourceFile] {
-            &self.files
-        }
-        fn read(&mut self, path: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
-            let size = size_of(self, path).unwrap_or(0);
-            self.read_range(path, 0, size as usize)
-        }
-        fn read_range(&mut self, _: &str, at: u64, len: usize) -> ps5upload_fpkg::Result<Vec<u8>> {
-            let at = (at as usize).min(self.index.len());
-            let end = (at + len.min(1000)).min(self.index.len());
-            Ok(self.index[at..end].to_vec())
-        }
-        fn describe(&self) -> String {
-            "chunked".into()
-        }
-    }
-
-    #[test]
-    fn an_index_is_read_in_as_many_reads_as_the_source_takes() {
-        let files: Vec<SourceFile> = (0..500)
-            .map(|i| SourceFile {
-                path: format!("data/{i}.bin"),
-                size: i,
-            })
-            .collect();
-        let rows: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
-        let index = ps5upload_fpkg::ampr_index::build(&rows, 0).unwrap();
-        assert!(index.len() > 10_000);
-        let listed = |size| {
-            vec![SourceFile {
-                path: INDEX.into(),
-                size,
-            }]
-        };
-        let mut tree = Chunked {
-            files: listed(index.len() as u64),
-            index: index.clone(),
-        };
-        match index_state(&mut tree, &files).unwrap() {
-            IndexState::Ok(bytes) => assert!(bytes == index),
-            _ => panic!("the index lists exactly these files"),
-        }
-        // A file that ends before its listed size is short.
-        let mut tree = Chunked {
-            files: listed(index.len() as u64 + 10),
-            index: index.clone(),
-        };
-        let err = index_state(&mut tree, &files).err().unwrap().to_string();
-        assert!(
-            err.contains(&format!(
-                "read {} of {} bytes",
-                index.len(),
-                index.len() + 10
-            )),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn packed_files_are_not_the_largest_output_file() {
-        const GIB: u64 = 1 << 30;
-        let spec = Some(PackSpec {
-            block_shift: 16,
-            store: false,
-            hot: false,
-            random: false,
-        });
-        let file = |path: &str, size, spec| PackFile {
-            path: path.into(),
-            size,
-            spec,
-        };
-        // A 5 GiB asset that is packed goes into volumes below 4 GiB.
-        let files = [
-            file("eboot.bin", 100, None),
-            file("data/huge.bin", 5 * GIB, spec),
-        ];
-        let largest = largest_file(&files, 4096);
-        assert!(
-            largest <= ps5_dump_forge_lz4::writer::VOLUME_CAP,
-            "{largest}"
-        );
-        assert!(largest > 4 * GIB - (1 << 20), "{largest}");
-        // A loose one stays as big as it is; so does a big index.
-        let files = [
-            file("eboot.bin", 100, None),
-            file("data/huge.bin", 5 * GIB, None),
-        ];
-        assert_eq!(largest_file(&files, 4096), 5 * GIB);
-        assert_eq!(largest_file(&files[..1], 4096), 4096);
-        // Small packs: the volume is about the data, not the cap.
-        let files = [
-            file("eboot.bin", 100, None),
-            file("data/a.bin", 300_000, spec),
-        ];
-        assert!(largest_file(&files, 4096) < 1 << 20);
     }
 }

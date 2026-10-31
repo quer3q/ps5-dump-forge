@@ -1,6 +1,6 @@
 // Pieces shared by the screens.
 
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 
 import {
@@ -20,7 +20,7 @@ import { basename, SEPARATORS, trimSep } from "./paths";
 import { nasName, nasPath } from "./peers";
 import { useCoverGlow } from "./glow";
 import { Icon, type IconName } from "./icons";
-import { useConnectState } from "./useConnectState";
+import { useSavedNames } from "./useConnectState";
 
 // Format names stay as they are in every language; only "Folder" is translated (kindLabel).
 const KIND_LABEL: Record<Format | ArchiveKind, string> = {
@@ -315,24 +315,31 @@ export function PathLine({ path: raw, prefix }: { path: string; prefix?: string 
  * `nfs://` one, as "<device name>: /<rel>" while that device is known (saved); anything else, or
  * an unknown device, as it is. */
 export function usePeerPath(): (path: string) => string {
-  const state = useConnectState().state;
-  return (path) => {
-    const p = peerOf(path, state?.devices);
-    return p ? `${p.name}: ${p.rest}` : (nasPath(path, state?.nas ?? []) ?? path);
-  };
+  // Names only: a poll that changes nothing else re-renders nothing here.
+  const { devices, nas } = useSavedNames();
+  return useCallback(
+    (path: string) => {
+      const p = peerOf(path, devices);
+      return p ? `${p.name}: ${p.rest}` : (nasPath(path, nas) ?? path);
+    },
+    [devices, nas],
+  );
 }
 
 /** The device a path is on when it isn't this one: a paired Forge (`flink://`) or a NAS
  * (`smb://`, `ftp://`, `nfs://`: its saved name, else its address), by name; `null` for this
  * device's paths. */
 export function useDeviceName(): (path: string) => string | null {
-  const state = useConnectState().state;
-  return (path) => {
-    const peer = peerOf(path, state?.devices);
-    if (peer) return peer.name;
-    if (/^flink:\/\//i.test(path)) return path.split(/[/\\]/)[2];
-    return nasName(path, state?.nas ?? []);
-  };
+  const { devices, nas } = useSavedNames();
+  return useCallback(
+    (path: string) => {
+      const peer = peerOf(path, devices);
+      if (peer) return peer.name;
+      if (/^flink:\/\//i.test(path)) return path.split(/[/\\]/)[2];
+      return nasName(path, nas);
+    },
+    [devices, nas],
+  );
 }
 
 function peerOf(path: string, devices: { key_id: string; name: string }[] | undefined) {
@@ -915,7 +922,7 @@ export function classify(line: string): { kind: "block" | "warn" | "info"; forma
   // .ffpfs takes ASCII names only, and a .ffpfsc's inner image refuses them too.
   if (/^name not in NFC/.test(line))
     return { kind: "warn", formats: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"] };
-  // PFS holds ASCII names only; a .ffpfsc defaults to ffpkg inside, which takes them.
+  // PFS holds ASCII names only; a .ffpfsc's default inner image (exfat in the UI, ffpkg in core) takes them.
   if (/^name not ASCII/.test(line)) return { kind: "warn", formats: ["ffpfs"] };
   if (/^extraction:/.test(line)) return { kind: "warn", formats: ["folder", "lz4"] };
   if (/^(already 512-byte sectors|geometry differs from the SMP fast path)/.test(line))
@@ -1046,7 +1053,8 @@ export function ChooseMenu<K extends string>(props: {
   label: ReactNode;
   /** The menu's accessible name. */
   menuLabel: string;
-  items: { id: K; icon: IconName; label: string }[];
+  /** `disabled`: shown and focusable, but not chosen (`aria-disabled`); `busy`: its work runs. */
+  items: { id: K; icon: IconName; label: ReactNode; disabled?: boolean; busy?: boolean }[];
   onChoose: (what: K) => void;
   className?: string;
   /** An icon-only button: no trailing chevron, this as its aria-label and tip. */
@@ -1133,7 +1141,14 @@ export function ChooseMenu<K extends string>(props: {
       {open && !props.disabled && (
         <span ref={menu} className={`menu${flip}`} role="menu" aria-label={props.menuLabel}>
           {props.items.map((it) => (
-            <button key={it.id} type="button" role="menuitem" onClick={() => choose(it.id)}>
+            <button
+              key={it.id}
+              type="button"
+              role="menuitem"
+              aria-disabled={it.disabled || undefined}
+              aria-busy={it.busy || undefined}
+              onClick={() => !it.disabled && choose(it.id)}
+            >
               <Icon name={it.icon} />
               {it.label}
             </button>

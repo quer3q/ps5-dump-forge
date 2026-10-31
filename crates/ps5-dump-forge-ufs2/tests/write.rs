@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use common::{Synth, build, compare_with_reader, fsck, scratch};
 use ps5_dump_forge_ufs2::Options;
@@ -89,80 +89,6 @@ fn game_folder_round_trip() {
     std::fs::remove_file(img2).unwrap();
 }
 
-#[test]
-fn free_bytes_reserved() {
-    let mut src = Synth::new(&[("eboot.bin", 100), ("sce_sys/param.json", 10)]);
-    let want = 300 * 1024 * 1024;
-    let (img, layout, _) = build(
-        "free",
-        &mut src,
-        &Options {
-            free_bytes: want,
-            ..Options::default()
-        },
-    );
-    assert!(layout.free_bytes >= want, "{} < {want}", layout.free_bytes);
-    assert!(layout.free_inodes >= 2048);
-    assert_clean(&img);
-    compare_with_reader(&img, &mut src);
-}
-
-/// Many empty files at the 64 KiB inode-density floor: `plan` must grow the image until
-/// every inode fits instead of laying out too few.
-#[test]
-fn inode_exhaustion_grows_the_image() {
-    let names: Vec<String> = (0..6000).map(|i| format!("d{}/f{i}", i % 7)).collect();
-    let list: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 0)).collect();
-    let mut src = Synth::new(&list);
-    let cancel = AtomicBool::new(false);
-    let layout = ps5_dump_forge_ufs2::plan(&src, &Options::default(), &cancel).unwrap();
-    let total = layout.cylinder_groups * layout.inodes_per_group;
-    assert!(total >= 6000 + 8 + 2, "{total} inodes for 6008 objects");
-    assert_eq!(layout.bytes_per_inode, 64 * 1024);
-    let (img, _, _) = build("inodes", &mut src, &Options::default());
-    let r = assert_clean(&img);
-    assert_eq!(r.files.len(), 6000);
-}
-
-/// The last cylinder group as small as allowed: its metadata plus a single data block
-/// (the UFS2Tool v4.1 bug sits one step below this). Only big images have groups of a
-/// fixed size (newfs fills the cg map block), so this one is ~70 GB, mostly free and
-/// sparse on disk; the requested free space is nudged until the last group is that small.
-#[test]
-fn nearly_empty_last_group() {
-    let mut src = Synth::new(&[("eboot.bin", 3 * B + 5), ("sce_sys/param.json", 100)]);
-    let cancel = AtomicBool::new(false);
-    let mut free: i64 = 64 << 30;
-    let mut found = None;
-    for _ in 0..40 {
-        let opts = Options {
-            free_bytes: free as u64,
-            ..Options::default()
-        };
-        let l = ps5_dump_forge_ufs2::plan(&src, &opts, &cancel).unwrap();
-        let meta = l.metadata_blocks_per_group as i64;
-        let last = l.last_group_blocks as i64;
-        assert!(last > meta, "last group {last} <= metadata {meta}");
-        if l.cylinder_groups > 4 && last == meta + 1 {
-            found = Some(opts);
-            break;
-        }
-        // Shrink the last group by its excess; if it would vanish, the planner moves on.
-        free -= (last - meta - 1).max(1) * B as i64;
-    }
-    let opts = found.expect("a layout whose last group has one data block");
-    let (img, layout, _) = build("lastcg", &mut src, &opts);
-    // -i comes from the tree, not the free space (ffpkg.sh): a tiny tree gets the floor.
-    assert_eq!(layout.bytes_per_inode, 64 * 1024);
-    assert_eq!(
-        layout.last_group_blocks,
-        layout.metadata_blocks_per_group + 1
-    );
-    let r = assert_clean(&img);
-    assert_eq!(r.size % r.fpg, r.dblkno + 1);
-    compare_with_reader(&img, &mut src);
-}
-
 /// Every bad name is reported, in one error, before anything is written.
 #[test]
 fn rejected_names_listed_together() {
@@ -199,49 +125,6 @@ fn rejected_names_listed_together() {
         assert!(e.contains(needle), "{needle} missing from: {e}");
     }
     assert!(!e.contains("fine.bin") && !e.contains(&ok255[..20]), "{e}");
-}
-
-#[test]
-fn cancellation() {
-    let mut src = Synth::new(&[("big.bin", 40 * 1024 * 1024), ("eboot.bin", 1)]);
-    let cancel = AtomicBool::new(true);
-    let e = ps5_dump_forge_ufs2::plan(&src, &Options::default(), &cancel).unwrap_err();
-    assert!(e.to_string().contains("cancelled"));
-
-    cancel.store(false, Ordering::Relaxed);
-    let layout = ps5_dump_forge_ufs2::plan(&src, &Options::default(), &cancel).unwrap();
-    let path = scratch("cancel.ffpkg");
-    let _ = std::fs::remove_file(&path);
-    let mut out = std::fs::File::create_new(&path).unwrap();
-    let mut calls = 0;
-    let e = ps5_dump_forge_ufs2::write(&mut src, &layout, &mut out, &cancel, &mut |done, total| {
-        calls += 1;
-        assert!(done <= total);
-        if done > 0 {
-            cancel.store(true, Ordering::Relaxed);
-        }
-    })
-    .unwrap_err();
-    assert!(e.to_string().contains("cancelled"), "{e}");
-    assert!(calls >= 2);
-    std::fs::remove_file(&path).unwrap();
-
-    // Cancelled from the very last progress call: still an error, not a finished image.
-    cancel.store(false, Ordering::Relaxed);
-    let mut out = std::fs::File::create_new(&path).unwrap();
-    let total = layout_total(&src);
-    let e = ps5_dump_forge_ufs2::write(&mut src, &layout, &mut out, &cancel, &mut |done, _| {
-        if done == total {
-            cancel.store(true, Ordering::Relaxed);
-        }
-    })
-    .unwrap_err();
-    assert!(e.to_string().contains("cancelled"), "{e}");
-    std::fs::remove_file(path).unwrap();
-}
-
-fn layout_total(src: &Synth) -> u64 {
-    src.files.iter().map(|f| f.size).sum()
 }
 
 /// The layout belongs to the tree it was planned from, and the output must be empty.

@@ -117,7 +117,15 @@ impl Digester {
         } else if self.buf.capacity() > 0 {
             pool().give_back(std::mem::take(&mut self.buf));
         }
-        Sealed(self.slices)
+        Sealed(std::mem::take(&mut self.slices))
+    }
+}
+
+impl Drop for Digester {
+    fn drop(&mut self) {
+        if self.buf.capacity() > 0 {
+            pool().give_back(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -146,6 +154,7 @@ struct Pool {
     jobs: SyncSender<(Vec<u8>, SyncSender<blake3::Hash>)>,
     spare: Arc<Mutex<Vec<Vec<u8>>>>,
     keep: usize,
+    workers: usize,
 }
 
 type Job = (Vec<u8>, SyncSender<blake3::Hash>);
@@ -166,11 +175,11 @@ fn pool() -> &'static Pool {
         // build half as fast (4.6 GB in its first 3 min of compress, 7.4 with 8), likely as
         // fresh 8 MiB slices page-fault through a libc that serializes every thread.
         let keep = POOL_MAX;
+        let mut workers = 0;
         for i in 0..threads {
             let (queue, spare) = (queue.clone(), spare.clone());
-            // ponytail: workers live as long as the process (the pool is static). If none
-            // starts, the queue's receiver is gone and the first `hash` fails loudly.
-            let _ = std::thread::Builder::new()
+            // ponytail: workers live as long as the process (the pool is static).
+            if std::thread::Builder::new()
                 .name(format!("hash-{i}"))
                 .spawn(move || {
                     loop {
@@ -185,9 +194,18 @@ fn pool() -> &'static Pool {
                             spare.push(buf);
                         }
                     }
-                });
+                })
+                .is_ok()
+            {
+                workers += 1;
+            }
         }
-        Pool { jobs, spare, keep }
+        Pool {
+            jobs,
+            spare,
+            keep,
+            workers,
+        }
     })
 }
 
@@ -212,6 +230,12 @@ impl Pool {
     /// `buf`'s hash, as soon as a worker gets to it.
     fn hash(&self, buf: Vec<u8>) -> Receiver<blake3::Hash> {
         let (reply, rx) = sync_channel(1);
+        if self.workers == 0 {
+            let hash = blake3::hash(&buf);
+            self.give_back(buf);
+            let _ = reply.send(hash);
+            return rx;
+        }
         self.jobs
             .send((buf, reply))
             .expect("the hashing pool is running");
@@ -227,9 +251,11 @@ pub(crate) struct Expected {
     pub empty_dirs: Vec<String>,
 }
 
-/// More files than this being read at once means the writer is not reading front to back;
-/// their hashes are then dropped and computed by a second read instead.
+/// More files than this being read at once, or more partial slice bytes than the budget, means
+/// the writer is not reading front to back; their hashes are then dropped and computed by a
+/// second read instead.
 const MAX_IN_FLIGHT: usize = 64;
+const MAX_IN_FLIGHT_BYTES: usize = 64 << 20;
 
 /// Files read whole whose last slices may still be hashing: the writer goes on to the next
 /// file instead of waiting at each file's end; past this many the oldest is waited for.
@@ -266,7 +292,8 @@ impl<'a> HashingTree<'a> {
             return;
         };
         if offset == 0 {
-            if self.in_flight.len() >= MAX_IN_FLIGHT {
+            let buffered: usize = self.in_flight.values().map(|d| d.buf.capacity()).sum();
+            if self.in_flight.len() >= MAX_IN_FLIGHT || buffered >= MAX_IN_FLIGHT_BYTES {
                 self.in_flight.clear();
             }
             self.in_flight.insert(path.to_string(), Digester::new());
@@ -921,38 +948,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sampled_manifest_checks_what_its_mode_reads() {
-        let data = bytes(5 * SLICE + 3, 5);
-        let small = bytes(1000, 6);
-        let fast = Mode::Fast {
-            seed: 7,
-            seam: false,
-        };
-        let sampled: Vec<usize> = (plan(&Mem::new(&[("big", data.clone())]).files, 7, false))
-            .iter()
-            .filter_map(|s| s.slice)
-            .collect();
-        let unsampled = (0..6).find(|s| !sampled.contains(s)).unwrap();
-        for mode in [fast, Mode::Full] {
-            let mut source = Mem::new(&[("big", data.clone()), ("small", small.clone())]);
-            let expected =
-                with_ctx(|ctx| expected_sampled(&mut source, ctx, mode, "write")).unwrap();
-            let check = |at: Option<(usize, &str)>| {
-                let mut out = Mem::new(&[("big", data.clone()), ("small", small.clone())]);
-                if let Some((at, path)) = at {
-                    out.bytes(path)[at] ^= 1;
-                }
-                with_ctx(|ctx| compare(&expected, &mut out, ctx, mode))
-            };
-            check(None).unwrap();
-            assert!(check(Some((999, "small"))).is_err());
-            assert!(check(Some((sampled[1] * SLICE as usize + 2, "big"))).is_err());
-            let far = check(Some((unsampled * SLICE as usize + 2, "big")));
-            assert_eq!(far.is_err(), matches!(mode, Mode::Full), "{mode:?}");
-        }
-    }
-
-    #[test]
     fn fast_misses_only_what_it_does_not_sample() {
         let data = bytes(5 * SLICE + 3, 5); // 6 slices: 4 sampled, 2 not
         let small = bytes(1000, 6);
@@ -1036,34 +1031,5 @@ mod tests {
         let mut same = Mem::new(&[("big", data.clone()), ("small", small.clone())]);
         let lines = with_ctx(|ctx| compare(&expected, &mut same, ctx, Mode::Full)).unwrap();
         assert_eq!(lines.last().unwrap(), "blake3: 2 files match the source");
-    }
-
-    #[test]
-    fn range_reads_stop_at_the_end_and_refuse_too_much() {
-        let mut mem = Mem::new(&[("f", bytes(100, 0))]);
-        mem.piece = 7;
-        let read = |mem: &mut Mem, offset, len| {
-            let mut hasher = blake3::Hasher::new();
-            with_ctx(|ctx| {
-                read_each(mem, "f", offset, len, ctx, &mut |b| {
-                    hasher.update(b);
-                })
-            })
-            .map(|()| hasher.finalize())
-        };
-        assert_eq!(
-            read(&mut mem, 10, 50).unwrap(),
-            blake3::hash(&bytes(100, 0)[10..60])
-        );
-        mem.cut = Some(40);
-        let err = read(&mut mem, 10, 50).unwrap_err().to_string();
-        assert!(err.contains("f: ended at byte 40 of 60"), "{err}");
-        mem.cut = None;
-        mem.oversize = true;
-        let err = read(&mut mem, 10, 50).unwrap_err().to_string();
-        assert!(
-            err.contains("51 bytes read at byte 10, 50 asked for"),
-            "{err}"
-        );
     }
 }

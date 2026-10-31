@@ -1,10 +1,8 @@
 # ampr_emu 0.4.2.1 (runtime binaries and source)
 
 One unmodified upstream binary of `libSceAmpr.sprx`, the AMPR emulation runtime that reads LZ4
-asset packs, plus `libSceAmpr-zstd.sprx` (ampr-emu-ng, below), a local build that reads zstd and LZ4
-packs. `ps5-dump-forge-lz4`
-embeds both `.sprx` files with `include_bytes!` and recognises a runtime found in a game folder by
-SHA-256.
+asset packs. `ps5-dump-forge-lz4` embeds it zstd-compressed (its `build.rs`, beside ampr-emu-ng; decoded by `runtime::release()`) and
+recognises a runtime found in a game folder by SHA-256.
 
 | | |
 |---|---|
@@ -41,19 +39,11 @@ this is not a claim that the binaries can be reproduced from the archive.
 
 ## ampr-emu-ng
 
-`libSceAmpr-zstd.sprx` is ampr-emu-ng, built locally from the `ampr-emu zstd` project (a Rust rewrite
-of ampr_emu, not upstream; GPL-3.0-or-later). It reads zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`,
-format in `docs/PAK.md`) and LZ4 packs (`AMPRPAK4`), picked at load. It takes the zstd pack convention
-from `crates/ps5-dump-forge-zstd` built `no_std` (this repo mounted read-only). In that project
-`./ps5/build-docker.sh` builds `libSceAmpr.sprx` (and `libSceAmpr-debug.sprx`) at its root; copy
-`libSceAmpr.sprx` over this `libSceAmpr-zstd.sprx` for a fresh build. Current file: 679712 bytes,
-SHA-256 `0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7`.
-
-Forge installs it at `fakelib/libSceAmpr.sprx` on every zstd Pack and on an LZ4 Pack with runtime
-`ng` (the default), and keeps it wherever it is found, LZ4 packs included; LZ4 Pack with `ampr_emu`
-and a zstd Unpack replace it with the release runtime (`runtime.rs`, `core/src/lz4.rs`). Its SHA-256 is
-computed at run time, not pinned, because fresh builds replace it. It uses a native libzstd decoder per
-worker and splits multi-chunk reads across workers; it does not verify zstd frame checksums.
+ampr-emu-ng (a Rust hard fork of ampr_emu, GPL-3.0) reads zstd packs and LZ4 packs. Forge embeds its
+v0.1.0 release build from `vendor/ampr-emu-ng/` (see the README there: files, hashes, when it is installed
+and kept). The local build that used to sit here as `libSceAmpr-zstd.sprx` (679712 bytes, SHA-256
+`0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7`) was removed; `runtime.rs` keeps its
+hash pinned so a game carrying it keeps it.
 
 ## Licenses
 

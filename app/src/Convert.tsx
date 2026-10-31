@@ -18,6 +18,7 @@ import {
   classify,
   emulatorNames,
   FormatPicker,
+  isNas,
   isWithin,
   kindLabel,
   onDeleted,
@@ -38,6 +39,7 @@ import {
   Lead,
   OutputField,
   useOutput,
+  DeleteSourceSwitch,
   VerifySwitch,
 } from "./target";
 
@@ -70,11 +72,13 @@ export function Convert(props: {
   const [password, setPassword] = useState<string | null>(null);
   const [format, setFormat] = useState<Format>(DEFAULT_FORMAT);
   /** The image inside a `.ffpfsc`; kept while other targets are picked. */
-  const [inner, setInner] = useState<InnerFormat>("ffpkg");
+  const [inner, setInner] = useState<InnerFormat>("exfat");
   /** Leave the backport libraries out; offered only for a source that has some. */
   const [removeBackport, setRemoveBackport] = useState(false);
   /** Re-read every byte instead of sampling; kept across sources and targets. */
   const [fullVerify, setFullVerify] = useState(false);
+  /** Delete the source once the job is Ok; off by default, kept across sources. */
+  const [deleteSource, setDeleteSource] = useState(false);
   /** The `.fpkg` compression level; kept across sources and targets. */
   const [krakenLevel, setKrakenLevel] = useState<KrakenLevel>("fast");
   /** The `.ffpfsc` zlib level, 0–9; kept across sources and targets. */
@@ -248,6 +252,8 @@ export function Convert(props: {
       inner: format === "ffpfsc" ? inner : null,
       remove_backport: removable && removeBackport,
       full_verify: fullVerify,
+      // A NAS's game can't be deleted from here; a patch can't be converted at all.
+      ...(deleteSource && !isNas(source) && { delete_source: true }),
       kraken_level: krakenLevel,
       ffpfsc_level: ffpfscLevel,
       // LZ4 and zstd packing and unpacking start from the Pack tab.
@@ -359,6 +365,7 @@ export function Convert(props: {
           )}
           {format === "pkg" && <KrakenField prefix="c" value={krakenLevel} onChange={setKrakenLevel} />}
           <VerifySwitch checked={fullVerify} onChange={setFullVerify} />
+          {!ins?.patch && <DeleteSourceSwitch checked={deleteSource} onChange={setDeleteSource} nas={isNas(source)} />}
           <OutputField out={out} source={source} prefix="c" />
           <div className="build-row">
             <GenerateSwitch out={out} source={source} />

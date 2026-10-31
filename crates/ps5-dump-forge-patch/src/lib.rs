@@ -23,7 +23,7 @@
 //! its declared length either way, an entry) is damage: an error, the journal kept.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write as _};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -233,7 +233,7 @@ fn apply_until(
         if half.is_some() {
             return Err(e);
         }
-        return match restore(image, &journal, sync) {
+        return match restore(Some(image), None, &journal, sync) {
             Ok(_) => Err(e),
             Err(r) => Err(io::Error::new(
                 e.kind(),
@@ -270,7 +270,7 @@ impl Applied {
 
     /// Undoes the edit: the journal's old bytes go back into the image, then it is deleted.
     pub fn rollback(mut self, sync: Syncs) -> io::Result<()> {
-        restore(&mut self.image, &self.journal, sync).map(drop)
+        restore(Some(&mut self.image), None, &self.journal, sync).map(drop)
     }
 }
 
@@ -284,8 +284,7 @@ pub fn recover(image_path: &Path, sync: Syncs) -> io::Result<Recovery> {
         Err(e) => return Err(ctx(e, &format!("read {}", journal.display()))),
         Ok(_) => {}
     }
-    let mut image = open_rw(image_path)?;
-    restore(&mut image, &journal, sync)
+    restore(None, Some(image_path), &journal, sync)
 }
 
 /// Refuses writes past the image's end and a free write overlapping any other write (live
@@ -467,7 +466,12 @@ fn put_all(
 
 /// Puts a journal's old bytes back into `image` and deletes it, or only deletes an incomplete
 /// one. The whole journal is checked before the image is touched.
-fn restore(image: &mut File, journal: &Path, sync: Syncs) -> io::Result<Recovery> {
+fn restore(
+    image: Option<&mut File>,
+    image_path: Option<&Path>,
+    journal: &Path,
+    sync: Syncs,
+) -> io::Result<Recovery> {
     let name = journal.display();
     let rd = |e| ctx(e, &format!("read {name}"));
     let bad = |what: &str| {
@@ -509,35 +513,51 @@ fn restore(image: &mut File, journal: &Path, sync: Syncs) -> io::Result<Recovery
             ),
         ));
     };
+    // Pass 1: every entry's place, by seeking over the old bytes.
+    let end = len - TRAILER_LEN;
+    let mut pos = HEADER_LEN;
+    let mut entries = Vec::new();
+    let mut reader = BufReader::new(&mut file);
+    reader.seek(SeekFrom::Start(pos)).map_err(rd)?;
+    for _ in 0..header.count {
+        let (mut offset, mut n) = ([0u8; 8], [0u8; 8]);
+        if end - pos < ENTRY_HEADER_LEN {
+            return Err(bad("an entry runs past its end"));
+        }
+        reader.read_exact(&mut offset).map_err(rd)?;
+        reader.read_exact(&mut n).map_err(rd)?;
+        pos += ENTRY_HEADER_LEN;
+        let (offset, n) = (u64::from_le_bytes(offset), u64::from_le_bytes(n));
+        if n > end - pos || offset.checked_add(n).is_none_or(|e| e > header.image_len) {
+            return Err(bad("an entry runs past its end or the image's"));
+        }
+        entries.push((offset, n, pos));
+        pos += n;
+        if let Ok(skip) = i64::try_from(n) {
+            reader.seek_relative(skip).map_err(rd)?;
+        } else {
+            reader.seek(SeekFrom::Start(pos)).map_err(rd)?;
+        }
+    }
+    if pos != end {
+        return Err(bad("bytes left after its last entry"));
+    }
+    drop(reader);
+    // A short journal was already discarded; only a complete, valid one needs the image.
+    let mut opened;
+    let image = match image {
+        Some(image) => image,
+        None => {
+            opened = open_rw(image_path.expect("recover supplies the image path"))?;
+            &mut opened
+        }
+    };
     let image_len = image
         .metadata()
         .map_err(|e| ctx(e, "read the image's length"))?
         .len();
     if header.image_len != image_len {
         return Err(bad("it was written for an image of another length"));
-    }
-    // Pass 1: every entry's place, by seeking over the old bytes.
-    let end = len - TRAILER_LEN;
-    let mut pos = HEADER_LEN;
-    let mut entries = Vec::new();
-    for _ in 0..header.count {
-        let (mut offset, mut n) = ([0u8; 8], [0u8; 8]);
-        if end - pos < ENTRY_HEADER_LEN {
-            return Err(bad("an entry runs past its end"));
-        }
-        file.seek(SeekFrom::Start(pos)).map_err(rd)?;
-        file.read_exact(&mut offset).map_err(rd)?;
-        file.read_exact(&mut n).map_err(rd)?;
-        pos += ENTRY_HEADER_LEN;
-        let (offset, n) = (u64::from_le_bytes(offset), u64::from_le_bytes(n));
-        if n > end - pos || offset.checked_add(n).is_none_or(|e| e > image_len) {
-            return Err(bad("an entry runs past its end or the image's"));
-        }
-        entries.push((offset, n, pos));
-        pos += n;
-    }
-    if pos != end {
-        return Err(bad("bytes left after its last entry"));
     }
     // Pass 2: the old bytes back.
     let mut buf = Vec::new();
@@ -881,6 +901,16 @@ mod tests {
         std::fs::write(&journal, &whole).unwrap();
         assert_eq!(recover(&path, Syncs::STD).unwrap(), Recovery::Restored);
         assert_restored(&path, &original, &writes);
+    }
+
+    #[test]
+    fn truncated_journal_is_discarded_without_image() {
+        let (_tmp, path, _) = image();
+        let journal = journal_path(&path);
+        std::fs::write(&journal, &MAGIC[..5]).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(recover(&path, Syncs::STD).unwrap(), Recovery::Discarded);
+        assert!(!journal.exists());
     }
 
     #[test]

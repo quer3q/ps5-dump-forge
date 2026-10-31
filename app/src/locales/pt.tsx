@@ -412,6 +412,9 @@ const pt: Messages = {
     inStep: (time) => `${time} nesta etapa`,
     result: (bytes, n) => `${bytes}, ${num(n)} ${plural(n, FILES)} →`,
     outputPath: "Caminho da saída",
+    sourceDeleted: (v) => `Origem excluída: ${v}`,
+    sourceKept: (v) => `Origem mantida: ${v}`,
+    sourcePartlyDeleted: (v) => `Origem excluída em parte: ${v}`,
     checks: "Verificações",
     verifiedPlain: (n) =>
       `Verificado: ${num(n)} ${plural(n, { one: "verificação aprovada", many: "verificações aprovadas", other: "verificações aprovadas" })}`,
@@ -555,9 +558,8 @@ const pt: Messages = {
           ? "Grava os pacotes zstd de volta como arquivos comuns."
           : "Empacota os assets do jogo em volumes zstd."
         : packed
-          ? "Experimental. Grava os pacotes LZ4 de volta como arquivos comuns."
-          : "Experimental: alguns jogos podem não iniciar. Empacota os assets do jogo em volumes LZ4.",
-    chooseGame: "Escolha um jogo primeiro.",
+          ? "Grava os pacotes LZ4 de volta como arquivos comuns."
+          : "Alguns jogos podem não iniciar. Empacota os assets do jogo em volumes LZ4.",
     noAmprGame: (e) => `Este jogo não usa AMPR, então os pacotes ${e === "zstd" ? "zstd" : "LZ4"} não podem ser usados.`,
     patch: "Um pacote de patch não pode ser empacotado.",
     additionalContent: "Conteúdo adicional (sem eboot.bin) não pode ser empacotado.",
@@ -602,8 +604,6 @@ const pt: Messages = {
     already: (a, fmt) => <>
       Este jogo já está sendo gravado como <b>{fmt}</b>; clicar em {a === "pack" ? "“Empacotar”" : "“Desempacotar”"} de novo gera uma segunda cópia.
     </>,
-    emptyTitle: "Escolha um jogo que use AMPR",
-    experimental: "Experimental: guarde uma cópia do jogo original.",
     source: "Origem",
   },
   // PackHelp.tsx
@@ -621,7 +621,7 @@ const pt: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>Experimental</b>: alguns jogos podem não iniciar. Guarde uma cópia.</li>
+          <li><b>Alguns jogos podem não iniciar.</b> Guarde uma cópia.</li>
           <li>Empacota em volumes LZ4, numa pasta ou numa imagem: <b>Rápido</b> (LZ4), <b>Médio</b> (HC 9), <b>Máximo</b> (HC 12).</li>
           <li>Runtime: <b>ampr-emu-ng</b> (padrão) ou o <b>ampr_emu</b> original.</li>
           <li>Um jogo empacotado mostra <b>Desempacotar</b>.</li>
@@ -818,6 +818,7 @@ const pt: Messages = {
       },
     },
     innerFfpkg: { text: "O sistema de arquivos próprio do PS5 (UFS2)." },
+    innerExfat: { tone: "good", text: "Recomendado. A imagem mais estável dentro de um contêiner compactado." },
     level0: { text: "Sem compressão: cada bloco é armazenado como está. O arquivo fica do tamanho da imagem." },
     levelDefault: {
       tone: "good",
@@ -856,6 +857,9 @@ const pt: Messages = {
     compression: "Compressão",
     fullVerify: "Verificação completa",
     fullVerifyHint: "Relê cada byte para verificar a saída. Demora mais.",
+    deleteSource: "Excluir a origem",
+    deleteSourceHint: "Não dá para desfazer. A origem só é excluída depois de uma conversão bem-sucedida.",
+    deleteSourceNas: "Um jogo em um NAS não pode ser excluído daqui.",
     separator: "Um nome não pode conter separador de pastas; use “Alterar” para a pasta.",
     badName: "Um nome não pode ficar em branco, começar com ponto, terminar com ponto ou espaço, nem ter caracteres de controle.",
     tooLong: (bytes, max, folder) =>
@@ -1019,6 +1023,13 @@ const pt: Messages = {
       "“Transferência de arquivos” copia arquivos e pastas entre qualquer um deles. Um nome que já existe lá só é substituído depois que você confirmar.",
     ],
     helpSecurity: "Nada do que é enviado entre os dispositivos é criptografado: qualquer pessoa na sua rede pode ler. A senha salva de um NAS fica neste dispositivo sem criptografia. Use o Conectar só na sua rede de casa.",
+    helpSpeed: "“Teste de velocidade”, na linha de um dispositivo pareado ou nos detalhes dele, envia 128 MiB para ele e busca 128 MiB de volta, sem gravar nada no disco, e mostra a velocidade da rede em cada sentido.",
+    speedTest: "Teste de velocidade",
+    speedTestWith: (name) => `Teste de velocidade com ${name}`,
+    speedTesting: "Testando",
+    speedResult: (up, down) => `Envio ${up} MB/s · Recebimento ${down} MB/s`,
+    speedFailed: "O teste de velocidade falhou:",
+    speedNote: "Envia 128 MiB e busca 128 MiB de volta; nada é gravado no disco.",
     installTitle: "Dump Forge no PS5",
     ps5Address: "Endereço do PS5",
     install: "Instalar no PS5",

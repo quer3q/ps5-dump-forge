@@ -199,7 +199,7 @@ pub(crate) fn prepare(
     }
     files.push(SourceFile {
         path: RUNTIME.into(),
-        size: runtime::ZSTD.len() as u64,
+        size: runtime::zstd().len() as u64,
     });
     let rows: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
     let index = match ps5upload_fpkg::ampr_index::build(&rows, mtime) {
@@ -240,7 +240,7 @@ pub(crate) fn prepare(
         CHUNK_SIZE >> 10
     ));
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
-    generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::ZSTD));
+    generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::zstd()));
     generated.insert(INDEX.into(), Cow::Owned(index));
     let plan = Plan {
         files: packed,

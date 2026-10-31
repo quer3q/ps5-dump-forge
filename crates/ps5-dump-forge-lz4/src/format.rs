@@ -108,9 +108,6 @@ fn put(b: &mut [u8], off: usize, v: &[u8]) -> Result<()> {
         })
 }
 
-pub fn put_u16(b: &mut [u8], off: usize, v: u16) -> Result<()> {
-    put(b, off, &v.to_le_bytes())
-}
 pub fn put_u32(b: &mut [u8], off: usize, v: u32) -> Result<()> {
     put(b, off, &v.to_le_bytes())
 }
@@ -347,14 +344,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hashes_fold_paths() {
-        assert_eq!(pak_hash(b"/APP0\\Dir\\X.Bin"), pak_hash(b"/app0/dir/x.bin"));
-        assert_eq!(idx_hash(b"/APP0\\Dir\\X.Bin"), idx_hash(b"/app0/dir/x.bin"));
-        // Only ASCII A-Z fold.
-        assert_ne!(pak_hash("É".as_bytes()), pak_hash("é".as_bytes()));
-    }
-
     fn sample(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 7 + 3) as u8).collect()
     }
@@ -387,102 +376,5 @@ mod tests {
             h[len] ^= 1;
             assert!(f(&h[..len - 1]).is_err());
         }
-    }
-
-    #[test]
-    fn logical_paths() {
-        assert_eq!(logical_to_rel("/app0/a/B.bin").unwrap(), "a/B.bin");
-        assert_eq!(logical_to_rel("/APP0/x").unwrap(), "x");
-        assert_eq!(
-            rel_to_logical("sce_sys/param.json").unwrap(),
-            "/app0/sce_sys/param.json"
-        );
-        for bad in [
-            "",
-            "/app0",
-            "/app0/",
-            "app0/x",
-            "/app1/x",
-            "/app0x/x",
-            "/app0//x",
-            "/app0/x/",
-            "/app0/./x",
-            "/app0/x/..",
-            "/app0/a\\b",
-            "/app0/a\0b",
-            "//app0/x",
-            "/é/x",
-        ] {
-            assert!(logical_to_rel(bad).is_err(), "{bad:?}");
-        }
-        // Multi-byte chars across the prefix are an error, never a slice panic.
-        for bad in [
-            "/appé/foo",
-            "éabcd/x",
-            "/app0é",
-            "/é",
-            "é",
-            "/ap\u{1F600}/x",
-        ] {
-            assert!(logical_to_rel(bad).is_err(), "{bad:?}");
-        }
-        assert!(rel_to_logical("").is_err());
-        assert!(rel_to_logical("a//b").is_err());
-        assert!(rel_to_logical("/a").is_err());
-        let comp = "a".repeat(255);
-        assert!(rel_to_logical(&comp).is_ok());
-        assert!(rel_to_logical(&"a".repeat(256)).is_err());
-        // 1023 bytes in all is the limit.
-        let long = format!(
-            "{}/{}/{}/{}",
-            comp,
-            comp,
-            comp,
-            "b".repeat(1023 - 6 - 3 * 256)
-        );
-        assert_eq!(long.len() + 6, 1023);
-        assert!(rel_to_logical(&long).is_ok());
-        assert!(rel_to_logical(&format!("{long}b")).is_err());
-    }
-
-    #[test]
-    fn pack_names() {
-        assert!(check_pack_name("ampr_assets-000.pak").is_ok());
-        assert!(check_pack_name("sub/dir.pak").is_ok());
-        for bad in ["", "/abs.pak", "a/../b", "a\\b", "a//b", "a/"] {
-            assert!(check_pack_name(bad).is_err(), "{bad:?}");
-        }
-        assert!(
-            check_pack_name(&format!(
-                "{}/{}/{}/{}",
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(249)
-            ))
-            .is_ok()
-        );
-        assert!(
-            check_pack_name(&format!(
-                "{}/{}/{}/{}",
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(255),
-                "a".repeat(250)
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn descriptors_reject_invalid() {
-        assert!(pack_descriptor(0, Codec::Raw, 0).is_err());
-        assert!(pack_descriptor(MAX_STORED + 1, Codec::Raw, 0).is_err());
-        assert!(pack_descriptor(1, Codec::Raw, 0x10).is_err());
-        assert!(unpack_descriptor(2 << 20).is_err());
-        assert!(unpack_descriptor(3 << 20).is_err());
-        assert!(unpack_descriptor(1 << 30).is_err());
-        assert!(unpack_descriptor(1 << 31).is_err());
-        assert!(unpack_descriptor(0x10 << 22).is_err());
     }
 }

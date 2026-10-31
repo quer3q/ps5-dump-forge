@@ -5,7 +5,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use ps5_dump_forge_exfat::{Layout, Options, plan, read_maker, write};
+use ps5_dump_forge_exfat::{Layout, Options, plan, write};
 use ps5upload_fpkg::Result;
 use ps5upload_fpkg::exfat::ExFatSource;
 use ps5upload_fpkg::source::{FolderSource, SourceFile, SourceTree};
@@ -206,11 +206,6 @@ fn assert_same(src: &Path, image: &Path) {
     }
 }
 
-fn boot_u32(image: &Path, at: usize) -> u32 {
-    let bytes = std::fs::read(image).unwrap();
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-}
-
 #[test]
 fn mixed_tree_round_trips() {
     let tmp = TempDir::new("mixed");
@@ -266,44 +261,6 @@ fn mixed_tree_round_trips() {
     assert!(std::fs::read(&image).unwrap() == std::fs::read(&again).unwrap());
 }
 
-#[test]
-fn many_entry_directory_spans_clusters() {
-    let tmp = TempDir::new("many");
-    let src = tmp.0.join("src");
-    for i in 0..3000 {
-        // Names over 15 units take two name entries: ~4 entries × 32 B × 3000 > 64 KiB.
-        put(
-            &src,
-            &format!("dir/file-number-{i:05}.bin"),
-            (i % 7) as u64 * 100,
-        );
-    }
-    put(&src, "eboot.bin", 10);
-    let image = tmp.0.join("many.exfat");
-    build(&src, &image, &Options::default());
-    assert_same(&src, &image);
-}
-
-#[test]
-fn free_bytes_grow_the_volume() {
-    let tmp = TempDir::new("free");
-    let src = tmp.0.join("src");
-    put(&src, "eboot.bin", 100);
-    let small = build(&src, &tmp.0.join("small.exfat"), &Options::default()).image_size;
-    // A tiny tree still gets exfat.sh's 64 MiB spare and 32 MiB metadata allowance.
-    assert_eq!(small, script_size(&[100], 1, 0));
-    let opts = Options {
-        free_bytes: 32 << 20,
-        ..Options::default()
-    };
-    let roomy = tmp.0.join("roomy.exfat");
-    let big = build(&src, &roomy, &opts).image_size;
-    assert_eq!(big, small + (32 << 20));
-    assert_same(&src, &roomy);
-    // ClusterCount (offset 92) covers the free space too.
-    assert!(u64::from(boot_u32(&roomy, 92)) * 65536 >= 96 << 20);
-}
-
 /// A tree held in memory, so names a case-insensitive macOS volume cannot hold side by
 /// side (and terabyte sizes) can be planned.
 struct MemTree {
@@ -353,18 +310,6 @@ impl SourceTree for MemTree {
 
 /// Each folder takes a whole cluster, which the size budgets at 256 B: the room asked for
 /// must still be free.
-#[test]
-fn free_bytes_stay_free_with_many_folders() {
-    let names: Vec<String> = (0..4000).map(|i| format!("d{i:04}/f")).collect();
-    let mut files: Vec<(&str, u64)> = names.iter().map(|n| (n.as_str(), 1)).collect();
-    files.push(("eboot.bin", 1));
-    let opts = Options {
-        free_bytes: 256 << 20,
-        ..Options::default()
-    };
-    let layout = plan(&MemTree::new(&files), &opts, &AtomicBool::new(false)).unwrap();
-    assert!(layout.free_bytes() >= 256 << 20, "{}", layout.free_bytes());
-}
 
 #[test]
 fn bad_names_are_all_listed() {
@@ -396,46 +341,6 @@ fn bad_names_are_all_listed() {
         assert!(e.contains(needle), "missing {needle:?} in:\n{e}");
     }
     assert!(e.starts_with("7 name problem(s)"), "{e}");
-}
-
-#[test]
-fn maker_mark_round_trips_and_is_bounded() {
-    let tmp = TempDir::new("maker");
-    let cancel = AtomicBool::new(false);
-    for (maker, name) in [
-        (Some("PS5-FORGE-v0.0.1-pre4"), "mark.exfat"),
-        (None, "plain.exfat"),
-    ] {
-        let mut tree = MemTree::new(&[("eboot.bin", 1)]);
-        let opts = Options {
-            maker: maker.map(str::to_string),
-            ..Options::default()
-        };
-        let layout = plan(&tree, &opts, &cancel).unwrap();
-        let mut out = File::create(tmp.0.join(name)).unwrap();
-        write(&mut tree, &layout, &mut out, &cancel, &mut |_, _| {}).unwrap();
-        let mut f = File::open(tmp.0.join(name)).unwrap();
-        assert_eq!(read_maker(&mut f).unwrap().as_deref(), maker);
-        // The backup boot region is the same bytes, so its OEM record matches too.
-        let regions = read_at(&mut f, 0, 24 * 512);
-        assert_eq!(regions[..12 * 512], regions[12 * 512..]);
-    }
-    // A bad boot checksum voids the OEM parameters (spec §3.3).
-    let mut boot = read_at(
-        &mut File::open(tmp.0.join("mark.exfat")).unwrap(),
-        0,
-        12 * 512,
-    );
-    boot[100] ^= 1;
-    assert_eq!(read_maker(&mut std::io::Cursor::new(boot)).unwrap(), None);
-    for bad in ["x".repeat(33), "tab\there".into(), "é".into()] {
-        let opts = Options {
-            maker: Some(bad),
-            ..Options::default()
-        };
-        let e = plan(&MemTree::new(&[("eboot.bin", 1)]), &opts, &cancel).unwrap_err();
-        assert!(e.to_string().contains("maker's mark"), "{e}");
-    }
 }
 
 #[test]

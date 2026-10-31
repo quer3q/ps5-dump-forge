@@ -115,6 +115,10 @@ export interface ConvertRequest {
   /** Set: an install job (the PS5 only): this `.pkg` (here, on a peer or a NAS) is handed to the
    * PS5's installer, which fetches it from the job. `source`, `output` and `format` are ignored. */
   install?: string;
+  /** A conversion or a pack/unpack only: once the job is Ok (output verified and in place),
+   * delete the source as Delete would; its `checks` then say `source deleted: <path>` or
+   * `source kept: <reason>` (the job stays Ok). */
+  delete_source?: boolean;
 }
 
 /** How the output was verified. `samples` and `seed` are 0 for full. */
@@ -386,6 +390,14 @@ export interface PackageEntry {
   has_cover: boolean;
 }
 
+/** A Connect speed test's result (`connect.speedTest`): each direction's bytes per second over
+ * `bytes` (sent, then fetched). */
+export interface SpeedTest {
+  up_bytes_per_s: number;
+  down_bytes_per_s: number;
+  bytes: number;
+}
+
 export interface PackageScan {
   entries: PackageEntry[];
   truncated: boolean;
@@ -580,6 +592,12 @@ export const connect = {
   /** Asks the paired PS5 `keyId` to install the `.pkg` at `path` on this device (it reads the
    * file over FLINK; the job shows here mirrored); the PS5's job id. */
   install: (keyId: string, path: string) => transport.connectInstall(keyId, path),
+  /** Times the link to the paired device `keyId`: 256 MiB sent, then fetched, nothing on disk
+   * (several seconds; rejects with the backend's text, e.g. an older peer's). */
+  speedTest: (keyId: string, run: string) => transport.connectSpeedTest(keyId, run),
+  /** Stops the speed test `run` with `keyId` (its `speedTest` rejects with "cancelled", at once
+   * when it starts after this). */
+  speedTestCancel: (keyId: string, run: string) => transport.connectSpeedTestCancel(keyId, run),
   /** http build: a browser file into the server's folder `dir`; its path. */
   upload: transport.connectUpload,
   /** http build: the URL that downloads the server's file; the app: null. */

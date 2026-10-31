@@ -51,10 +51,10 @@ export function Lead({ note }: { note: Note }) {
 /** The image a `.ffpfsc` holds, in picker order. */
 const INNER_FORMATS: InnerFormat[] = ["exfat", "ffpkg", "ffpfs"];
 
-/** One line under the inner-image picker: the format's own line, less what a `.ffpfsc` (always
- * mounted read-only) doesn't give. */
+/** One line under the inner-image picker: exfat (the UI's default) recommended, ffpkg its own line
+ * less what a `.ffpfsc` (always mounted read-only) doesn't give, ffpfs its format line. */
 function innerInfo(f: InnerFormat, t: Messages["target"]): Note {
-  return f === "ffpkg" ? t.innerFfpkg : t.format[f];
+  return f === "exfat" ? t.innerExfat : f === "ffpkg" ? t.innerFfpkg : t.format[f];
 }
 
 /** The `.ffpfsc` zlib level a new window starts on. */
@@ -188,6 +188,40 @@ export function VerifySwitch(props: {
           <span className="muted hint">{t.fullVerifyHint}</span>
         </span>
       </label>
+    </div>
+  );
+}
+
+/** Delete the source once the job is Ok (output verified and in place); off by default, in memory
+ * only. `nas`: a NAS's game can't be deleted from here, so the switch is off with the reason. */
+export function DeleteSourceSwitch(props: {
+  checked: boolean;
+  onChange: (on: boolean) => void;
+  nas: boolean;
+}) {
+  const t = useMessages().target;
+  return (
+    <div className="field verify delete-source">
+      <label className="switch">
+        <input
+          type="checkbox"
+          className="visually-hidden"
+          checked={props.checked && !props.nas}
+          disabled={props.nas}
+          onChange={(e) => props.onChange(e.target.checked)}
+        />
+        <span className="switch-track" aria-hidden="true" />
+        <span>
+          {t.deleteSource}
+          {!props.nas && <span className="muted hint">{t.deleteSourceHint}</span>}
+        </span>
+      </label>
+      {props.nas && (
+        <p className="note-line warn">
+          <Icon name="warn" />
+          <span>{t.deleteSourceNas}</span>
+        </p>
+      )}
     </div>
   );
 }

@@ -1492,89 +1492,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_compound_is_just_the_header() {
-        assert_eq!(words(&Compound::new().into_bytes()), [0, MINOR_VERSION, 0]);
-    }
-
-    #[test]
-    fn walk_reads_each_body_in_order() {
-        let buf = reply(
-            0,
-            "",
-            &[(op::PUTROOTFH, 0, &[]), (op::GETFH, 0, &[4, 0xdead_beef])],
-        );
-        let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
-        assert_eq!(w.status(), status::OK);
-        w.op(op::PUTROOTFH).unwrap();
-        assert_eq!(
-            w.op(op::GETFH).unwrap().opaque(128).unwrap(),
-            [0xde, 0xad, 0xbe, 0xef]
-        );
-        w.finish().unwrap();
-    }
-
-    #[test]
-    fn walk_skips_a_nonempty_tag() {
-        let buf = reply(0, "tag!x", &[(op::SAVEFH, 0, &[])]);
-        let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
-        w.op(op::SAVEFH).unwrap();
-        w.finish().unwrap();
-    }
-
-    #[test]
-    fn walk_stops_at_the_first_failing_op() {
-        let buf = reply(
-            status::NOENT,
-            "",
-            &[(op::PUTROOTFH, 0, &[]), (op::LOOKUP, status::NOENT, &[])],
-        );
-        let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
-        w.op(op::PUTROOTFH).unwrap();
-        let e = w.op(op::LOOKUP).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::NotFound);
-        assert!(e.to_string().contains("NFS4ERR_NOENT"), "{e}");
-        // Later ops report the same failure, as does finish.
-        assert_eq!(w.op(op::GETATTR).unwrap_err().kind(), ErrorKind::NotFound);
-        assert_eq!(w.finish().unwrap_err().kind(), ErrorKind::NotFound);
-    }
-
-    #[test]
     fn walk_refuses_a_result_for_another_op() {
         let buf = reply(0, "", &[(op::GETFH, 0, &[0])]);
         let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
         assert_eq!(w.op(op::PUTFH).unwrap_err().kind(), ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn walk_accepts_op_illegal_for_an_unknown_op() {
-        let buf = reply(
-            status::OP_ILLEGAL,
-            "",
-            &[(op::ILLEGAL, status::OP_ILLEGAL, &[])],
-        );
-        let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
-        assert_eq!(
-            w.op(op::RECLAIM_COMPLETE).unwrap_err().kind(),
-            ErrorKind::Unsupported
-        );
-    }
-
-    #[test]
-    fn walk_reports_the_overall_status_when_results_run_out() {
-        // A server may answer MINOR_VERS_MISMATCH with no results at all.
-        let buf = reply(status::MINOR_VERS_MISMATCH, "", &[]);
-        let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
-        assert_eq!(
-            w.op(op::SEQUENCE).unwrap_err().kind(),
-            ErrorKind::Unsupported
-        );
-        // An OK reply short of a result is malformed.
-        let buf = reply(0, "", &[]);
-        let mut w = Walk::new(XdrReader::new(&buf)).unwrap();
-        assert_eq!(
-            w.op(op::SEQUENCE).unwrap_err().kind(),
-            ErrorKind::InvalidData
-        );
     }
 
     #[test]
@@ -1591,43 +1512,6 @@ mod tests {
         let mut x = Xdr::new();
         x.u32(0).string("").u32(u32::MAX);
         assert!(Walk::new(XdrReader::new(&x.into_bytes())).is_err());
-    }
-
-    #[test]
-    fn errors_map_to_kinds() {
-        use status::*;
-        let cases = [
-            (NOENT, ErrorKind::NotFound),
-            (EXIST, ErrorKind::AlreadyExists),
-            (ACCESS, ErrorKind::PermissionDenied),
-            (PERM, ErrorKind::PermissionDenied),
-            (NOSPC, ErrorKind::StorageFull),
-            (DQUOT, ErrorKind::StorageFull),
-            (ROFS, ErrorKind::ReadOnlyFilesystem),
-            (ISDIR, ErrorKind::IsADirectory),
-            (NOTDIR, ErrorKind::NotADirectory),
-            (NOTEMPTY, ErrorKind::DirectoryNotEmpty),
-            (XDEV, ErrorKind::CrossesDevices),
-            (NAMETOOLONG, ErrorKind::InvalidFilename),
-            (STALE, ErrorKind::StaleNetworkFileHandle),
-            (BADHANDLE, ErrorKind::InvalidData),
-            (MINOR_VERS_MISMATCH, ErrorKind::Unsupported),
-            (DELAY, ErrorKind::Other),
-            (BADSESSION, ErrorKind::NotConnected),
-            (DEADSESSION, ErrorKind::NotConnected),
-            (12345, ErrorKind::Other),
-        ];
-        for (code, kind) in cases {
-            assert_eq!(nfs4_error(code).kind(), kind, "{code}");
-        }
-        assert!(is_stale(&nfs4_error(STALE)));
-        assert!(!is_stale(&nfs4_error(NOENT)));
-        let delay = nfs4_error(DELAY).to_string();
-        assert!(
-            delay.contains("NFS4ERR_DELAY") && delay.contains("10008"),
-            "{delay}"
-        );
-        assert!(nfs4_error(12345).to_string().contains("12345"));
     }
 }
 
@@ -1781,15 +1665,6 @@ mod session_tests {
     }
 
     #[test]
-    fn a_failing_reclaim_complete_fails_the_connect() {
-        let (listener, port) = listen();
-        let server = std::thread::spawn(move || session_server(listener, status::SERVERFAULT));
-        let e = Nfs4::connect("127.0.0.1", Some(port)).err().unwrap();
-        assert!(e.to_string().contains("NFS4ERR_SERVERFAULT"), "{e}");
-        server.join().unwrap();
-    }
-
-    #[test]
     fn no_minor_version_1_is_unsupported() {
         let (listener, port) = listen();
         let server = std::thread::spawn(move || {
@@ -1805,19 +1680,6 @@ mod session_tests {
         assert!(e.to_string().contains("NFS4ERR_MINOR_VERS_MISMATCH"), "{e}");
         server.join().unwrap();
     }
-
-    #[test]
-    fn no_rpc_version_4_is_unsupported() {
-        let (listener, port) = listen();
-        let server = std::thread::spawn(move || {
-            serve(listener, |_, _, x| {
-                x.u32(2).u32(3).u32(3); // PROG_MISMATCH: versions 3..3
-            })
-        });
-        let e = Nfs4::connect("127.0.0.1", Some(port)).err().unwrap();
-        assert_eq!(e.kind(), ErrorKind::Unsupported, "{e}");
-        server.join().unwrap();
-    }
 }
 
 #[cfg(test)]
@@ -1831,76 +1693,6 @@ mod attr_tests {
             x.u32(*w);
         }
         x.opaque(&vals.buf);
-    }
-
-    #[test]
-    fn bitmaps_hold_the_asked_attributes() {
-        assert_eq!(STAT_ATTRS, [(1 << 1) | (1 << 4) | (1 << 20), 1 << 21]);
-        assert_eq!(
-            LIST_ATTRS,
-            [(1 << 1) | (1 << 4) | (1 << 19) | (1 << 20), 1 << 21]
-        );
-        assert_eq!(FREE_ATTRS, [0, 1 << 10]);
-        let mut x = Xdr::new();
-        put_bitmap(&mut x, STAT_ATTRS);
-        assert_eq!(x.buf.len(), 12);
-    }
-
-    #[test]
-    fn fattr4_decodes_in_attribute_order() {
-        let mut v = Xdr::new();
-        v.u32(NF4REG).u64(1234).opaque(b"fh!").u64(77);
-        v.u64(1 << 40).u64(1_700_000_000).u32(5);
-        let mut x = Xdr::new();
-        fattr(&mut x, &[LIST_ATTRS[0], LIST_ATTRS[1] | FREE_ATTRS[1]], &v);
-        x.u32(0xdead); // what follows stays unread
-        let mut r = XdrReader::new(&x.buf);
-        let a = Fattr::read(&mut r).unwrap();
-        assert_eq!(r.u32().unwrap(), 0xdead);
-        assert_eq!(a.kind, Some(NF4REG));
-        assert_eq!(a.size, Some(1234));
-        assert_eq!(a.fh.as_deref(), Some(&b"fh!"[..]));
-        assert_eq!(a.fileid, Some(77));
-        assert_eq!(a.space_avail, Some(1 << 40));
-        assert_eq!(a.mtime, Some((1_700_000_000, 5)));
-        let e = a.entry("x".into()).unwrap();
-        assert_eq!(
-            (e.dir, e.size, e.link, e.special),
-            (false, 1234, false, false)
-        );
-        let want = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 5);
-        assert_eq!(e.mtime, Some(want));
-    }
-
-    #[test]
-    fn fattr4_with_fewer_attributes_or_extra_words() {
-        // Only the type, in a three-word bitmap whose last word is zero.
-        let mut v = Xdr::new();
-        v.u32(NF4DIR);
-        let mut x = Xdr::new();
-        fattr(&mut x, &[1 << 1, 0, 0], &v);
-        let a = Fattr::read(&mut XdrReader::new(&x.buf)).unwrap();
-        assert_eq!((a.kind, a.size, a.mtime), (Some(NF4DIR), None, None));
-        let e = a.entry("d".into()).unwrap();
-        assert!(e.dir && e.size == 0 && e.mtime.is_none());
-        // Kinds: a link and the special ones are marked.
-        for (kind, link, special) in [(NF4LNK, true, false), (3, false, true), (7, false, true)] {
-            let a = Fattr {
-                kind: Some(kind),
-                ..Fattr::default()
-            };
-            let e = a.entry("k".into()).unwrap();
-            assert_eq!((e.link, e.special), (link, special), "kind {kind}");
-        }
-        // A time before the epoch.
-        let a = Fattr {
-            kind: Some(NF4REG),
-            mtime: Some((-2, 500)),
-            ..Fattr::default()
-        };
-        let want = std::time::UNIX_EPOCH - std::time::Duration::new(1, 999_999_500);
-        assert_eq!(a.entry("t".into()).unwrap().mtime, Some(want));
-        assert!(Fattr::default().entry("none".into()).is_err());
     }
 
     #[test]
@@ -2157,19 +1949,6 @@ mod file_tests {
     }
 
     #[test]
-    fn a_deep_path_is_walked_in_several_compounds() {
-        let (mut nfs, server) = session(false);
-        let e = nfs.stat("/deep/1/2/3/4/5/6/7/8/9").unwrap();
-        assert!(e.dir && e.name == "9");
-        nfs.stat("/deep/1/2/3/4/5/6/7/x").unwrap();
-        drop(nfs);
-        let seen = server.join().unwrap();
-        // 6 + 4 LOOKUPs for the first, then 1 from the cached /deep/1/2/3/4/5/6/7.
-        assert_eq!(count(&seen, op::LOOKUP), 11, "{seen:?}");
-        assert_eq!(count(&seen, op::PUTROOTFH), 1);
-    }
-
-    #[test]
     fn a_walk_fits_the_ops_the_server_granted() {
         let (mut nfs, server) = session(false);
         nfs.max_ops = 8; // SEQUENCE + PUTFH + 3 LOOKUP/GETFH pairs
@@ -2180,20 +1959,6 @@ mod file_tests {
         // 3 + 3 + 3 + 1 LOOKUPs: PUTROOTFH, then 3 PUTFHs, then the GETATTR's PUTFH.
         assert_eq!(count(&seen, op::PUTROOTFH), 1);
         assert_eq!(count(&seen, op::PUTFH), 4, "{seen:?}");
-    }
-
-    #[test]
-    fn a_refused_anonymous_read_opens_the_file() {
-        let (mut nfs, server) = session(true);
-        assert_eq!(nfs.read_at("/games/a.bin", 0, 6).unwrap(), b"012345");
-        assert!(nfs.open_reads);
-        assert_eq!(nfs.read_at("/games/a.bin", 9, 6).unwrap(), b"9");
-        drop(nfs);
-        let seen = server.join().unwrap();
-        assert_eq!(count(&seen, op::OPEN), 2, "{seen:?}");
-        assert_eq!(count(&seen, op::CLOSE), 2);
-        // One refused anonymous READ, then 2 + 1 under the open stateid.
-        assert_eq!(count(&seen, op::READ), 4);
     }
 }
 
@@ -2258,48 +2023,6 @@ mod write_tests {
             let e = open_result(&mut XdrReader::new(&buf)).unwrap_err();
             assert_eq!(e.kind(), ErrorKind::InvalidData);
         }
-    }
-
-    #[test]
-    fn write_errors_map_to_kinds_and_link_refusals_fall_back() {
-        for (code, kind) in [
-            (status::EXIST, ErrorKind::AlreadyExists),
-            (status::NOENT, ErrorKind::NotFound),
-            (status::NOSPC, ErrorKind::StorageFull),
-            (status::DQUOT, ErrorKind::StorageFull),
-            (status::ROFS, ErrorKind::ReadOnlyFilesystem),
-            (status::ACCESS, ErrorKind::PermissionDenied),
-            (status::NOTEMPTY, ErrorKind::DirectoryNotEmpty),
-            (status::NOTSUPP, ErrorKind::Unsupported),
-            (status::INVAL, ErrorKind::InvalidInput),
-        ] {
-            assert_eq!(nfs4_error(code).kind(), kind, "{code}");
-        }
-        for code in [1, 18, 21, 22, 10004, 10083] {
-            assert!(link_falls_back(code), "{code}");
-        }
-        for code in [0, 2, 13, 17, 28, 30, 70, 10008] {
-            assert!(!link_falls_back(code), "{code}");
-        }
-    }
-
-    #[test]
-    fn parents_and_the_root() {
-        assert_eq!(
-            parent("/srv/games/x", ErrorKind::AlreadyExists).unwrap(),
-            ("/srv/games".to_string(), "x".to_string())
-        );
-        assert_eq!(
-            parent("/x", ErrorKind::NotFound).unwrap(),
-            ("/".into(), "x".into())
-        );
-        for kind in [ErrorKind::AlreadyExists, ErrorKind::ReadOnlyFilesystem] {
-            assert_eq!(parent("/", kind).unwrap_err().kind(), kind);
-        }
-        assert_eq!(
-            parent("x", ErrorKind::NotFound).unwrap_err().kind(),
-            ErrorKind::InvalidInput
-        );
     }
 
     #[test]

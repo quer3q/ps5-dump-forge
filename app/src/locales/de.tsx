@@ -396,6 +396,9 @@ const de: Messages = {
     inStep: (time) => `${time} in diesem Schritt`,
     result: (bytes, n) => `${bytes}, ${num(n)} ${plural(n, FILES)} →`,
     outputPath: "Ausgabepfad",
+    sourceDeleted: (v) => `Quelle gelöscht: ${v}`,
+    sourceKept: (v) => `Quelle behalten: ${v}`,
+    sourcePartlyDeleted: (v) => `Quelle teilweise gelöscht: ${v}`,
     checks: "Prüfungen",
     verifiedPlain: (n) => `Geprüft: ${num(n)} ${plural(n, CHECKS)} bestanden`,
     verifiedFull: (n) => `Vollständige Prüfung bestanden: ${num(n)} ${plural(n, CHECKS)}`,
@@ -537,9 +540,8 @@ const de: Messages = {
           ? "Schreibt die zstd-Pakete als normale Dateien zurück."
           : "Packt die Assets des Spiels in zstd-Volumes."
         : packed
-          ? "Experimentell. Schreibt die LZ4-Pakete als normale Dateien zurück."
-          : "Experimentell: Manche Spiele starten eventuell nicht. Packt die Assets des Spiels in LZ4-Volumes.",
-    chooseGame: "Wählen Sie zuerst ein Spiel.",
+          ? "Schreibt die LZ4-Pakete als normale Dateien zurück."
+          : "Manche Spiele starten eventuell nicht. Packt die Assets des Spiels in LZ4-Volumes.",
     noAmprGame: (e) => `Dieses Spiel nutzt kein AMPR, daher sind ${e === "zstd" ? "zstd" : "LZ4"}-Pakete nicht nutzbar.`,
     patch: "Ein Patch-Paket lässt sich nicht packen.",
     additionalContent: "Zusatzinhalte (ohne eboot.bin) lassen sich nicht packen.",
@@ -590,8 +592,6 @@ const de: Messages = {
       : <>
         Dieses Spiel wird bereits als <b>{fmt}</b> geschrieben; erneutes Entpacken erzeugt eine zweite Kopie.
       </>,
-    emptyTitle: "Wählen Sie ein Spiel mit AMPR",
-    experimental: "Experimentell: Bewahren Sie eine Kopie des Originalspiels auf.",
     source: "Quelle",
   },
   // PackHelp.tsx
@@ -609,7 +609,7 @@ const de: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>Experimentell</b>: Manche Spiele starten eventuell nicht. Bewahren Sie eine Kopie auf.</li>
+          <li><b>Manche Spiele starten eventuell nicht.</b> Bewahren Sie eine Kopie auf.</li>
           <li>Packt in LZ4-Volumes, in einen Ordner oder ein Image: <b>Schnell</b> (LZ4), <b>Mittel</b> (HC 9), <b>Maximal</b> (HC 12).</li>
           <li>Runtime: <b>ampr-emu-ng</b> (Standard) oder das Original-<b>ampr_emu</b>.</li>
           <li>Ein gepacktes Spiel zeigt <b>Entpacken</b>.</li>
@@ -809,6 +809,7 @@ const de: Messages = {
       },
     },
     innerFfpkg: { text: "Das eigene Dateisystem der PS5 (UFS2)." },
+    innerExfat: { tone: "good", text: "Empfohlen. Das stabilste Image in einem komprimierten Container." },
     level0: { text: "Keine Kompression: Jeder Block wird unverändert gespeichert. Die Datei ist so groß wie das Image." },
     levelDefault: {
       tone: "good",
@@ -847,6 +848,9 @@ const de: Messages = {
     compression: "Kompression",
     fullVerify: "Vollständige Prüfung",
     fullVerifyHint: "Liest jedes Byte erneut, um die Ausgabe zu prüfen. Dauert länger.",
+    deleteSource: "Quelle löschen",
+    deleteSourceHint: "Nicht rückgängig zu machen. Die Quelle wird erst nach einer erfolgreichen Konvertierung gelöscht.",
+    deleteSourceNas: "Ein Spiel auf einem NAS kann von hier aus nicht gelöscht werden.",
     separator: "Ein Name darf kein Ordnertrennzeichen enthalten; den Ordner ändern Sie mit „Ändern“.",
     badName: "Ein Name darf nicht leer sein, nicht mit einem Punkt beginnen, nicht auf Punkt oder Leerzeichen enden und keine Steuerzeichen enthalten.",
     tooLong: (bytes, max, folder) =>
@@ -1011,6 +1015,13 @@ const de: Messages = {
       "„Dateiübertragung“ kopiert Dateien und Ordner zwischen ihnen. Ein Name, der dort schon existiert, wird erst nach Ihrer Bestätigung ersetzt.",
     ],
     helpSecurity: "Nichts, was zwischen Geräten gesendet wird, ist verschlüsselt: Jeder in Ihrem Netzwerk kann es mitlesen. Ein gespeichertes NAS-Passwort liegt unverschlüsselt auf diesem Gerät. Nutzen Sie Verbinden nur im Heimnetz.",
+    helpSpeed: "„Geschwindigkeitstest“ in der Zeile eines gekoppelten Geräts oder in seinen Details sendet 128 MiB dorthin und holt 128 MiB zurück, ohne etwas auf die Festplatte zu schreiben, und zeigt die Netzwerkgeschwindigkeit in beide Richtungen.",
+    speedTest: "Geschwindigkeitstest",
+    speedTestWith: (name) => `Geschwindigkeitstest mit ${name}`,
+    speedTesting: "Wird getestet",
+    speedResult: (up, down) => `Upload ${up} MB/s · Download ${down} MB/s`,
+    speedFailed: "Geschwindigkeitstest fehlgeschlagen:",
+    speedNote: "Sendet 128 MiB und holt 128 MiB zurück; nichts wird auf die Festplatte geschrieben.",
     installTitle: "Dump Forge auf der PS5",
     ps5Address: "PS5-Adresse",
     install: "Auf der PS5 installieren",

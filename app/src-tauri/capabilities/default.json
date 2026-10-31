@@ -21,6 +21,7 @@
     "allow-move-path",
     "allow-list-dir",
     "allow-home-folder",
+    "allow-local-roots",
     "allow-reveal",
     "allow-open-repo",
     "allow-update-target",
@@ -43,6 +44,8 @@
     "allow-connect-cancel-job",
     "allow-connect-install",
     "allow-connect-payload-install",
-    "allow-connect-payload-send"
+    "allow-connect-payload-send",
+    "allow-connect-speed-test",
+    "allow-connect-speed-test-cancel"
   ]
 }

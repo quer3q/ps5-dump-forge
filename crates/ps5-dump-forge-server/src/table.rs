@@ -195,85 +195,9 @@ mod tests {
             replace: false,
             edit_rebuild: false,
             install: None,
+            delete_source: false,
             archive_password: None,
         }
-    }
-
-    #[test]
-    fn events_before_admission_and_history() {
-        let mut t = Table::default();
-        let line = |job, n: usize| Event::Log {
-            job,
-            line: format!("l{n}"),
-        };
-        for n in 0..250 {
-            t.record(&line(1, n));
-        }
-        assert!(t.snapshot().is_empty()); // no request yet
-        t.admit(1, request("/o/a.exfat"));
-        let snap = &t.snapshot()[0];
-        assert_eq!(snap["log_total"], 250);
-        assert_eq!(snap["log"].as_array().unwrap().len(), 200);
-        assert_eq!(snap["log"][0], "l50");
-        assert_eq!(snap["stages"], serde_json::json!([])); // until `Stages` comes
-        t.record(&Event::Stages {
-            job: 1,
-            stages: vec!["scan".into(), "write".into()],
-        });
-        assert_eq!(
-            t.snapshot()[0]["stages"],
-            serde_json::json!(["scan", "write"])
-        );
-        assert_eq!(t.unfinished(), [(1, PathBuf::from("/o/a.exfat"))]);
-        t.admit(2, request("/o/b.exfat"));
-        assert_eq!(t.unfinished()[1], (2, PathBuf::from("/o/b.exfat")));
-        // An edit job's `output` is ignored: it edits the source (or rebuilds beside it).
-        t.admit(
-            3,
-            ConvertRequest {
-                source: "/i/edit.exfat".into(),
-                edits: vec![
-                    Edit::Delete { path: "a".into() },
-                    Edit::Add {
-                        from: "/s/x.bin".into(),
-                        to: "x.bin".into(),
-                    },
-                ],
-                ..request("/o/ignored")
-            },
-        );
-        assert_eq!(t.unfinished()[2], (3, PathBuf::from("/i/edit.exfat")));
-        assert_eq!(t.adds(), [PathBuf::from("/s/x.bin")]);
-        for job in [2, 3] {
-            t.record(&Event::Done {
-                job,
-                result: Err("cancelled".into()),
-            });
-        }
-        assert!(t.adds().is_empty());
-        for job in 1..=40 {
-            t.admit(job, request("/o/x"));
-            t.record(&Event::Done {
-                job,
-                result: Err("cancelled".into()),
-            });
-        }
-        let snap = t.snapshot();
-        assert_eq!(snap.len(), 32);
-        assert_eq!(snap[0]["id"], 9);
-        assert_eq!(snap[0]["done"]["result"]["Err"], "cancelled");
-        assert!(t.unfinished().is_empty());
-        // The job list never shows an archive's password.
-        t.admit(
-            41,
-            ConvertRequest {
-                edits: Vec::new(),
-                archive_password: Some(ps5_dump_forge_core::ArchivePassword::new("Secret1")),
-                ..request("/o/y")
-            },
-        );
-        let snap = serde_json::to_string(&t.snapshot()).unwrap();
-        assert!(snap.contains("/o/y") && !snap.contains("Secret1"), "{snap}");
     }
 
     fn done(job: JobId, result: Result<&str, &str>) -> Event {

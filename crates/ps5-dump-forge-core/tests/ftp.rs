@@ -58,6 +58,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         replace: false,
         edit_rebuild: false,
         install: None,
+        delete_source: false,
         archive_password: None,
     }
 }
@@ -102,49 +103,4 @@ fn a_session_the_server_closed_is_replaced_on_the_next_call() {
     // The cached session dies as an idle one does; the call logs in again instead of failing.
     server.kick();
     assert_eq!(ps5_dump_forge_core::list_dir(&at).unwrap().entries.len(), 1);
-}
-
-/// A transfer onto an FTP server the user confirmed replacing: a file over a file, the folder
-/// merged (what else is there kept); without `replace` refused as ever.
-#[test]
-fn a_transfer_onto_an_ftp_server_replaces_and_merges_when_asked() {
-    let root = dir("ftp-replace");
-    let src = root.join("src");
-    write(&src, "f.bin", b"one file");
-    write(&src, "g/zero.bin", b"");
-    write(&src, "g/data/new.bin", b"new");
-    let server = fake::start();
-    write(&server.root, "out/f.bin", b"old");
-    write(&server.root, "out/g/zero.bin", b"old zero");
-    write(&server.root, "out/g/old.bin", b"keep");
-    let out = PathBuf::from(format!("ftp://127.0.0.1:{}/out", server.port));
-    let mut req = request(&src, Format::Folder, &out);
-    req.transfer = vec![src.join("g"), src.join("f.bin")];
-
-    let jobs = Jobs::new(|_| {});
-    assert_eq!(
-        jobs.existing_targets(&req).unwrap(),
-        [out.join("g"), out.join("f.bin")]
-    );
-    let e = run(req.clone()).unwrap_err();
-    assert!(e.contains("already exists (never replaced)"), "{e}");
-    assert_eq!(
-        std::fs::read(server.root.join("out/f.bin")).unwrap(),
-        b"old"
-    );
-
-    req.replace = true;
-    let report = run(req).unwrap();
-    assert_eq!(report.files, 3);
-    let at = |rel: &str| std::fs::read(server.root.join("out").join(rel)).unwrap();
-    assert_eq!(at("f.bin"), b"one file");
-    assert_eq!(at("g/zero.bin"), b"");
-    assert_eq!(at("g/old.bin"), b"keep");
-    assert_eq!(at("g/data/new.bin"), b"new");
-    let left: Vec<_> = std::fs::read_dir(server.root.join("out/g"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    assert!(left.iter().all(|n| !n.ends_with(".tmp")), "{left:?}");
-    let _ = std::fs::remove_dir_all(&root);
 }

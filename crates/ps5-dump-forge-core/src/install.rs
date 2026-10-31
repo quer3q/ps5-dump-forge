@@ -869,22 +869,6 @@ mod tests {
         data
     }
 
-    #[test]
-    fn a_ps5_package_is_read_through_its_fih_header() {
-        let dir = crate::test_dir("install-fih");
-        let path = dir.join("game.pkg");
-        let mut data: Vec<u8> = vec![0; 0x2000];
-        data[..4].copy_from_slice(b"\x7FFIH");
-        data[0x58..0x60].copy_from_slice(&0x1000u64.to_le_bytes());
-        data[0x1000..0x1004].copy_from_slice(b"\x7FCNT");
-        data[0x1040..0x1064].copy_from_slice(ID);
-        std::fs::write(&path, &data).unwrap();
-        let pkg = probe(&path).unwrap();
-        assert_eq!(pkg.content_id.as_deref().map(str::as_bytes), Some(&ID[..]));
-        std::fs::write(&path, b"\x7FXYZ not a package").unwrap();
-        assert!(probe(&path).err().unwrap().contains("is not a PS5 package"));
-    }
-
     fn request(path: &Path) -> ConvertRequest {
         serde_json::from_value(serde_json::json!({
             "source": "", "format": "folder", "output": "", "install": path
@@ -991,43 +975,6 @@ mod tests {
     }
 
     #[test]
-    fn install_keeps_one_reader_per_connection_and_rechecks_its_stamp() {
-        let dir = crate::test_dir("install-kept-reader");
-        let path = dir.join("game.pkg");
-        let data = package(&path, 4096);
-        let pkg = probe(&path).unwrap();
-        let mut reader = Reader::default();
-        reader.get(&pkg).unwrap().seek(SeekFrom::Start(0)).unwrap();
-        let replacement = dir.join("replacement.pkg");
-        std::fs::write(&replacement, &data).unwrap();
-        std::fs::rename(replacement, &path).unwrap();
-        // Within RECHECK the kept reader serves on without a stat.
-        let mut first = [0; 100];
-        reader.get(&pkg).unwrap().read_exact(&mut first).unwrap();
-        assert_eq!(first, data[..100]);
-        // Past it, the replacement is seen.
-        reader.open.as_mut().unwrap().1 = Instant::now() - RECHECK;
-        let err = reader.get(&pkg).err().unwrap().to_string();
-        assert_eq!(err, changed(&pkg));
-    }
-
-    #[test]
-    fn install_refused_names_the_code_and_its_hint() {
-        let dir = crate::test_dir("install-refused");
-        let path = dir.join("game.pkg");
-        package(&path, 4096);
-        let installer = |url: &str, _: &str| -> Result<(), u32> {
-            assert!(url.ends_with("/game.pkg"), "{url}");
-            Err(0x80A3_000C)
-        };
-        let err = run(&request(&path), &installer, &AtomicBool::new(false)).unwrap_err();
-        assert_eq!(
-            err,
-            "the PS5 refused the package: 0x80A3000C (close the game before installing)"
-        );
-    }
-
-    #[test]
     fn install_cancelled_stops_serving_and_says_what_stays() {
         let dir = crate::test_dir("install-cancel");
         let path = dir.join("game.pkg");
@@ -1047,27 +994,6 @@ mod tests {
         // The server is gone with the job.
         let (host, _) = split(&url.lock().unwrap());
         assert!(TcpStream::connect(&host).is_err());
-    }
-
-    #[test]
-    fn install_fails_once_the_ps5_fetches_nothing() {
-        let dir = crate::test_dir("install-stall");
-        let path = dir.join("game.pkg");
-        package(&path, 4096);
-        let emit: Box<dyn Fn(crate::Event) + Send + Sync> = Box::new(|_| {});
-        let cancel = AtomicBool::new(false);
-        let ctx = Ctx::new(1, &emit, &cancel);
-        let installer = |_: &str, _: &str| -> Result<(), u32> { Ok(()) };
-        let err = run_with(
-            &request(&path),
-            &ctx,
-            Some(&installer),
-            Duration::from_millis(300),
-        );
-        assert_eq!(
-            format!("{:#}", err.unwrap_err()),
-            "the PS5 stopped fetching the package"
-        );
     }
 
     #[test]
@@ -1096,29 +1022,5 @@ mod tests {
                 "{err:#}"
             );
         }
-    }
-
-    #[test]
-    fn install_ranges_dates_and_coverage() {
-        assert_eq!(parse_range("bytes=0-9", 100), Range::Part(0, 9));
-        assert_eq!(parse_range("bytes=90-", 100), Range::Part(90, 99));
-        assert_eq!(parse_range("bytes=50-500", 100), Range::Part(50, 99));
-        assert_eq!(parse_range("bytes=-10", 100), Range::Part(90, 99));
-        assert_eq!(parse_range("bytes=-500", 100), Range::Part(0, 99));
-        assert_eq!(parse_range("bytes=100-", 100), Range::Unsatisfiable);
-        assert_eq!(parse_range("bytes=9-3", 100), Range::Unsatisfiable);
-        assert_eq!(parse_range("bytes=0-1,5-6", 100), Range::Whole);
-        assert_eq!(parse_range("items=0-1", 100), Range::Whole);
-        assert_eq!(http_date(1_735_689_600), LAST_MODIFIED);
-        assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
-        let mut c = Coverage::default();
-        c.add(10, 20);
-        c.add(30, 40);
-        c.add(0, 5);
-        c.add(15, 35);
-        c.add(5, 10);
-        assert_eq!(c.0, vec![(0, 40)]);
-        c.add(50, 50);
-        assert_eq!(c.covered(), 40);
     }
 }

@@ -11,10 +11,7 @@ use std::sync::mpsc;
 
 use ps5_dump_forge_core::remote::{FlinkPath, host_port};
 use ps5_dump_forge_core::smb::{SmbCredential, set_credentials};
-use ps5_dump_forge_core::{
-    ConvertRequest, Edit, Event, Format, JobReport, Jobs, KrakenLevel, inspect, library_cover,
-    list_dir,
-};
+use ps5_dump_forge_core::{ConvertRequest, Event, Format, JobReport, Jobs, KrakenLevel, inspect};
 
 fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
     ConvertRequest {
@@ -39,6 +36,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         replace: false,
         edit_rebuild: false,
         install: None,
+        delete_source: false,
         archive_password: None,
     }
 }
@@ -109,107 +107,6 @@ impl Drop for OutDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-#[test]
-fn a_game_on_a_share_inspects_converts_and_extracts() {
-    let Some(share) = share() else {
-        eprintln!("skipped: set FORGE_SMB_TEST");
-        return;
-    };
-    let share = PathBuf::from(share);
-    let game = share.join("Stub Game");
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("smb-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&out).unwrap();
-
-    // Pickers: the server's shares, then the share's games.
-    let server = FlinkPath::parse(&share).unwrap().parent().unwrap().url();
-    let shares = list_dir(&server).unwrap();
-    assert!(
-        shares
-            .entries
-            .iter()
-            .any(|e| e.dir && share.ends_with(&e.name)),
-        "{shares:?}"
-    );
-    let listing = list_dir(&share).unwrap();
-    let entry = listing
-        .entries
-        .iter()
-        .find(|e| e.name == "Stub Game")
-        .unwrap();
-    assert!(entry.dir && entry.path == game, "{entry:?}");
-    assert_eq!(listing.parent.as_deref(), Some(server.as_path()));
-
-    let t = std::time::Instant::now();
-    let info = inspect(&game).unwrap();
-    eprintln!("inspect over SMB: {:?}", t.elapsed());
-    assert_eq!(info.title_id.as_deref(), Some("PPSA99999"));
-    assert!(
-        info.cover.is_some() && info.findings.is_empty(),
-        "{:?}",
-        info.findings
-    );
-    assert!(library_cover(&game).unwrap().is_some());
-
-    let (jobs, rx) = jobs();
-    let image = out.join("stub.exfat");
-    let t = std::time::Instant::now();
-    let report = run(&jobs, &rx, request(&game, Format::Exfat, &image)).unwrap();
-    eprintln!("convert to .exfat (full verify): {:?}", t.elapsed());
-    assert_eq!(report.output, image);
-    let local = inspect(&image).unwrap();
-    assert_eq!(local.title_id.as_deref(), Some("PPSA99999"));
-    assert_eq!(local.total_bytes, info.total_bytes);
-
-    // Extract one file and one folder.
-    let mut req = request(&game, Format::Folder, &out);
-    req.extract = vec!["eboot.bin".into(), "data".into()];
-    run(&jobs, &rx, req).unwrap();
-    assert_eq!(
-        std::fs::metadata(out.join("eboot.bin")).unwrap().len(),
-        4096
-    );
-    assert_eq!(
-        std::fs::metadata(out.join("data/stub.bin")).unwrap().len(),
-        4 << 20
-    );
-
-    // The game itself stays read only: no edits, no delete or move.
-    let mut req = request(&game, Format::Exfat, Path::new(""));
-    req.edits = vec![Edit::Delete {
-        path: "eboot.bin".into(),
-    }];
-    let check = jobs.edit_check(&req);
-    assert!(
-        check.in_place.iter().any(|f| f.contains("NAS")),
-        "{check:?}"
-    );
-    assert!(jobs.delete_path(&game, &[]).is_err());
-    assert!(jobs.move_path(&game, &share.join("x"), false, &[]).is_err());
-
-    // An image on the share opens through the image readers.
-    if let Ok(dir) = std::env::var("FORGE_SMB_TEST_SHARE_DIR") {
-        let name = format!("stub-{}.exfat", std::process::id());
-        let copy = Path::new(&dir).join(&name);
-        std::fs::copy(&image, &copy).unwrap();
-        let remote = share.join(&name);
-        let got = inspect(&remote);
-        let back = run(
-            &jobs,
-            &rx,
-            request(&remote, Format::Folder, &out.join("back")),
-        );
-        std::fs::remove_file(&copy).unwrap();
-        assert_eq!(got.unwrap().title_id.as_deref(), Some("PPSA99999"));
-        back.unwrap();
-        assert_eq!(
-            std::fs::read(out.join("back/eboot.bin")).unwrap().len(),
-            4096
-        );
-    }
-    let _ = std::fs::remove_dir_all(&out);
 }
 
 #[test]

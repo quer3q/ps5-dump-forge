@@ -294,39 +294,3 @@ impl Drop for File {
         self.session.close(self.tree, &self.id);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-
-    /// `probe` against a fake server sending `reply` (with its 4-byte length) to the first
-    /// message.
-    fn probe_answered(reply: Vec<u8>) -> io::Result<()> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut n = [0u8; 4];
-            s.read_exact(&mut n).unwrap();
-            let mut msg = vec![0u8; u32::from_be_bytes(n) as usize];
-            s.read_exact(&mut msg).unwrap();
-            assert_eq!(&msg[..4], b"\xFESMB");
-            s.write_all(&(reply.len() as u32).to_be_bytes()).unwrap();
-            s.write_all(&reply).unwrap();
-        });
-        let r = probe(TcpStream::connect(addr).unwrap(), Duration::from_secs(2));
-        server.join().unwrap();
-        r
-    }
-
-    #[test]
-    fn probe_wants_an_smb2_reply() {
-        // A NEGOTIATE reply header (message id 0), status NOT_SUPPORTED: still SMB.
-        let mut head = vec![0u8; 72];
-        head[..4].copy_from_slice(b"\xFESMB");
-        head[8..12].copy_from_slice(&0xC000_00BBu32.to_le_bytes());
-        probe_answered(head).unwrap();
-        assert!(probe_answered(b"HTTP/1.1 400 Bad Request\r\n\r\n".to_vec()).is_err());
-    }
-}

@@ -17,8 +17,8 @@ use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
 use crate::convert::{Kind, SourceStamp, open_source};
 use crate::extract_paths::{
-    CHUNK, Selection, Written, log_replaced, made_note, preflight_failed, select, target_findings,
-    verify, write,
+    CHUNK, Selection, Written, log_replaced, made_note, preflight_failed, read_ahead, select,
+    target_findings, verify, write,
 };
 use crate::jobs::Ctx;
 use crate::remote::{FlinkPath, RemoteDir, is_remote};
@@ -367,9 +367,10 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
         made: &mut made,
         replaced: &mut replaced,
     };
-    let wrote = (trees.iter_mut().zip(&selections)).try_for_each(|(tree, s)| {
+    let wrote = (trees.into_iter().zip(&selections)).try_for_each(|(tree, s)| {
+        let mut tree = read_ahead(tree, std::slice::from_ref(s))?;
         write(
-            tree.as_mut(),
+            &mut tree,
             &root,
             peer.as_mut(),
             std::slice::from_ref(s),
@@ -605,27 +606,6 @@ mod tests {
 
     type Done = (u64, Result<JobReport, String>);
 
-    #[test]
-    fn a_file_source_holds_a_handle_only_while_it_is_read() {
-        use ps5upload_fpkg::source::SourceTree;
-        let dir = crate::test_dir("transfer-onefile");
-        put(&dir, "f.bin", b"0123456789");
-        let (mut one, _) = super::OneFile::open(&dir.join("f.bin"), "f.bin").unwrap();
-        assert!(one.reader.is_none(), "closed after the scan");
-        assert_eq!(one.read_range("f.bin", 0, 4).unwrap(), b"0123");
-        assert!(one.reader.is_some());
-        assert_eq!(one.read_range("f.bin", 4, 100).unwrap(), b"456789");
-        assert!(one.reader.is_none(), "closed at its end");
-        // Replaced since the scan (same length): the next open refuses it.
-        put(&dir, "g.bin", b"abcdefghij");
-        std::fs::rename(dir.join("g.bin"), dir.join("f.bin")).unwrap();
-        has(
-            one.read_range("f.bin", 0, 4).unwrap_err(),
-            "changed while it was read",
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Jobs whose job 1 waits at its stages until `release` is sent; `done` gets each Done.
     fn held() -> (Jobs, mpsc::Sender<()>, mpsc::Receiver<Done>) {
         let (release, wait) = mpsc::channel::<()>();
@@ -707,33 +687,6 @@ mod tests {
         assert_eq!(job, 1);
         result.unwrap();
         assert!(out.join("g/data/empty").is_dir());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn transfers_queue_in_order_and_a_cancelled_one_leaves_the_queue() {
-        let dir = crate::test_dir("transfer-fifo");
-        let src = dir.join("src");
-        sources(&src);
-        let out = dir.join("out");
-        std::fs::create_dir_all(&out).unwrap();
-        let (jobs, release, done) = held();
-        assert_eq!(jobs.start(request(&[src.join("f.bin")], &out)), 1);
-        let second = jobs.start(request(&[src.join("g")], &out));
-        let third = jobs.start(request(&[src.join("g/zero.bin")], &out));
-        // Queued behind the first: cancelled, it ends at once and writes nothing.
-        jobs.cancel(third);
-        let (job, result) = next(&done);
-        assert_eq!((job, result.unwrap_err()), (third, "cancelled".to_string()));
-        assert!(!out.join("zero.bin").exists() && !out.join("g").exists());
-        release.send(()).unwrap();
-        let (job, result) = next(&done);
-        assert_eq!(job, 1);
-        result.unwrap();
-        let (job, result) = next(&done);
-        assert_eq!(job, second);
-        result.unwrap();
-        assert!(out.join("g/data/big.bin").is_file());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

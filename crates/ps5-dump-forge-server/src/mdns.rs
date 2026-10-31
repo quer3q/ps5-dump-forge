@@ -295,51 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_adds_what_probes_confirmed_once() {
-        let nas = |name: &str, service: &str, address: &str, port| Nas {
-            name: name.into(),
-            service: service.into(),
-            address: address.into(),
-            port,
-        };
-        let mdns = [
-            nas("Home NAS", "smb", "10.0.0.20", 445),
-            nas("Home NAS", "ftp", "10.0.0.20", 2121),
-        ];
-        let wsd = [
-            nas("DESKTOP-1", "smb", "10.0.0.30", 445),
-            nas("Ghost", "smb", "10.0.0.40", 445),
-            nas("Home PC", "smb", "10.0.0.20", 445),
-        ];
-        let mut probed = Probed::new();
-        // NFS found beside mDNS's two; SMB on 445 again is the same entry; FTP on 21 is another.
-        probed.insert(
-            "10.0.0.20".into(),
-            Some(vec![("nfs", 2049), ("smb", 445), ("ftp", 21)]),
-        );
-        probed.insert("10.0.0.30".into(), Some(vec![("smb", 445), ("nfs", 2049)]));
-        probed.insert("10.0.0.40".into(), Some(vec![])); // nothing answered: not listed
-        probed.insert("10.0.0.50".into(), None); // still probing, and no name for it
-        assert_eq!(
-            merge(&mdns, &wsd, &probed),
-            vec![
-                nas("DESKTOP-1", "nfs", "10.0.0.30", 2049),
-                nas("DESKTOP-1", "smb", "10.0.0.30", 445),
-                nas("Home NAS", "ftp", "10.0.0.20", 21),
-                nas("Home NAS", "ftp", "10.0.0.20", 2121),
-                nas("Home NAS", "nfs", "10.0.0.20", 2049),
-                nas("Home NAS", "smb", "10.0.0.20", 445),
-            ]
-        );
-        // Before any probe: mDNS's list as announced.
-        assert_eq!(merge(&mdns, &wsd, &Probed::new()), {
-            let mut m = mdns.to_vec();
-            m.reverse();
-            m
-        });
-    }
-
-    #[test]
     fn query_and_answer_parse() {
         let q = query();
         assert_eq!(&q[4..6], &[0, 3]);

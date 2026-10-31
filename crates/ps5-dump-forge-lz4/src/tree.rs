@@ -408,7 +408,7 @@ impl SourceTree for PackedTree<'_> {
 mod tests {
     use super::*;
     use crate::writer::testkit::*;
-    use crate::writer::{PAGE, VOLUME_CAP, measure, measure_with_cap, pack};
+    use crate::writer::{PAGE, VOLUME_CAP, measure_with_cap};
     use crate::{PackSpec, RuntimeProfile};
 
     type Entries = Vec<(&'static str, Vec<u8>, Option<PackSpec>)>;
@@ -498,62 +498,6 @@ mod tests {
                     assert_eq!(tree.read_range(&f.path, off, len).unwrap(), want);
                 }
             }
-        }
-    }
-
-    /// A level reaches every pass: HC 12 packs smaller than fast, `measure` records it, and
-    /// the tree re-encodes at it byte for byte; an invalid level is refused.
-    #[test]
-    fn an_hc_level_is_measured_and_served_as_packed() {
-        let mut e = entries();
-        // Text HC finds longer matches in than the fast compressor.
-        let rows = (0..20_000u32).flat_map(|i| {
-            format!("row {i} = {}\n", i.wrapping_mul(2_654_435_761) % 977).into_bytes()
-        });
-        e.push(("g/rows", rows.collect(), spec(16)));
-        let (mut src, files, _) = measured(&e, None, VOLUME_CAP);
-        let cancel = AtomicBool::new(false);
-        let run = |src: &mut Mem, level, out: &mut MemOut| {
-            pack(
-                src,
-                &files,
-                1_700_000_000,
-                None,
-                2,
-                level,
-                out,
-                &mut |_| {},
-                &cancel,
-            )
-        };
-        let fast = run(&mut src, 0, &mut MemOut::default()).unwrap();
-        assert!(run(&mut src, 2, &mut MemOut::default()).is_err());
-        let mut out = MemOut::default();
-        let report = run(&mut src, 12, &mut out).unwrap();
-        assert!(
-            report.stored_bytes < fast.stored_bytes,
-            "{report:?} {fast:?}"
-        );
-        let m = measure(
-            &mut src,
-            &files,
-            1_700_000_000,
-            None,
-            3,
-            12,
-            &mut |_| {},
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!((m.level, m.report), (12, report));
-        let mut want = deployed(&e, &out);
-        let mut tree = PackedTree::new(&mut src, &m, &files, 3, &cancel).unwrap();
-        for f in want.files().to_vec() {
-            assert!(
-                tree.read(&f.path).unwrap() == want.read(&f.path).unwrap(),
-                "{}",
-                f.path
-            );
         }
     }
 

@@ -24,6 +24,7 @@ import {
 } from "./http-client";
 import { setServerSeparator } from "./paths";
 import { picker, type SavedDevices } from "./Picker";
+import type { SpeedTest } from "./api";
 import type { DropEvent, DropItem, Transport, Unlisten } from "./transport";
 
 const { pick, pickFiles } = picker({
@@ -111,4 +112,7 @@ export const transport: Transport = {
   connectDownloadUrl,
   packageScan: () => call("package_scan", {}),
   connectInstall: (keyId, path) => connectCall<{ job: number }>("install", { key_id: keyId, path }).then((r) => r.job),
+  connectSpeedTest: (keyId, run) => connectCall<SpeedTest>("speed_test", { key_id: keyId, run }),
+  connectSpeedTestCancel: (keyId, run) =>
+    connectCall<null>("speed_test_cancel", { key_id: keyId, run }).then(() => undefined),
 };

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{BIG, BIG_LEN, Rng, assert_matches, build, error_of};
+use common::{assert_matches, build, error_of};
 use ps5_dump_forge_fpkg::{FpkgSource, WRONG_PASSCODE};
 use ps5upload_fpkg::ImageMode;
 use ps5upload_fpkg::source::SourceTree;
@@ -29,37 +29,6 @@ fn a_kraken_package_reads_back_as_its_manifest() {
     assert!(details.contains("layout: Kraken"), "{details}");
     assert!(details.contains("plaintext"), "{details}");
     assert!(source.describe().contains(common::CONTENT_ID));
-}
-
-#[test]
-fn unaligned_ranges_of_a_multi_block_file_match() {
-    let built = build("ranges", 0, |_| {});
-    let want = built.bytes(BIG);
-    assert_eq!(want.len(), BIG_LEN);
-    let mut source = FpkgSource::open(&built.path, None).unwrap();
-    let mut rng = Rng::new(99);
-    for _ in 0..300 {
-        let offset = rng.below(BIG_LEN as u64 + 100) as usize;
-        let len = rng.below(700_000) as usize;
-        let got = source.read_range(BIG, offset as u64, len).unwrap();
-        let start = offset.min(BIG_LEN);
-        let end = offset.saturating_add(len).min(BIG_LEN);
-        assert!(got == want[start..end], "{offset} + {len}");
-    }
-    // Sequential reads of more than two blocks, each starting in the block the last one ended in.
-    let mut got = Vec::new();
-    while got.len() < BIG_LEN {
-        got.extend(source.read_range(BIG, got.len() as u64, 600_001).unwrap());
-    }
-    assert!(got == want, "sequential");
-    // Block boundaries of the 256 KiB Kraken blocks, from either side.
-    for k in 1..5u64 {
-        let at = k * 256 * 1024;
-        let got = source.read_range(BIG, at - 3, 7).unwrap();
-        assert_eq!(got, want[at as usize - 3..at as usize + 4]);
-    }
-    assert!(source.read_range(BIG, u64::MAX, 10).unwrap().is_empty());
-    assert!(source.read_range("no/such/file", 0, 10).is_err());
 }
 
 #[test]

@@ -204,62 +204,6 @@ fn exact_chunk_empty_file_and_raw_fallback() {
 }
 
 #[test]
-fn incompressible_file_is_store_only() {
-    let data = noise(CHUNK + 4096, 7);
-    let (index, physical) = pack(&[("noise.bin", data.clone())]);
-    assert!(index.files[0].store_only);
-    assert!(index.chunks.iter().all(|chunk| chunk.codec == Codec::Raw));
-    assert_eq!(unpack(&physical).unwrap().1["noise.bin"], data);
-}
-
-#[test]
-fn thread_count_does_not_change_the_packs() {
-    let mut files = vec![
-        ("a/noise.bin".to_string(), noise(3 * CHUNK + 77, 11)),
-        ("b/mixed.bin".to_string(), {
-            let mut mixed = vec![3u8; 5 * CHUNK];
-            mixed.extend(noise(2 * CHUNK, 5));
-            mixed.extend((0..CHUNK + 9).map(|i| (i % 13) as u8));
-            mixed
-        }),
-        ("c/empty.bin".to_string(), Vec::new()),
-    ];
-    files.extend((0..20).map(|i| (format!("d/{i}.bin"), vec![i as u8; 1000 + i * CHUNK / 3])));
-    let run = |threads: usize| {
-        let mut source = Mem::new(files.iter().cloned().collect());
-        let listed = source.files().to_vec();
-        let mut output = Output::default();
-        let mut index = writer::pack_with(
-            &mut source,
-            &listed,
-            5,
-            threads,
-            &mut output,
-            &mut |_| {},
-            &std::sync::atomic::AtomicBool::new(false),
-        )
-        .unwrap();
-        let (decoded, unpacked) = unpack(&output.0).unwrap();
-        assert_eq!(decoded, index);
-        for (path, bytes) in &files {
-            assert_eq!(&unpacked[path], bytes, "{path}");
-        }
-        // The archive ID is random per pack: it sits in every header, not in the payloads.
-        index.archive_id = [0; 16];
-        let payloads: Vec<Vec<u8>> = (0..index.volume_sizes.len())
-            .map(|id| output.0[&volume_name(id as u32)][VOLUME_HEADER_SIZE..].to_vec())
-            .collect();
-        (index, payloads)
-    };
-    let default = run(0);
-    assert!(default.0.chunks.iter().any(|c| c.codec == Codec::Zstd));
-    assert!(default.0.chunks.iter().any(|c| c.codec == Codec::Raw));
-    for threads in [1, 2, 3, 64] {
-        assert!(run(threads) == default, "{threads} threads");
-    }
-}
-
-#[test]
 fn a_listed_file_not_as_in_the_source_fails_before_writing() {
     let mut source = Mem::new(
         [

@@ -9,14 +9,10 @@ import { picker, type Listing, type SavedDevices } from "./Picker";
 import type { DropEvent, Transport, Unlisten } from "./transport";
 
 /** This device's roots in the picker: the home folder and the volume folders there are (Windows:
- * each drive C: to Z: that lists; ponytail: A: and B: are left out, a floppy probe can stall). */
+ * each drive C: to Z:), checked for existence only by `local_roots`; a root lists when opened. */
 async function localRoots(): Promise<Listing> {
-  const home = await invoke<string | null>("home_folder");
-  const vols = /Windows/.test(navigator.userAgent)
-    ? Array.from({ length: 24 }, (_, i) => `${String.fromCharCode(67 + i)}:\\`)
-    : ["/Volumes", "/media", "/run/media", "/mnt", "/"];
-  const found = await Promise.all(vols.map((p) => invoke("list_dir", { path: p }).then(() => p, () => null)));
-  const paths = [home, ...found].filter((p): p is string => p !== null);
+  const [home, vols] = await Promise.all([invoke<string | null>("home_folder"), invoke<string[]>("local_roots")]);
+  const paths = home === null ? vols : [home, ...vols];
   return { path: null, parent: null, entries: paths.map((p) => ({ name: basename(p) || p, path: p, dir: true, size: null })) };
 }
 
@@ -78,4 +74,6 @@ export const transport: Transport = {
   connectDownloadUrl: () => null,
   packageScan: () => Promise.reject("packages install only on a PS5"),
   connectInstall: (keyId, path) => invoke("connect_install", { keyId, path }),
+  connectSpeedTest: (keyId, run) => invoke("connect_speed_test", { keyId, run }),
+  connectSpeedTestCancel: (keyId, run) => invoke("connect_speed_test_cancel", { keyId, run }),
 };

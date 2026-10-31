@@ -26,6 +26,14 @@
 //! `Request write {handle, offset, len}` + its `Data` (BLAKE3), each answered `DataOk`;
 //! pipelining ok.
 //!
+//! Speed test (`speed_test`): the `speed` RPC → `{max}` (an older peer: `unknown method`), then
+//! lanes of `speed_up {offset, len}` + `Data` (dropped, answered `DataOk`) and `speed_down
+//! {offset, len}` (answered by a `Data` of zeros; `len` 1..=`CHUNK`, any other method refused);
+//! nothing on disk, at most `SPEED_PEER_LANES` lanes and `SPEED_BUDGET` bytes per device at once.
+//! A cancel (`Connect::speed_test_cancel`, by run id; `SpeedCancel`) shuts the test's own
+//! control conn (dial, handshake, `speed` RPC) and every lane's socket and stops each before
+//! its next chunk: `cancelled`.
+//!
 //! While a lane's read, write or put works the disk, the peer sends a `Ping` on the lane every
 //! `PING_EVERY` (`pinging`), which the reader skips: a disk stall past `DEAD_AFTER` doesn't end
 //! the lane. An older peer sends none.
@@ -34,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,8 +50,8 @@ use ps5_dump_forge_core::DeleteError;
 use ps5_dump_forge_core::remote::{self, FlinkPath, RemoteEntry, RemoteStat};
 use ps5_dump_forge_flink::{
     CHUNK, Conn, DEAD_AFTER, DataHead, DataOk, Frame, Handshake, MAX_BODY, MAX_RPC_BODY,
-    PING_EVERY, Request, Session, TRANSFER_FAILED, chunk_hash, client_join, data_frame, kind2,
-    parse_data, send_refusal,
+    PING_EVERY, Request, Session, TRANSFER_FAILED, chunk_hash, client_join, kind2, parse_data,
+    send_refusal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -469,7 +477,7 @@ impl Reads {
                 return Err(send_refusal(conn, ps5_dump_forge_flink::NOT_PAIRED));
             }
             match pinging(conn, || self.read(sid, root, &f)) {
-                Ok((head, bytes)) => conn.send_frame(&data_frame(&head, &bytes)?)?,
+                Ok((head, bytes)) => conn.send_data(&head, &bytes)?,
                 Err(why) => return Err(send_refusal(conn, &format!("{TRANSFER_FAILED}: {why}"))),
             }
             f = recv_kind(conn, kind2::REQUEST, "read")?;
@@ -648,6 +656,11 @@ pub fn answer(
         #[cfg(test)]
         "reattach" if writes.old.load(Ordering::SeqCst) => return None,
         "reattach" => path().and_then(|p| writes.reattach(hs, root, p, me)),
+        // A speed test's lanes are served here (`serve_speed`); an older peer answers
+        // `unknown method`.
+        #[cfg(test)]
+        "speed" if writes.old.load(Ordering::SeqCst) => return None,
+        "speed" => Ok(serde_json::json!({ "max": SPEED_MAX })),
         _ => return None,
     })
 }
@@ -719,7 +732,7 @@ pub struct Writes {
     /// Tests: `KEPT_FOR` shortened.
     #[cfg(test)]
     pub(crate) kept_for: Mutex<Option<Duration>>,
-    /// Tests: answers as a peer from before `reattach`.
+    /// Tests: answers as a peer from before `reattach` (and the speed test).
     #[cfg(test)]
     pub(crate) old: std::sync::atomic::AtomicBool,
 }
@@ -1326,6 +1339,237 @@ impl Writes {
     }
 }
 
+// ---- Speed test: a paired device timing the lanes, nothing on disk ------------------------------
+
+/// What `Connect::speed_test` sends and then fetches.
+pub const SPEED_BYTES: u64 = 128 << 20;
+/// What one speed test sends (and then fetches) at most.
+pub const SPEED_MAX: u64 = SPEED_BYTES;
+/// What one paired device's open speed lanes carry at most together, both directions: a
+/// request past it is refused. Released as each lane ends.
+pub const SPEED_BUDGET: u64 = SPEED_BYTES * 2;
+/// Lanes a speed test deals its chunks to, as a transfer's writes.
+const SPEED_LANES: usize = KEPT_LANES;
+/// A peer without the speed lanes (it answers the `speed` RPC `unknown method`).
+pub const SPEED_OLDER: &str = "that device's Dump Forge is older: update it to run a speed test";
+/// A speed test its user stopped (`Connect::speed_test_cancel`).
+pub const SPEED_CANCELLED: &str = "cancelled";
+
+/// One speed test's cancel: the flag every lane checks and a clone of its control conn's and
+/// each lane's socket, shut down by `cancel` so a dial, an RPC or a lane blocked on its answer
+/// ends at once.
+#[derive(Default)]
+pub struct SpeedCancel {
+    flag: AtomicBool,
+    socks: Mutex<Vec<std::net::TcpStream>>,
+}
+
+impl SpeedCancel {
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        for s in lock(&self.socks).iter() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Keeps `sock` for `cancel` (shut at once when already cancelled).
+    pub(crate) fn watch(&self, sock: std::net::TcpStream) {
+        let mut socks = lock(&self.socks);
+        if self.cancelled() {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+        socks.push(sock);
+    }
+
+    /// `SPEED_CANCELLED` in place of `e` once cancelled (a shut lane's error is the cancel's).
+    fn or(&self, e: io::Error) -> io::Error {
+        if self.cancelled() {
+            io::Error::other(SPEED_CANCELLED)
+        } else {
+            e
+        }
+    }
+}
+
+/// A speed test's result: each direction's bytes per second over `bytes`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedTest {
+    pub up_bytes_per_s: u64,
+    pub down_bytes_per_s: u64,
+    pub bytes: u64,
+}
+
+/// Speed lanes one paired device may hold open at once (a test uses `SPEED_LANES`).
+pub const SPEED_PEER_LANES: usize = 8;
+
+/// Per paired device's key id: its open speed lanes and the bytes they have carried.
+static SPEED_OPEN: Mutex<Option<HashMap<String, (usize, u64)>>> = Mutex::new(None);
+
+/// One open speed lane of a device and the bytes it reserved, counted in `SPEED_OPEN` until
+/// dropped.
+struct SpeedLane {
+    peer: String,
+    bytes: u64,
+}
+
+impl SpeedLane {
+    /// The lane, unless `peer` already holds `SPEED_PEER_LANES`.
+    fn take(peer: &str) -> Option<SpeedLane> {
+        let mut open = lock(&SPEED_OPEN);
+        let (n, _) = open
+            .get_or_insert_with(HashMap::new)
+            .entry(peer.to_string())
+            .or_default();
+        if *n >= SPEED_PEER_LANES {
+            return None;
+        }
+        *n += 1;
+        Some(SpeedLane {
+            peer: peer.to_string(),
+            bytes: 0,
+        })
+    }
+
+    /// Reserves `len` more bytes of the device's `SPEED_BUDGET`; false (nothing reserved) past it.
+    fn reserve(&mut self, len: u64) -> bool {
+        let mut open = lock(&SPEED_OPEN);
+        let Some((_, used)) = open.as_mut().and_then(|m| m.get_mut(&self.peer)) else {
+            return false;
+        };
+        match used.checked_add(len) {
+            Some(total) if total <= SPEED_BUDGET => {
+                *used = total;
+                self.bytes += len;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Drop for SpeedLane {
+    fn drop(&mut self) {
+        let mut open = lock(&SPEED_OPEN);
+        if let Some(map) = open.as_mut()
+            && let Some((n, used)) = map.get_mut(&self.peer)
+        {
+            *n -= 1;
+            *used -= self.bytes;
+            if *n == 0 {
+                map.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// One `CHUNK` of zeros and its hash, shared by every speed lane.
+fn speed_zeros() -> &'static (Vec<u8>, String) {
+    static ZEROS: std::sync::OnceLock<(Vec<u8>, String)> = std::sync::OnceLock::new();
+    ZEROS.get_or_init(|| {
+        let zeros = vec![0u8; CHUNK as usize];
+        let hash = chunk_hash(&zeros);
+        (zeros, hash)
+    })
+}
+
+/// Whether a lane's first frame is a speed test's.
+pub fn is_speed(f: &Frame) -> bool {
+    is_method(f, "speed_up") || is_method(f, "speed_down")
+}
+
+/// The requests of a speed lane (the first already received): `speed_up {offset, len}` and its
+/// `Data` (BLAKE3-checked, then dropped), answered `DataOk`; `speed_down {offset, len}`, answered
+/// by a `Data` of `len` zero bytes. `len` 1..=`CHUNK`; at most `SPEED_PEER_LANES` lanes and
+/// `SPEED_BUDGET` bytes (both directions, reserved per request, released as each lane ends) per
+/// paired device at once; any other method is refused. Nothing is read from or written to disk.
+pub fn serve_speed(
+    conn: &mut Conn,
+    first: Frame,
+    peer: &str,
+    allowed: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    let Some(mut lane) = SpeedLane::take(peer) else {
+        let why = format!("{TRANSFER_FAILED}: at most {SPEED_PEER_LANES} speed lanes at once");
+        return Err(send_refusal(conn, &why));
+    };
+    let (zeros, full) = speed_zeros();
+    let mut f = first;
+    loop {
+        if !allowed() {
+            return Err(send_refusal(conn, ps5_dump_forge_flink::NOT_PAIRED));
+        }
+        let req = serde_json::from_slice::<Request>(&f.body).ok();
+        let (offset, len) = match &req {
+            Some(r) => (r.body["offset"].as_u64(), r.body["len"].as_u64()),
+            None => (None, None),
+        };
+        let (Some(req), Some(offset), Some(len)) = (req, offset, len) else {
+            return Err(send_refusal(
+                conn,
+                &format!("{TRANSFER_FAILED}: bad speed test"),
+            ));
+        };
+        let up = match req.method.as_str() {
+            "speed_up" => true,
+            "speed_down" => false,
+            _ => {
+                let why =
+                    format!("{TRANSFER_FAILED}: a speed lane carries only speed_up and speed_down");
+                return Err(send_refusal(conn, &why));
+            }
+        };
+        if len == 0 {
+            return Err(send_refusal(
+                conn,
+                &format!("{TRANSFER_FAILED}: bad speed test"),
+            ));
+        }
+        if len > CHUNK || !lane.reserve(len) {
+            let why = format!(
+                "{TRANSFER_FAILED}: a device's speed tests carry at most {SPEED_BUDGET} bytes at once"
+            );
+            return Err(send_refusal(conn, &why));
+        }
+        if up {
+            let data = recv_kind(conn, kind2::DATA, "speed")?;
+            let (head, bytes) = parse_data(&data)?;
+            if (head.job, head.file, head.offset, bytes.len() as u64) != (0, 0, offset, len)
+                || chunk_hash(bytes) != head.hash
+            {
+                let why = format!("{TRANSFER_FAILED}: a chunk doesn't match its speed test");
+                return Err(send_refusal(conn, &why));
+            }
+            let ok = DataOk {
+                job: 0,
+                file: 0,
+                offset,
+                complete: false,
+            };
+            conn.send_frame(&ok.frame()?)?;
+        } else {
+            let bytes = &zeros[..len as usize];
+            let hash = if len == CHUNK {
+                full.clone()
+            } else {
+                chunk_hash(bytes)
+            };
+            let head = DataHead {
+                job: 0,
+                file: 0,
+                offset,
+                hash,
+                stat: None,
+            };
+            conn.send_data(&head, bytes)?;
+        }
+        f = recv_kind(conn, kind2::REQUEST, "speed")?;
+    }
+}
+
 // ---- The reading side (core's `Remote` builds on these) -----------------------------------------
 
 /// A data lane to the peer of `hs`, joined under its session (lane number `n`).
@@ -1401,7 +1645,7 @@ pub fn send_write(conn: &mut Conn, handle: u64, offset: u64, bytes: &[u8]) -> io
         hash: chunk_hash(bytes),
         stat: None,
     };
-    conn.send_frame(&data_frame(&head, bytes)?)
+    conn.send_data(&head, bytes)
 }
 
 /// The answer to a `send_write` (they come in the order sent).
@@ -1417,6 +1661,171 @@ pub fn recv_written(conn: &mut Conn, handle: u64, offset: u64) -> io::Result<()>
             "flink: wanted the write's DataOk",
         )),
     }
+}
+
+/// Sends, then fetches, `bytes` (at most `SPEED_MAX`) over up to `SPEED_LANES` lanes of `hs`'s
+/// session (`rpc` keeps it up), in `CHUNK` pieces dealt round robin as a transfer's writes;
+/// each direction timed from its first request to its last answer. Nothing touches a disk on
+/// either side. A peer without the speed lanes: `SPEED_OLDER`. `cancel`, checked before each
+/// chunk is sent or awaited on every lane, ends it with `SPEED_CANCELLED`: it shuts every lane's
+/// socket, so a lane waiting on its answer ends at once too.
+pub fn speed_test(
+    rpc: &mut Rpc,
+    hs: &Handshake,
+    bytes: u64,
+    cancel: &SpeedCancel,
+) -> io::Result<SpeedTest> {
+    let bytes = bytes.clamp(1, SPEED_MAX);
+    if let Err(e) = rpc.call("speed", serde_json::json!({})) {
+        if e.to_string().starts_with("unknown method") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, SPEED_OLDER));
+        }
+        return Err(cancel.or(e));
+    }
+    if cancel.cancelled() {
+        return Err(io::Error::other(SPEED_CANCELLED));
+    }
+    let pieces: Vec<(u64, u64)> = (0..bytes.div_ceil(CHUNK))
+        .map(|i| (i * CHUNK, CHUNK.min(bytes - i * CHUNK)))
+        .collect();
+    let n = pieces.len().min(SPEED_LANES);
+    let mut lanes = Vec::with_capacity(n);
+    for k in 0..n {
+        if cancel.cancelled() {
+            return Err(io::Error::other(SPEED_CANCELLED));
+        }
+        // `join_lane`, the socket kept for `cancel` first.
+        let lane = (std::net::TcpStream::connect_timeout(&hs.remote, DEAD_AFTER))
+            .and_then(|s| {
+                cancel.watch(s.try_clone()?);
+                Conn::new(s, MAX_BODY, DEAD_AFTER)
+            })
+            .and_then(|mut c| client_join(&mut c, &hs.session, k as u32).map(|()| c));
+        lanes.push(lane.map_err(|e| cancel.or(e))?);
+    }
+    let (zeros, full) = speed_zeros();
+    let speed = |method: &str, offset: u64, len: u64| Request {
+        id: 0,
+        method: method.into(),
+        body: serde_json::json!({ "offset": offset, "len": len }),
+    };
+    let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("flink: {why}"));
+    let up = speed_run(
+        &mut lanes,
+        &pieces,
+        &cancel.flag,
+        &|conn, offset, len| {
+            conn.send_frame(&speed("speed_up", offset, len).frame()?)?;
+            let bytes = &zeros[..len as usize];
+            let hash = if len == CHUNK {
+                full.clone()
+            } else {
+                chunk_hash(bytes)
+            };
+            let head = DataHead {
+                job: 0,
+                file: 0,
+                offset,
+                hash,
+                stat: None,
+            };
+            conn.send_data(&head, bytes)
+        },
+        &|conn, offset, _| {
+            let f = recv_answer(conn)?;
+            let ok = (f.kind == kind2::DATA_OK)
+                .then(|| serde_json::from_slice::<DataOk>(&f.body).ok())
+                .flatten();
+            match ok {
+                Some(ok) if (ok.job, ok.file, ok.offset) == (0, 0, offset) => Ok(()),
+                _ => Err(bad("wanted the speed test's DataOk")),
+            }
+        },
+    )?;
+    let down = speed_run(
+        &mut lanes,
+        &pieces,
+        &cancel.flag,
+        &|conn, offset, len| conn.send_frame(&speed("speed_down", offset, len).frame()?),
+        &|conn, offset, len| {
+            let f = recv_answer(conn)?;
+            if f.kind != kind2::DATA {
+                return Err(bad("wanted Data"));
+            }
+            let (head, got) = parse_data(&f)?;
+            if (head.job, head.file, head.offset, got.len() as u64) != (0, 0, offset, len) {
+                return Err(bad("stray Data"));
+            }
+            if chunk_hash(got) != head.hash {
+                return Err(bad("a chunk's hash doesn't match"));
+            }
+            Ok(())
+        },
+    )?;
+    let rate = |took: Duration| (bytes as u128 * 1_000_000_000 / took.as_nanos().max(1)) as u64;
+    Ok(SpeedTest {
+        up_bytes_per_s: rate(up),
+        down_bytes_per_s: rate(down),
+        bytes,
+    })
+}
+
+/// One lane's part of a speed test direction: a request and its answer.
+type SpeedStep<'a> = &'a (dyn Fn(&mut Conn, u64, u64) -> io::Result<()> + Sync);
+
+/// `pieces` dealt round robin to `lanes`, each lane sending all of its share before reading the
+/// answers (as `write_lane`); how long the slowest lane took. The peer's refusal comes first,
+/// a cancel before it: a lane that sees `cancel` stops at once, its answers left unread.
+fn speed_run(
+    lanes: &mut [Conn],
+    pieces: &[(u64, u64)],
+    cancel: &AtomicBool,
+    send: SpeedStep<'_>,
+    recv: SpeedStep<'_>,
+) -> io::Result<Duration> {
+    let n = lanes.len();
+    let start = Instant::now();
+    let results: Vec<io::Result<()>> = std::thread::scope(|sc| {
+        let runs: Vec<_> = (lanes.iter_mut().enumerate())
+            .map(|(k, conn)| {
+                sc.spawn(move || {
+                    let mine: Vec<(u64, u64)> = pieces.iter().skip(k).step_by(n).copied().collect();
+                    let mut sent = 0;
+                    let mut failed = None;
+                    let cancelled = || cancel.load(Ordering::SeqCst);
+                    for &(o, len) in &mine {
+                        if cancelled() {
+                            return Err(io::Error::other(SPEED_CANCELLED));
+                        }
+                        if let Err(e) = send(conn, o, len) {
+                            failed = Some(e);
+                            break;
+                        }
+                        sent += 1;
+                    }
+                    for &(o, len) in &mine[..sent] {
+                        if cancelled() {
+                            return Err(io::Error::other(SPEED_CANCELLED));
+                        }
+                        recv(conn, o, len)?;
+                    }
+                    failed.map_or(Ok(()), Err)
+                })
+            })
+            .collect();
+        (runs.into_iter())
+            .map(|r| {
+                r.join()
+                    .unwrap_or_else(|_| Err(io::Error::other("a speed lane panicked")))
+            })
+            .collect()
+    });
+    let took = start.elapsed();
+    if cancel.load(Ordering::SeqCst) {
+        return Err(io::Error::other(SPEED_CANCELLED));
+    }
+    let errs: Vec<io::Error> = results.into_iter().filter_map(Result::err).collect();
+    first_error(errs).map_or(Ok(took), Err)
 }
 
 // ---- Core's `Remote`: this device reading a paired device's files ------------------------------
@@ -1838,6 +2247,25 @@ impl ConnectRemote {
 
     fn peer(&self, key_id: &str) -> Arc<PeerFs> {
         lock(&self.peers).entry(key_id.into()).or_default().clone()
+    }
+
+    /// One RPC that may run long (a delete or move of a whole folder) on a control
+    /// session of its own, so the device's shared session (a transfer's per-file calls, the
+    /// keep-alive) never waits behind it. No retry: a fresh session that breaks is the error.
+    fn alone(&self, key_id: &str, method: &str, body: Value) -> io::Result<Value> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| io::Error::other("the Connect service has stopped"))?;
+        if !inner.serves(key_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                ps5_dump_forge_flink::NOT_PAIRED,
+            ));
+        }
+        let (mut rpc, _) = inner.session(key_id)?;
+        rpc.call(method, body)
+            .map_err(|e| if is_answer(&e) { answered(e) } else { e })
     }
 
     /// `f` on the device's session: a fresh one when there is none or it sat idle, and once
@@ -2402,7 +2830,7 @@ impl remote::Remote for ConnectRemote {
                 hash: chunk_hash(bytes),
                 stat: None,
             };
-            conn.send_frame(&data_frame(&head, bytes)?)?;
+            conn.send_data(&head, bytes)?;
             recv_written(&mut conn, 0, 0)?;
             put_lane(&peer.write_lanes, g, conn);
             peer.touch();
@@ -2568,15 +2996,13 @@ impl remote::Remote for ConnectRemote {
             .ok_or_else(|| io::Error::other("flink: free gave no number"))
     }
 
-    /// The peer deletes it as its own Delete would (`delete_path` RPC).
-    // ponytail: a session found broken is tried once more; a delete the peer did before the
-    // link broke then reads as missing.
+    /// The peer deletes it as its own Delete would (`delete_path` RPC), on a session of its own.
+    // ponytail: a link that breaks mid-delete fails the request; the peer may have finished.
     fn delete_path(&self, path: &FlinkPath) -> Result<(), DeleteError> {
         let body = serde_json::json!({ "path": path.path });
-        self.with(&path.key_id, |s| {
-            s.rpc.call("delete_path", body.clone()).map(drop)
-        })
-        .map_err(deleted)
+        self.alone(&path.key_id, "delete_path", body)
+            .map(drop)
+            .map_err(deleted)
     }
 
     /// The peer moves it as its own Move to would (`move_path` RPC); one device only.
@@ -2592,17 +3018,10 @@ impl remote::Remote for ConnectRemote {
             ));
         }
         let body = serde_json::json!({ "from": from.path, "to": to.path, "replace": replace });
-        let moved = self.with(&from.key_id, |s| {
-            s.rpc.call("move_path", body.clone()).map(drop)
-        });
-        match moved.map_err(deleted) {
-            // The retry of a move the peer did before the link broke finds `from` gone: `to`
-            // there and `from` not means it moved.
-            Err(DeleteError::Missing(_)) if self.stat(to).is_ok() && self.stat(from).is_err() => {
-                Ok(())
-            }
-            r => r,
-        }
+        // No retry (a session of its own), so a missing `from` is the peer's answer.
+        self.alone(&from.key_id, "move_path", body)
+            .map(drop)
+            .map_err(deleted)
     }
 }
 
@@ -2610,7 +3029,6 @@ impl remote::Remote for ConnectRemote {
 mod tests {
     use super::*;
     use crate::connect::{Connect, Rpc};
-    use ps5_dump_forge_flink::refusal;
     use std::time::Duration;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -2644,6 +3062,140 @@ mod tests {
 
     fn call(rpc: &mut Rpc, method: &str, path: &str) -> io::Result<Value> {
         rpc.call(method, serde_json::json!({ "path": path }))
+    }
+
+    /// A speed test sends and fetches its bytes over several lanes (a short last chunk
+    /// included) and leaves nothing on the peer's disk; an older peer is named as one.
+    #[test]
+    fn a_speed_test_times_both_directions_and_names_an_older_peer() {
+        let share = temp_dir("speed");
+        fs::create_dir_all(&share).unwrap();
+        let (a, b, rpc, _, dirs) = paired("speed", &share);
+        drop(rpc);
+        let ka = a.state().device.key_id;
+        let bytes = 2 * CHUNK + 1000;
+        let got = b.speed_test_of(&ka, "r1", bytes).unwrap();
+        assert_eq!(got.bytes, bytes);
+        assert!(
+            got.up_bytes_per_s > 0 && got.down_bytes_per_s > 0,
+            "{got:?}"
+        );
+        assert_eq!(fs::read_dir(&share).unwrap().count(), 0);
+        assert!(!a.peers_active());
+
+        // A lane refuses an empty request and a method other than speed_up / speed_down.
+        let (_rpc, hs) = b.session(&ka).unwrap();
+        for (method, len) in [("speed_down", 0), ("speed_up", 0), ("read", 10)] {
+            let mut lane = join_lane(&hs, 0).unwrap();
+            let first = Request {
+                id: 0,
+                method: "speed_down".into(),
+                body: serde_json::json!({ "offset": 0, "len": 10 }),
+            };
+            lane.send_frame(&first.frame().unwrap()).unwrap();
+            assert_eq!(recv_answer(&mut lane).unwrap().kind, kind2::DATA);
+            let req = Request {
+                id: 0,
+                method: method.into(),
+                body: serde_json::json!({ "offset": 0, "len": len }),
+            };
+            lane.send_frame(&req.frame().unwrap()).unwrap();
+            let e = recv_answer(&mut lane).unwrap_err().to_string();
+            assert!(e.starts_with(TRANSFER_FAILED), "{method} {len}: {e}");
+        }
+        // A first frame of length 0 is refused too.
+        let mut lane = join_lane(&hs, 0).unwrap();
+        let req = Request {
+            id: 0,
+            method: "speed_up".into(),
+            body: serde_json::json!({ "offset": 0, "len": 0 }),
+        };
+        lane.send_frame(&req.frame().unwrap()).unwrap();
+        assert!(recv_answer(&mut lane).is_err());
+
+        // One device's lanes share one budget: past it a request is refused, and a lane's
+        // bytes come back when it ends.
+        let kb = b.state().device.key_id;
+        let mut held = SpeedLane::take(&kb).unwrap();
+        assert!(held.reserve(SPEED_BUDGET - 5));
+        assert!(!held.reserve(6));
+        let down = |len: u64| Request {
+            id: 0,
+            method: "speed_down".into(),
+            body: serde_json::json!({ "offset": 0, "len": len }),
+        };
+        let mut lane = join_lane(&hs, 0).unwrap();
+        lane.send_frame(&down(10).frame().unwrap()).unwrap();
+        let e = recv_answer(&mut lane).unwrap_err().to_string();
+        assert!(e.contains("at most"), "{e}");
+        drop(held);
+        let mut lane = join_lane(&hs, 0).unwrap();
+        lane.send_frame(&down(10).frame().unwrap()).unwrap();
+        assert_eq!(recv_answer(&mut lane).unwrap().kind, kind2::DATA);
+        drop(lane);
+
+        a.writes().old.store(true, Ordering::SeqCst);
+        assert_eq!(b.speed_test_of(&ka, "r1", bytes).unwrap_err(), SPEED_OLDER);
+
+        for s in [a, b] {
+            s.shutdown();
+        }
+        for d in dirs.iter().chain([&share]) {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    /// A cancel during a speed test ends it `cancelled` at once, its lanes shut and released: the
+    /// next test runs. A cancel before its run starts ends that run `cancelled` as it starts; a
+    /// late cancel of an old run leaves a new one alone.
+    #[test]
+    fn a_cancelled_speed_test_ends_cancelled_and_frees_its_lanes() {
+        let share = temp_dir("speed-cancel");
+        fs::create_dir_all(&share).unwrap();
+        let (a, b, rpc, _, dirs) = paired("speed-cancel", &share);
+        drop(rpc);
+        let ka = a.state().device.key_id;
+        let b = Arc::new(b);
+        let started = Instant::now();
+        let run = std::thread::spawn({
+            let (b, ka) = (b.clone(), ka.clone());
+            move || b.speed_test_of(&ka, "r1", SPEED_MAX)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        while !run.is_finished() {
+            b.speed_test_cancel(&ka, "r1");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(run.join().unwrap().unwrap_err(), SPEED_CANCELLED);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // Cancelled before it starts: ends `cancelled` at once, the cancel used up.
+        b.speed_test_cancel(&ka, "r2");
+        assert_eq!(
+            b.speed_test_of(&ka, "r2", SPEED_MAX).unwrap_err(),
+            SPEED_CANCELLED
+        );
+        assert_eq!(b.speed_test_of(&ka, "r2", CHUNK).unwrap().bytes, CHUNK);
+
+        // A stale cancel of r1 (it ended) while r3 runs: r3 finishes.
+        let run = std::thread::spawn({
+            let (b, ka) = (b.clone(), ka.clone());
+            move || b.speed_test_of(&ka, "r3", 8 * CHUNK)
+        });
+        while !run.is_finished() {
+            b.speed_test_cancel(&ka, "r1");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(run.join().unwrap().unwrap().bytes, 8 * CHUNK);
+        let got = b.speed_test_of(&ka, "r4", CHUNK + 1).unwrap();
+        assert_eq!(got.bytes, CHUNK + 1);
+        assert_eq!(fs::read_dir(&share).unwrap().count(), 0);
+
+        a.shutdown();
+        b.shutdown();
+        for d in dirs.iter().chain([&share]) {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     /// The PS5's reach (by user request): `/` lists `data` (a link here, shown as the folder)
@@ -2723,164 +3275,6 @@ mod tests {
         for d in dirs.iter().chain([&share]) {
             let _ = fs::remove_dir_all(d);
         }
-    }
-
-    #[test]
-    fn stat_list_and_ranged_reads() {
-        let share = temp_dir("share");
-        let outside = temp_dir("outside");
-        fs::create_dir_all(share.join("g/d")).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("secret"), b"no").unwrap();
-        let data: Vec<u8> = (0..CHUNK + 100).map(|i| (i * 7 % 251) as u8).collect();
-        fs::write(share.join("g/big.bin"), &data).unwrap();
-        fs::write(share.join("g/empty"), b"").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink("big.bin", share.join("g/ln")).unwrap();
-            symlink(&outside, share.join("g/out")).unwrap();
-            let fifo = std::ffi::CString::new(share.join("g/fifo").to_str().unwrap()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
-        }
-        let (a, b, mut rpc, hs, dirs) = paired("rw", &share);
-
-        // stat: a file, a folder, the root; a link reported, not followed.
-        let st: FsStat =
-            serde_json::from_value(call(&mut rpc, "stat", "g/big.bin").unwrap()).unwrap();
-        assert_eq!(
-            (st.dir, st.size, st.link),
-            (false, data.len() as u64, false)
-        );
-        assert!(st.mtime_ns.is_some());
-        let root: FsStat = serde_json::from_value(call(&mut rpc, "stat", "").unwrap()).unwrap();
-        assert!(root.dir);
-
-        // fs_list: names sorted, the list's mtime the stat's.
-        let v = call(&mut rpc, "fs_list", "g").unwrap();
-        let entries: Vec<FsEntry> = serde_json::from_value(v["entries"].clone()).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        let big = entries.iter().find(|e| e.name == "big.bin").unwrap();
-        assert_eq!(big.stat, st);
-        assert!(entries.iter().find(|e| e.name == "d").unwrap().stat.dir);
-        #[cfg(unix)]
-        {
-            assert_eq!(names, ["big.bin", "d", "empty", "fifo", "ln", "out"]);
-            let fifo = entries.iter().find(|e| e.name == "fifo").unwrap();
-            assert!(fifo.special && !fifo.bad_name && fifo.stat.size == 0);
-            assert!(entries.iter().filter(|e| e.special || e.bad_name).count() == 1);
-            let ln: FsStat =
-                serde_json::from_value(call(&mut rpc, "stat", "g/ln").unwrap()).unwrap();
-            assert_eq!((ln.link, ln.dir, ln.size), (true, false, 0));
-            let out = entries.iter().find(|e| e.name == "out").unwrap();
-            assert!(out.stat.link && !out.stat.dir);
-            let e = call(&mut rpc, "stat", "g/fifo").unwrap_err();
-            assert!(e.to_string().contains("not a file or folder"), "{e}");
-            // A link is never read or listed through; one leading outside is refused as a folder.
-            assert!(call(&mut rpc, "read_open", "g/ln").is_err());
-            assert!(call(&mut rpc, "read_open", "g/fifo").is_err());
-            assert!(call(&mut rpc, "fs_list", "g/out").is_err());
-            let e = call(&mut rpc, "stat", "g/out/secret").unwrap_err();
-            assert!(e.to_string().contains("outside the shared folder"), "{e}");
-            let e = call(&mut rpc, "read_open", "g/out/secret").unwrap_err();
-            assert!(e.to_string().contains("outside the shared folder"), "{e}");
-        }
-        #[cfg(not(unix))]
-        assert_eq!(names, ["big.bin", "d", "empty"]);
-        for bad in ["../x", "g/../g/big.bin", "/etc", "g//big.bin"] {
-            assert!(call(&mut rpc, "stat", bad).is_err(), "{bad}");
-            assert!(call(&mut rpc, "read_open", bad).is_err(), "{bad}");
-        }
-        assert!(call(&mut rpc, "read_open", "g/d").is_err(), "a folder");
-        assert!(call(&mut rpc, "fs_list", "g/big.bin").is_err(), "a file");
-        assert!(call(&mut rpc, "stat", "g/nope").is_err());
-
-        // read_open + ranged reads over a lane: across the 8 MiB boundary, at and past EOF.
-        let o = call(&mut rpc, "read_open", "g/big.bin").unwrap();
-        assert_eq!(o["size"], data.len() as u64);
-        assert_eq!(o["mtime_ns"], serde_json::json!(st.mtime_ns));
-        let h = o["handle"].as_u64().unwrap();
-        let mut lane = join_lane(&hs, 0).unwrap();
-        let n = data.len() as u64;
-        let at = CHUNK - 50;
-        assert_eq!(
-            read_range(&mut lane, h, at, 100).unwrap(),
-            &data[at as usize..][..100]
-        );
-        assert_eq!(
-            read_range(&mut lane, h, 0, CHUNK).unwrap(),
-            &data[..CHUNK as usize]
-        );
-        // Pipelined: two asks, two answers in order.
-        send_read(&mut lane, h, n - 10, 64).unwrap();
-        send_read(&mut lane, h, n, 64).unwrap();
-        assert_eq!(
-            recv_read(&mut lane, h, n - 10, 64).unwrap(),
-            &data[n as usize - 10..]
-        );
-        assert!(recv_read(&mut lane, h, n, 64).unwrap().is_empty());
-        // A second lane joins under the same session.
-        let mut lane2 = join_lane(&hs, 1).unwrap();
-        assert_eq!(read_range(&mut lane2, h, 1, 3).unwrap(), &data[1..4]);
-        // Too long a read fails the lane.
-        let e = read_range(&mut lane2, h, 0, CHUNK + 1).unwrap_err();
-        assert!(e.to_string().starts_with(TRANSFER_FAILED), "{e}");
-
-        // An empty file reads as nothing; a closed handle is refused.
-        let o = call(&mut rpc, "read_open", "g/empty").unwrap();
-        let he = o["handle"].as_u64().unwrap();
-        assert!(read_range(&mut lane, he, 0, 10).unwrap().is_empty());
-        rpc.call("read_close", serde_json::json!({ "handle": he }))
-            .unwrap();
-        assert!(
-            rpc.call("read_close", serde_json::json!({ "handle": he }))
-                .is_err()
-        );
-        let e = read_range(&mut lane, he, 0, 10).unwrap_err();
-        assert!(
-            refusal(&e).is_some() || e.to_string().starts_with(TRANSFER_FAILED),
-            "{e}"
-        );
-
-        // Another session can't use the handle, nor join a lane once the session ends.
-        let (mut rpc2, hs2) = b.session(&a.state().device.key_id).unwrap();
-        assert!(
-            rpc2.call("read_close", serde_json::json!({ "handle": h }))
-                .is_err()
-        );
-        drop(rpc);
-        for _ in 0..100 {
-            if join_lane(&hs, 2).is_err() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            join_lane(&hs, 3).is_err(),
-            "the session's handles closed with it"
-        );
-        drop((rpc2, hs2));
-
-        a.shutdown();
-        b.shutdown();
-        for d in dirs.iter().chain([&share, &outside]) {
-            let _ = fs::remove_dir_all(d);
-        }
-    }
-
-    /// A name that isn't UTF-8 is listed, marked (Linux: macOS filesystems refuse such names).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_bad_name_is_listed_marked() {
-        use std::os::unix::ffi::OsStrExt;
-        let share = temp_dir("badname");
-        fs::create_dir_all(&share).unwrap();
-        fs::write(share.join(std::ffi::OsStr::from_bytes(b"bad\xff")), b"x").unwrap();
-        let entries = list(Some(&Share::new(share.clone(), None)), "").unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].bad_name && !entries[0].special);
-        assert_eq!(entries[0].name, "bad\u{fffd}");
-        let _ = fs::remove_dir_all(&share);
     }
 
     /// `rename` with `replace`: over a regular file only, never a folder, a link or a path
@@ -3048,58 +3442,6 @@ mod tests {
         made(&mut rpc, "g/f.part");
         rename(&mut rpc, "g/new").unwrap();
         assert!(share.join("g/new").is_file());
-
-        a.shutdown();
-        b.shutdown();
-        for d in dirs.iter().chain([&share]) {
-            let _ = fs::remove_dir_all(d);
-        }
-    }
-
-    /// What the quits see (`Connect::activity_hook`, `peers_active`): a file a peer created and
-    /// hasn't renamed, kept for a reattach too, and a file it holds open for reading.
-    #[test]
-    fn a_peers_open_files_count_as_activity() {
-        let share = temp_dir("actshare");
-        fs::create_dir_all(&share).unwrap();
-        fs::write(share.join("game.bin"), b"game").unwrap();
-        let (a, b, mut rpc, _hs, dirs) = paired("act", &share);
-        let active = a.activity_hook();
-        assert!(!active() && !a.peers_active());
-
-        let h = call(&mut rpc, "create", "f.part").unwrap()["handle"]
-            .as_u64()
-            .unwrap();
-        assert!(active() && a.peers_active());
-        rpc.call("close", serde_json::json!({ "handle": h }))
-            .unwrap();
-        assert!(active(), "unrenamed: still the peer's");
-        rpc.call("rename", serde_json::json!({ "from": "f.part", "to": "f" }))
-            .unwrap();
-        assert!(!active());
-
-        let h = call(&mut rpc, "read_open", "game.bin").unwrap()["handle"]
-            .as_u64()
-            .unwrap();
-        assert!(active());
-        rpc.call("read_close", serde_json::json!({ "handle": h }))
-            .unwrap();
-        assert!(!active());
-
-        // A session that ends with a file unrenamed: active while it is kept for a reattach.
-        *lock(&a.writes().kept_for) = Some(Duration::from_secs(2));
-        call(&mut rpc, "create", "g.part").unwrap();
-        drop(rpc);
-        std::thread::sleep(Duration::from_millis(500));
-        a.writes().sweep();
-        assert!(active(), "kept for a reattach");
-        let wait = Instant::now() + Duration::from_secs(10);
-        while share.join("g.part").exists() {
-            assert!(Instant::now() < wait, "never removed");
-            a.writes().sweep();
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!active());
 
         a.shutdown();
         b.shutdown();
@@ -3575,101 +3917,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_peer_file_is_written_through_core() {
-        use ps5_dump_forge_core::remote::RemoteReader;
-        use std::io::Read;
-        let share = temp_dir("wcore-share");
-        fs::create_dir_all(&share).unwrap();
-        fs::write(share.join("taken"), b"theirs").unwrap();
-        let (a, b, rpc, _, dirs) = paired("wcore", &share);
-        drop(rpc);
-        let key = a.state().device.key_id;
-        let at = |rel: &str| FlinkPath::parse(Path::new(&format!("flink://{key}/{rel}"))).unwrap();
-        // Through core's dispatcher: handles must route back to this service.
-        let r = remote::get().unwrap();
-
-        r.mkdir(&at("out")).unwrap();
-        let e = r.mkdir(&at("out")).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
-        assert!(r.free_space(&at("out")).unwrap() > 0);
-
-        // 20 MiB in odd pieces, some past CHUNK (dealt to several lanes).
-        let total = 20 << 20;
-        let data: Vec<u8> = (0..total).map(|i| (i * 7 % 253) as u8).collect();
-        let h = r.create(&at("out/game.bin.part")).unwrap();
-        let e = r.create(&at("out/game.bin.part")).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
-        let sizes = [
-            1,
-            4093,
-            CHUNK as usize + 3,
-            65_537,
-            2 * CHUNK as usize + 11,
-            777_777,
-        ];
-        let mut at_ = 0;
-        for n in sizes.iter().cycle() {
-            if at_ == total {
-                break;
-            }
-            let end = (at_ + n).min(total);
-            r.write_at(h, at_ as u64, &data[at_..end]).unwrap();
-            at_ = end;
-        }
-        r.sync(h).unwrap();
-        r.close(h).unwrap();
-        assert!(r.write_at(h, 0, b"x").is_err(), "a closed handle is gone");
-        let e = r
-            .rename_no_replace(&at("out/game.bin.part"), &at("taken"))
-            .unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
-        assert_eq!(fs::read(share.join("taken")).unwrap(), b"theirs");
-        r.rename_no_replace(&at("out/game.bin.part"), &at("out/game.bin"))
-            .unwrap();
-        let mut back = Vec::new();
-        RemoteReader::open(r.clone(), &at("out/game.bin"))
-            .unwrap()
-            .read_to_end(&mut back)
-            .unwrap();
-        assert!(back == data, "the file reads back as written");
-
-        // Remove: a created file only (a renamed one is the peer's now).
-        let h = r.create(&at("out/tmp.part")).unwrap();
-        r.write_at(h, 0, b"partial").unwrap();
-        r.close(h).unwrap();
-        r.remove(&at("out/tmp.part")).unwrap();
-        assert!(!share.join("out/tmp.part").exists());
-        assert!(r.remove(&at("out/game.bin")).is_err());
-        assert!(share.join("out/game.bin").exists());
-
-        // Replacing: a created file over the one there, through core's dispatcher.
-        let h = r.create(&at("out/new.part")).unwrap();
-        r.write_at(h, 0, b"new").unwrap();
-        r.close(h).unwrap();
-        r.rename_replace(&at("out/new.part"), &at("taken")).unwrap();
-        assert_eq!(fs::read(share.join("taken")).unwrap(), b"new");
-        assert!(!share.join("out/new.part").exists());
-
-        // The session lost: an open handle fails, saying the file went with it.
-        let h = r.create(&at("out/lost.part")).unwrap();
-        a.shutdown();
-        let e = r.write_at(h, 0, &data[..CHUNK as usize + 1]).unwrap_err();
-        assert!(
-            e.to_string().contains("connection to the device was lost"),
-            "{e}"
-        );
-        let e = r.sync(h).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted, "{e}");
-        let _ = r.close(h);
-        r.remove(&at("out/lost.part")).unwrap();
-        assert!(r.write_at(h, 0, b"x").is_err());
-        b.shutdown();
-        for d in dirs.iter().chain([&share]) {
-            let _ = fs::remove_dir_all(d);
-        }
-    }
-
     /// A peer's Delete and Move to: refused until the peer sets its hooks, then its own
     /// `Jobs::delete_path`/`move_path` (its protected paths) inside its share only; core's
     /// `Jobs` hands a `flink://` path to the peer.
@@ -3769,66 +4016,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_survive_a_lost_handle_a_dropped_lane_and_the_peer_timeout() {
-        use ps5_dump_forge_core::remote::Remote;
-        let share = temp_dir("keep-share");
-        fs::create_dir_all(&share).unwrap();
-        let data: Vec<u8> = (0..3 << 20).map(|i| (i * 7 % 253) as u8).collect();
-        fs::write(share.join("f.bin"), &data).unwrap();
-        let (a, b, rpc, _, dirs) = paired("keep", &share);
-        drop(rpc);
-        let key = a.state().device.key_id;
-        let p = FlinkPath::parse(Path::new(&format!("flink://{key}/f.bin"))).unwrap();
-        let r = b.remote();
-        assert_eq!(r.read_at(&p, 0, 16).unwrap(), data[..16]);
-        let peer = r.peer(&key);
-
-        // A kept handle the peer no longer holds: reopened, the read asked again.
-        lock(&peer.session).as_mut().unwrap().handles[0].1 = 999_999;
-        assert_eq!(r.read_at(&p, 5, 100).unwrap(), data[5..105]);
-
-        // A dead kept lane: that read retries; the others, sharing the session, never notice.
-        let (hs, g) = {
-            let s = lock(&peer.session);
-            let s = s.as_ref().unwrap();
-            (s.hs.clone(), s.generation)
-        };
-        let dead = join_lane(&hs, 1).unwrap();
-        dead.try_clone_stream()
-            .unwrap()
-            .shutdown(std::net::Shutdown::Both)
-            .unwrap();
-        lock(&peer.lanes).push((g, dead, Instant::now()));
-        std::thread::scope(|s| {
-            for t in 0..4usize {
-                let (r, p, data) = (&r, &p, &data);
-                s.spawn(move || {
-                    let o = t * 500_003;
-                    assert_eq!(
-                        r.read_at(p, o as u64, 1 << 20).unwrap(),
-                        data[o..][..1 << 20]
-                    );
-                });
-            }
-        });
-
-        // Reads of a kept handle (no control call) for longer than the peer waits on a silent
-        // session: the keepalive holds it, so the handle stays open.
-        let start = Instant::now();
-        while start.elapsed() < DEAD_AFTER + Duration::from_secs(2) {
-            assert_eq!(r.read_at(&p, 7, 9).unwrap(), data[7..16]);
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        assert_eq!(lock(&peer.session).as_ref().unwrap().generation, g);
-
-        a.shutdown();
-        b.shutdown();
-        for d in dirs.iter().chain([&share]) {
-            let _ = fs::remove_dir_all(d);
-        }
-    }
-
-    #[test]
     fn a_lane_outlasts_a_disk_stall_longer_than_its_timeout() {
         // Lanes keyed as real ones, with 3 s standing in for `DEAD_AFTER`, and a peer whose disk
         // takes 4.5 s for each write, put and read: its pings keep both lanes up (without them
@@ -3899,7 +4086,8 @@ mod tests {
                     hash: chunk_hash(b"small"),
                     stat: None,
                 };
-                w.send_frame(&data_frame(&head, b"small").unwrap()).unwrap();
+                w.send_frame(&ps5_dump_forge_flink::data_frame(&head, b"small").unwrap())
+                    .unwrap();
                 recv_written(&mut w, 0, 0).unwrap();
             });
             // The read lane meanwhile: a chunk by path.
@@ -4137,21 +4325,5 @@ mod tests {
         for d in dirs.iter().chain([&share]) {
             let _ = fs::remove_dir_all(d);
         }
-    }
-
-    /// A retried `put` writes under a temporary name of its own, never the first attempt's.
-    #[test]
-    fn a_retried_put_takes_a_fresh_temporary_name() {
-        let tmp = ".a.bin.forge-12-3.tmp";
-        let (one, two) = (retry_name(tmp), retry_name(tmp));
-        assert_ne!(one, tmp);
-        assert_ne!(one, two);
-        for name in [&one, &two] {
-            assert!(
-                name.starts_with(".a.bin.forge-12-3-r") && name.ends_with(".tmp"),
-                "{name}"
-            );
-        }
-        assert!(retry_name("plain").starts_with("plain-r"));
     }
 }

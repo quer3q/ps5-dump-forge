@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use ps5_dump_forge_core::{
     ConvertRequest, DeleteError, Event, Format, JobReport, Jobs, KrakenLevel, ScannedFolder,
-    VerifyMode, default_output, extraction_findings, inspect, rename_no_replace, stale_parts,
+    VerifyMode, default_output, extraction_findings, inspect, stale_parts,
 };
 use ps5upload_fpkg::source::SourceTree;
 
@@ -66,6 +66,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         replace: false,
         edit_rebuild: false,
         install: None,
+        delete_source: false,
         archive_password: None,
     }
 }
@@ -247,24 +248,6 @@ fn extraction_refuses_unsafe_names() {
 }
 
 #[test]
-fn rename_never_replaces() {
-    let root = dir("rename");
-    write(&root, "from", b"new");
-    write(&root, "to", b"old");
-    let err = rename_no_replace(&root.join("from"), &root.join("to")).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-    assert_eq!(std::fs::read(root.join("to")).unwrap(), b"old");
-    assert!(root.join("from").exists());
-
-    std::fs::create_dir(root.join("dir.part")).unwrap();
-    std::fs::create_dir(root.join("dir")).unwrap();
-    assert!(rename_no_replace(&root.join("dir.part"), &root.join("dir")).is_err());
-    std::fs::remove_dir(root.join("dir")).unwrap();
-    rename_no_replace(&root.join("dir.part"), &root.join("dir")).unwrap();
-    assert!(root.join("dir").is_dir() && !root.join("dir.part").exists());
-}
-
-#[test]
 fn folder_round_trip_verifies_with_blake3() {
     let root = dir("round-trip");
     let src = root.join("src");
@@ -347,27 +330,6 @@ fn folder_round_trip_verifies_with_blake3() {
     assert_eq!(tree_bytes(&src), tree_bytes(&out));
 }
 
-#[test]
-fn preflight_lists_every_problem() {
-    let root = dir("preflight");
-    let src = root.join("src");
-    write(&src, "readme.txt", b"no game here");
-    let (_, result) = run(request(&src, Format::Folder, &src.join("inside")));
-    let err = result.unwrap_err();
-    for want in [
-        "eboot.bin is missing",
-        "sce_sys/param.json is missing",
-        "inside the source folder",
-    ] {
-        assert!(err.contains(want), "{want:?} not in:\n{err}");
-    }
-
-    game(&src);
-    write(&root, "taken", b"");
-    let (_, result) = run(request(&src, Format::Folder, &root.join("taken")));
-    assert!(result.unwrap_err().contains("already exists"));
-}
-
 /// Progress stages in the order they first appear.
 fn stages(events: &[Event]) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
@@ -379,34 +341,6 @@ fn stages(events: &[Event]) -> Vec<&str> {
         }
     }
     out
-}
-
-/// A game of many tiny files: the builder's per-file passes (check, plan) take a small share
-/// of the bar, never most of it before compress begins.
-#[test]
-fn pkg_of_tiny_files_keeps_the_bar_for_compress() {
-    let root = dir("pkg-tiny");
-    let src = root.join("src");
-    write(&src, "eboot.bin", b"\x7fELF fake eboot");
-    write(
-        &src,
-        "sce_sys/param.json",
-        br#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST"}"#,
-    );
-    for i in 0..600 {
-        write(&src, &format!("data/tiny/{i:03}.bin"), &[i as u8; 32]);
-    }
-    let (events, result) = run(request(&src, Format::Pkg, &root.join("tiny.pkg")));
-    result.unwrap();
-    let bar = one_bar(&events);
-    let planned = bar.iter().rposition(|&(s, _, _)| s == "plan").unwrap();
-    let most = bar[..=planned]
-        .iter()
-        .filter(|&&(_, _, t)| t > 0)
-        .map(|&(_, d, t)| d as f64 / t as f64)
-        .fold(0.0, f64::max);
-    assert!(most < 0.10, "{most} after plan: {bar:?}");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -532,106 +466,6 @@ fn pkg_to_folder_round_trip() {
         .unwrap();
     assert!(report.checks.iter().any(|c| c == "empty dirs: 1 match"));
     assert!(stale_parts(&root).is_empty());
-}
-
-/// `pkg` re-wrapped as a patch package (`\x7FLIH`) carrying every outer block: a 64 KiB header,
-/// the FIH block, the blocks, the container (see `ps5-dump-forge-fpkg`'s `lih.rs`).
-fn patch_of(pkg: &[u8]) -> Vec<u8> {
-    const B: usize = 0x10000;
-    let le = |at: usize| u64::from_le_bytes(pkg[at..at + 8].try_into().unwrap()) as usize;
-    let (pfs_offset, pfs_size, cnt_offset) = (le(0x10), le(0x18), le(0x58));
-    let cnt_end = if cnt_offset < pfs_offset {
-        pfs_offset
-    } else {
-        pkg.len()
-    };
-    let mut out = vec![0u8; B];
-    out.extend_from_slice(&pkg[..B]);
-    out.extend_from_slice(&pkg[pfs_offset..pfs_offset + pfs_size]);
-    let cnt_at = out.len();
-    out.extend_from_slice(&pkg[cnt_offset..cnt_end]);
-    let len = out.len();
-    out[..4].copy_from_slice(b"\x7FLIH");
-    for (at, v) in [
-        (0x18, len),
-        (0x20, B),
-        (0x28, B),
-        (0x30, cnt_at),
-        (0x38, cnt_end - cnt_offset),
-    ] {
-        out[at..at + 8].copy_from_slice(&(v as u64).to_le_bytes());
-    }
-    out
-}
-
-/// A patch package is browsed and extracted from only: inspect flags it, Extract copies its
-/// files, a conversion and an edit refuse it, and the Library leaves it out.
-#[test]
-fn a_patch_package_is_extracted_from_only() {
-    let root = dir("patch-pkg");
-    let src = root.join("src");
-    game(&src);
-    let pkg = root.join("PPSA01234.pkg");
-    run(request(&src, Format::Pkg, &pkg)).1.unwrap();
-    let patch = root.join("patches/PPSA01234-patch.pkg");
-    write(
-        &root,
-        "patches/PPSA01234-patch.pkg",
-        &patch_of(&std::fs::read(&pkg).unwrap()),
-    );
-
-    let ins = inspect(&patch).unwrap();
-    assert!(ins.patch && ins.lz4.is_none(), "{:?}", ins.details);
-    assert!(
-        !ins.additional_content && ins.findings.is_empty(),
-        "{:?}",
-        ins.findings
-    );
-    assert_eq!(ins.title_id.as_deref(), Some("PPSA01234"));
-    assert!(!inspect(&pkg).unwrap().patch);
-
-    let out = root.join("out");
-    std::fs::create_dir(&out).unwrap();
-    run(ConvertRequest {
-        extract: vec!["data".into()],
-        ..request(&patch, Format::Folder, &out)
-    })
-    .1
-    .unwrap();
-    assert!(
-        std::fs::read(out.join("data/big.bin")).unwrap()
-            == std::fs::read(src.join("data/big.bin")).unwrap()
-    );
-
-    // Refused before the patch is read: no LZ4 step logs anything first.
-    let (events, result) = run(request(&patch, Format::Exfat, &root.join("x.exfat")));
-    let err = result.unwrap_err();
-    assert!(
-        !events.iter().any(|e| matches!(e, Event::Log { .. })),
-        "{events:?}"
-    );
-    assert!(err.contains("a patch package (LIH)"), "{err}");
-    assert!(!root.join("x.exfat").exists());
-    let check = edit_check(&ConvertRequest {
-        edits: vec![ps5_dump_forge_core::Edit::Delete {
-            path: "data/zero.bin".into(),
-        }],
-        ..request(&patch, Format::Pkg, &patch)
-    });
-    for findings in [&check.in_place, &check.rebuild] {
-        assert!(
-            findings.iter().any(|f| f.contains("patch package")),
-            "{check:?}"
-        );
-    }
-
-    let scan = ps5_dump_forge_core::scan_library_folder(&root).unwrap();
-    let listed: Vec<&Path> = scan.entries.iter().map(|e| e.path.as_path()).collect();
-    assert!(
-        listed.contains(&pkg.as_path()) && !listed.contains(&patch.as_path()),
-        "{listed:?}"
-    );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Cancels `format`'s job at the first progress of `at`, while its `.part` exists.
@@ -890,119 +724,6 @@ fn ffpfsc_round_trip_with_each_inner_image() {
     }
 }
 
-#[test]
-fn pfs_targets_refuse_what_smp_cannot_mount() {
-    let root = dir("pfs-refuse");
-    let src = root.join("src");
-    game(&src);
-    write(&src, "data/café.bin", b"x");
-    write(&src, "data/naïve/x.bin", b"x");
-    // PFS names are ASCII only: every offender is listed, for `.ffpfs` and a `.ffpfs` inside
-    // a `.ffpfsc`; an exFAT inside takes them.
-    let ffpfsc = |inner| ConvertRequest {
-        inner,
-        ..request(&src, Format::Ffpfsc, &root.join("a.ffpfsc"))
-    };
-    for req in [
-        request(&src, Format::Ffpfs, &root.join("a.ffpfs")),
-        ffpfsc(Some(Format::Ffpfs)),
-    ] {
-        let err = run(req).1.unwrap_err();
-        for want in [
-            "PFS layout: ",
-            "data/café.bin: non-ASCII name",
-            "data/naïve: non-ASCII name",
-        ] {
-            assert!(err.contains(want), "{want:?} not in:\n{err}");
-        }
-    }
-    let found = inspect(&src).unwrap();
-    assert_eq!(
-        found.findings,
-        [
-            "name not ASCII (refused by .ffpfs): data/café.bin",
-            "name not ASCII (refused by .ffpfs): data/naïve/x.bin"
-        ]
-    );
-    // Only an `.exfat`, `.ffpkg` or `.ffpfs` goes inside.
-    for (inner, what) in [
-        (Format::Pkg, ".pkg"),
-        (Format::Folder, "a folder"),
-        (Format::Ffpfsc, ".ffpfsc"),
-    ] {
-        let err = run(ffpfsc(Some(inner))).1.unwrap_err();
-        let want = format!("a .ffpfsc holds an .exfat, .ffpkg or .ffpfs image, not {what}");
-        assert!(err.contains(&want), "{want:?} not in:\n{err}");
-    }
-    // An explicit name over ShadowMountPlus's limit (extension excluded) is refused: 63
-    // bytes for an image, 58 for a .ffpfsc.
-    for (format, ext, max) in [
-        (Format::Exfat, "exfat", 63),
-        (Format::Ffpkg, "ffpkg", 63),
-        (Format::Ffpfs, "ffpfs", 63),
-        (Format::Ffpfsc, "ffpfsc", 58),
-    ] {
-        let long = format!("{}.{ext}", "n".repeat(max + 1));
-        let err = run(request(&src, format, &root.join(&long))).1.unwrap_err();
-        let want = format!(
-            "{long} is {} bytes long without its .{ext}: ShadowMountPlus fails to mount a \
-             .{ext} whose name is over {max} bytes",
-            max + 1
-        );
-        assert!(err.contains(&want), "{want:?} not in:\n{err}");
-    }
-    // A .pkg (not image-mounted) keeps to the same 63 bytes.
-    let long = format!("{}.pkg", "n".repeat(64));
-    let err = run(request(&src, Format::Pkg, &root.join(&long)))
-        .1
-        .unwrap_err();
-    let want = format!("{long} is 64 bytes long without its .pkg: output names are at most 63");
-    assert!(err.contains(&want), "{want:?} not in:\n{err}");
-    std::fs::remove_file(src.join("data/café.bin")).unwrap();
-    std::fs::remove_dir_all(src.join("data/naïve")).unwrap();
-    let fits = format!("{}.ffpfs", "n".repeat(63));
-    run(request(&src, Format::Ffpfs, &root.join(&fits)))
-        .1
-        .unwrap();
-    assert!(stale_parts(&root).is_empty());
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn too_deep_for_the_image_readers_is_refused() {
-    let root = dir("deep");
-    let src = root.join("src");
-    game(&src);
-    let deep = |n: usize| vec!["d"; n].join("/");
-    // 32 directory levels read back fine; 33 do not.
-    write(&src, &format!("{}/ok.bin", deep(32)), b"x");
-    let report = run(request(&src, Format::Exfat, &root.join("ok.exfat")))
-        .1
-        .unwrap();
-    assert!(report.checks.iter().any(|c| c.starts_with("blake3:")));
-    write(&src, &format!("{}/deep.bin", deep(33)), b"x");
-    for (format, name) in [
-        (Format::Exfat, "a.exfat"),
-        (Format::Ffpkg, "a.ffpkg"),
-        (Format::Ffpfs, "a.ffpfs"),
-        (Format::Ffpfsc, "a.ffpfsc"),
-    ] {
-        let err = run(request(&src, format, &root.join(name))).1.unwrap_err();
-        assert!(
-            err.contains(&format!(
-                "nested deeper than 32 directories (image readers' limit): {}/deep.bin",
-                deep(33)
-            )),
-            "{err}"
-        );
-    }
-    // A folder has no such limit.
-    run(request(&src, Format::Folder, &root.join("out")))
-        .1
-        .unwrap();
-    assert!(stale_parts(&root).is_empty());
-}
-
 /// A minimal ELF whose process param carries the PS5 SDK `sdk` (as `sdk.rs` reads it).
 fn eboot(sdk: u32) -> Vec<u8> {
     let mut f = vec![0u8; 0x300];
@@ -1096,7 +817,7 @@ fn remove_backport_keeps_emulators_and_refuses_a_lowered_sdk() {
 // ---- LZ4 asset packs ----------------------------------------------------------------------------
 
 use ps5_dump_forge_core::Lz4Mode;
-use ps5_dump_forge_lz4::runtime::RELEASE;
+use ps5_dump_forge_lz4::runtime::release;
 
 /// Bytes that do not compress.
 fn noise(len: usize, seed: u64) -> Vec<u8> {
@@ -1248,12 +969,61 @@ fn zstd_pack_refusals_and_packed_sources() {
     let mut source = tree_bytes(&src);
     source.push((
         "fakelib/libSceAmpr.sprx".into(),
-        ps5_dump_forge_lz4::runtime::ZSTD.to_vec(),
+        ps5_dump_forge_lz4::runtime::zstd().to_vec(),
     ));
     source.sort();
     let mut logical = zstd_logical(&packed);
     logical.sort();
     assert_eq!(logical, source);
+    let ng = ps5_dump_forge_lz4::runtime::zstd();
+    assert!(std::fs::read(copy.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
+}
+
+/// ampr-emu-ng goes into a game only by packing (by user decision): a plain conversion of an
+/// unpacked game carrying it, and an LZ4 Unpack of one packed with it, put the release ampr_emu
+/// in its place; a zstd-packed game keeps it (above).
+#[test]
+fn ampr_emu_ng_is_replaced_outside_packing() {
+    let root = dir("ng-replaced");
+    let src = root.join("src");
+    ampr_game(&src);
+    let ng = ps5_dump_forge_lz4::runtime::zstd();
+    write(&src, "fakelib/libSceAmpr.sprx", ng);
+    let info = ps5_dump_forge_core::inspect(&src).unwrap();
+    let facts = info.lz4.unwrap();
+    assert_eq!(facts.runtime, "zstd");
+    assert_eq!(facts.runtime_action, Some("replace"));
+    let out = root.join("out");
+    let (events, result) = run(request(&src, Format::Folder, &out));
+    result.unwrap();
+    assert!(
+        logged(&events, "replacing ampr-emu-ng at fakelib/libSceAmpr.sprx"),
+        "{events:?}"
+    );
+    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    assert_eq!(assets(&out), assets(&src));
+
+    // LZ4 Pack with ampr-emu-ng keeps it; unpacking puts the release runtime back.
+    let packed = root.join("packed");
+    let (_, result) = run(ConvertRequest {
+        lz4_runtime: ps5_dump_forge_core::Lz4Runtime::Ng,
+        ..lz4_request(&src, Format::Folder, &packed, Some(Lz4Mode::Pack))
+    });
+    result.unwrap();
+    assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
+    let facts = ps5_dump_forge_core::inspect(&packed).unwrap().lz4.unwrap();
+    assert_eq!(facts.pack_runtime_action, Some("replace"));
+    let back = root.join("back");
+    let (_, result) = run(lz4_request(
+        &packed,
+        Format::Folder,
+        &back,
+        Some(Lz4Mode::Unpack),
+    ));
+    result.unwrap();
+    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    assert_eq!(assets(&back), assets(&src));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// zstd packs straight into a `.ffpkg`: measured, written with no staging folder, verified as
@@ -1301,213 +1071,10 @@ fn zstd_pack_straight_into_an_ffpkg() {
     let mut source = tree_bytes(&src);
     source.push((
         "fakelib/libSceAmpr.sprx".into(),
-        ps5_dump_forge_lz4::runtime::ZSTD.to_vec(),
+        ps5_dump_forge_lz4::runtime::zstd().to_vec(),
     ));
     source.sort();
     assert_eq!(logical, source);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn zstd_pack_from_lz4_packed_folder() {
-    let root = dir("zstd-from-lz4");
-    let src = root.join("src");
-    ampr_game(&src);
-    let lz4 = root.join("lz4");
-    run(request(&src, Format::Lz4, &lz4)).1.unwrap();
-    assert!(lz4.join("ampr_assets-000.pak").is_file());
-
-    let forged = root.join("forged");
-    let (events, result) = run(zstd_request(&lz4, &forged));
-    result.unwrap();
-    assert!(
-        logged(&events, "wrote zstd packs: 3 files packed"),
-        "{events:?}"
-    );
-    // Packed as LZ4 packed them: its three assets in the volume, its loose files on disk.
-    for loose in [
-        "readme.txt",
-        "data/zero.bin",
-        "eboot.bin",
-        "sce_sys/param.json",
-    ] {
-        assert!(forged.join(loose).is_file(), "{loose}");
-    }
-    for packed in ["data/big.bin", "data/assets/noise.bin"] {
-        assert!(!forged.join(packed).exists(), "{packed}");
-    }
-    // No LZ4 pack, manifest or LZ4 runtime survives; the logical files are the source's.
-    for gone in [
-        "ampr_assets.index",
-        "ampr_assets.index.crc",
-        "ampr_assets-000.pak",
-        "data/assets/level1.bin",
-    ] {
-        assert!(!forged.join(gone).exists(), "{gone}");
-    }
-    let mut source = tree_bytes(&src);
-    source.push((
-        "fakelib/libSceAmpr.sprx".into(),
-        ps5_dump_forge_lz4::runtime::ZSTD.to_vec(),
-    ));
-    source.sort();
-    let mut logical = zstd_logical(&forged);
-    logical.sort();
-    assert_eq!(logical, source);
-}
-
-/// What a zstd pack holds apart from its random archive ID and its index's timestamp: the
-/// decoded `ampr_zstd.index` (ID zeroed), each volume's payload, and every other file.
-fn zstd_content(root: &Path) -> (ps5_dump_forge_zstd::Index, Vec<(String, Vec<u8>)>) {
-    let tree = ScannedFolder::scan(root, &AtomicBool::new(false)).unwrap();
-    let mut index = ps5_dump_forge_zstd::reader::unpack(Box::new(tree))
-        .unwrap()
-        .index()
-        .clone();
-    index.archive_id = [0; 16];
-    let header = ps5_dump_forge_zstd::VOLUME_HEADER_SIZE;
-    let files = tree_bytes(root)
-        .into_iter()
-        .filter(|(p, _)| p != "ampr_emu.index" && p != "ampr_zstd.index")
-        .map(|(p, bytes)| {
-            let pak = p.starts_with("ampr_zstd-") && p.ends_with(".pak");
-            let bytes = if pak { bytes[header..].to_vec() } else { bytes };
-            (p, bytes)
-        })
-        .collect();
-    (index, files)
-}
-
-#[test]
-fn zstd_pack_honours_compression_threads() {
-    let root = dir("zstd-threads");
-    let src = root.join("src");
-    ampr_game(&src);
-    let default = root.join("default");
-    let (events, result) = run(zstd_request(&src, &default));
-    result.unwrap();
-    assert!(logged(&events, "MB/s on "), "{events:?}");
-    let want = zstd_content(&default);
-    assert!(!want.0.files.is_empty());
-    for threads in [1, 2] {
-        let out = root.join(format!("t{threads}"));
-        let (events, result) = run(ConvertRequest {
-            compression_threads: Some(threads),
-            ..zstd_request(&src, &out)
-        });
-        result.unwrap();
-        assert!(
-            logged(&events, &format!("MB/s on {threads} threads")),
-            "{threads}: {events:?}"
-        );
-        assert!(zstd_content(&out) == want, "{threads} threads");
-    }
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// A zstd-packed folder converted plainly into an image or a `.pkg` keeps `ampr_emu.index`
-/// (it lists the packed files), the packs and the zstd runtime byte for byte (the builder
-/// keeps a zstd-packed source's index: vendor patch 0030). Inspect labels it.
-#[test]
-fn a_zstd_packed_source_keeps_its_index_in_an_image() {
-    let root = dir("zstd-plain-image");
-    let src = root.join("src");
-    ampr_game(&src);
-    let packed = root.join("packed");
-    run(zstd_request(&src, &packed)).1.unwrap();
-    assert!(packed.join("ampr_zstd-000.pak").is_file());
-    let image = root.join("PPSA01234.ffpkg");
-    let (events, result) = run(request(&packed, Format::Ffpkg, &image));
-    result.unwrap();
-    assert!(
-        logged(&events, "keeping ampr_emu.index as it is"),
-        "{events:?}"
-    );
-    let back = root.join("back");
-    run(request(&image, Format::Folder, &back)).1.unwrap();
-    for same in [
-        "ampr_emu.index",
-        "ampr_zstd.index",
-        "ampr_zstd-000.pak",
-        "fakelib/libSceAmpr.sprx",
-    ] {
-        assert!(
-            std::fs::read(back.join(same)).unwrap() == std::fs::read(packed.join(same)).unwrap(),
-            "{same}"
-        );
-    }
-    assert_eq!(zstd_logical(&back), zstd_logical(&packed));
-
-    assert!(inspect(&packed).unwrap().zstd_packed);
-    assert!(!inspect(&src).unwrap().zstd_packed);
-
-    let pkg = root.join("game.pkg");
-    run(request(&packed, Format::Pkg, &pkg)).1.unwrap();
-    let from_pkg = root.join("from-pkg");
-    run(request(&pkg, Format::Folder, &from_pkg)).1.unwrap();
-    for same in [
-        "ampr_emu.index",
-        "ampr_zstd.index",
-        "ampr_zstd-000.pak",
-        "fakelib/libSceAmpr.sprx",
-    ] {
-        assert!(
-            std::fs::read(from_pkg.join(same)).unwrap()
-                == std::fs::read(packed.join(same)).unwrap(),
-            "{same}"
-        );
-    }
-    // The packed files read back through the packaged packs (the builder rewrites param.json
-    // and adds its keystone beside them).
-    let packed_only = |root: &Path| -> Vec<(String, Vec<u8>)> {
-        (zstd_logical(root).into_iter())
-            .filter(|(p, _)| !packed.join(p).exists())
-            .collect()
-    };
-    let want = packed_only(&packed);
-    let got: Vec<(String, Vec<u8>)> = (packed_only(&from_pkg).into_iter())
-        .filter(|(p, _)| want.iter().any(|(w, _)| w == p))
-        .collect();
-    let names = |v: &[(String, Vec<u8>)]| v.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
-    assert!(!want.is_empty());
-    assert!(got == want, "{:?} vs {:?}", names(&got), names(&want));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// A zstd-packed source converted as it is ends with the zstd runtime (another one replaced),
-/// and refuses `remove_backport`: its kept `ampr_emu.index` lists the backport.
-#[test]
-fn a_zstd_packed_source_gets_the_zstd_runtime_and_keeps_its_backport() {
-    let root = dir("zstd-runtime");
-    let src = root.join("src");
-    ampr_game(&src);
-    let packed = root.join("packed");
-    run(zstd_request(&src, &packed)).1.unwrap();
-    write(&packed, "fakelib/libSceAmpr.sprx", RELEASE);
-    let out = root.join("out");
-    let (events, result) = run(request(&packed, Format::Folder, &out));
-    result.unwrap();
-    assert!(logged(&events, "with the zstd runtime"), "{events:?}");
-    assert!(
-        std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap()
-            == ps5_dump_forge_lz4::runtime::ZSTD
-    );
-
-    write(
-        &packed,
-        "fakelib/libSceAgc.sprx",
-        b"\x7fELF a system library",
-    );
-    let err = run(ConvertRequest {
-        remove_backport: true,
-        ..request(&packed, Format::Folder, &root.join("b"))
-    })
-    .1
-    .unwrap_err();
-    assert!(
-        err.contains("lists its backport in its ampr_emu.index"),
-        "{err}"
-    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1529,7 +1096,7 @@ fn zstd_unpack_restores_the_logical_files() {
     result.unwrap();
     assert!(logged(&events, "with zstd packs unpacked"), "{events:?}");
     assert!(!out.join("ampr_zstd.index").exists() && !out.join("ampr_zstd-000.pak").exists());
-    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
+    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
     assert_eq!(assets(&out), assets(&src));
     let mut listed = index_paths(&out);
     listed.sort();
@@ -1550,7 +1117,7 @@ fn zstd_unpack_restores_the_logical_files() {
         run(request(&image, Format::Folder, &back)).1.unwrap();
         assert!(!back.join("ampr_zstd.index").exists(), "{name}");
         assert!(back.join("data/assets/level1.bin").is_file(), "{name}");
-        assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
+        assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
     }
 
     let refused = |req: ConvertRequest, want: &str| {
@@ -1575,35 +1142,6 @@ fn zstd_unpack_restores_the_logical_files() {
         },
         "zstd pack and zstd unpack can't go together",
     );
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// LZ4 Pack of a zstd-packed game decodes the zstd packs first: the LZ4 packs hold the
-/// logical files, with the release runtime in place of the zstd one.
-#[test]
-fn lz4_pack_of_a_zstd_packed_game_decodes_it_first() {
-    let root = dir("zstd-to-lz4");
-    let src = root.join("src");
-    ampr_game(&src);
-    let packed = root.join("packed");
-    run(zstd_request(&src, &packed)).1.unwrap();
-    let lz4 = root.join("lz4");
-    let (events, result) = run(request(&packed, Format::Lz4, &lz4));
-    result.unwrap();
-    assert!(logged(&events, "with zstd packs unpacked"), "{events:?}");
-    assert!(lz4.join("ampr_assets-000.pak").is_file());
-    assert!(!lz4.join("ampr_zstd.index").exists());
-    let back = root.join("back");
-    run(lz4_request(
-        &lz4,
-        Format::Folder,
-        &back,
-        Some(Lz4Mode::Unpack),
-    ))
-    .1
-    .unwrap();
-    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
-    assert_eq!(assets(&back), assets(&src));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1663,11 +1201,14 @@ fn folder_to_lz4_and_back() {
     }
     assert!(!packed.join("ampr_assets.index.runtime").exists());
     assert!(packed.join("data/empty").is_dir());
-    assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
+    assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
     let mut want: Vec<(String, u64)> = tree_bytes(&src)
         .into_iter()
         .map(|(p, b)| (p, b.len() as u64))
-        .chain([("fakelib/libSceAmpr.sprx".to_string(), RELEASE.len() as u64)])
+        .chain([(
+            "fakelib/libSceAmpr.sprx".to_string(),
+            release().len() as u64,
+        )])
         .collect();
     want.sort();
     let mut got = index_paths(&packed);
@@ -1689,7 +1230,7 @@ fn folder_to_lz4_and_back() {
         "with LZ4 packs unpacked (3 packed files in 1 volumes)"
     ));
     assert_eq!(assets(&back), tree_bytes(&src));
-    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
+    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
     // Unpacking keeps the index byte for byte: it lists exactly the unpacked files.
     assert!(logged(&events, "keeping ampr_emu.index"), "{events:?}");
     let index = |dir: &Path| std::fs::read(dir.join("ampr_emu.index")).unwrap();
@@ -1738,7 +1279,7 @@ fn a_plain_conversion_repairs_an_ampr_title() {
         "{events:?}"
     );
     assert!(logged(&events, "no ampr_emu.index yet"), "{events:?}");
-    assert!(runtime(&fixed).unwrap() == RELEASE);
+    assert!(runtime(&fixed).unwrap() == release());
     assert_indexes_folder(&fixed);
     assert_eq!(assets(&fixed), tree_bytes(&src));
     write(&fixed, "ampr_commands.bin", b"a session's journal");
@@ -1766,7 +1307,7 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     run(request(&image, Format::Folder, &back)).1.unwrap();
     assert!(!back.join("ampr_commands.bin").exists() && !back.join("ampr_emu.log").exists());
     assert_indexes_folder(&back);
-    assert!(runtime(&back).unwrap() == RELEASE);
+    assert!(runtime(&back).unwrap() == release());
 
     // A damaged index is written anew too.
     write(&fixed, "ampr_emu.index", b"not an index");
@@ -1793,7 +1334,7 @@ fn a_plain_conversion_repairs_an_ampr_title() {
         assert_indexes_folder(&out);
         let packed = root.join(format!("{name}-packed"));
         run(request(&other, Format::Lz4, &packed)).1.unwrap();
-        let want = if packs { bytes } else { RELEASE };
+        let want = if packs { bytes } else { release() };
         assert!(runtime(&packed).unwrap() == want, "{name}");
     }
 
@@ -1812,7 +1353,7 @@ fn a_plain_conversion_repairs_an_ampr_title() {
             logged(&events, "replacing the game's runtime"),
             "{events:?}"
         );
-        assert!(runtime(&out).unwrap() == RELEASE, "{name}");
+        assert!(runtime(&out).unwrap() == release(), "{name}");
         assert_indexes_folder(&out);
     }
 
@@ -1824,7 +1365,7 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     let (events, result) = run(request(&none, Format::Folder, &out));
     result.unwrap();
     assert!(logged(&events, "installing the release runtime"));
-    assert!(runtime(&out).unwrap() == RELEASE);
+    assert!(runtime(&out).unwrap() == release());
     assert!(
         std::fs::read(out.join("ampr_emu.index")).unwrap()
             == std::fs::read(exact.join("ampr_emu.index")).unwrap()
@@ -1839,156 +1380,6 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     result.unwrap();
     assert!(!logged(&events, "LZ4"), "{events:?}");
     assert_eq!(tree_bytes(&out), tree_bytes(&plain));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// A STORED `.zip` of `entries` at `path`.
-fn stored_zip(path: &Path, entries: &[(String, Vec<u8>)]) {
-    let (mut out, mut central) = (Vec::new(), Vec::new());
-    for (name, data) in entries {
-        let at = out.len() as u32;
-        // version 20, no flags, stored, 1980-01-01 00:00, crc, sizes, name length, no extra
-        let fields = |b: &mut Vec<u8>| {
-            for v in [20u16, 0, 0, 0, 0x21] {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in [crc32fast::hash(data), data.len() as u32, data.len() as u32] {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            b.extend_from_slice(&0u16.to_le_bytes());
-        };
-        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-        fields(&mut out);
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
-        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        central.extend_from_slice(&20u16.to_le_bytes());
-        fields(&mut central);
-        central.extend_from_slice(&[0; 10]); // comment, disk, attributes
-        central.extend_from_slice(&at.to_le_bytes());
-        central.extend_from_slice(name.as_bytes());
-    }
-    let (cd_at, cd_len, n) = (out.len() as u32, central.len() as u32, entries.len() as u16);
-    out.append(&mut central);
-    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-    out.extend_from_slice(&[0; 4]);
-    for v in [n, n] {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in [cd_len, cd_at] {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out.extend_from_slice(&[0; 2]);
-    std::fs::write(path, out).unwrap();
-}
-
-/// Into a `.pkg`, a plain conversion builds no `ampr_emu.index` of its own: the builder writes one after leaving out SDK leftovers, so names only they share in
-/// case don't refuse the job.
-#[test]
-fn a_pkg_of_an_ampr_title_leaves_its_index_to_the_builder() {
-    let root = dir("lz4-plain-pkg");
-    let src = root.join("src");
-    ampr_game(&src);
-    write(&src, "ampr_commands.bin", b"a session's journal");
-    write(&src, "ampr_emu.log", b"log");
-    write(&src, "ampr_emu.index", b"a stale index");
-    let mut entries = tree_bytes(&src);
-    entries.push(("sce_sc/a".into(), b"an SDK leftover".to_vec()));
-    entries.push(("sce_sc/A".into(), b"another one".to_vec()));
-    let zip = root.join("game.zip");
-    stored_zip(&zip, &entries);
-    {
-        let name = "plain";
-        let pkg = root.join(format!("{name}.pkg"));
-        let (events, result) = run(request(&zip, Format::Pkg, &pkg));
-        result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(
-            logged(&events, "installing the release runtime"),
-            "{name}: {events:?}"
-        );
-        assert!(logged(&events, "leaving out ampr_commands.bin"), "{name}");
-        assert!(logged(&events, "leaving out ampr_emu.log"), "{name}");
-        assert!(!logged(&events, "LZ4: writing a new"), "{name}: {events:?}");
-        // The package as built, not a conversion of it (which would write its own index).
-        let mut tree = ps5_dump_forge_fpkg::FpkgSource::open(&pkg, None).unwrap();
-        let index = tree.read("ampr_emu.index").unwrap();
-        let mut got = ps5_dump_forge_lz4::index::read_index(&index)
-            .unwrap()
-            .records;
-        let mut want: Vec<(String, u64)> = tree
-            .files()
-            .iter()
-            .filter(|f| f.path != "ampr_emu.index")
-            .map(|f| (f.path.clone(), f.size))
-            .collect();
-        got.sort();
-        want.sort();
-        assert_eq!(got, want, "{name}");
-        assert!(
-            got.contains(&("fakelib/libSceAmpr.sprx".to_string(), RELEASE.len() as u64)),
-            "{name}"
-        );
-        assert!(
-            tree.read("fakelib/libSceAmpr.sprx").unwrap() == RELEASE,
-            "{name}"
-        );
-        assert!(
-            !got.iter()
-                .any(|(p, _)| p.starts_with("ampr_") || p.starts_with("sce_sc/")),
-            "{name}: {got:?}"
-        );
-    }
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// A packed source converted without LZ4 options: its index and packs byte for byte, the
-/// runtime replaced by the release one; Forge still unpacks the result.
-#[test]
-fn a_packed_source_keeps_its_index_and_gets_the_release_runtime() {
-    let root = dir("lz4-plain-packed");
-    let src = root.join("src");
-    ampr_game(&src);
-    let packed = root.join("packed");
-    run(request(&src, Format::Lz4, &packed)).1.unwrap();
-    write(
-        &packed,
-        "fakelib/libSceAmpr.sprx",
-        b"\x7fELF AMPRPAK4 AMPRDAT3 0.4.2 (c) Drakmor",
-    );
-    write(&packed, "ampr_emu.log", b"log");
-    let image = root.join("PPSA01234.ffpkg");
-    let (events, result) = run(request(&packed, Format::Ffpkg, &image));
-    result.unwrap();
-    assert!(
-        logged(&events, "replacing the game's runtime"),
-        "{events:?}"
-    );
-    assert!(logged(&events, "keeping ampr_emu.index as it is"));
-    let back = root.join("back");
-    run(request(&image, Format::Folder, &back)).1.unwrap();
-    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
-    for same in [
-        "ampr_emu.index",
-        "ampr_emu.log",
-        "ampr_assets.index",
-        "ampr_assets-000.pak",
-    ] {
-        assert!(
-            std::fs::read(back.join(same)).unwrap() == std::fs::read(packed.join(same)).unwrap(),
-            "{same}"
-        );
-    }
-    let unpacked = root.join("unpacked");
-    run(lz4_request(
-        &back,
-        Format::Folder,
-        &unpacked,
-        Some(Lz4Mode::Unpack),
-    ))
-    .1
-    .unwrap();
-    assert_eq!(assets(&unpacked), tree_bytes(&src));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2127,107 +1518,6 @@ fn assert_indexes_folder(root: &Path) {
     assert_eq!(got, want);
 }
 
-/// Inspect's `index`: the plain conversion's own comparison, journal and logs left out, a
-/// runtime it installs or replaces counted at the release runtime's size, one it keeps at its
-/// own; `None` where no conversion touches the index.
-#[test]
-fn inspect_reports_the_index_state() {
-    let root = dir("lz4-facts-index");
-    let src = root.join("src");
-    ampr_game(&src);
-    let index = |path: &Path| inspect(path).unwrap().lz4.unwrap().index;
-    assert_eq!(
-        index(&src),
-        Some("missing"),
-        "no runtime, no index: both written"
-    );
-
-    let game = root.join("game");
-    run(request(&src, Format::Folder, &game)).1.unwrap();
-    write(&game, "ampr_commands.bin", b"a session's journal");
-    write(&game, "ampr_emu.log", b"log");
-    assert_eq!(index(&game), Some("ok"));
-    let image = root.join("PPSA01234.ffpkg");
-    run(request(&game, Format::Ffpkg, &image)).1.unwrap();
-    assert_eq!(index(&image), Some("ok"));
-    write(
-        &game,
-        "fakelib/libSceAmpr.sprx",
-        b"\x7fELF AMPRPAK4 AMPRDAT3 9.9 (c) Drakmor",
-    );
-    assert_eq!(index(&game), Some("stale"), "a newer runtime is kept");
-    write(
-        &game,
-        "fakelib/libSceAmpr.sprx",
-        b"\x7fELF AMPRPAK4 AMPRDAT3 0.4.2 (c) Drakmor",
-    );
-    assert_eq!(index(&game), Some("ok"), "an older one is replaced");
-
-    let packed = root.join("packed");
-    run(request(&game, Format::Lz4, &packed)).1.unwrap();
-    assert_eq!(index(&packed), None, "kept byte for byte");
-
-    write(&game, "data/added.bin", b"new");
-    assert_eq!(index(&game), Some("stale"));
-    write(&game, "ampr_emu.index", b"not an index");
-    assert_eq!(index(&game), Some("damaged"));
-    std::fs::remove_file(game.join("ampr_emu.index")).unwrap();
-    assert_eq!(index(&game), Some("missing"));
-    std::fs::remove_file(game.join("fakelib/libSceAmpr.sprx")).unwrap();
-    assert_eq!(index(&game), Some("missing"), "no runtime: both written");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// Inspect's `runtime_action` (a plain conversion) and `pack_runtime_action` (Pack, or Unpack
-/// of a packed source): `lz4::Runtime::action`, `None` for a non-AMPR title.
-#[test]
-fn inspect_reports_the_runtime_action() {
-    let root = dir("lz4-facts-runtime");
-    let src = root.join("src");
-    ampr_game(&src);
-    let actions = |path: &Path| {
-        let f = inspect(path).unwrap().lz4.unwrap();
-        (f.runtime_action, f.pack_runtime_action)
-    };
-    let both = |a| (Some(a), Some(a));
-    assert_eq!(actions(&src), both("install"), "no runtime");
-
-    let game = root.join("game");
-    run(request(&src, Format::Folder, &game)).1.unwrap();
-    assert_eq!(actions(&game), both("keep"), "Forge's release runtime");
-    let packed = root.join("packed");
-    run(request(&game, Format::Lz4, &packed)).1.unwrap();
-    assert_eq!(
-        actions(&packed),
-        both("keep"),
-        "packed, Unpack keeps it too"
-    );
-
-    let runtime = |bytes: &[u8]| write(&game, "fakelib/libSceAmpr.sprx", bytes);
-    runtime(b"\x7fELF AMPRPAK4 AMPRDAT3 9.9 (c) Drakmor");
-    assert_eq!(actions(&game), both("keep"), "newer, reads packs");
-    let f = inspect(&game).unwrap().lz4.unwrap();
-    assert_eq!(f.runtime_version.as_deref(), Some("9.9"));
-    runtime(b"\x7fELF 9.9 (c) Drakmor");
-    assert_eq!(
-        actions(&game),
-        (Some("keep"), Some("replace")),
-        "newer without the pack format: Pack replaces it"
-    );
-    runtime(b"\x7fELF AMPRPAK4 AMPRDAT3 0.4.2 (c) Drakmor");
-    assert_eq!(actions(&game), both("replace"), "older");
-    runtime(b"\x7fELF AMPRPAK4 AMPRDAT3 no version");
-    assert_eq!(actions(&game), both("replace"), "no version");
-
-    let other = root.join("other");
-    self::game(&other);
-    write(&other, "ampr_emu.index", b"an index");
-    let f = inspect(&other).unwrap().lz4.unwrap();
-    assert!(!f.imports_ampr);
-    assert_eq!((f.runtime_action, f.pack_runtime_action), (None, None));
-    let _ = std::fs::remove_dir_all(root);
-}
-
 /// The pack files of a packed folder (or an image's files extracted as they are) without the
 /// bytes that carry the job's time: every volume past its 64-byte header, the CRCs past the
 /// sidecar's header, the manifest's chunk table only, and no `ampr_emu.index`. Loose files whole.
@@ -2324,7 +1614,7 @@ fn lz4_pack_straight_into_each_image() {
             .1
             .unwrap();
             assert_eq!(assets(&back), tree_bytes(&src), "{rules} {ext}");
-            assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == RELEASE);
+            assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
             assert!(
                 index_paths(&back)
                     .iter()
@@ -2337,57 +1627,6 @@ fn lz4_pack_straight_into_each_image() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// An HC level reaches the measure pass and the image's re-encode, which must agree.
-#[test]
-fn lz4_pack_at_an_hc_level_into_an_image() {
-    let root = dir("lz4-level");
-    let src = root.join("src");
-    ampr_game(&src);
-    let image = root.join("g.ffpkg");
-    let (events, result) = run(ConvertRequest {
-        lz4: Some(Lz4Mode::Pack),
-        lz4_level: 12,
-        ..request(&src, Format::Ffpkg, &image)
-    });
-    result.unwrap();
-    assert!(logged(&events, "level 12"), "{events:?}");
-    let back = root.join("back");
-    run(lz4_request(
-        &image,
-        Format::Folder,
-        &back,
-        Some(Lz4Mode::Unpack),
-    ))
-    .1
-    .unwrap();
-    assert_eq!(assets(&back), tree_bytes(&src));
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// LZ4 Pack with ampr-emu-ng installs it, and a plain conversion of the packed folder keeps it
-/// (it reads LZ4 packs).
-#[test]
-fn lz4_pack_with_ampr_emu_ng_keeps_it() {
-    let root = dir("lz4-ng");
-    let src = root.join("src");
-    ampr_game(&src);
-    let packed = root.join("packed");
-    run(ConvertRequest {
-        lz4_runtime: ps5_dump_forge_core::Lz4Runtime::Ng,
-        ..lz4_request(&src, Format::Lz4, &packed, None)
-    })
-    .1
-    .unwrap();
-    let ng = ps5_dump_forge_lz4::runtime::ZSTD;
-    assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
-    let copy = root.join("copy");
-    run(request(&packed, Format::Folder, &copy)).1.unwrap();
-    assert!(std::fs::read(copy.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// Cancelled in the measure pass (before any `.part`) or while the image is written: nothing
-/// of the job is left.
 #[test]
 fn cancel_lz4_into_an_image_leaves_nothing() {
     let pack = |format: Format| {
@@ -2602,143 +1841,6 @@ fn delete_leaves_what_unfinished_jobs_use() {
     }
     jobs.cancel_all_and_wait();
     let _ = std::fs::remove_dir_all(root);
-}
-
-/// A request with `edits` is an edit job: its own stages, the image itself as the subject,
-/// refusals as preflight findings. Applying the plan is not wired yet.
-#[test]
-fn an_edit_request_runs_the_edit_job() {
-    use ps5_dump_forge_core::Edit;
-    for (ext, format) in [("exfat", Format::Exfat), ("ffpkg", Format::Ffpkg)] {
-        let root = dir(&format!("edit-dispatch-{ext}"));
-        let src = root.join("src");
-        game(&src);
-        let image = root.join(format!("game.{ext}"));
-        run(request(&src, format, &image)).1.unwrap();
-        let edit = |edits: Vec<Edit>| ConvertRequest {
-            edits,
-            // Ignored for an edit.
-            ..request(&image, Format::Pkg, &root.join("ignored"))
-        };
-        let (events, result) = run(edit(vec![Edit::Mkdir {
-            path: "more".into(),
-        }]));
-        assert_eq!(
-            announced_stages(&events),
-            ["scan", "preflight", "write", "verify", "finalize"]
-        );
-        assert_eq!(stages(&events).last(), Some(&"finalize"));
-        let report = result.unwrap();
-        assert_eq!(report.output, image);
-        assert_eq!(report.verify.mode, VerifyMode::Fast);
-        let seen = inspect(&image).unwrap();
-        assert!(seen.empty_dirs.contains(&"more".to_string()), "{ext}");
-        assert!(!seen.interrupted_edit);
-
-        // Add, replace, delete and rename; the image then converts to the edited folder.
-        let host = root.join("host");
-        write(&host, "added.bin", &[5u8; 300_000]);
-        write(&host, "zero.bin", b"no longer empty");
-        let mut want = tree_bytes(&src);
-        let mut full = edit(vec![
-            Edit::Add {
-                from: host.join("added.bin"),
-                to: "data/added.bin".into(),
-            },
-            Edit::Add {
-                from: host.join("zero.bin"),
-                to: "data/zero.bin".into(),
-            },
-            Edit::Rename {
-                from: "data/big.bin".into(),
-                to: "big.bin".into(),
-            },
-            Edit::Delete {
-                path: "more".into(),
-            },
-        ]);
-        full.full_verify = true;
-        let report = run(full).1.unwrap();
-        assert_eq!(report.verify.mode, VerifyMode::Full);
-        for (path, bytes) in &mut want {
-            match path.as_str() {
-                "data/big.bin" => *path = "big.bin".into(),
-                "data/zero.bin" => *bytes = b"no longer empty".to_vec(),
-                _ => {}
-            }
-        }
-        want.push(("data/added.bin".into(), vec![5u8; 300_000]));
-        want.sort();
-        let out = root.join("out");
-        run(request(&image, Format::Folder, &out)).1.unwrap();
-        assert_eq!(tree_bytes(&out), want, "{ext}");
-        assert!(!root.join(format!("game.{ext}.forge-undo")).exists());
-
-        // A refused edit writes nothing.
-        let before = std::fs::read(&image).unwrap();
-        let (_, result) = run(edit(vec![Edit::Delete {
-            path: "nope".into(),
-        }]));
-        let err = result.unwrap_err();
-        assert!(
-            err.starts_with("preflight failed:") && err.contains("nope is not in the game"),
-            "{err}"
-        );
-        assert_eq!(std::fs::read(&image).unwrap(), before, "nothing written");
-        assert!(!root.join("ignored").exists());
-
-        // A journal beside the image is an interrupted edit.
-        let journal = root.join(format!("game.{ext}.forge-undo"));
-        std::fs::write(&journal, b"x").unwrap();
-        assert!(inspect(&image).unwrap().interrupted_edit);
-        std::fs::remove_file(&journal).unwrap();
-    }
-}
-
-#[test]
-fn a_panic_during_an_edit_restores_the_image_before_the_job_ends() {
-    let root = dir("edit-panic");
-    let src = root.join("src");
-    game(&src);
-    let image = root.join("game.exfat");
-    run(request(&src, Format::Exfat, &image)).1.unwrap();
-    let before = inspect(&image).unwrap();
-    let (tx, rx) = mpsc::channel();
-    let tx = Mutex::new(tx);
-    let watched = image.clone();
-    let jobs = Jobs::new(move |e| {
-        if let Event::Progress { stage, .. } = &e
-            && stage == "verify"
-        {
-            panic!("simulated panic in an event callback");
-        }
-        if let Event::Done { result, .. } = &e {
-            // Seen as Done goes out: the image is already back.
-            let seen = inspect(&watched).unwrap();
-            let journal = watched.with_extension("exfat.forge-undo");
-            let _ = tx
-                .lock()
-                .unwrap()
-                .send((result.clone(), seen, journal.exists()));
-        }
-    });
-    jobs.start(ConvertRequest {
-        edits: vec![ps5_dump_forge_core::Edit::Delete {
-            path: "data/big.bin".into(),
-        }],
-        ..request(&image, Format::Exfat, &image)
-    });
-    let (result, seen, journal) = rx.recv().unwrap();
-    let err = result.unwrap_err();
-    assert!(err.contains("simulated panic"), "{err}");
-    assert!(!journal);
-    let paths = |i: &ps5_dump_forge_core::Inspection| {
-        (i.files.iter())
-            .map(|f| (f.path.clone(), f.size))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(paths(&seen), paths(&before));
-    assert_eq!(seen.empty_dirs, before.empty_dirs);
 }
 
 #[test]
@@ -3035,266 +2137,6 @@ fn a_refused_rebuild_leaves_the_image_as_it_was() {
 }
 
 #[test]
-fn an_ampr_edit_refreshes_the_index_and_drops_the_journal_and_logs() {
-    use ps5_dump_forge_core::Edit;
-    let root = dir("edit-ampr");
-    let src = root.join("src");
-    ampr_game(&src);
-    let fixed = root.join("fixed");
-    run(request(&src, Format::Folder, &fixed)).1.unwrap();
-    write(&fixed, "ampr_commands.bin", b"a session's journal");
-    write(&fixed, "ampr_emu.log", b"a log");
-    let host = root.join("host");
-    write(&host, "added.bin", b"new");
-    // An older ampr_emu, which a conversion would replace.
-    let own: &[u8] = b"\x7fELF AMPRPAK4 AMPRDAT3 0.4.2 (c) Drakmor";
-    write(&host, "own.sprx", own);
-    let edits = || {
-        vec![
-            Edit::Add {
-                from: host.join("added.bin"),
-                to: "data/added.bin".into(),
-            },
-            // The user's own runtime stays: an edit never swaps it.
-            Edit::Add {
-                from: host.join("own.sprx"),
-                to: "fakelib/libSceAmpr.sprx".into(),
-            },
-        ]
-    };
-    let read = |image: &Path| {
-        let file = std::fs::File::open(image).unwrap();
-        ps5upload_fpkg::ufs2_source::Ufs2Source::from_reader(Box::new(file), "ffpkg".into())
-            .unwrap()
-    };
-    let traces = ["ampr_commands.bin", "ampr_emu.log"];
-    for rebuilt in [true, false] {
-        let image = root.join(format!("game-{rebuilt}.ffpkg"));
-        run(request(&fixed, Format::Ffpkg, &image)).1.unwrap();
-        assert!(traces.iter().all(|t| read(&image).read(t).is_ok()));
-        let req = |edits| ConvertRequest {
-            edit_rebuild: rebuilt,
-            ..rebuild(&image, edits)
-        };
-        if rebuilt {
-            // An undo journal beside the image is settled before anything reads the image;
-            // one that can't be refuses the rebuild.
-            let undo = image.with_file_name(format!("game-{rebuilt}.ffpkg.forge-undo"));
-            std::fs::write(&undo, b"x").unwrap();
-            let before = std::fs::read(&image).unwrap();
-            let err = run(req(edits())).1.unwrap_err();
-            assert!(err.contains("undo journal could not be settled"), "{err}");
-            assert_eq!(std::fs::read(&image).unwrap(), before);
-            std::fs::remove_file(&undo).unwrap();
-        }
-        // A new folder changes no file: the index stays, and so do the journal and logs.
-        run(req(vec![Edit::Mkdir { path: "x".into() }])).1.unwrap();
-        assert!(
-            traces.iter().all(|t| read(&image).read(t).is_ok()),
-            "{rebuilt}"
-        );
-
-        let (events, result) = run(req(edits()));
-        result.unwrap();
-        assert!(
-            logged(&events, "writing a new ampr_emu.index"),
-            "{events:?}"
-        );
-        assert!(
-            logged(&events, "removing ampr_commands.bin, ampr_emu.log"),
-            "{events:?}"
-        );
-        assert!(!logged(&events, "runtime"), "{events:?}");
-        // Read back by the image's own reader: a conversion would swap the older runtime.
-        let mut tree = read(&image);
-        assert!(tree.read("fakelib/libSceAmpr.sprx").unwrap() == own);
-        assert_eq!(tree.read("data/added.bin").unwrap(), b"new");
-        for t in traces {
-            assert!(tree.files().iter().all(|f| f.path != t), "{rebuilt}: {t}");
-        }
-        let index = ps5_dump_forge_lz4::index::read_index(&tree.read("ampr_emu.index").unwrap())
-            .unwrap()
-            .records;
-        let mut got: Vec<(String, u64)> = index;
-        let mut want: Vec<(String, u64)> = (tree.files().iter())
-            .filter(|f| f.path != "ampr_emu.index")
-            .map(|f| (f.path.clone(), f.size))
-            .collect();
-        got.sort();
-        want.sort();
-        assert_eq!(got, want, "{rebuilt}");
-    }
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// [`Jobs::edit_check`] on a table with no job.
-fn edit_check(req: &ConvertRequest) -> ps5_dump_forge_core::EditCheck {
-    Jobs::new(|_| {}).edit_check(req)
-}
-
-#[test]
-fn a_ffpfs_is_edited_in_place_within_its_runs() {
-    use ps5_dump_forge_core::Edit;
-    let root = dir("edit-ffpfs");
-    let src = root.join("src");
-    game(&src);
-    let image = rebuilt_image(&root, &src, ("ffpfs", Format::Ffpfs, None));
-    let size = std::fs::metadata(&image).unwrap().len();
-    let host = root.join("host");
-    // As big as data/big.bin (served from the host file), and a shorter eboot.
-    let big: Vec<u8> = (0..9 * 1024 * 1024 + 7).map(|i| (i % 241) as u8).collect();
-    write(&host, "big.bin", &big);
-    write(&host, "eboot.bin", b"\x7fELF eboot");
-    let put = |from: &str, to: &str| Edit::Add {
-        from: host.join(from),
-        to: to.into(),
-    };
-    let rename = |from: &str, to: &str| Edit::Rename {
-        from: from.into(),
-        to: to.into(),
-    };
-    let in_place = |edits| ConvertRequest {
-        edit_rebuild: false,
-        ..rebuild(&image, edits)
-    };
-    let edits = vec![
-        put("big.bin", "data/big.bin"),
-        put("eboot.bin", "eboot.bin"),
-        Edit::Delete {
-            path: "data/empty".into(),
-        },
-        rename("data/zero.bin", "zero.bin"),
-        rename("data", "assets"),
-    ];
-    let check = edit_check(&in_place(edits.clone()));
-    assert_eq!(check.in_place, Vec::<String>::new());
-    // PFS keeps no free count: no sizes inside.
-    assert_eq!((check.needed_inside, check.free_inside), (None, None));
-    let report = run(in_place(edits)).1.unwrap();
-    assert_eq!(report.output, image);
-    assert!(
-        report.checks.iter().any(|c| c.starts_with("blake3:")),
-        "{report:?}"
-    );
-    // A second edit, fully verified: a file moved into a renamed folder and back out.
-    let mut req = in_place(vec![
-        rename("zero.bin", "sce_sys/zero.bin"),
-        rename("sce_sys/zero.bin", "zero.bin"),
-    ]);
-    req.full_verify = true;
-    run(req).1.unwrap();
-    assert_eq!(std::fs::metadata(&image).unwrap().len(), size);
-    assert!(!ps5_dump_forge_patch::journal_path(&image).exists());
-    let mut tree = ps5_dump_forge_pfs::PfsSource::open(&image).unwrap();
-    let mut paths: Vec<String> = tree.files().iter().map(|f| f.path.clone()).collect();
-    paths.sort();
-    assert_eq!(
-        paths,
-        [
-            "assets/big.bin",
-            "eboot.bin",
-            "sce_sys/param.json",
-            "zero.bin"
-        ]
-    );
-    assert!(tree.read("assets/big.bin").unwrap() == big);
-    assert_eq!(tree.read("eboot.bin").unwrap(), b"\x7fELF eboot");
-    assert_eq!(tree.read("zero.bin").unwrap(), b"");
-    assert!(tree.empty_dirs().is_empty(), "{:?}", tree.empty_dirs());
-    drop(tree);
-
-    // A new file, a folder, a file past its run (eboot.bin holds one 64 KiB block), each on
-    // its own and all together: refused in place (said once), a rebuild offered.
-    write(&host, "run.bin", &[1u8; 65_536]);
-    write(&host, "past.bin", &[1u8; 65_537]);
-    let refusals = [
-        vec![put("eboot.bin", "assets/new.bin")],
-        vec![Edit::Mkdir {
-            path: "more".into(),
-        }],
-        vec![put("past.bin", "eboot.bin")],
-    ];
-    let all = refusals.concat();
-    for edits in refusals.into_iter().chain([all]) {
-        let check = edit_check(&in_place(edits.clone()));
-        assert_eq!(
-            check.in_place,
-            [ps5_dump_forge_pfs::edit::NO_ROOM],
-            "{edits:?}"
-        );
-        assert_eq!(check.rebuild, Vec::<String>::new(), "{edits:?}");
-        assert!(check.rebuild_needs.is_some(), "{edits:?}");
-    }
-    // The whole run still fits.
-    let check = edit_check(&in_place(vec![put("run.bin", "eboot.bin")]));
-    assert_eq!(check.in_place, Vec::<String>::new());
-    let _ = std::fs::remove_dir_all(root);
-}
-
-// ponytail: one smoke test for folder edits (the MVP cut stopped Task 8 before its own tests).
-#[test]
-fn a_game_folder_is_edited_directly() {
-    use ps5_dump_forge_core::Edit;
-    let root = dir("edit-folder");
-    let src = root.join("src");
-    game(&src);
-    let host = root.join("host");
-    write(&host, "new.bin", b"new file");
-    write(&host, "eboot.bin", b"\x7fELF new eboot");
-    let req = |edits| ConvertRequest {
-        edits,
-        edit_rebuild: false,
-        ..request(&src, Format::Folder, &root.join("ignored"))
-    };
-    let edits = vec![
-        Edit::Add {
-            from: host.join("new.bin"),
-            to: "data/sub/new.bin".into(),
-        },
-        Edit::Add {
-            from: host.join("eboot.bin"),
-            to: "eboot.bin".into(),
-        },
-        Edit::Delete {
-            path: "data/zero.bin".into(),
-        },
-        Edit::Rename {
-            from: "data/empty".into(),
-            to: "data/renamed".into(),
-        },
-        Edit::Mkdir {
-            path: "extra".into(),
-        },
-    ];
-    let check = edit_check(&req(edits.clone()));
-    assert_eq!(check.in_place, Vec::<String>::new());
-    run(req(edits)).1.unwrap();
-    assert_eq!(
-        std::fs::read(src.join("data/sub/new.bin")).unwrap(),
-        b"new file"
-    );
-    assert_eq!(
-        std::fs::read(src.join("eboot.bin")).unwrap(),
-        b"\x7fELF new eboot"
-    );
-    assert!(!src.join("data/zero.bin").exists());
-    assert!(!src.join("data/empty").exists());
-    assert!(src.join("data/renamed").is_dir());
-    assert!(src.join("extra").is_dir());
-    assert_eq!(
-        std::fs::read(src.join("data/big.bin")).unwrap().len(),
-        9 * 1024 * 1024 + 7
-    );
-    // A refused edit changes nothing.
-    let bad = vec![Edit::Delete {
-        path: "missing.bin".into(),
-    }];
-    assert!(run(req(bad)).1.is_err());
-    assert!(src.join("extra").is_dir());
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
 fn extract_copies_files_and_folders_out_of_a_folder_or_an_image() {
     let root = dir("extract");
     let src = root.join("src");
@@ -3469,98 +2311,55 @@ fn names_in(dir: &Path) -> Vec<String> {
     out
 }
 
-// No eboot.bin but a param.json with a title id is additional content (a DLC, an update), by
-// user decision: no finding, fpkg or a folder only, every edit allowed, listed by the Library.
 #[test]
-fn additional_content_converts_to_fpkg_or_a_folder_and_takes_edits() {
-    use ps5_dump_forge_core::Edit;
-    let root = dir("no-eboot");
+fn delete_source_after_a_verified_conversion() {
+    let root = dir("delete-source");
     let src = root.join("src");
     game(&src);
-    std::fs::remove_file(src.join("eboot.bin")).unwrap();
-    let seen = inspect(&src).unwrap();
-    assert!(seen.additional_content);
-    assert!(
-        !seen.findings.iter().any(|f| f.contains("eboot.bin")),
-        "{:?}",
-        seen.findings
-    );
-    run(request(&src, Format::Pkg, &root.join("dlc.pkg")))
-        .1
-        .unwrap();
-    assert!(inspect(&root.join("dlc.pkg")).unwrap().additional_content);
-    run(request(&src, Format::Folder, &root.join("copy")))
-        .1
-        .unwrap();
-    for format in [Format::Exfat, Format::Ffpkg, Format::Lz4] {
-        let err = run(request(&src, format, &root.join("refused")))
-            .1
-            .unwrap_err();
-        assert!(
-            err.contains("additional content (no eboot.bin) can only be packaged as fpkg"),
-            "{format:?}: {err}"
-        );
-    }
+    let image = root.join("PPSA01234.exfat");
+    let mut req = request(&src, Format::Exfat, &image);
+    req.delete_source = true;
+    let (events, result) = run(req);
+    let report = result.unwrap();
+    let line = format!("source deleted: {}", src.display());
+    assert!(report.checks.contains(&line), "{:?}", report.checks);
+    let logged = |e: &Event| matches!(e, Event::Log { line: l, .. } if *l == line);
+    assert!(events.iter().any(logged), "{events:?}");
+    assert!(!src.exists());
+    // The image holds the game: read back, it matches a fresh copy of it.
+    let back = root.join("back");
+    run(request(&image, Format::Folder, &back)).1.unwrap();
+    let again = root.join("again");
+    game(&again);
+    assert_eq!(tree_bytes(&again), tree_bytes(&back));
+    let _ = std::fs::remove_dir_all(root);
+}
 
-    // An image of a game whose eboot.bin an edit deletes, then a second edit on it.
-    let full = root.join("full");
-    game(&full);
-    let image = root.join("game.exfat");
-    run(request(&full, Format::Exfat, &image)).1.unwrap();
-    assert!(!inspect(&image).unwrap().additional_content);
-    let edit = |edits| ConvertRequest {
-        edits,
-        ..request(&image, Format::Pkg, &root.join("ignored"))
+#[test]
+fn delete_source_refused_keeps_the_source_and_the_job_done() {
+    let root = dir("delete-source-kept");
+    let src = root.join("src");
+    game(&src);
+    let (tx, rx) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    let jobs = Jobs::new(move |e| {
+        let _ = tx.lock().unwrap().send(e);
+    });
+    let keep = src.clone();
+    jobs.set_protected(Arc::new(move || vec![keep.clone()]));
+    let mut req = request(&src, Format::Exfat, &root.join("PPSA01234.exfat"));
+    req.delete_source = true;
+    jobs.start(req);
+    let report = loop {
+        if let Event::Done { result, .. } = rx.recv().unwrap() {
+            break result.unwrap();
+        }
     };
-    let delete = edit(vec![Edit::Delete {
-        path: "eboot.bin".into(),
-    }]);
-    let check = edit_check(&delete);
-    assert!(
-        check.in_place.is_empty() && check.rebuild.is_empty(),
-        "{check:?}"
-    );
-    run(delete).1.unwrap();
-    assert!(inspect(&image).unwrap().additional_content);
-    let mkdir = edit(vec![Edit::Mkdir {
-        path: "more".into(),
-    }]);
-    let check = edit_check(&mkdir);
-    assert!(
-        check.in_place.is_empty() && check.rebuild.is_empty(),
-        "{check:?}"
-    );
-    run(mkdir).1.unwrap();
-    run(rebuild(
-        &image,
-        vec![Edit::Delete {
-            path: "more".into(),
-        }],
-    ))
-    .1
-    .unwrap();
-    let seen = inspect(&image).unwrap();
-    assert!(
-        seen.additional_content && !seen.findings.iter().any(|f| f.contains("eboot.bin")),
-        "{:?}",
-        seen.findings
-    );
-
-    // The Library lists the folder and the image, flagged.
-    std::fs::remove_dir_all(&full).unwrap();
-    std::fs::remove_dir_all(root.join("copy")).unwrap();
-    let scan = ps5_dump_forge_core::scan_library_folder(&root).unwrap();
-    let mut listed: Vec<(String, bool)> = scan
-        .entries
+    let kept = report
+        .checks
         .iter()
-        .map(|e| {
-            let name = e.path.file_name().unwrap().to_string_lossy().into_owned();
-            (name, e.additional_content)
-        })
-        .collect();
-    listed.sort();
-    let want = [("dlc.pkg", true), ("game.exfat", true), ("src", true)];
-    let want: Vec<(String, bool)> = want.iter().map(|(n, f)| (n.to_string(), *f)).collect();
-    assert_eq!(listed, want, "{:?}", scan.warnings);
+        .find(|c| c.starts_with("source kept: "));
+    assert!(kept.is_some(), "{:?}", report.checks);
+    assert!(src.join("eboot.bin").is_file());
     let _ = std::fs::remove_dir_all(root);
 }

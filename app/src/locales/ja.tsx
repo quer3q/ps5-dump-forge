@@ -386,6 +386,9 @@ const ja: Messages = {
     inStep: (time) => `このステップで ${time} 経過`,
     result: (bytes, n) => `${bytes}、${num(n)} 個のファイル →`,
     outputPath: "出力先のパス",
+    sourceDeleted: (v) => `ソースを削除しました：${v}`,
+    sourceKept: (v) => `ソースを残しました：${v}`,
+    sourcePartlyDeleted: (v) => `ソースの一部を削除しました：${v}`,
     checks: "チェック",
     verifiedPlain: (n) => `検証済み：${num(n)} 項目のチェックに合格`,
     verifiedFull: (n) => `完全検証に合格：${num(n)} 項目のチェック`,
@@ -521,9 +524,8 @@ const ja: Messages = {
           ? "zstd パックを通常のファイルに戻します。"
           : "ゲームのアセットを zstd ボリュームにパックします。"
         : packed
-          ? "実験的。LZ4 パックを通常のファイルに戻します。"
-          : "実験的：一部のゲームは起動しない場合があります。ゲームのアセットを LZ4 ボリュームにパックします。",
-    chooseGame: "先にゲームを選んでください。",
+          ? "LZ4 パックを通常のファイルに戻します。"
+          : "一部のゲームは起動しない場合があります。ゲームのアセットを LZ4 ボリュームにパックします。",
     noAmprGame: (e) => `このゲームは AMPR を使用していないため、${e === "zstd" ? "zstd" : "LZ4"} パックは使えません。`,
     patch: "パッチパッケージはパックできません。",
     additionalContent: "追加コンテンツ（eboot.bin なし）はパックできません。",
@@ -577,8 +579,6 @@ const ja: Messages = {
       : <>
         このゲームはすでに <b>{fmt}</b> として書き込み中です。もう一度アンパックすると 2 つ目のコピーが作成されます。
       </>,
-    emptyTitle: "AMPR を使うゲームを選んでください",
-    experimental: "実験的：元のゲームのコピーを残しておいてください。",
     source: "ソース",
   },
   // PackHelp.tsx
@@ -596,7 +596,7 @@ const ja: Messages = {
 
         <h3>LZ4</h3>
         <ol>
-          <li><b>実験的</b>：一部のゲームは起動しない場合があります。コピーを残しておいてください。</li>
+          <li><b>一部のゲームは起動しない場合があります。</b>コピーを残しておいてください。</li>
           <li>LZ4 ボリュームにパックし、フォルダーかイメージに書き込みます：<b>高速</b>（LZ4）、<b>標準</b>（HC 9）、<b>最大</b>（HC 12）。</li>
           <li>ランタイム：<b>ampr-emu-ng</b>（既定）または上流の <b>ampr_emu</b>。</li>
           <li>パック済みのゲームには<b>アンパック</b>が表示されます。</li>
@@ -794,6 +794,7 @@ const ja: Messages = {
       },
     },
     innerFfpkg: { text: "PS5 本来のファイルシステム（UFS2）です。" },
+    innerExfat: { tone: "good", text: "推奨。圧縮コンテナー内で最も安定したイメージです。" },
     level0: { text: "圧縮なし：すべてのブロックをそのまま格納します。ファイルはイメージと同じサイズになります。" },
     levelDefault: {
       tone: "good",
@@ -832,6 +833,9 @@ const ja: Messages = {
     compression: "圧縮",
     fullVerify: "完全検証",
     fullVerifyHint: "出力の全バイトを読み直して検証します。時間がかかります。",
+    deleteSource: "ソースを削除",
+    deleteSourceHint: "元に戻せません。ソースは変換が成功した後にのみ削除されます。",
+    deleteSourceNas: "NAS 上のゲームはここから削除できません。",
     separator: "名前にフォルダーの区切り文字は使えません。フォルダーは「変更」で指定してください。",
     badName: "名前は空にできず、ドットで始めることも、ドットや空白で終えることも、制御文字を含めることもできません。",
     tooLong: (bytes, max, folder) =>
@@ -991,6 +995,13 @@ const ja: Messages = {
       "「ファイル転送」は、これらの間でファイルやフォルダーをコピーします。転送先に同じ名前がある場合は、確認したあとにだけ置き換えます。",
     ],
     helpSecurity: "デバイス間で送信される内容は暗号化されないため、同じネットワークの誰でも読めます。保存した NAS のパスワードは暗号化されずにこのデバイスに保存されます。「接続」は自宅のネットワークでのみ使ってください。",
+    helpSpeed: "ペアリングしたデバイスの行または詳細にある「速度テスト」は、相手に 128 MiB を送って 128 MiB を受け取り（ディスクには何も書きません）、ネットワークの速度を方向ごとに表示します。",
+    speedTest: "速度テスト",
+    speedTestWith: (name) => `${name} との速度テスト`,
+    speedTesting: "テスト中",
+    speedResult: (up, down) => `アップロード ${up} MB/s · ダウンロード ${down} MB/s`,
+    speedFailed: "速度テストに失敗しました:",
+    speedNote: "128 MiB を送って 128 MiB を受け取ります。ディスクには何も書きません。",
     installTitle: "PS5 の Dump Forge",
     ps5Address: "PS5 のアドレス",
     install: "PS5 にインストール",

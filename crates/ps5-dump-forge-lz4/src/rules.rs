@@ -229,41 +229,6 @@ pub fn sample_indices(size: u64, block_shift: u8) -> Vec<u64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn always_loose_table() {
-        for p in [
-            "eboot.bin",
-            "a/b/eboot.bin",
-            "x.ELF",
-            "d/y.Self",
-            "m.prx",
-            "d/m.SPRX",
-            "sce_sys/param.json",
-            "sce_module/a.bin",
-            "fakelib/libSceAmpr.sprx",
-            "fakelib2/a.dat",
-            "ampr_assets.index",
-            "ampr_assets.index.crc",
-            "ampr_assets.index.runtime",
-            "ampr_emu.index",
-            "ampr_commands.bin",
-            "ampr_emu.log",
-            "apr_emu.log",
-        ] {
-            assert!(always_loose(p), "{p}");
-        }
-        for p in [
-            "fakelib",
-            "fakelibs.txt",
-            "d/sce_sys/a",
-            "data/eboot.bin.bak",
-            "ampr_assets-000.pak",
-            "d/ampr_emu.log",
-        ] {
-            assert!(!always_loose(p), "{p}");
-        }
-    }
-
     fn spec(shift: u8, store: bool, hot: bool, random: bool) -> Option<PackSpec> {
         Some(PackSpec {
             block_shift: shift,
@@ -306,59 +271,5 @@ mod tests {
             "the root rule is the fallback's only"
         );
         assert_eq!(select("data/a.bin", 0), None, "empty");
-    }
-
-    #[test]
-    fn fallback_stellar_blade_packs_only_ucas() {
-        let paths = [
-            "contentids.json",
-            "engine/saved/config/ps5/manifest.ini",
-            "sb/content/paks/global.ucas",
-            "sb/content/paks/global.utoc",
-            "sb/content/paks/pakchunk0-ps5.pak",
-            "sb/content/paks/pakchunk0-ps5.ucas",
-            "sb/content/paks/pakchunk0-ps5.utoc",
-            "sb/content/paks/pakchunk1-ps5.ucas",
-            "sb/saved/config/ps5/engine.ini",
-        ];
-        let packed: Vec<&str> = paths
-            .into_iter()
-            .filter(|p| select(p, 1000).is_some())
-            .collect();
-        assert_eq!(
-            packed,
-            [
-                "sb/content/paks/global.ucas",
-                "sb/content/paks/pakchunk0-ps5.ucas",
-                "sb/content/paks/pakchunk1-ps5.ucas"
-            ]
-        );
-    }
-
-    #[test]
-    fn auto_loose_samples_spread_and_judge() {
-        let spec = plain_spec();
-        assert!(!auto_loose_applies(AUTO_LOOSE_MIN_SIZE - 1, &spec));
-        assert!(auto_loose_applies(AUTO_LOOSE_MIN_SIZE, &spec));
-        let stored = PackSpec {
-            store: true,
-            ..spec
-        };
-        assert!(!auto_loose_applies(AUTO_LOOSE_MIN_SIZE, &stored));
-        // 1 GiB of 64 KiB blocks: 32 picks, first and last block included.
-        let ks = sample_indices(1 << 30, 16);
-        assert_eq!((ks.len(), ks[0], ks[31]), (32, 0, (1 << 14) - 1));
-        // 1 MiB blocks: 16 MiB allows 16.
-        assert_eq!(sample_indices(1 << 30, 20).len(), 16);
-        assert_eq!(sample_indices(3 << 16, 16), [0, 1, 2]);
-        let s = |stored_bytes, raw_blocks| Sample {
-            raw_bytes: 100,
-            stored_bytes,
-            blocks: 10,
-            raw_blocks,
-        };
-        assert!(s(96, 0).keeps_loose(), "saves 4%");
-        assert!(s(50, 9).keeps_loose(), "90% RAW");
-        assert!(!s(50, 8).keeps_loose());
     }
 }

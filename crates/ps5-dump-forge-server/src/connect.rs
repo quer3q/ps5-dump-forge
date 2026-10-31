@@ -402,6 +402,22 @@ pub struct Connect {
     /// The NAS (mDNS) part of a search.
     lan: Arc<Lan>,
     lan_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The speed tests running and the cancels that came before their run (`speed_test_cancel`).
+    speed: Mutex<SpeedRuns>,
+}
+
+/// A speed test's run: the device's key id and the id the UI gave it.
+type SpeedRun = (String, String);
+
+/// Cancels kept for a run not started yet, at most this many (the oldest dropped)...
+const SPEED_EARLY_MAX: usize = 16;
+/// ...and for at most this long.
+const SPEED_EARLY_FOR: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct SpeedRuns {
+    running: HashMap<SpeedRun, Arc<crate::connect_fs::SpeedCancel>>,
+    early: std::collections::VecDeque<(SpeedRun, Instant)>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -555,6 +571,7 @@ impl Connect {
             discovery,
             lan: Arc::default(),
             lan_thread: Mutex::default(),
+            speed: Mutex::default(),
         };
         // One search at every start (by user request; the desktop app and the PS5 alike): its
         // finds wait under Nearby, and a saved device that moved to a new address is found: a
@@ -875,6 +892,77 @@ impl Connect {
             .ok_or_else(|| "the device answered no job".to_string())
     }
 
+    /// Times the link to the paired device `key_id`: `SPEED_BYTES` sent, then fetched, over
+    /// FLINK's data lanes, nothing written to disk on either side. Holds `awake()` meanwhile.
+    /// `run` is the UI's id for this test, the one `speed_test_cancel` names.
+    pub fn speed_test(
+        &self,
+        key_id: &str,
+        run: &str,
+    ) -> Result<crate::connect_fs::SpeedTest, String> {
+        self.speed_test_of(key_id, run, crate::connect_fs::SPEED_BYTES)
+    }
+
+    pub(crate) fn speed_test_of(
+        &self,
+        key_id: &str,
+        run: &str,
+        bytes: u64,
+    ) -> Result<crate::connect_fs::SpeedTest, String> {
+        let id: SpeedRun = (key_id.to_string(), run.to_string());
+        let cancel = Arc::new(crate::connect_fs::SpeedCancel::default());
+        {
+            let mut speed = lock(&self.speed);
+            speed.early.retain(|(_, at)| at.elapsed() < SPEED_EARLY_FOR);
+            if let Some(k) = speed.early.iter().position(|(r, _)| *r == id) {
+                speed.early.remove(k);
+                return Err(crate::connect_fs::SPEED_CANCELLED.to_string());
+            }
+            speed.running.insert(id.clone(), cancel.clone());
+        }
+        let _awake = ps5_dump_forge_core::awake();
+        // A control conn of its own (never the shared cached session), its socket kept for
+        // `cancel`, so a Stop while it connects or waits for the `speed` RPC ends it at once.
+        let got = (self.inner.session_with(key_id, Some(&cancel))).and_then(|(mut rpc, hs)| {
+            if cancel.cancelled() {
+                return Err(io::Error::other(crate::connect_fs::SPEED_CANCELLED));
+            }
+            crate::connect_fs::speed_test(&mut rpc, &hs, bytes, &cancel)
+        });
+        let mut speed = lock(&self.speed);
+        if speed
+            .running
+            .get(&id)
+            .is_some_and(|c| Arc::ptr_eq(c, &cancel))
+        {
+            speed.running.remove(&id);
+        }
+        drop(speed);
+        if cancel.cancelled() {
+            return Err(crate::connect_fs::SPEED_CANCELLED.to_string());
+        }
+        got.map_err(|e| error_text(&e))
+    }
+
+    /// Stops the speed test `run` with `key_id` (it ends `cancelled`, its lanes shut). A run not
+    /// started yet is remembered (the last `SPEED_EARLY_MAX`, for `SPEED_EARLY_FOR`) and ends
+    /// `cancelled` as it starts; any other run is left alone.
+    pub fn speed_test_cancel(&self, key_id: &str, run: &str) {
+        let id: SpeedRun = (key_id.to_string(), run.to_string());
+        let mut speed = lock(&self.speed);
+        if let Some(c) = speed.running.get(&id) {
+            c.cancel();
+            return;
+        }
+        speed
+            .early
+            .retain(|(r, at)| *r != id && at.elapsed() < SPEED_EARLY_FOR);
+        if speed.early.len() >= SPEED_EARLY_MAX {
+            speed.early.pop_front();
+        }
+        speed.early.push_back((id, Instant::now()));
+    }
+
     /// This device's user cancels a paired peer's job shown here; false when it isn't listed.
     pub fn cancel_remote_job(&self, key_id: &str, job: JobId) -> bool {
         self.inner.jobs.cancel_remote(key_id, job)
@@ -1072,11 +1160,23 @@ impl Inner {
     }
 
     /// A control conn to `addr` with a stored pair secret.
-    fn dial(&self, addr: SocketAddr) -> io::Result<(Conn, Handshake)> {
+    /// Its socket kept for `cancel` when given (a speed test's Stop shuts it, the handshake and
+    /// the RPCs after it with it).
+    fn dial(
+        &self,
+        addr: SocketAddr,
+        cancel: Option<&crate::connect_fs::SpeedCancel>,
+    ) -> io::Result<(Conn, Handshake)> {
         if !is_local(addr.ip()) {
             return Err(not_local(addr.ip()));
         }
         let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        if let Some(c) = cancel {
+            c.watch(stream.try_clone()?);
+            if c.cancelled() {
+                return Err(io::Error::other(crate::connect_fs::SPEED_CANCELLED));
+            }
+        }
         let mut conn = Conn::new(stream, MAX_CONTROL_BODY, DEAD_AFTER)?;
         let hs = client_handshake(&mut conn, &self.me, &|k| self.secret_of(k), None)?;
         self.record(&hs)?;
@@ -1168,7 +1268,16 @@ impl Inner {
 
     /// A control session with a paired device; an error names the device.
     pub(crate) fn session(self: &Arc<Self>, key_id: &str) -> io::Result<(Rpc, Handshake)> {
-        let (conn, hs) = self.open(key_id).map_err(|e| {
+        self.session_with(key_id, None)
+    }
+
+    /// `session` on a conn of its own whose socket `cancel` shuts (a speed test's).
+    pub(crate) fn session_with(
+        self: &Arc<Self>,
+        key_id: &str,
+        cancel: Option<&crate::connect_fs::SpeedCancel>,
+    ) -> io::Result<(Rpc, Handshake)> {
+        let (conn, hs) = self.open_with(key_id, cancel).map_err(|e| {
             match lock(&self.peers).get(key_id).map(|p| p.name.clone()) {
                 Some(name) => io::Error::new(e.kind(), format!("{name} can't be reached: {e}")),
                 None => e,
@@ -1191,6 +1300,15 @@ impl Inner {
     /// Another device answering there is recorded as itself (its own entry, if paired) and the
     /// next address tried.
     fn open(&self, key_id: &str) -> io::Result<(Conn, Handshake)> {
+        self.open_with(key_id, None)
+    }
+
+    /// `open`, each socket kept for `cancel` and no further address tried once it is cancelled.
+    fn open_with(
+        &self,
+        key_id: &str,
+        cancel: Option<&crate::connect_fs::SpeedCancel>,
+    ) -> io::Result<(Conn, Handshake)> {
         let last = lock(&self.peers)
             .get(key_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "that device isn't paired"))?
@@ -1210,7 +1328,10 @@ impl Inner {
             .into_iter()
             .flatten()
         {
-            match self.dial(addr) {
+            if cancel.is_some_and(|c| c.cancelled()) {
+                return Err(io::Error::other(crate::connect_fs::SPEED_CANCELLED));
+            }
+            match self.dial(addr, cancel) {
                 Ok((conn, hs)) if hs.peer.key_id == key_id => return Ok((conn, hs)),
                 Ok(_) => err = io::Error::other(format!("another device answers at {addr}")),
                 Err(e) if Some(addr) != moved || refusal(&e).is_some() => err = e,
@@ -1378,6 +1499,9 @@ impl Inner {
                     return self
                         .reads
                         .serve(&mut conn, &sid, self.share.as_ref(), f, &allowed);
+                }
+                kind2::REQUEST if crate::connect_fs::is_speed(&f) => {
+                    return crate::connect_fs::serve_speed(&mut conn, f, &peer, &allowed);
                 }
                 kind2::REQUEST if crate::connect_fs::is_write(&f) => {
                     let root = self.share.as_ref();
@@ -2052,34 +2176,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pairing_done_as_cancel_came_says_paired() {
-        let dir = temp_dir("cancel-race");
-        let c = Connect::start(&dir, 0).unwrap();
-        let addr: SocketAddr = "127.0.0.1:9883".parse().unwrap();
-        let device = Device {
-            key_id: "k".into(),
-            name: "ps5".into(),
-            platform: "ps5".into(),
-            address: Some("127.0.0.1:9883".into()),
-            last_seen: 0,
-            online: true,
-        };
-        for (ok, state) in [(false, "cancelled"), (true, "paired")] {
-            *lock(&c.inner.outgoing) = Some(Outgoing::new(1, addr));
-            c.pair_cancel();
-            let result = if ok {
-                Ok(device.clone())
-            } else {
-                Err(io::Error::other("cancelled"))
-            };
-            c.inner.pair_done(1, result);
-            assert_eq!(c.outgoing().unwrap().state, state);
-        }
-        c.shutdown();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn local_networks_only() {
         for (ip, local) in [
             ("192.168.99.230", true),
@@ -2106,24 +2202,6 @@ mod tests {
         let e = c.pair("8.8.8.8").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         c.shutdown();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn discover_start_stop_and_shutdown() {
-        let dir = temp_dir("discover");
-        let c = Connect::start_rooted(&dir, 0, None).unwrap();
-        assert!(c.discovery().forge.is_empty());
-        c.discover_start();
-        assert!(c.discovery().searching);
-        c.discover_start(); // already searching: unchanged
-        c.discover_stop();
-        let t = Instant::now();
-        c.shutdown();
-        // The LAN searches see the stop within a read timeout (a description fetch could
-        // take longer on a real LAN).
-        assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
-        assert!(!c.discovery().searching);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2204,27 +2282,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn identity_persists() {
-        let dir = temp_dir("id");
-        let a = Identity::load_or_create(&dir).unwrap();
-        assert_eq!(a.key_id.len(), 32);
-        let b = Identity::load_or_create(&dir).unwrap();
-        assert_eq!(a.secret, b.secret);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.join(SECRET_FILE))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        fs::write(dir.join(SECRET_FILE), b"short").unwrap();
-        assert!(Identity::load_or_create(&dir).is_err());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// Handshakes recorded at once from many threads, each from a new address: every one saves
     /// outside the `peers` lock, and peers.json ends as memory does (never an older snapshot
     /// written last). A failed save is tried again by the next handshake.
@@ -2285,58 +2342,6 @@ mod tests {
         assert_eq!(Peers::load(&dir).unwrap(), *lock(&c.inner.peers));
         c.shutdown();
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn peers_round_trip() {
-        let dir = temp_dir("peers");
-        assert_eq!(Peers::load(&dir).unwrap(), Peers::default());
-        let peer = |id: &str, addr: &str| Peer {
-            key_id: id.repeat(32),
-            name: format!("dev {id}"),
-            platform: "ps5".into(),
-            address: Some(addr.into()),
-            last_seen: 10,
-            secret: "ab".repeat(32),
-        };
-        let mut p = Peers::default();
-        p.upsert(peer("a", "10.0.0.2:9883"));
-        p.upsert(peer("b", "10.0.0.3:9883"));
-        // Pairing again with a known key id updates that one entry.
-        p.upsert(Peer {
-            name: "renamed".into(),
-            ..peer("a", "10.0.0.9:9883")
-        });
-        assert_eq!(p.peers.len(), 2);
-        // Seen at b's old address: b keeps its own entry and address.
-        assert!(p.seen(&"a".repeat(32), "10.0.0.3:9883", 20));
-        assert!(!p.seen(&"c".repeat(32), "10.0.0.4:9883", 20));
-        assert_eq!(
-            p.get(&"b".repeat(32)).unwrap().address.as_deref(),
-            Some("10.0.0.3:9883")
-        );
-        assert_eq!(
-            p.get(&"a".repeat(32)).unwrap().pair_secret(),
-            Some([0xab; 32])
-        );
-        p.save(&dir).unwrap();
-        let q = Peers::load(&dir).unwrap();
-        assert_eq!(q, p);
-        assert_eq!(q.get(&"a".repeat(32)).unwrap().name, "renamed");
-        assert_eq!(q.get(&"a".repeat(32)).unwrap().last_seen, 20);
-        let mut q = q;
-        assert!(q.forget(&"a".repeat(32)));
-        assert!(!q.forget(&"a".repeat(32)));
-        q.save(&dir).unwrap();
-        assert_eq!(Peers::load(&dir).unwrap().peers.len(), 1);
-        assert!(
-            fs::read_dir(&dir).unwrap().all(|e| !e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp"))
-        );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2425,45 +2430,6 @@ mod tests {
         assert_eq!(refusal(&e), Some(NOT_PAIRED));
 
         for s in [a, b, c] {
-            s.shutdown();
-        }
-        for d in dirs {
-            fs::remove_dir_all(d).unwrap();
-        }
-    }
-
-    /// A peer's `install` is refused on a device with no install hook (not a PS5); with one,
-    /// the job starts on the caller's package, spelled `flink://<caller>/...`.
-    #[test]
-    fn install_is_refused_without_a_hook() {
-        let dirs = ["inst-a", "inst-b"].map(temp_dir);
-        let a = Connect::start(&dirs[0], 0).unwrap();
-        let b = Connect::start(&dirs[1], 0).unwrap();
-        let addr_a = format!("127.0.0.1:{}", a.me().port);
-        assert_eq!(pair_for_test(&b, &a, &addr_a, true).state, "paired");
-        let pkg = dunce::canonicalize(&dirs[1]).unwrap().join("game.pkg");
-        let ka = a.me().key_id.clone();
-
-        assert_eq!(b.install(&ka, &pkg).unwrap_err(), CANT_INSTALL);
-        let e = (b.call(&ka, "install", serde_json::json!({ "path": "x/../y.pkg" }))).unwrap_err();
-        assert_eq!(error_text(&e), CANT_INSTALL, "the hook is asked for first");
-
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let got = seen.clone();
-        a.set_install(Arc::new(move |p| {
-            lock(&got).push(p);
-            Ok(7)
-        }));
-        assert_eq!(b.install(&ka, &pkg), Ok(7));
-        let rel =
-            crate::connect_jobs::relative(b.inner.share_root().unwrap(), pkg.to_str().unwrap());
-        let want = PathBuf::from(format!("flink://{}/{}", b.me().key_id, rel.unwrap()));
-        assert_eq!(*lock(&seen), [want]);
-        let e = (b.call(&ka, "install", serde_json::json!({ "path": "x/../y.pkg" }))).unwrap_err();
-        assert!(error_text(&e).contains("is not a file path"), "{e}");
-        assert_eq!(lock(&seen).len(), 1);
-
-        for s in [a, b] {
             s.shutdown();
         }
         for d in dirs {

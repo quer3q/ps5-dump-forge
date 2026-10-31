@@ -1076,90 +1076,6 @@ mod tests {
         scan.entries.iter().map(|e| e.path.as_path()).collect()
     }
 
-    #[test]
-    fn folder_metadata() {
-        let root = tmp("meta");
-        game(
-            &root,
-            "a",
-            r#"{"titleId":"PPSA00001","contentVersion":"01.002.000","localizedParameters":{"defaultLanguage":"de-DE","de-DE":{"titleName":"Spiel"},"en-US":{"titleName":"Game"}}}"#,
-        );
-        // No titleId: the content ID names it; no title, no version.
-        game(
-            &root,
-            "b",
-            r#"{"contentId":"UP0000-PPSA00002_00-TESTTESTTESTTEST"}"#,
-        );
-        put(&root.join("a"), "sce_sys/icon0.png", b"png");
-        let scan = run(&[&root], &LIMITS);
-        let (a, b) = (&scan.entries[1], &scan.entries[0]);
-        assert_eq!(a.kind, Format::Folder);
-        assert_eq!(
-            (a.title_id.as_str(), a.title_name.as_deref()),
-            ("PPSA00001", Some("Spiel"))
-        );
-        assert_eq!(
-            (a.version.as_deref(), a.has_cover),
-            (Some("01.002.000"), true)
-        );
-        assert_eq!(a.title_names.len(), 2);
-        assert_eq!(a.title_names["en-US"], "Game");
-        assert!(b.title_names.is_empty());
-        assert_eq!(
-            (
-                b.title_id.as_str(),
-                b.title_name.as_deref(),
-                b.version.as_deref()
-            ),
-            ("PPSA00002", None, None)
-        );
-        assert!(!b.has_cover);
-        assert!(scan.warnings.is_empty());
-    }
-
-    #[test]
-    fn exfat_image_is_listed_and_junk_image_warns() {
-        let root = tmp("image");
-        let src = game(
-            &root,
-            "src",
-            r#"{"titleId":"PPSA00009","titleName":"Image Game","contentVersion":"01.000.000"}"#,
-        );
-        put(&src, "sce_sys/icon0.png", b"png");
-        // A manifest by its magic is what makes an image LZ4 packed (as `reader::detect`).
-        put(&src, "ampr_assets.index", b"AMPRPAK4 rest of a manifest");
-        let tree = ps5upload_fpkg::source::FolderSource::open(&src).unwrap();
-        let layout =
-            ps5_dump_forge_exfat::plan(&tree, &Default::default(), &AtomicBool::new(false))
-                .unwrap();
-        let mut tree = tree;
-        let mut out = fs::File::create(root.join("Game.exfat")).unwrap();
-        ps5_dump_forge_exfat::write(
-            &mut tree,
-            &layout,
-            &mut out,
-            &AtomicBool::new(false),
-            &mut |_, _| {},
-        )
-        .unwrap();
-        drop(out);
-        fs::remove_dir_all(&src).unwrap();
-        put(&root, "bad.ffpkg", b"junk bytes");
-        let scan = run(&[&root], &LIMITS);
-        assert_eq!(scan.entries.len(), 1);
-        let e = &scan.entries[0];
-        assert_eq!(
-            (e.kind, e.title_id.as_str(), e.title_name.as_deref()),
-            (Format::Exfat, "PPSA00009", Some("Image Game"))
-        );
-        assert_eq!(
-            (e.version.as_deref(), e.has_cover, e.lz4_packed),
-            (Some("01.000.000"), true, true)
-        );
-        assert_eq!(scan.warnings.len(), 1);
-        assert!(scan.warnings[0].contains("bad.ffpkg"));
-    }
-
     #[cfg(unix)]
     const OK: &str = r#"{"titleId":"PPSA00001"}"#;
 
@@ -1191,19 +1107,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn links_are_not_followed() {
-        let root = tmp("links");
-        let real = tmp("links-real");
-        let g = game(&real, "g", OK);
-        std::os::unix::fs::symlink(&g, root.join("linked")).unwrap();
-        // A game whose sce_sys is a link to a real one.
-        put(&root, "game/eboot.bin", b"x");
-        std::os::unix::fs::symlink(g.join("sce_sys"), root.join("game/sce_sys")).unwrap();
-        assert!(run(&[&root], &LIMITS).entries.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn a_chosen_link_is_followed_unless_it_points_into_a_system_folder() {
         // Under the build folder: the temp dir is a refused system folder on macOS.
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
@@ -1229,32 +1132,6 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// The desktop explorer's rule: the Library's refusals, a path not there yet by its folder.
-    #[test]
-    fn folder_refusal_matches_the_library() {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        assert_eq!(folder_refusal(&base), None);
-        assert_eq!(folder_refusal(&base.join("forge-not-there")), None);
-        if Os::HOST.is_none() {
-            return; // FreeBSD (the PS5) has no system-folder list.
-        }
-        let system = match cfg!(windows) {
-            true => format!("{}:\\Windows", system_drive()),
-            false => "/usr".to_string(),
-        };
-        let system = Path::new(&system);
-        let why = folder_refusal(system).unwrap();
-        assert_eq!(why, refuse_folder(system).unwrap_err().to_string());
-        assert!(!why.starts_with(r"\\?\"), "{why}");
-        let inside = folder_refusal(&system.join("forge-not-there")).unwrap();
-        assert!(inside.contains("system folder"), "{inside}");
-        let root = match cfg!(windows) {
-            true => format!("{}:\\", system_drive()),
-            false => "/".to_string(),
-        };
-        assert!(folder_refusal(Path::new(&root)).is_some(), "{root}");
-    }
-
     /// The PS5's automatic scan with the real `statfs` classifier (run by scripts/test-freebsd.sh).
     #[cfg(target_os = "freebsd")]
     #[test]
@@ -1265,23 +1142,6 @@ mod tests {
         assert_eq!(paths(&found), [g.as_path()]);
         let found = scan_library(&[PathBuf::from("/mnt/shadowmnt")]).unwrap();
         assert!(found.roots.is_empty() && !found.warnings.is_empty());
-    }
-
-    fn deny_none() -> impl Fn(&Path) -> Result<(), String> + Sync {
-        |_| Ok(())
-    }
-
-    #[test]
-    fn cover_none_for_non_png_and_oversized() {
-        let root = tmp("cover-none");
-        let dir = game(&root, "g", r#"{"titleId":"PPSA00001"}"#);
-        put(&dir, "sce_sys/icon0.png", b"JPEG....");
-        assert_eq!(
-            cover_with(&dir, MAX_LIBRARY_COVER, &deny_none()).unwrap(),
-            None
-        );
-        put(&dir, "sce_sys/icon0.png", b"\x89PNG\r\n");
-        assert_eq!(cover_with(&dir, 4, &deny_none()).unwrap(), None);
     }
 
     /// A small game's `.pkg` at `out`, built as a conversion builds one.

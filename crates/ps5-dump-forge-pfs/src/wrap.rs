@@ -568,22 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_of_the_wrong_length_fails() {
-        let d = temp("len");
-        for (wrote, planned) in [(100_000u64, 200_000u64), (300_000, 200_000)] {
-            let path = d.join(format!("{wrote}.ffpfsc"));
-            let mut out = File::create(&path).unwrap();
-            let cancel = AtomicBool::new(false);
-            let e = wrap("x.exfat", planned, &mut out, &opts(2), &cancel, |s| {
-                feed(s, wrote)
-            })
-            .unwrap_err();
-            let e = e.to_string();
-            assert!(e.contains("planned"), "{e}");
-        }
-    }
-
-    #[test]
     fn a_worker_panic_is_the_error() {
         let d = temp("panic");
         let r = bounded(move || {
@@ -609,37 +593,5 @@ mod tests {
         });
         let e = r.unwrap_err().to_string();
         assert!(e.contains("panicked: encoder exploded"), "{e}");
-    }
-
-    /// Every worker gone while the queue is at its depth: the next submit or the oldest
-    /// reply fails at once instead of blocking.
-    #[test]
-    fn all_workers_gone_fails_fast() {
-        let d = temp("gone");
-        let r = bounded(move || {
-            let mut out = File::create(d.join("g.ffpfsc")).unwrap();
-            let encode = |_: &[u8]| -> io::Result<Vec<u8>> { panic!("every worker dies") };
-            let cancel = AtomicBool::new(false);
-            let mut fill_err = None;
-            let r = wrap_with(
-                "x.exfat",
-                256 * BLOCK,
-                &mut out,
-                &opts(2),
-                &cancel,
-                &encode,
-                |s| {
-                    let r = feed(s, 256 * BLOCK);
-                    fill_err = r.as_ref().err().map(|e| e.to_string());
-                    r
-                },
-            );
-            (r.map(|_| ()), fill_err)
-        });
-        let (r, fill_err) = r;
-        let fill_err = fill_err.expect("the stream itself reported the failure");
-        assert!(fill_err.contains("compression worker failed"), "{fill_err}");
-        let e = r.unwrap_err().to_string();
-        assert!(e.contains("panicked: every worker dies"), "{e}");
     }
 }

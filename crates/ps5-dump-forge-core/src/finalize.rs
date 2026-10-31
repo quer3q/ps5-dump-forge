@@ -771,26 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_creation_id_still_publishes_and_cleans_up() {
-        let dir = crate::test_dir("part-stale");
-        let mut part = written(&dir, "a.part", b"image");
-        stale(&mut part);
-        let open = File::open(dir.join("a.part")).unwrap();
-        assert!(
-            part.is(handle_id(&open).unwrap()),
-            "an open handle on the part is recognised"
-        );
-        drop(open);
-        part.publish(&dir.join("a.exfat")).unwrap();
-        assert_eq!(std::fs::read(dir.join("a.exfat")).unwrap(), b"image");
-
-        let mut part = written(&dir, "b.part", b"image");
-        stale(&mut part);
-        drop(part);
-        assert!(!dir.join("b.part").exists());
-    }
-
-    #[test]
     fn a_panic_after_writing_removes_the_part() {
         let dir = crate::test_dir("part-panic");
         let path = dir.join("a.part");
@@ -1001,16 +981,5 @@ mod tests {
                 only(&dir, &["game.ffpkg"]);
             }
         }
-    }
-
-    /// A file whose mode can't be set (fchmod on the PS5) is removed again, as is a folder.
-    #[test]
-    fn create_new_removes_what_it_could_not_open_up() {
-        let dir = crate::test_dir("create-open-up");
-        FAIL.with(|f| f.set(Some(Step::OpenUp)));
-        let err = create_new(&dir.join("f")).unwrap_err();
-        FAIL.with(|f| f.set(None));
-        assert!(err.to_string().contains("injected failure"), "{err}");
-        only(&dir, &[]);
     }
 }

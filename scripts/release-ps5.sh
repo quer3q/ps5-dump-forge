@@ -8,10 +8,12 @@
 # saves on the console): llvm-readelf from the ps5-dump-forge-ps5 Docker image (built here if
 # missing) for the payload's shape (ELF64 little-endian x86-64, a PIE DYN, NEEDED exactly the
 # SDK's six modules, no PT_INTERP or TLS, the entry point in an executable PT_LOAD), then
-# python3 on the host: every file of app/dist-http is in it byte for byte (not the placeholder
-# page), no debug routes, and its version marker (VERSION_MARKER in the server) is the workspace
-# version. Then the self copy (crates/ps5-dump-forge-server/src/self_copy.rs): A carries none,
-# and B exactly one, which decompresses to A byte for byte, its length and SHA-256 matching.
+# python3 on the host: every file of app/dist-http is in it byte for byte, or as a gzip stream
+# that decodes to it byte for byte (the server's build.rs gzips what that shrinks; not the
+# placeholder page), no debug routes, and its version marker (VERSION_MARKER in the server) is the
+# workspace version. Then the self copy (crates/ps5-dump-forge-server/src/self_copy.rs): A carries
+# none, and B exactly one, which decompresses (the zstd CLI) to A byte for byte, its length and
+# SHA-256 matching.
 # The release asset is B alone.
 #
 #   scripts/release-ps5.sh                 # build the web UI and the ELF, then copy and check
@@ -115,14 +117,14 @@ check() {
   # Embedded web UI (build.rs's rule: every file, dotfiles left out), the version marker and the
   # self copy.
   python3 -I - "$file" app/dist-http "$version" "$a" <<'EOF'
-import hashlib, os, re, struct, sys, zlib
+import hashlib, os, re, struct, subprocess, sys, zlib
 elf, web, version, stage1 = sys.argv[1:]
 data = open(elf, "rb").read()
 def fail(why):
     sys.exit(f"release-ps5.sh: {elf}: {why}")
 
-# Every valid blob: `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256, then a zlib
-# stream that decompresses to exactly that length and hash. The magic also sits in the code that
+# Every valid blob: `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256, then a zstd
+# frame that decompresses to exactly that length and hash. The magic also sits in the code that
 # reads it, with no such descriptor behind it.
 def blobs(data):
     found, at = [], data.find(b"PDFGSELF")
@@ -132,21 +134,38 @@ def blobs(data):
             digest, end = data[at + 24:at + 56], at + 56 + packed_len
             if end <= len(data) and raw_len <= 256 << 20:
                 try:
-                    raw = zlib.decompressobj().decompress(data[at + 56:end], raw_len + 1)
-                except zlib.error:
+                    raw = subprocess.run(["zstd", "-q", "-d", "-c"], input=data[at + 56:end],
+                                         capture_output=True, check=True).stdout
+                except FileNotFoundError:
+                    fail("needs the zstd command (brew install zstd, apt install zstd)")
+                except subprocess.CalledProcessError:
                     raw = None
                 if raw is not None and len(raw) == raw_len and hashlib.sha256(raw).digest() == digest:
                     found.append((at, end, raw))
         at = data.find(b"PDFGSELF", at + 1)
     return found
 
-missing = []
+web_files = []
 for d, dirs, files in os.walk(web):
     dirs[:] = [x for x in dirs if not x.startswith(".")]
-    for f in files:
-        path = os.path.join(d, f)
-        if not f.startswith(".") and open(path, "rb").read() not in data:
-            missing.append(path)
+    web_files += [os.path.join(d, f) for f in files if not f.startswith(".")]
+# What every gzip stream in the ELF decodes to (SHA-256s), for the files embedded gzipped.
+biggest = max((os.path.getsize(p) for p in web_files), default=0)
+gzipped, view, at = set(), memoryview(data), data.find(b"\x1f\x8b\x08")
+while at >= 0:
+    z = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = z.decompress(view[at:at + biggest + 4096], biggest + 1)
+        if z.eof:
+            gzipped.add(hashlib.sha256(out).digest())
+    except zlib.error:
+        pass
+    at = data.find(b"\x1f\x8b\x08", at + 1)
+missing = []
+for path in web_files:
+    raw = open(path, "rb").read()
+    if raw not in data and hashlib.sha256(raw).digest() not in gzipped:
+        missing.append(path)
 if missing:
     fail(f"not embedded byte for byte: {', '.join(sorted(missing))}")
 # debug.rs's JSON keys: present only in a build with the debug routes.

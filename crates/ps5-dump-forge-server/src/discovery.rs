@@ -326,6 +326,7 @@ fn run(
     let mut scan_id = String::new();
     let mut rates: HashMap<Ipv4Addr, (Instant, u8)> = HashMap::new();
     let mut buffer = [0; LIMIT + 1];
+    let mut failing = false;
     while !cancel.load(Ordering::Acquire) {
         let now = Instant::now();
         let active = {
@@ -339,10 +340,16 @@ fn run(
             scan_id.clear();
             next = now;
         } else if now >= next {
-            scan_id = random_id()?;
-            started = now;
             next = now + CYCLE;
-            let bytes = serde_json::to_vec(&Packet::query(scan_id.clone()))?;
+            // A failed id skips this cycle's query; the responder keeps answering.
+            let Ok(id) = random_id() else {
+                continue;
+            };
+            scan_id = id;
+            started = now;
+            let Ok(bytes) = serde_json::to_vec(&Packet::query(scan_id.clone())) else {
+                continue;
+            };
             let targets = injected.clone().unwrap_or_else(|| {
                 // Some payload/libc combinations can't list interfaces; the limited broadcast
                 // still goes out on the interface the OS picks.
@@ -370,7 +377,10 @@ fn run(
                     return Ok(());
                 }
                 let (len, source) = match socket.recv_from(&mut buffer) {
-                    Ok(v) => v,
+                    Ok(v) => {
+                        failing = false;
+                        v
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e)
                         if matches!(
@@ -380,7 +390,17 @@ fn run(
                     {
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    // A network going down and up (or the PS5's rest mode: ENETDOWN, ENOBUFS)
+                    // must not end the responder: this device would stop being found.
+                    // ponytail: the sockets are never bound again.
+                    Err(e) => {
+                        if !failing {
+                            eprintln!("discovery: {e} (retrying every second)");
+                        }
+                        failing = true;
+                        thread::sleep(Duration::from_secs(1));
+                        break;
+                    }
                 };
                 let SocketAddr::V4(source) = source else {
                     continue;
@@ -436,7 +456,9 @@ fn run(
                     rate.1 += 1;
                     packet.kind = "reply".into();
                     packet.node = Some(lock(shared).node.clone());
-                    let bytes = serde_json::to_vec(&packet)?;
+                    let Ok(bytes) = serde_json::to_vec(&packet) else {
+                        continue;
+                    };
                     // A departing peer must not stop discovery for everyone.
                     if bytes.len() <= LIMIT
                         && let Err(e) = responder.send_to(&bytes, source)

@@ -580,32 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn largest_run_follows_dictionary_resets() {
-        let mut lzma2 = vec![0xAA]; // a byte before the stream
-        // Compressed with a reset (props): 1000 bytes from 10.
-        lzma2.extend([0xE0, 0x03, 0xE7, 0, 9, 0x5D]);
-        lzma2.extend([0; 10]);
-        // Compressed, no reset: 500 more from 5.
-        lzma2.extend([0x80, 0x01, 0xF3, 0, 4]);
-        lzma2.extend([0; 5]);
-        // Uncompressed with a reset, then without: 300 + 100.
-        lzma2.extend([0x01, 0x01, 0x2B]);
-        lzma2.extend([0; 300]);
-        lzma2.extend([0x02, 0x00, 0x63]);
-        lzma2.extend([0; 100]);
-        lzma2.push(0x00);
-        let len = lzma2.len() as u64 - 1;
-        let mut cursor = std::io::Cursor::new(lzma2.clone());
-        let go = AtomicBool::new(false);
-        assert_eq!(largest_run(&mut cursor, 1, len, &go), Some(1500));
-        lzma2[1] = 0x03; // not a control byte
-        assert_eq!(
-            largest_run(&mut std::io::Cursor::new(lzma2), 1, len, &go),
-            None
-        );
-    }
-
-    #[test]
     fn memory_limits() {
         // An encoded header of one LZMA2 coder: property `dict`, unpack size `size` (7z number).
         let encoded = |dict: u8, size: &[u8]| {

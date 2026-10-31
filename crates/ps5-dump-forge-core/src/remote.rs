@@ -605,6 +605,11 @@ impl RemoteTree {
         self.seen.get(path).copied()
     }
 
+    /// A listed file's modification time as listed.
+    pub(crate) fn mtime(&self, path: &str) -> Option<SystemTime> {
+        self.seen.get(path).and_then(|s| s.mtime)
+    }
+
     fn at(&self, rel: &str) -> FlinkPath {
         if rel.is_empty() {
             self.root.clone()
@@ -1828,50 +1833,44 @@ pub(crate) mod tests {
         assert!(!p("nfs://nas:12049/srv/g").within(&p("nfs://nas/srv/g")));
     }
 
+    /// `within` and `in_use` compare as spelled, so a path with an empty, `.` or `..` part
+    /// is refused on every scheme.
     #[test]
-    fn parses_and_spells_paths() {
+    fn parse_refuses_dot_and_empty_parts() {
+        let parse = |s: &str| FlinkPath::parse(Path::new(s));
         let upper = KEY.to_ascii_uppercase();
-        let p = FlinkPath::parse(Path::new(&format!(
-            "FLINK://{upper}/data/Stub Game/sce_sys"
-        )))
-        .unwrap();
-        assert_eq!(p, at("data/Stub Game/sce_sys"));
+        let p = parse(&format!("FLINK://{upper}/data/Stub Game/")).unwrap();
+        assert_eq!(p, at("data/Stub Game"));
         assert_eq!(
             p.url(),
-            PathBuf::from(format!("flink://{KEY}/data/Stub Game/sce_sys"))
+            PathBuf::from(format!("flink://{KEY}/data/Stub Game"))
         );
-        let root = p.parent().unwrap().parent().unwrap().parent().unwrap();
-        assert_eq!(root, at(""));
-        assert_eq!(root.url(), PathBuf::from(format!("flink://{KEY}")));
-        assert_eq!(root.parent(), None);
-        assert_eq!(root.join("data").join("g"), at("data/g"));
+        assert_eq!(parse(&format!("flink://{KEY}\\a\\b")).unwrap(), at("a/b"));
         for ok in [format!("flink://{KEY}"), format!("flink://{KEY}/")] {
-            assert_eq!(FlinkPath::parse(Path::new(&ok)).unwrap(), at(""), "{ok}");
+            assert_eq!(parse(&ok).unwrap(), at(""), "{ok}");
         }
-        let win = FlinkPath::parse(Path::new(&format!("flink://{KEY}\\a\\b"))).unwrap();
-        assert_eq!(win, at("a/b"));
-        for bad in [
-            "flink://".to_string(),
-            "flink://abc/x".to_string(),
-            format!("flink://{}g/x", &KEY[1..]),
-            format!("flink://{KEY}/a/../b"),
-            format!("flink://{KEY}/a/./b"),
-            format!("flink://{KEY}/a//b"),
-            format!("flink://{KEY}//a"),
-            "/local/x".to_string(),
-        ] {
-            assert!(FlinkPath::parse(Path::new(&bad)).is_err(), "{bad}");
+        for scheme in ["flink", "smb", "nfs", "ftp"] {
+            let dev = match scheme {
+                "flink" => KEY,
+                _ => "nas",
+            };
+            assert!(
+                parse(&format!("{scheme}://{dev}/s/a/b")).is_ok(),
+                "{scheme}"
+            );
+            for rest in ["/s/a/../b", "/s/a/./b", "/s/a//b", "//a", "/s/..", "/."] {
+                let bad = format!("{scheme}://{dev}{rest}");
+                assert!(parse(&bad).is_err(), "{bad}");
+            }
+            assert!(
+                parse(&format!("{scheme}:///a")).is_err(),
+                "{scheme}: empty device"
+            );
         }
-        assert!(is_flink(Path::new("FLINK://x")));
-        for p in [
-            "flink://",
-            "flink:/x",
-            "/mnt/Игры",
-            "smb://h/s",
-            "日本語/ゲーム",
-        ] {
-            assert!(!is_flink(Path::new(p)), "{p}");
+        for bad in ["flink://", "flink://abc/x", "/local/x"] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
+        assert!(parse(&format!("flink://{}g/x", &KEY[1..])).is_err());
     }
 
     /// Every test that goes through the registry ([`get`]) shares one `Peers`, each with a
@@ -1980,117 +1979,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn registry_serves_each_peer() {
-        let dir = crate::test_dir("remote-registry");
-        std::fs::write(dir.join("a.txt"), b"a").unwrap();
-        let (one, _) = peer(&dir);
-        let (two, fake) = peer(&dir);
-        fake.nodes.lock().unwrap().remove("a.txt");
-        assert_eq!(seen(&one.join("a.txt").url()).unwrap().0, 1);
-        assert!(seen(&two.join("a.txt").url()).is_err());
-        let other = FlinkPath::parse(Path::new(&format!("flink://{}", "f".repeat(32)))).unwrap();
-        let e = seen(&other.url()).unwrap_err();
-        assert!(format!("{e:#}").contains("no such device"), "{e:#}");
-    }
-
-    #[test]
-    fn lists_a_folder() {
-        let fake = Fake::with(
-            &[("g/b.bin", bytes(5)), ("g/a.bin", bytes(3))],
-            &["g", "g/sce_sys"],
-        );
-        let l = listing(&*fake, &at("g")).unwrap();
-        assert_eq!(l.path, PathBuf::from(format!("flink://{KEY}/g")));
-        assert_eq!(l.parent, Some(PathBuf::from(format!("flink://{KEY}"))));
-        let names: Vec<_> = l.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["sce_sys", "a.bin", "b.bin"]);
-        assert_eq!(l.entries[0].size, None);
-        assert_eq!(l.entries[2].size, Some(5));
-        assert_eq!(
-            l.entries[1].path,
-            PathBuf::from(format!("flink://{KEY}/g/a.bin"))
-        );
-        assert_eq!(listing(&*fake, &at("")).unwrap().parent, None);
-        // A `\` name would parse as another path: left out. A link is marked.
-        fake.nodes
-            .lock()
-            .unwrap()
-            .insert("g/a\\b".into(), Some((bytes(1), 1)));
-        fake.links.lock().unwrap().push("g/b.bin".into());
-        let l = listing(&*fake, &at("g")).unwrap();
-        let names: Vec<_> = l
-            .entries
-            .iter()
-            .map(|e| (e.name.as_str(), e.link))
-            .collect();
-        assert_eq!(
-            names,
-            [("sce_sys", false), ("a.bin", false), ("b.bin", true)]
-        );
-    }
-
-    #[test]
-    fn reader_reads_ahead_and_seeks() {
-        let data = bytes(20 << 20);
-        let fake = Fake::with(&[("img.ffpkg", data.clone())], &[]);
-        let mut r = RemoteReader::open(fake.clone(), &at("img.ffpkg")).unwrap();
-        assert_eq!(r.len(), data.len() as u64);
-        // Small sequential reads: windows of 1, 2, 4, 8, 16 MiB (the last cut at the end).
-        let mut got = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = r.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            got.extend_from_slice(&buf[..n]);
-        }
-        assert!(got == data);
-        assert_eq!(fake.reads.load(Ordering::Relaxed), 5);
-        // A seek back reads a fresh 1 MiB window; reads past the end give nothing.
-        let mut small = [0u8; 300];
-        r.seek(SeekFrom::Start(12_345)).unwrap();
-        r.read_exact(&mut small).unwrap();
-        assert!(small[..] == data[12_345..12_645]);
-        assert_eq!(fake.reads.load(Ordering::Relaxed), 6);
-        r.seek(SeekFrom::End(-10)).unwrap();
-        let mut tail = Vec::new();
-        r.read_to_end(&mut tail).unwrap();
-        assert!(tail[..] == data[data.len() - 10..]);
-        assert!(r.seek(SeekFrom::Current(-(data.len() as i64) - 1)).is_err());
-        // A big read skips the window.
-        let mut big = vec![0u8; 3 << 20];
-        r.seek(SeekFrom::Start(5)).unwrap();
-        r.read_exact(&mut big).unwrap();
-        assert!(big[..] == data[5..5 + (3 << 20)]);
-        assert!(RemoteReader::open(fake.clone(), &at("")).is_err());
-        // A link is never opened (its stat would pass for an empty file).
-        fake.links.lock().unwrap().push("img.ffpkg".into());
-        let e = RemoteReader::open(fake.clone(), &at("img.ffpkg"))
-            .err()
-            .unwrap();
-        assert!(e.to_string().contains("a link (not followed)"), "{e}");
-        assert!(RemoteReader::open(fake, &at("nope")).is_err());
-    }
-
-    #[test]
-    fn read_small_skips_links_folders_and_big_files() {
-        let fake = Fake::with(&[("g/p.json", bytes(10))], &["g/d"]);
-        let got = read_small_at(&*fake, &at("g/p.json"), 10).unwrap();
-        assert_eq!(got, Some(bytes(10)));
-        for (path, max) in [("g/p.json", 9), ("g/d", 10), ("g/none", 10)] {
-            assert_eq!(
-                read_small_at(&*fake, &at(path), max).unwrap(),
-                None,
-                "{path}"
-            );
-        }
-        // A server that lists a link with its target's size would serve the target.
-        fake.links.lock().unwrap().push("g/p.json".into());
-        assert_eq!(read_small_at(&*fake, &at("g/p.json"), 10).unwrap(), None);
-    }
-
-    #[test]
     fn reader_fails_once_the_file_changes() {
         let fake = Fake::with(&[("img.exfat", bytes(3 << 20))], &[]);
         let mut r = RemoteReader::open(fake.clone(), &at("img.exfat")).unwrap();
@@ -2105,26 +1993,6 @@ pub(crate) mod tests {
             e.to_string().contains("changed while it was being read"),
             "{e}"
         );
-    }
-
-    #[test]
-    fn tree_reads_ahead_while_reads_continue() {
-        let data = bytes(3 << 20);
-        let fake = Fake::with(&[("g/big.bin", data.clone())], &["g"]);
-        let cancel = AtomicBool::new(false);
-        let mut tree = RemoteTree::open(fake.clone(), &at("g"), &cancel).unwrap();
-        let mut got = Vec::new();
-        for o in [0u64, 1 << 20, 2 << 20] {
-            got.extend(tree.read_range("big.bin", o, 1 << 20).unwrap());
-        }
-        assert!(got == data);
-        assert_eq!(fake.reads.load(Ordering::Relaxed), 2);
-        // The rest came with the second read: served from there, so a change since is seen
-        // only by the next fetch.
-        fake.touch("g/big.bin");
-        assert!(tree.read_range("big.bin", 2 << 20, 10).unwrap() == data[2 << 20..][..10]);
-        let e = tree.read_range("big.bin", 5, 10).unwrap_err().to_string();
-        assert!(e.contains("changed while it was being read"), "{e}");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
 use ps5_dump_forge_core::ScannedFolder;
-use ps5_dump_forge_lz4::runtime::ZSTD;
+use ps5_dump_forge_lz4::runtime::zstd;
 use ps5_dump_forge_zstd::{CHUNK_SIZE, Codec};
 use ps5upload_fpkg::source::SourceTree;
 
@@ -122,7 +122,7 @@ fn zstd_pack_to_a_folder_reads_back() {
     ] {
         assert!(out.join(loose).is_file(), "{loose}");
     }
-    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == ZSTD);
+    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == zstd());
     let packed = ["data/level1.bin", "data/noise.bin"];
     for path in packed {
         assert!(!out.join(path).exists(), "{path} is packed");
@@ -169,7 +169,7 @@ fn zstd_pack_to_a_folder_reads_back() {
     let mut expected: Vec<(String, u64)> = files
         .iter()
         .map(|(p, b)| (p.clone(), b.len() as u64))
-        .chain([("fakelib/libSceAmpr.sprx".to_string(), ZSTD.len() as u64)])
+        .chain([("fakelib/libSceAmpr.sprx".to_string(), zstd().len() as u64)])
         .collect();
     expected.sort();
     assert_eq!(listed, expected);

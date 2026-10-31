@@ -97,7 +97,8 @@ ps5-dump-forge convert <lz4_packed_game> --to folder --lz4-unpack
 A zstd or LZ4 packed game (labelled **zstd** or **LZ4** on the source card and in the Library) is an ordinary source. Convert copies it to any format, a debug FPKG (`.pkg`) included, with its
 packs as plain files: its `ampr_emu.index` (which lists the files inside the packs), pack index or manifest,
 journal and logs are kept byte for byte, and the package builder packages that index as it is. zstd packs
-get ampr-emu-ng (kept, else installed). To change the packed files, unpack first; **Remove backport** is refused for
+get ampr-emu-ng (kept, else installed or put in place of any other runtime); an LZ4 packed game follows
+the runtime rule below. To change the packed files, unpack first; **Remove backport** is refused for
 a packed game for the same reason. Edit changes a packed game like any other but leaves its packs, its pack
 index and `ampr_emu.index` as they are: a change to a packed file is refused.
 
@@ -108,10 +109,13 @@ fixes two things in the output by itself, with nothing to choose; Edit, Convert 
 which. The source is left as it is.
 
 - **The runtime** (`fakelib/libSceAmpr.sprx`). Installed: a game without its own ampr_emu gets the bundled
-  release runtime (0.4.2.1). Replaced: Forge's old trace runtime, an ampr_emu older than Forge's, or one whose
-  version can't be read. Kept: Forge's release runtime, ampr-emu-ng, or another ampr_emu at Forge's
-  version or newer; into LZ4 packs (LZ4 Pack, or an LZ4 packed game copied as it is) only if it can also read
-  them, else it is replaced.
+  release runtime (0.4.2.1). Replaced: Forge's old trace runtime, an ampr_emu older than Forge's, one whose
+  version can't be read, and ampr-emu-ng: it goes into a game only by packing, so any other conversion
+  (an LZ4 Unpack and a zstd Unpack included) puts the release runtime in its place. Kept: Forge's release
+  runtime, or another ampr_emu at Forge's version or newer; into LZ4 packs (LZ4 Pack, or an LZ4 packed game
+  copied as it is) only if it can also read them, else it is replaced. Packing sets its own runtime: a zstd
+  Pack and an LZ4 Pack with ampr-emu-ng (the default) keep ampr-emu-ng or put it in, and a zstd packed game
+  copied as it is keeps ampr-emu-ng and gets it in place of any other runtime.
 - **The index.** `ampr_emu.index` stays only when it lists exactly the files written, with their sizes;
   otherwise (stale, damaged or missing) a fresh one is written, and the journal and logs are left out with
   the old one, since the journal names files by the old index's order. The files written include the
