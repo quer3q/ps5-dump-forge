@@ -387,7 +387,7 @@ pub(crate) fn followed_id(path: &Path) -> io::Result<FileId> {
 /// Opens a file or folder for its attributes only. It shares everything, so it never
 /// stands in the way of a rename or a delete; `follow: false` opens a link itself.
 #[cfg(windows)]
-fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
+pub(crate) fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x7;

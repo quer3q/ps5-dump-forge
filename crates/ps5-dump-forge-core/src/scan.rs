@@ -266,7 +266,7 @@ impl Walk {
                     self.empty_dirs.push(path);
                 }
             } else if kind.is_file() {
-                match open_nofollow(&entry.path()).and_then(|f| {
+                match open_for_links(&entry.path()).and_then(|f| {
                     // The entry may have been swapped since it was listed.
                     let now = f.metadata()?;
                     if !now.is_file() {
@@ -314,6 +314,19 @@ pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
         opts.custom_flags(crate::finalize::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     opts.open(path)
+}
+
+/// [`open_nofollow`] for the walk's type and link count, which read no data. Windows: for
+/// attributes only, since an open for reading has an on-access scanner (Defender) check the
+/// file first; one at a time, ~95k assets kept the scan going for minutes.
+#[cfg(windows)]
+fn open_for_links(path: &Path) -> io::Result<File> {
+    crate::finalize::open_attributes(path, false)
+}
+
+#[cfg(not(windows))]
+fn open_for_links(path: &Path) -> io::Result<File> {
+    open_nofollow(path)
 }
 
 /// How many names the open file `file` (whose metadata is `meta`) has.
