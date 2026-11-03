@@ -13,6 +13,8 @@ use crate::{
 
 pub const INDEX: &str = crate::INDEX_NAME;
 const MAX_INDEX_BYTES: u64 = 512 << 20;
+/// A packed file also on disk is compared byte for byte up to this size.
+const MAX_DUPLICATE_BYTES: u64 = 16 << 20;
 /// Stored bytes read per volume request: 8 chunks of 256 KiB, decoded in parallel.
 const BATCH_CHUNKS: usize = ((2 << 20) / CHUNK_SIZE) as usize;
 
@@ -49,10 +51,18 @@ pub struct Unpacked<T: SourceTree + ?Sized> {
     files: Vec<SourceFile>,
     empty_dirs: Vec<String>,
     packed: HashMap<String, usize>,
+    /// Packed files also on disk with identical bytes (the plain copy kept).
+    identical: Vec<String>,
+    /// Packed files also on disk with other contents (the packed copy served).
+    differing: Vec<String>,
     hidden: HashSet<String>,
 }
 
-/// Validate the whole index and each volume header and advertised physical size.
+/// Validate the whole index and each volume header and advertised physical size. A packed
+/// path also on disk (ASCII case-folded) is never refused, as LZ4's reader: one identical copy
+/// (same name, same size, at most 16 MiB, same bytes, no other record folding to it) keeps the
+/// plain file; otherwise the packed copy is served under the index's name and every physical file folding to it leaves
+/// the tree.
 pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> {
     let mut sizes = HashMap::with_capacity(inner.files().len());
     for file in inner.files() {
@@ -90,36 +100,91 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
         }
         hidden.insert(name);
     }
+    // Every physical file but the packs by its folded path, sorted (several may fold to one).
+    let mut physical: HashMap<String, Vec<String>> = HashMap::new();
+    for path in sizes.keys().filter(|p| !hidden.contains(*p)) {
+        physical
+            .entry(path.to_ascii_lowercase())
+            .or_default()
+            .push(path.clone());
+    }
+    for paths in physical.values_mut() {
+        paths.sort();
+    }
+    // Records by folded path: two that fold to one (a case-sensitive source) both keep their
+    // packed copy, so neither can give its listing to the one file on disk.
+    let mut folds: HashMap<String, usize> = HashMap::new();
+    for file in &index.files {
+        *folds.entry(file.path.to_ascii_lowercase()).or_default() += 1;
+    }
     let mut packed = HashMap::with_capacity(index.files.len());
+    let mut duplicates = Vec::new();
     for (i, file) in index.files.iter().enumerate() {
-        if sizes.contains_key(file.path.as_str()) || hidden.contains(&file.path) {
+        if hidden.contains(&file.path) {
             return Err(bad(format!(
-                "{}: packed path also exists physically",
+                "{}: a packed path names a pack file",
                 file.path
             )));
         }
+        let key = file.path.to_ascii_lowercase();
+        if let Some(paths) = physical.get(&key) {
+            let alone = folds[&key] == 1;
+            duplicates.push((file.path.clone(), paths.clone(), file.logical_size, alone));
+        }
         packed.insert(file.path.clone(), i);
     }
-    let mut files: Vec<_> = inner
-        .files()
-        .iter()
-        .filter(|file| !hidden.contains(&file.path))
-        .cloned()
-        .collect();
-    files.extend(index.files.iter().map(|file| SourceFile {
-        path: file.path.clone(),
-        size: file.logical_size,
-    }));
-    files.sort_by(|a, b| a.path.cmp(&b.path));
     let empty_dirs = inner.empty_dirs().to_vec();
-    Ok(Unpacked {
+    let mut unpacked = Unpacked {
         inner,
         index,
-        files,
+        files: Vec::new(),
         empty_dirs,
         packed,
+        identical: Vec::new(),
+        differing: Vec::new(),
         hidden,
-    })
+    };
+    let mut gone = HashSet::new();
+    for (record, physical, size, alone) in duplicates {
+        let same = match physical.as_slice() {
+            [one] if alone => {
+                *one == record
+                    && sizes[one] == size
+                    && size <= MAX_DUPLICATE_BYTES
+                    && exact(&mut unpacked, &record, 0, size as usize)?
+                        == exact(&mut *unpacked.inner, one, 0, size as usize)?
+            }
+            _ => false,
+        };
+        if same {
+            // The plain file stays listed; the record's listing goes.
+            unpacked.packed.remove(&record);
+            unpacked.identical.push(record);
+            continue;
+        }
+        unpacked
+            .hidden
+            .extend(physical.iter().filter(|p| **p != record).cloned());
+        gone.extend(physical);
+        unpacked.differing.push(record);
+    }
+    // An identical record is listed by its plain file, a differing one by the record alone.
+    let identical: HashSet<&str> = unpacked.identical.iter().map(String::as_str).collect();
+    let mut files: Vec<SourceFile> = (unpacked.inner.files().iter())
+        .filter(|f| !unpacked.hidden.contains(&f.path) && !gone.contains(&f.path))
+        .cloned()
+        .collect();
+    files.extend(
+        (unpacked.index.files.iter())
+            .filter(|f| !identical.contains(f.path.as_str()))
+            .map(|f| SourceFile {
+                path: f.path.clone(),
+                size: f.logical_size,
+            }),
+    );
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    unpacked.files = files;
+    Ok(unpacked)
 }
 
 pub(crate) fn decode_chunk(frame: &[u8], codec: Codec, expected: usize) -> Result<Vec<u8>> {
@@ -175,6 +240,17 @@ impl<T: SourceTree + ?Sized> Unpacked<T> {
 
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Packed files also on disk with identical bytes; their plain copies are kept.
+    pub fn identical_paths(&self) -> &[String] {
+        &self.identical
+    }
+
+    /// Packed files also on disk with another name's case, size or bytes (or over 16 MiB);
+    /// the packed copy is served and the physical files are left out.
+    pub fn differing_paths(&self) -> &[String] {
+        &self.differing
     }
 
     fn read_packed(&mut self, file_id: usize, offset: u64, len: usize) -> Result<Vec<u8>> {

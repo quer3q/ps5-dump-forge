@@ -3064,6 +3064,20 @@ mod tests {
         rpc.call(method, serde_json::json!({ "path": path }))
     }
 
+    /// Waits until the serving side has released `peer`'s speed lanes: a test returns once
+    /// its answers are in, and each lane is freed only when the peer sees it close, so a
+    /// test started at once could find the lanes still taken and be refused.
+    fn speed_lanes_released(peer: &str) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while lock(&SPEED_OPEN)
+            .as_ref()
+            .is_some_and(|m| m.contains_key(peer))
+        {
+            assert!(Instant::now() < until, "{peer}'s speed lanes stay open");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// A speed test sends and fetches its bytes over several lanes (a short last chunk
     /// included) and leaves nothing on the peer's disk; an older peer is named as one.
     #[test]
@@ -3082,6 +3096,8 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&share).unwrap().count(), 0);
         assert!(!a.peers_active());
+        let kb = b.state().device.key_id;
+        speed_lanes_released(&kb);
 
         // A lane refuses an empty request and a method other than speed_up / speed_down.
         let (_rpc, hs) = b.session(&ka).unwrap();
@@ -3115,7 +3131,7 @@ mod tests {
 
         // One device's lanes share one budget: past it a request is refused, and a lane's
         // bytes come back when it ends.
-        let kb = b.state().device.key_id;
+        speed_lanes_released(&kb);
         let mut held = SpeedLane::take(&kb).unwrap();
         assert!(held.reserve(SPEED_BUDGET - 5));
         assert!(!held.reserve(6));
@@ -3155,6 +3171,7 @@ mod tests {
         let (a, b, rpc, _, dirs) = paired("speed-cancel", &share);
         drop(rpc);
         let ka = a.state().device.key_id;
+        let kb = b.state().device.key_id;
         let b = Arc::new(b);
         let started = Instant::now();
         let run = std::thread::spawn({
@@ -3168,6 +3185,7 @@ mod tests {
         }
         assert_eq!(run.join().unwrap().unwrap_err(), SPEED_CANCELLED);
         assert!(started.elapsed() < Duration::from_secs(5));
+        speed_lanes_released(&kb);
 
         // Cancelled before it starts: ends `cancelled` at once, the cancel used up.
         b.speed_test_cancel(&ka, "r2");
@@ -3176,6 +3194,7 @@ mod tests {
             SPEED_CANCELLED
         );
         assert_eq!(b.speed_test_of(&ka, "r2", CHUNK).unwrap().bytes, CHUNK);
+        speed_lanes_released(&kb);
 
         // A stale cancel of r1 (it ended) while r3 runs: r3 finishes.
         let run = std::thread::spawn({
@@ -3187,6 +3206,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(run.join().unwrap().unwrap().bytes, 8 * CHUNK);
+        speed_lanes_released(&kb);
         let got = b.speed_test_of(&ka, "r4", CHUNK + 1).unwrap();
         assert_eq!(got.bytes, CHUNK + 1);
         assert_eq!(fs::read_dir(&share).unwrap().count(), 0);

@@ -112,9 +112,14 @@ fn stream(addr: SocketAddr, mut elf: impl Read, len: u64, what: &str) -> io::Res
     stream.flush()?;
     stream.shutdown(Shutdown::Write)?;
     // Whatever elfldr writes back (a payload's output with some loaders) is left unread; a
-    // short wait lets it take the last bytes before the close.
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let _ = stream.read(&mut [0u8; 256]);
+    // short wait lets it take the last bytes before the close. Every byte is sent by now: a
+    // peer that already closed makes macOS refuse the timeout (EINVAL), so it only skips the wait.
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_ok()
+    {
+        let _ = stream.read(&mut [0u8; 256]);
+    }
     Ok(sent)
 }
 

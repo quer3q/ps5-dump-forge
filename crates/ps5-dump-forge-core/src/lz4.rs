@@ -180,28 +180,7 @@ pub(crate) fn open(
     if packs.packed && wants_unpack(req) {
         let tree = ps5_dump_forge_lz4::reader::unpack(source).context("opening the LZ4 packs")?;
         ctx.log(format!("LZ4: {}", tree.describe()));
-        let (same, other) = (tree.identical_paths(), tree.differing_paths());
-        if !same.is_empty() || !other.is_empty() {
-            let mut parts = Vec::new();
-            if !same.is_empty() {
-                parts.push(format!("{} identical (plain copy kept)", same.len()));
-            }
-            if !other.is_empty() {
-                parts.push(format!("{} different (packed copy used)", other.len()));
-            }
-            let paths: Vec<&str> = same
-                .iter()
-                .chain(other)
-                .take(10)
-                .map(String::as_str)
-                .collect();
-            ctx.log(format!(
-                "LZ4: {} files both packed and on disk: {}: {}",
-                same.len() + other.len(),
-                parts.join(", "),
-                paths.join(", ")
-            ));
-        }
+        log_duplicates(ctx, "LZ4", tree.identical_paths(), tree.differing_paths());
         source = Box::new(tree);
         packs.unpacked = true;
     }
@@ -211,10 +190,37 @@ pub(crate) fn open(
     {
         let tree = ps5_dump_forge_zstd::reader::unpack(source).context("opening the zstd packs")?;
         ctx.log(format!("zstd: {}", tree.describe()));
+        log_duplicates(ctx, "zstd", tree.identical_paths(), tree.differing_paths());
         source = Box::new(tree);
         packs.zstd_unpacked = true;
     }
     Ok((source, packs))
+}
+
+/// One line for the packed files also on disk (none: no line), the first 10 named.
+fn log_duplicates(ctx: &Ctx, kind: &str, same: &[String], other: &[String]) {
+    if same.is_empty() && other.is_empty() {
+        return;
+    }
+    let mut parts = Vec::new();
+    if !same.is_empty() {
+        parts.push(format!("{} identical (plain copy kept)", same.len()));
+    }
+    if !other.is_empty() {
+        parts.push(format!("{} different (packed copy used)", other.len()));
+    }
+    let paths: Vec<&str> = same
+        .iter()
+        .chain(other)
+        .take(10)
+        .map(String::as_str)
+        .collect();
+    ctx.log(format!(
+        "{kind}: {} files both packed and on disk: {}: {}",
+        same.len() + other.len(),
+        parts.join(", "),
+        paths.join(", ")
+    ));
 }
 
 /// The pack list and its options, for the `Lz4` target.

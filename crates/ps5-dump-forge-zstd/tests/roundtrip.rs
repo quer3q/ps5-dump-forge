@@ -308,3 +308,39 @@ fn measured_packed_tree_reads_as_the_packs_pack_writes() {
         assert_eq!(&pieces, bytes, "{path} in pieces");
     }
 }
+
+/// A packed file also on disk is never refused: an identical copy keeps the plain file, another
+/// (here another case and other bytes) is replaced by the packed copy under the index's name.
+#[test]
+fn a_packed_file_also_on_disk_keeps_one_copy() {
+    let a = noise(1000, 1);
+    let b = noise(2000, 2);
+    let (_, mut physical) = pack(&[("data/a.bin", a.clone()), ("data/b.bin", b.clone())]);
+    physical.insert("data/a.bin".into(), a.clone());
+    physical.insert("DATA/B.bin".into(), vec![9; 10]);
+    let mut tree = ps5_dump_forge_zstd::reader::unpack(Box::new(Mem::new(physical))).unwrap();
+    assert_eq!(tree.identical_paths(), ["data/a.bin"]);
+    assert_eq!(tree.differing_paths(), ["data/b.bin"]);
+    let listed: Vec<(&str, u64)> = (tree.files().iter())
+        .map(|f| (f.path.as_str(), f.size))
+        .collect();
+    assert_eq!(listed, [("data/a.bin", 1000), ("data/b.bin", 2000)]);
+    assert_eq!(tree.read("data/a.bin").unwrap(), a);
+    assert_eq!(tree.read("data/b.bin").unwrap(), b);
+    assert!(tree.read("DATA/B.bin").is_err());
+}
+
+/// Two records folding to one path, one of them identical to the file on disk: both stay
+/// packed, so neither loses its contents to the other.
+#[test]
+fn records_folding_together_both_keep_their_packed_copy() {
+    let a = noise(1000, 3);
+    let b = noise(1000, 4);
+    let (_, mut physical) = pack(&[("data/a.bin", a.clone()), ("DATA/A.bin", b.clone())]);
+    physical.insert("data/a.bin".into(), a.clone());
+    let mut tree = ps5_dump_forge_zstd::reader::unpack(Box::new(Mem::new(physical))).unwrap();
+    assert!(tree.identical_paths().is_empty());
+    assert_eq!(tree.read("data/a.bin").unwrap(), a);
+    assert_eq!(tree.read("DATA/A.bin").unwrap(), b);
+    assert_eq!(tree.files().len(), 2);
+}

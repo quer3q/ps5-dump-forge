@@ -395,11 +395,11 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   packed, K loose; ...`.
   `--lz4-unpack` (automatic when the target is lz4) restores the logical assets; the runtime follows the runtime
   rule above (kept unless installed or replaced) and an `ampr_emu.index` listing exactly the output stays.
-  A packed record whose path (ASCII case-folded) is also a file on disk is never refused (by user decision; a
-  third-party release packed `sce_sys/ext_info.dat` and kept it): identical copies (same name, same size, at most
-  16 MiB, same bytes) keep the plain file (it leaves the packed set), any other case serves the packed copy and leaves the
-  physical file out of the listing; one log line `LZ4: N files both packed and on disk: I identical (plain copy
-  kept), D different (packed copy used): ...`.
+  A packed record (LZ4 or zstd) whose path (ASCII case-folded) is also a file on disk is never refused (by user
+  decision; a third-party release packed `sce_sys/ext_info.dat` and kept it): identical copies (same name, same
+  size, at most 16 MiB, same bytes) keep the plain file (it leaves the packed set), any other case serves the packed
+  copy and leaves the physical file out of the listing (both readers' `unpack`); one log line `LZ4: N files both
+  packed and on disk: I identical (plain copy kept), D different (packed copy used): ...` (`zstd: ...` for zstd packs).
   Packed files exist for the game only through AMPR, so anything the engine opens, stats or lists
   before that or outside APR (Unreal `.pak`/`.utoc`, `.ini`, `.uproject`) must stay loose. Built-in: the keep-loose list
   (`rules::keep_loose`: `FALLBACK_SUFFIXES` + the protected directory families (any case, `fakelib*`
