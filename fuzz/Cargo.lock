@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-exfat"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ps5-dump-forge-patch",
  "ps5upload-fpkg",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-fpkg"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ps5upload-fpkg",
 ]
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-lz4"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -405,14 +405,14 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-patch"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "ps5-dump-forge-pfs"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "ps5-dump-forge-patch",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-ufs2"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ps5-dump-forge-patch",
  "ps5upload-fpkg",
