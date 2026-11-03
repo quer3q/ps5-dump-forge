@@ -8,14 +8,14 @@ game's assets are compressed into a few pack volumes, and a runtime that Forge i
 Everything is in the app's **Pack** tab (**How pack works** there shows the steps in short, offline). Choose
 the kind of packs first:
 
-- **zstd** (the default): zstd packs, `ampr_zstd.index` + `ampr_zstd-NNN.pak` (`docs/PAK.md` has the format).
-- **LZ4** (experimental): ampr_emu's asset packs, `ampr_assets.index` + `ampr_assets-NNN.pak`.
+- **zstd** (the default): zstd packs, `ampr_zstd.index` + `ampr_zstd-NNN.pak` (`docs/zstd.md` has the format).
+- **LZ4**: ampr_emu's asset packs, `ampr_assets.index` + `ampr_assets-NNN.pak`.
 
 Both are read by **ampr-emu-ng**, the bundled runtime Pack installs by default. An LZ4 Pack can install the
 bundled upstream [ampr_emu](https://github.com/drakmor/ampr_emu) 0.4.2.1 instead.
 
 A plain game gets **Pack**; a game already packed by the kind chosen gets **Unpack**. A game packed by the
-other kind must be unpacked under that kind first. A game that doesn't use AMPR, a patch package and
+other kind is repacked: Pack decodes its packs and packs it again by the packing strategy. A game that doesn't use AMPR, a patch package and
 additional content get a note and no action.
 
 > **ShadowMount+ can replace the runtime.** Its fakelib update replaces ampr-emu-ng, and the game then
@@ -24,6 +24,38 @@ additional content get a note and no action.
 
 > **ampr_emu 0.4.2.1 is an upstream test build; known issue: some games crash when saving.** Forge logs
 > this on every LZ4 Pack with runtime ampr_emu. Keep a copy of the original game.
+
+## Packing strategy
+
+Which files are packed and which stay loose is the **packing strategy**, the same for zstd and LZ4 Pack;
+zstd and LZ4 are only the pack formats. Executables (`eboot.bin`, `.elf`, `.self`, `.prx`, `.sprx`),
+`sce_sys`, `sce_module`, `fakelib` and empty files always stay loose.
+
+The **built-in packing strategy** packs everything but the game's root files and the keep-loose list.
+The runtime serves only AMPR reads, so anything the game reads other than through AMPR (plain reads, mmap)
+stays loose, as does anything it reads before it has started AMPR. The **keep-loose list** (any depth, any
+case for the new names and folders): container indexes (`.pak`, `.utoc`), configs and text (`.ini`,
+`.json`, ...), Unreal project files (`.uproject`, `.uplugin`, `.upluginmanifest`), images, video (`.bik`,
+`.mpg`, `.mpeg`, `.m2v`, ...), audio, the protected folders (`sce_module`, `system`, `save`, `fakelib*`, ..., in any letter case), every
+file in a video folder (`video`, `videos`, `movie`, `movies`, `cutscene`, `cutscenes`, `fmv`; not
+`cinematic*`) and Insomniac's extensionless boot and streaming containers, by file name (`bootload_*`,
+`critbootload`, `soundbank`, `soundbank.*`, `soundbank_*`, `wem`, `wem.*`, `wem_*`, `screenreaderwem*`,
+`movie`, `movie_*`, `movies`, `movies_*`). An LZ4-packed source repacked as zstd is unpacked and then packed by the same
+strategy (or a TOML profile); its LZ4 packs' old set is not reused.
+
+Each Pack job logs why files stayed loose, for example:
+
+    packing strategy: kept loose 812 files, 31.4 GB: root files 0.2 GB, keep-loose suffixes 27.9 GB (.bnk 12.0 GB, .pak 9.1 GB, .wem 4.0 GB, .mp4 2.1 GB, .json 0.4 MB, ...), protected folders and names 3.3 GB, auto-loose 0.0 MB
+
+(`auto-loose` for LZ4 only; decimal GB, MB under 1 GB). With a profile it counts the files and bytes the
+profile kept loose and those the always-loose files did instead. A large keep-loose suffix or folder there
+is where a profile could pack more.
+
+**Custom rules** (Pack only): a TOML profile of the packing strategy, in upstream `ampr_pack.py`'s and
+Lazy_AMPR's format, decides instead (**Custom rules (TOML)** in the Pack tab, `--pack-profile <toml>` in the
+CLI). The last matching rule wins; only the always-loose files above override it, so the keep-loose list and
+root files are the profile's call. Wrong rules can leave a game that won't start: keep a copy.
+[packing.md](packing.md) lists the keys Forge reads.
 
 ## zstd packs
 
@@ -38,9 +70,7 @@ ps5-dump-forge convert <game> --to folder --zstd-pack [--zstd-level 1..22]   # a
 Forge installs ampr-emu-ng at `fakelib/libSceAmpr.sprx` (replacing whatever is there), leaves out the old
 journal (`ampr_commands.bin`) and logs, and writes a fresh `ampr_emu.index` that lists every file, loose and
 packed. Files go into 256 KiB chunks, each one zstd frame, or stored raw when zstd doesn't make it smaller.
-Which files are packed follows LZ4's built-in rules (below; no auto-loose): executables, `sce_sys`,
-`sce_module`, `fakelib`, files at the game's root and the keep-loose list stay loose. An LZ4-packed source
-repacked as zstd keeps the set its LZ4 packs held. Into an image there is no temporary folder: as for LZ4
+Which files are packed follows the packing strategy (above; no auto-loose). Into an image there is no temporary folder: as for LZ4
 (below), Forge measures the packs first (about 16 bytes per chunk), then makes each chunk again while the
 image is written and checks it against the measurement. The job is verified through the packs (the index,
 every volume header, then the game's files read back against the source).
@@ -70,12 +100,7 @@ ps5-dump-forge convert <game> --to lz4 [--lz4-level 0|3..12] [--lz4-runtime ng|a
 ps5-dump-forge convert <game> --to ffpkg --lz4-pack [--lz4-level N]   # also exfat, ffpfs, ffpfsc
 ```
 
-Which files to pack comes from the **built-in rules**: everything but the game's root files and the
-keep-loose list. Packed files exist for the game only once it has started AMPR, so anything it reads before
-that must stay loose. The **keep-loose list**: container indexes (`.pak`, `.utoc`), configs and text (`.ini`,
-`.json`, ...), Unreal project files (`.uproject`, `.uplugin`, `.upluginmanifest`), images, video (`.bik`,
-`.mpg`, `.mpeg`, `.m2v`, ...), audio and the protected folders (`sce_module`, `system`, `save`, ...). Then
-**auto-loose** (as upstream's packer): a file of 64 MiB or more left to compress is sampled (32 blocks spread
+Which files to pack follows the packing strategy (above). Then, for LZ4 only, **auto-loose** (as upstream's packer): a file of 64 MiB or more left to compress is sampled (32 blocks spread
 across it, at most 16 MiB) and stays loose when the samples save under 5% or 90% of them stay uncompressed.
 
 The runtime (**Runtime** in the tab, `--lz4-runtime`): **ampr-emu-ng** (`ng`, the default) is installed

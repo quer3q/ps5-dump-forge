@@ -7,11 +7,13 @@ in place or rebuilt) or copies some out (Extract). Rust core, Tauri 2 GUI (`PS5 
 CLI (`ps5-dump-forge`), and a PS5 ELF payload (the CLI's `serve`: the same UI as a web page on port 8095).
 Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, the PS5 `.elf`.
 `ps5/README.md` holds the payload's details (harness, HTTP routes, tile/self copy/launch on open, U1–U10
-write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK.md` the zstd pack format.
+write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zstd.md` the zstd pack format; `docs/packing.md` the TOML profiles of the packing strategy (`docs/packing-sample.toml` a sample).
 
 ## Layout
 - `crates/ps5-dump-forge-core`: everything a job does. Own folder scanner (no symlink follow,
-  exact names), preflight (names, special files, space, FAT32, depth, name limits), jobs (a worker thread
+  exact names; no per-file open on unix: type, nlink and read permission from the lstat (mode bits, else
+  `access(2)`; ponytail: an ACL deny shows at read), `OpenAhead` opens the next 16 files on 4 threads once reads go
+  in `files()` order), preflight (names, special files, space, FAT32, depth, name limits), jobs (a worker thread
   per job, one heavy job and one transfer at a time, each slot FIFO, conflicts refused at start, cancel
   flag (a cancelled job's error is `cancelled`, or `cancelled; ` + what else failed or stays when that is
   more than the cancel), `catch_unwind`), `.part` + atomic no-replace
@@ -77,22 +79,22 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   plaintext `param.json`, `icon0.png` size; the package scan's); `lih.rs` reads a patch package (`\x7FLIH`) as the package it patches (Patch packages
   below).
 - `crates/ps5-dump-forge-lz4`: ampr_emu asset packs: AMPRPAK4 manifest + AMPRDAT3 volume writer and
-  reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, pack rules (`rules.rs`), LZ4 blocks through
+  reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, the packing strategy (`rules.rs`, shared by zstd and LZ4 Pack), LZ4 blocks through
   the C liblz4 (`block.rs`, `lz4-sys`: `LZ4_compress_default` at level 0, `LZ4_compress_HC` at 3..=12,
   `LZ4_decompress_safe`), the embedded runtimes (`runtime.rs`: the release runtime `runtime::release()` and ampr-emu-ng
-  v0.1.0 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
+  v0.2.0 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
   once on first use into a `OnceLock`; sizes and SHA-256 pinned (`pinned_sizes_and_hashes`); `classify` also recognizes by pinned
   SHA-256 the old trace build and the old local ng build (`OLD_ZSTD_SHA256`), neither shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
   runtime swap). `tree.rs` is `PackedTree`, the packs served as a `SourceTree` from a `writer::measure` pass.
   `vendor/ampr_emu/`: the upstream 0.4.2.1 release `.sprx` + the source archive. `vendor/ampr-emu-ng/`: the
-  ampr-emu-ng v0.1.0 release (`libSceAmpr.sprx`, embedded as `runtime::zstd()`; `libSceAmpr-debug.sprx`, never
+  ampr-emu-ng v0.2.0 release (`libSceAmpr.sprx`, embedded as `runtime::zstd()`; `libSceAmpr-debug.sprx`, never
   embedded; `SHA256SUMS`) + its source archive.
 - `crates/ps5-dump-forge-zstd`: zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak` volumes of at most 4 GiB -
   64 KiB, 256 KiB chunks, one zstd frame or raw each): the format (encode + validating decode), the
   writer (`writer::pack_with`; `writer::measure` + `tree::PackedTree`, the packs made on demand for an
   image, as LZ4's) and the reader (`reader::detect`, `reader::unpack`: the index and every
   volume header checked, then the logical files served as a `SourceTree`, 8 chunks per volume read decoded
-  in parallel; a loose file found by a binary search of the sorted listing, `Unpacked::listed`); spec in `docs/PAK.md`. Without its default `std` feature the crate is `no_std` and keeps
+  in parallel; a loose file found by a binary search of the sorted listing, `Unpacked::listed`); spec in `docs/zstd.md`. Without its default `std` feature the crate is `no_std` and keeps
   only the convention (magics, layout, names, `Chunk`, the volume header): ampr-emu-ng builds against
   that. Glue in `core/src/zstd_pack.rs` (the pack job's tree, plan, packing,
   checks).
@@ -267,21 +269,22 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   (`block.rs`, by user decision): `lz4_level` 0 (Fast, `LZ4_compress_default`, the default) or an HC level
   3..=12 (Medium 9, Max 12), any other value a finding; CLI `--lz4-level`. The runtime is `lz4_runtime`
   (`Lz4Runtime`, `ng` default | `ampr_emu`; CLI `--lz4-runtime`): ampr-emu-ng (`runtime::zstd()`) or the
-  release build; `runtime::WARNING` is logged only for `ampr_emu`. By user decision: no traces and no
-  profiles; the rules are the built-in guess (below).
-- zstd packs (`core/src/zstd_pack.rs`, `ps5-dump-forge-zstd`; spec `docs/PAK.md`; named zstd, files on disk AMPR
+  release build; `runtime::WARNING` is logged only for `ampr_emu`. By user decision: no traces; which files are packed is the packing strategy
+  (built-in or a TOML profile; Packing strategy, below).
+- zstd packs (`core/src/zstd_pack.rs`, `ps5-dump-forge-zstd`; spec `docs/zstd.md`; named zstd, files on disk AMPR
   style, by user decision: `ampr_zstd.index` (`AMPRZPK1`) + `ampr_zstd-NNN.pak` (`AMPRZDT1`, from 000)): volumes
   (zstd, 256 KiB chunks, a chunk kept raw when zstd doesn't shrink it) that ampr-emu-ng (`runtime::zstd()`,
-  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.1.0 release, size and SHA-256
-  pinned (`ZSTD_SHA256`); the user's runtime, which reads LZ4 packs too; the old local build (`OLD_ZSTD_SHA256`,
-  file removed) is still recognized by its hash, so a game carrying it keeps it, and any other build holding the
+  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.2.0 release, size and SHA-256
+  pinned (`ZSTD_SHA256`); the user's runtime, which reads LZ4 packs too; the v0.1.0 release (`PREVIOUS_ZSTD_SHA256`)
+  and the old local build (`OLD_ZSTD_SHA256`), both files removed, are still recognized by their hashes, so a game carrying it keeps it, and any other build holding the
   `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng too) reads.
   Pack (`zstd_pack`, `zstd_level` 1..=22, default 5; CLI `--zstd-pack [--zstd-level N]`): into a `folder` or
   straight into an `.exfat`/`.ffpkg`/`.ffpfs`/`.ffpfsc` (`.pkg` refused), no LZ4 option, an AMPR title (`eboot.bin` imports libSceAmpr), no source file named like a pack file;
   else preflight findings. `zstd_pack::prepare`: ampr-emu-ng at `fakelib/libSceAmpr.sprx` (installed or
   replacing any), journal, logs and old index left out, a fresh `ampr_emu.index` (the job's `mtime`) listing
-  every file written, loose and packed. The packed set is LZ4's: the built-in guess (`rules::select`:
-  root files and the keep-loose list stay loose) or, for an LZ4-packed source, the files its packs held; never
+  every file written, loose and packed. The packed set is the packing strategy's (shared with LZ4 Pack): the built-in one (`rules::select`:
+  root files and the keep-loose list stay loose; an LZ4-packed source too, by user decision: its packs' old set is
+  not reused) or a TOML profile's; never
   `zstd_pack::loose` (`always_loose`, the pack files, the index); no auto-loose. A folder: stages scan, preflight,
   write, pack, verify, finalize. An image: two passes as LZ4's (`writer::measure`, then the image written from
   `tree::PackedTree`; stages scan, preflight, measure, write, verify, finalize). Verify checks the index and
@@ -296,8 +299,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   files) and keeps ampr-emu-ng (`zstd_action`: installed where missing, any other runtime replaced); into a `.pkg` the builder
   packages that index as it is (vendor patch 0030: `source::lz4_packed` answers true for it). Remove backport is
   refused in the UI for a packed source (`convert.zstdBackport`/`lz4Backport`: unpack first). Its label is
-  shown wherever the LZ4 one is: the source card's **zstd** tile (`ZstdTile`, in the LZ4 tile's place:
-  Packed, "a conversion keeps them", the runtime), the Library's **zstd** chip and card/row badge.
+  shown wherever the LZ4 one is: the source card's AMPR tile (`AmprTile`, one for LZ4 and zstd, by user
+  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.2.0`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
+  the value Packed (zstd) / Packed (LZ4) in the green neon look, Damaged packs as before, Unpacked greyed
+  `.tile.unpacked`), the Library's **zstd** chip and card/row badge.
   UI (by user decision): the **Pack** tab (`app/src/Pack.tsx`, after Edit; **How pack works** in `PackHelp.tsx`)
   with a kind selector **zstd** (default) / **LZ4**; the action is **Unpack** for a game packed
   by the kind chosen, else **Pack**. Its empty source card (`PackEmpty`, by user request) is the shared one's text ("Choose a game folder,
@@ -305,13 +310,17 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   nothing. LZ4's line under the selector: an unpacked game a warn "Some games may not start. ...", a packed one
   plain "Writes the LZ4 packs back as plain files."; How pack works opens its LZ4 list with "**Some games may
   not start.** Keep a copy.". Blocked (a note in place of the settings): a patch package, additional
-  content, a game packed by the other kind ("unpack it under <kind> first"), a game that doesn't use AMPR
-  (`pack.noAmprGame`). Pack's targets (a UI limit; core and CLI keep `.ffpfsc`): zstd folder (default)/
+  content, a game that doesn't use AMPR (`pack.noAmprGame`). A game packed by the other kind is not blocked: Pack
+  decodes its packs and packs it again by the packing strategy (by user decision). Pack's targets (a UI limit; core and CLI keep `.ffpfsc`): zstd folder (default)/
   `.exfat`/`.ffpkg`/`.ffpfs`, LZ4 packed folder (default)/`.exfat`/`.ffpkg`/`.ffpfs`, an image with the muted
   `pack.direct` (reads the game twice). Unpack: zstd folder (default)/`.exfat`/`.ffpkg`/`.ffpfs`/`.pkg`, LZ4
   folder (default)/`.exfat`/`.ffpkg`/`.ffpfs`. Pack's **Compression** presets **Fast** / **Medium** / **Max**
   (`LevelField`, `LEVEL_OF`: zstd 5/9/19, LZ4 0/9/12; Fast default), each with a `levelNotes` line (Fast
-  tagged Recommended). LZ4 Pack's **Runtime** (`RuntimeField`): **ampr-emu-ng** (`ng`, default, Recommended:
+  tagged Recommended). Pack (zstd and LZ4, not Unpack) has a closed fold **Custom rules (TOML)** (`RulesField`):
+  a muted hint, a warn line (wrong rules can leave a game that won't start), the file (`PathLine`, once picked;
+  nothing in its place before, by user decision), Pick (the tabbed picker: this device, online peers, saved NAS; `.toml`) and Clear; in
+  memory only, sent as `pack_profile` on a Pack request only; the fold opens on a pick; job tag ` · custom rules`.
+  LZ4 Pack's **Runtime** (`RuntimeField`): **ampr-emu-ng** (`ng`, default, Recommended:
   reads zstd and LZ4 packs) or **ampr_emu <version>** (upstream). A Pack that installs ampr-emu-ng (every zstd
   Pack, LZ4 with `ng`) shows the warning `pack.ngNote`: turn off ShadowMount+'s fakelib update, or it replaces
   the runtime. LZ4 Unpack, or Pack with ampr_emu: the runtime action from `Lz4Facts.pack_runtime_action`
@@ -325,8 +334,20 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   ampr-emu-ng `convert.amprNgReplaced`) and the index (a
   non-ok one written afresh, `amprIndex`, an ok one counted stale while Remove backport is on; for an fpkg target
   always `amprPkgIndex`: the builder writes it; none for a packed game). The Edit tab's
-  LZ4 tile (its Game facts fold) names install/replace (keep only for an `other` build with a version) and a non-ok index, and shows for
-  an AMPR game a conversion installs the runtime into.
+  LZ4 tile (its Game facts fold) names install/replace ("a conversion keeps it" only for an `other` build with a version, the version
+  not repeated) and a non-ok index, and shows for an AMPR game a conversion installs the runtime into; with no runtime (`none`) it
+  carries no notes (by user decision: the title "No runtime" says it).
+- A folder output (a conversion's: plain, LZ4 or zstd pack; local `.part` folder or a peer/NAS folder) puts
+  `sce_sys/**` and the root `eboot.bin` in place last, after every other file and the packs, right before verify
+  (`convert::launch_order`): ShadowMount+ finds a game folder by them, so a half-written one isn't
+  launched. A plain local folder keeps the source's read order (a solid archive is decoded once): the folder writer
+  writes the launch files under temporary names at the `.part` root and renames them (`sce_sys/` first, then
+  `eboot.bin`) once every other file is written and synced and its writers are joined, before the folder's sync.
+  Onto a peer or NAS, and in an LZ4/zstd pack's folder, they are written in a last pass of their own, `sce_sys/`
+  first (ponytail: read out of order there, so a solid archive is decoded again; a peer renames only files it saw
+  created). The folder writer (`extract::write`) reads files of at most 4 MiB whole on the job thread and has 4
+  threads create, write, sync and close them (at most 13 files in flight; joined before the folder's sync, so the
+  macOS F_FULLFSYNC barrier and FreeBSD's per-file `sync_retry` hold); larger files take the old path.
 - Every conversion repairs an AMPR title (`eboot.bin` imports libSceAmpr; by user decision): any target, Convert,
   CLI, server and Pack jobs alike (`lz4::plain` for a request without LZ4 options, `prepare`'s full path otherwise).
   Edit jobs are the exception (their own index rule, runtime never swapped; see the Edit tab below).
@@ -358,13 +379,36 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   `Lz4Facts.index` (`ok`/`stale`/`damaged`/`missing`; `None` when packed, when the action is `Untouched`, or for an
   archive's index over 16 MiB) is that comparison. Edit's game facts, Convert, the Pack tab and the CLI say a
   conversion refreshes it.
-- LZ4 rules: the built-in guess only (profiles and `--lz4-profile` removed, by user decision).
+- Packing strategy (by user decision one neutral name: which files are packed and which stay loose, shared by
+  zstd and LZ4 Pack; zstd and LZ4 are only the pack formats; `docs/packing.md` the TOML keys): the built-in
+  packing strategy, or a TOML profile of it (by user request:
+  upstream `ampr_pack.py`'s / Lazy_AMPR's format; `ConvertRequest.pack_profile`, CLI `--pack-profile <toml>`,
+  only with an LZ4 or zstd pack, else a finding). The profile may be on this device, a paired peer or a saved NAS
+  (`net::read_small`, at most 1 MiB, a regular UTF-8 file), read once in preflight (ponytail: not guarded as a job
+  path); every problem a finding `pack rules <file>: ...`. Only `[pack]` and `[[rule]]` are read: `default_action`
+  (default `loose`), `default_block_size`, the `auto_loose_*` keys; a rule's `action` compress|store|loose,
+  `include`/`exclude` (Python `fnmatchcase`: `*` crosses `/`), `block_size`, `layout`, `hot`; the last matching
+  rule wins. Every other key (`[groups]`, lanes, dedupe, a typo) is ignored, one log line `pack rules: ignored
+  keys: ...`; `include_from`/`exclude_from` are findings. With a profile only `rules::always_loose` (system and
+  runtime files) overrides it; the keep-loose list doesn't apply (the user's call; Pack warns). zstd: `store` packs
+  as compress (chunks that don't shrink are raw anyway), no auto-loose. Log `pack rules: <file>: N rules; M files
+  packed, K loose; ...`.
   `--lz4-unpack` (automatic when the target is lz4) restores the logical assets; the runtime follows the runtime
   rule above (kept unless installed or replaced) and an `ampr_emu.index` listing exactly the output stays.
-  Packed files exist for the game only after it starts AMPR, so anything the engine opens, stats or lists
-  before that (Unreal `.pak`/`.utoc`, `.ini`, `.uproject`) must stay loose. The keep-loose list
-  (`rules::keep_loose`: `FALLBACK_SUFFIXES` + the protected directory families) and every root file stay
-  loose (`rules::select`). Then auto-loose (upstream `ampr_pack.py`'s defaults, `rules::auto_loose_applies`):
+  A packed record whose path (ASCII case-folded) is also a file on disk is never refused (by user decision; a
+  third-party release packed `sce_sys/ext_info.dat` and kept it): identical copies (same name, same size, at most
+  16 MiB, same bytes) keep the plain file (it leaves the packed set), any other case serves the packed copy and leaves the
+  physical file out of the listing; one log line `LZ4: N files both packed and on disk: I identical (plain copy
+  kept), D different (packed copy used): ...`.
+  Packed files exist for the game only through AMPR, so anything the engine opens, stats or lists
+  before that or outside APR (Unreal `.pak`/`.utoc`, `.ini`, `.uproject`) must stay loose. Built-in: the keep-loose list
+  (`rules::keep_loose`: `FALLBACK_SUFFIXES` + the protected directory families (any case, `fakelib*`
+  by prefix; `always_loose`'s names too: images fold case) + `VIDEO_DIRS` (`video`, `movies`,
+  `cutscenes`, `fmv`, ..., any depth, ASCII case-insensitive) + `LOOSE_NAMES` (Insomniac's extensionless
+  `bootload_*`, `soundbank*`, `wem*`, `movie*` containers, by file name)) and every root file stay
+  loose (`rules::select`); `rules::loose_reason` names why, for the one line per Pack job `packing strategy: kept
+  loose N files, X GB: root files, keep-loose suffixes (top 5), protected folders and names, auto-loose (LZ4)`
+  (`lz4::loose_line`; with a profile: the profile's and `always_loose`'s counts). Then auto-loose (upstream `ampr_pack.py`'s defaults, `AutoLoose`):
   a compress-spec file (not store, not hot) of ≥ 64 MiB is sampled during preflight (32 blocks / ≤ 16 MiB at fixed, evenly
   spread block indices, `writer::sample` = the writer's `encode`) and kept loose when it saves < 5% or
   ≥ 90% of the blocks stay RAW; one log line `auto-loose: N large files kept loose (incompressible samples): …`.
@@ -1317,10 +1361,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/PAK
   (a RAW chunk is exactly one I/O page); files the runtime cannot serve stay loose. CRCs detect
   corruption, they do not authenticate. The manifest's runtime-contract checks run on every open.
   Not an SMP image: ShadowMountPlus mounts none (no `.lz4` extension, no mount name limit beyond a folder's).
-- zstd packs (`docs/PAK.md`): `ampr_zstd.index` (`AMPRZPK1`, version 1, 128-byte header, file, chunk and volume
+- zstd packs (`docs/zstd.md`): `ampr_zstd.index` (`AMPRZPK1`, version 1, 128-byte header, file, chunk and volume
   records, FNV-1a 64 path hashes, CRC-32 over header and tables) and `ampr_zstd-NNN.pak` volumes (`AMPRZDT1`, from 000; 64-byte header with
   the index's archive id, at most 4 GiB - 64 KiB, at most 4,096); 256 KiB chunks, each one zstd frame or raw
-  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.1.0, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
+  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.2.0, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
 
 ## Commands
 ```sh

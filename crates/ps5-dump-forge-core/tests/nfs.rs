@@ -38,6 +38,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         edit_rebuild: false,
         install: None,
         delete_source: false,
+        pack_profile: None,
         archive_password: None,
     }
 }

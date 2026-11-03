@@ -2,11 +2,12 @@
 //! names lossily and turns a literal `\` into `/`. A game opens its files by their exact
 //! spelling, so each of those is an error here instead of a silent change.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
@@ -64,6 +65,109 @@ pub struct ScannedFolder {
     empty_dirs: Vec<String>,
     /// The last file read, kept open: writers read one file in many chunks.
     open: Option<(usize, File)>,
+    /// The next files opened ahead, once reads go through the files in order.
+    ahead: Option<OpenAhead>,
+}
+
+/// Files a few ahead of the reader opened on [`OPENERS`] threads. With many small files the
+/// open is most of a file's cost (~60 us each on a macOS SSD, 100k files 6 s of a folder
+/// copy), and a reader opening them one at a time waits on each. Only the open moves:
+/// [`ScannedFolder::checked`] still checks every file against its stamp as it reads it.
+struct OpenAhead {
+    ask: Option<mpsc::Sender<(usize, PathBuf)>>,
+    got: mpsc::Receiver<(usize, io::Result<File>)>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    /// Files asked for: `None` while their open runs.
+    asked: HashMap<usize, Option<io::Result<File>>>,
+}
+
+const OPENERS: usize = 4;
+/// How many files past the one read are opened ahead (descriptors held at most).
+const OPEN_AHEAD: usize = 16;
+
+impl OpenAhead {
+    fn start() -> io::Result<Self> {
+        let (ask, asks) = mpsc::channel::<(usize, PathBuf)>();
+        let (give, got) = mpsc::channel();
+        let asks = Arc::new(Mutex::new(asks));
+        let mut workers = Vec::new();
+        for _ in 0..OPENERS {
+            let (asks, give) = (Arc::clone(&asks), give.clone());
+            workers.push(
+                std::thread::Builder::new()
+                    .name("open-ahead".into())
+                    .spawn(move || {
+                        while let Ok((i, path)) = { asks.lock().expect("not poisoned").recv() } {
+                            if give.send((i, open_nofollow(&path))).is_err() {
+                                return;
+                            }
+                        }
+                    })?,
+            );
+        }
+        Ok(Self {
+            ask: Some(ask),
+            got,
+            workers,
+            asked: HashMap::new(),
+        })
+    }
+
+    /// File `i`'s open, if it was asked for (waiting for it if it still runs). When the reads
+    /// go forward (`forward`), the files after it are asked for; every other one is forgotten.
+    /// A reader in its own order (the pack writers) then asks for nothing.
+    fn take(
+        &mut self,
+        i: usize,
+        forward: bool,
+        root: &Path,
+        files: &[SourceFile],
+    ) -> Option<io::Result<File>> {
+        while let Ok((at, file)) = self.got.try_recv() {
+            self.settle(at, file);
+        }
+        while matches!(self.asked.get(&i), Some(None)) {
+            let Ok((at, file)) = self.got.recv() else {
+                break;
+            };
+            self.settle(at, file);
+        }
+        let mine = self.asked.remove(&i).flatten();
+        let next = if forward {
+            i + 1..(i + 1 + OPEN_AHEAD).min(files.len())
+        } else {
+            0..0
+        };
+        self.asked.retain(|at, _| next.contains(at));
+        for at in next {
+            if !self.asked.contains_key(&at)
+                && let Some(ask) = &self.ask
+            {
+                let mut full = root.to_path_buf();
+                full.extend(files[at].path.split('/'));
+                if ask.send((at, full)).is_ok() {
+                    self.asked.insert(at, None);
+                }
+            }
+        }
+        mine
+    }
+
+    /// An open that came back: kept while it is still wanted, else closed.
+    fn settle(&mut self, at: usize, file: io::Result<File>) {
+        if let Some(slot @ None) = self.asked.get_mut(&at) {
+            *slot = Some(file);
+        }
+    }
+}
+
+impl Drop for OpenAhead {
+    fn drop(&mut self) {
+        self.ask = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -113,6 +217,7 @@ impl ScannedFolder {
             stamps,
             empty_dirs: walk.empty_dirs,
             open: None,
+            ahead: None,
         })
     }
 
@@ -136,10 +241,27 @@ impl ScannedFolder {
         let path = &self.files[i].path;
         let with_path = |e: io::Error| Error::Io(io::Error::new(e.kind(), format!("{path}: {e}")));
         if self.open.as_ref().is_none_or(|(at, _)| *at != i) {
-            self.open = None;
-            let mut full = self.root.clone();
-            full.extend(path.split('/'));
-            self.open = Some((i, open_nofollow(&full).map_err(with_path)?));
+            // Reads moving to the next file in order start the openers; forward within the
+            // window (empty files are never opened) they keep asking; a jump elsewhere finds
+            // nothing opened for it and asks for nothing.
+            let last = self.open.take().map(|(at, _)| at);
+            let forward = last.is_some_and(|at| i > at && i <= at + OPEN_AHEAD);
+            if last.is_some_and(|at| at + 1 == i) && self.ahead.is_none() {
+                self.ahead = OpenAhead::start().ok();
+            }
+            let early = match &mut self.ahead {
+                Some(ahead) => ahead.take(i, forward, &self.root, &self.files),
+                None => None,
+            };
+            let file = match early {
+                Some(file) => file,
+                None => {
+                    let mut full = self.root.clone();
+                    full.extend(path.split('/'));
+                    open_nofollow(&full)
+                }
+            };
+            self.open = Some((i, file.map_err(with_path)?));
         }
         let file = &mut self.open.as_mut().expect("opened above").1;
         let meta = file.metadata().map_err(with_path)?;
@@ -266,14 +388,7 @@ impl Walk {
                     self.empty_dirs.push(path);
                 }
             } else if kind.is_file() {
-                match open_for_links(&entry.path()).and_then(|f| {
-                    // The entry may have been swapped since it was listed.
-                    let now = f.metadata()?;
-                    if !now.is_file() {
-                        return Err(io::Error::other("no longer a regular file"));
-                    }
-                    hard_link_count(&f, &now)
-                }) {
+                match links(&entry.path(), &meta) {
                     Err(e) => self.unreadable.push(format!("{path}: {e}")),
                     Ok(links) if links > 1 => self.hard_links.push(path),
                     Ok(_) => {
@@ -316,35 +431,57 @@ pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
-/// [`open_nofollow`] for the walk's type and link count, which read no data. Windows: for
-/// attributes only, since an open for reading has an on-access scanner (Defender) check the
-/// file first; one at a time, ~95k assets kept the scan going for minutes.
-#[cfg(windows)]
-fn open_for_links(path: &Path) -> io::Result<File> {
-    crate::finalize::open_attributes(path, false)
-}
-
-#[cfg(not(windows))]
-fn open_for_links(path: &Path) -> io::Result<File> {
-    open_nofollow(path)
-}
-
-/// How many names the open file `file` (whose metadata is `meta`) has.
+/// How many names the regular file at `path` (listed with the lstat `meta`) has; an error
+/// when it can't be read. Unix: the lstat already holds the link count, and the read
+/// permission comes from its mode bits where they decide it alone (root, ours and
+/// owner-readable, or group- and world-readable), else from access(2); no open (on macOS
+/// an open per file was ~3.8 s of a 100k-file scan's 5.6 s, access(2) ~9 us each, the lstat
+/// ~1 us). A file swapped after the listing is caught when it is read: every read opens it
+/// with `O_NOFOLLOW` and checks its stamp.
+// ponytail: an ACL or MAC policy denying a mode-readable file is found only when it is read.
 #[cfg(unix)]
-fn hard_link_count(_: &File, meta: &Metadata) -> io::Result<u64> {
+fn links(path: &Path, meta: &Metadata) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    // Only the one class that applies counts: the owner's when it is ours, else the group's
+    // or the world's (which one needs our groups), so both of those must allow it.
+    let mode = meta.mode();
+    let readable = euid == 0
+        || if meta.uid() == euid {
+            mode & 0o400 != 0
+        } else {
+            mode & 0o044 == 0o044
+        };
+    if !readable {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+        // SAFETY: a valid C string.
+        if unsafe { libc::access(c.as_ptr(), libc::R_OK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(meta.nlink())
 }
 
+/// Windows: opened for attributes only, since an open for reading has an on-access scanner
+/// (Defender) check the file first; one at a time, ~95k assets kept the scan going for
+/// minutes.
 #[cfg(windows)]
-fn hard_link_count(file: &File, _: &Metadata) -> io::Result<u64> {
-    crate::win::link_count(file)
+fn links(path: &Path, _: &Metadata) -> io::Result<u64> {
+    let f = crate::finalize::open_attributes(path, false)?;
+    // The entry may have been swapped since it was listed.
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("no longer a regular file"));
+    }
+    crate::win::link_count(&f)
 }
 
 // ponytail: other OSes have no link count wired; hard links are not detected there.
 #[cfg(not(any(unix, windows)))]
-fn hard_link_count(_: &File, _: &Metadata) -> io::Result<u64> {
-    Ok(1)
+fn links(path: &Path, _: &Metadata) -> io::Result<u64> {
+    open_nofollow(path).map(|_| 1)
 }
 
 #[cfg(windows)]

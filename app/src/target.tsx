@@ -24,7 +24,7 @@ import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
 import type { Job } from "./jobs";
 
-/** A one-line note; `tone`: its first word ("Recommended", "Experimental") is coloured. */
+/** A one-line note; `tone`: its first word ("Recommended", "Some") is coloured. */
 export interface Note {
   tone?: "good" | "warn";
   text: string;
@@ -36,7 +36,7 @@ export function formatInfo(f: Format): Note {
 }
 
 /** A note with its leading word in green (`good`: "Recommended") or amber (`warn`:
- * "Experimental"); text colour only, the word itself says it. */
+ * "Some"); text colour only, the word itself says it. */
 export function Lead({ note }: { note: Note }) {
   const word = note.tone ? /^[\p{L}\p{M}]+/u.exec(note.text)?.[0] : undefined;
   if (!word) return <Prose text={note.text} />;

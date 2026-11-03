@@ -22,6 +22,7 @@ const MAX_WORKERS: u32 = 16;
 const PHYSICAL_ALIGN: u64 = 64;
 const MIN_IO_PAGE: u32 = 1 << 12;
 const MAX_IO_PAGE: u32 = 1 << 20;
+const MAX_DUPLICATE_BYTES: u64 = 16 << 20;
 
 fn bad(msg: impl Into<String>) -> Error {
     Error::Format(msg.into())
@@ -490,6 +491,10 @@ pub struct Unpacked<T: SourceTree + ?Sized> {
     empty_dirs: Vec<String>,
     /// Packed records by path: index into `manifest.files`.
     packed: HashMap<String, usize>,
+    /// Packed records also on disk with identical bytes (the plain copy kept).
+    identical: Vec<String>,
+    /// Packed records also on disk with other contents (the packed copy served).
+    differing: Vec<String>,
     hidden: HashSet<String>,
     /// The last decoded chunk: (chunk index, decoded length, bytes).
     cache: Option<(usize, usize, Vec<u8>)>,
@@ -505,9 +510,11 @@ fn read_exact<T: SourceTree + ?Sized>(tree: &mut T, path: &str, size: u64) -> Re
 }
 
 /// Opens the packs of `tree`: the manifest with every runtime check, every volume header, and
-/// the CRC sidecar and runtime profile when present. Fails if a packed path is also a physical
-/// file (or folder). A loose record's file may be missing or of another size: the runtime
-/// reads loose files from the disk as they are, so an edited packed game still unpacks.
+/// the CRC sidecar and runtime profile when present. A packed path also on disk (ASCII
+/// case-folded) is never refused: identical copies keep the plain file, otherwise the packed
+/// copy wins and the physical file is left out. A loose record's file may be missing or of
+/// another size: the runtime reads loose files from the disk as they are, so an edited packed
+/// game still unpacks.
 pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> {
     let sizes: HashMap<String, u64> = inner
         .files()
@@ -558,7 +565,17 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
 
     let mut hidden: HashSet<String> = [MANIFEST, CRC_SIDECAR, PROFILE].map(String::from).into();
     hidden.extend(manifest.packs.iter().map(|p| p.name.clone()));
-    let physical: HashSet<String> = sizes.keys().map(|p| p.to_ascii_lowercase()).collect();
+    // Every physical file by its folded path, in sorted order (several may fold to one).
+    let mut physical: HashMap<String, Vec<String>> = HashMap::new();
+    for p in sizes.keys() {
+        physical
+            .entry(p.to_ascii_lowercase())
+            .or_default()
+            .push(p.clone());
+    }
+    for paths in physical.values_mut() {
+        paths.sort();
+    }
     let mut files: Vec<SourceFile> = inner
         .files()
         .iter()
@@ -566,6 +583,7 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
         .cloned()
         .collect();
     let mut packed = HashMap::new();
+    let mut duplicates = Vec::new();
     for (i, f) in manifest.files.iter().enumerate() {
         if hidden.contains(&f.path) {
             return Err(bad(format!(
@@ -579,11 +597,11 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
         if !f.packed() {
             continue;
         }
-        if physical.contains(&f.path.to_ascii_lowercase()) {
-            return Err(bad(format!(
-                "{} is both packed and a physical file",
-                f.path
-            )));
+        // Also on disk (ASCII case-folded): settled once the packs can be read, below.
+        if let Some(paths) = physical.get(&f.path.to_ascii_lowercase()) {
+            duplicates.push((f.path.clone(), paths.clone(), f.size));
+            packed.insert(f.path.clone(), i);
+            continue;
         }
         packed.insert(f.path.clone(), i);
         files.push(SourceFile {
@@ -627,7 +645,7 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
             empty_dirs.push(d.clone());
         }
     }
-    Ok(Unpacked {
+    let mut unpacked = Unpacked {
         inner,
         manifest,
         crcs,
@@ -635,9 +653,50 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
         files,
         empty_dirs,
         packed,
+        identical: Vec::new(),
+        differing: Vec::new(),
         hidden,
         cache: None,
-    })
+    };
+    // A packed record also on disk: one identical copy (same name, same size, at most
+    // MAX_DUPLICATE_BYTES, same bytes) keeps the plain file; otherwise (another copy, another
+    // case, or several files folding to the record) the packed copy is served under the
+    // record's name and every physical file folding to it leaves the tree, so the tree keeps
+    // the manifest's spelling.
+    for (record, physical, size) in duplicates {
+        let same = match physical.as_slice() {
+            [one] => {
+                *one == record
+                    && sizes[one] == size
+                    && size <= MAX_DUPLICATE_BYTES
+                    && read_exact(&mut unpacked, &record, size)?
+                        == read_exact(&mut *unpacked.inner, one, size)?
+            }
+            _ => false,
+        };
+        if same {
+            unpacked.packed.remove(&record);
+            unpacked.identical.push(record);
+            continue;
+        }
+        unpacked.files.retain(|f| !physical.contains(&f.path));
+        let at = unpacked
+            .files
+            .binary_search_by(|f| f.path.as_str().cmp(&record))
+            .unwrap_or_else(|at| at);
+        unpacked.files.insert(
+            at,
+            SourceFile {
+                path: record.clone(),
+                size,
+            },
+        );
+        unpacked
+            .hidden
+            .extend(physical.into_iter().filter(|p| *p != record));
+        unpacked.differing.push(record);
+    }
+    Ok(unpacked)
 }
 
 impl<T: SourceTree + ?Sized> Unpacked<T> {
@@ -648,6 +707,17 @@ impl<T: SourceTree + ?Sized> Unpacked<T> {
     /// The relative paths the packs held (packed records).
     pub fn packed_paths(&self) -> impl Iterator<Item = &str> {
         self.packed.keys().map(String::as_str)
+    }
+
+    /// Packed records also on disk with identical bytes; their plain copies are kept.
+    pub fn identical_paths(&self) -> &[String] {
+        &self.identical
+    }
+
+    /// Packed records also on disk with another size or other bytes (or over 16 MiB); the
+    /// packed copy is served and the physical file is left out.
+    pub fn differing_paths(&self) -> &[String] {
+        &self.differing
     }
 
     /// The validated runtime profile, if the tree has one.
@@ -802,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_records_may_change_and_packed_paths_must_not_exist() {
+    fn loose_records_may_change_and_a_packed_copy_on_disk_never_fails() {
         let u = unpack(Box::new(tree(|f| drop(f.remove("eboot.bin"))))).unwrap();
         assert!(!u.files().iter().any(|f| f.path == "eboot.bin"));
         let u = unpack(Box::new(tree(|f| {
@@ -814,8 +884,53 @@ mod tests {
                 .iter()
                 .any(|f| f.path == "eboot.bin" && f.size == 301)
         );
-        let both = err(tree(|f| drop(f.insert("DATA/A.bin".into(), vec![0]))));
-        assert!(both.contains("both packed and a physical"), "{both}");
+        let original = text(200_000, 1);
+        let u = unpack(Box::new(tree(|f| {
+            drop(f.insert("data/a.bin".into(), original.clone()));
+        })))
+        .unwrap();
+        assert_eq!(u.identical_paths(), &["data/a.bin"]);
+        // Any other copy: the packed bytes are served and the path is listed once.
+        let mut u = unpack(Box::new(tree(|f| {
+            let mut copy = original.clone();
+            copy[0] ^= 1;
+            drop(f.insert("data/a.bin".into(), copy));
+        })))
+        .unwrap();
+        assert_eq!(
+            u.files().iter().filter(|f| f.path == "data/a.bin").count(),
+            1
+        );
+        assert_eq!(u.differing_paths(), &["data/a.bin"]);
+        assert_eq!(u.read("data/a.bin").unwrap(), original);
+        let mut u = unpack(Box::new(tree(|f| {
+            drop(f.insert("DATA/A.bin".into(), vec![0]))
+        })))
+        .unwrap();
+        let listed: Vec<_> = u
+            .files()
+            .iter()
+            .filter(|f| f.path.eq_ignore_ascii_case("data/a.bin"))
+            .map(|f| (f.path.as_str(), f.size))
+            .collect();
+        assert_eq!(listed, [("data/a.bin", 200_000)]);
+        assert_eq!(u.read("data/a.bin").unwrap(), original);
+        assert!(u.read_range("DATA/A.bin", 0, 1).is_err());
+        // Two case variants on disk, one of them identical: the packed copy, listed once.
+        let mut u = unpack(Box::new(tree(|f| {
+            drop(f.insert("data/a.bin".into(), original.clone()));
+            drop(f.insert("DATA/A.bin".into(), vec![0]));
+        })))
+        .unwrap();
+        let listed: Vec<_> = u
+            .files()
+            .iter()
+            .filter(|f| f.path.eq_ignore_ascii_case("data/a.bin"))
+            .map(|f| (f.path.as_str(), f.size))
+            .collect();
+        assert_eq!(listed, [("data/a.bin", 200_000)]);
+        assert_eq!(u.read("data/a.bin").unwrap(), original);
+        assert!(u.read_range("DATA/A.bin", 0, 1).is_err());
         let dir = err(tree(|f| drop(f.insert("data/a.bin/x".into(), vec![0]))));
         assert!(dir.contains("file and a folder"), "{dir}");
     }

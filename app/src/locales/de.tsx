@@ -115,14 +115,14 @@ const de: Messages = {
       },
       zstd: { tagline: "Für Spiele mit AMPR, mit ampr-emu-ng", cells: ["Bis zu 80 % schnelleres Laden", "Bis zu halb so groß wie das Spiel"] },
       lz4: {
-        tagline: "Experimentell, für Spiele mit AMPR",
+        tagline: "Für Spiele mit AMPR",
         cells: ["30–40 % schnelleres Laden, laut den Autoren", "Etwa halb so groß wie das Spiel, laut den Autoren"],
       },
       ffpkg: { tagline: "Empfohlen für ShadowMountPlus", cells: ["Volles Image-Tempo", FLAT] },
       exfat: { tagline: "Kompatibilität", cells: ["Volles Image-Tempo", FLAT] },
-      ffpfs: { tagline: "Experimentell", cells: ["Volles Image-Tempo", FLAT] },
+      ffpfs: { tagline: "Unkomprimiertes PFS", cells: ["Volles Image-Tempo", FLAT] },
       ffpfsc: {
-        tagline: "Am kleinsten, experimentell",
+        tagline: "Am kleinsten",
         cells: ["150–250 MB/s, kann ruckeln", "Hängt von der Kompressionsstufe ab, meist 30–60 % kleiner"],
       },
       folder: { tagline: "Normale Spieldateien", cells: ["Volles Laufwerkstempo", FLAT] },
@@ -134,7 +134,7 @@ const de: Messages = {
       ["Gestreamt", "von jeder Quelle zu jedem Ziel: ohne temporäre Kopie, auch für das Image in einem ffpfsc oder ein Spiel in einem Archiv."],
       ["Archive", "ein .zip, .7z oder .rar mit einem Spiel wird wie ein Ordner durchsucht, konvertiert oder gepackt."],
       ["USB und SD-Karten", "geschrieben auf Sticks und Karten mit exFAT oder FAT32."],
-      ["Packen", "Asset-Pakete mit zstd oder LZ4 (experimentell) und intelligenter Reparatur."],
+      ["Packen", "Asset-Pakete mit zstd oder LZ4 und intelligenter Reparatur."],
       ["Speicher", "eine Bibliothek Ihrer Spiele und ein Datei-Explorer zum Umbenennen, Verschieben und Löschen."],
       ["Sicher", "Ihr Spiel wird nie verändert, außer Sie wünschen es; Müll-Dateien werden übersprungen, ungültige Dateinamen vorab gemeldet."],
     ],
@@ -146,7 +146,7 @@ const de: Messages = {
     upstream: (app) =>
       `Angaben der Autoren: was die Autoren von ampr_emu und Lazy_AMPR berichten, nicht von ${app} gemessen; die Werte schwanken je nach Spiel. ampr_emu 0.4.2.1 ist ein Test-Build der Autoren; bekanntes Problem: Manche Spiele stürzen beim Speichern ab.`,
     bundled: "LZ4-gepackte Ordner laufen mit ampr_emu 0.4.2.1 von drakmor (GPL-3.0), unverändert mitgeliefert. Quellcode:",
-    lazy: "Das LZ4-Packen baut auf Lazy_AMPR von Nazky auf:",
+    lazy: "Die Packstrategie baut auf Lazy_AMPR von Nazky auf:",
     ng: "zstd- und LZ4-Pakete laufen auf ampr-emu-ng. Quelle:",
     logo: "Das Logo stammt von Xxcco:",
     unrar:
@@ -371,6 +371,7 @@ const de: Messages = {
       zstdPack: (level: string) => `zstd packen · ${level}`,
       level: (n: number) => `Stufe ${num(n)}`,
       zstdUnpack: "zstd entpacken",
+      withRules: (tag) => `${tag} · eigene Regeln`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Bearbeiten",
@@ -593,6 +594,14 @@ const de: Messages = {
         Dieses Spiel wird bereits als <b>{fmt}</b> geschrieben; erneutes Entpacken erzeugt eine zweite Kopie.
       </>,
     source: "Quelle",
+    rules: {
+      title: "Eigene Regeln (TOML)",
+      titleWith: (name) => `Eigene Regeln (TOML): ${name}`,
+      info: "Ein Profil der Packstrategie im Format von ampr_emus ampr_pack.py und Lazy_AMPR legt fest, welche Dateien gepackt werden und welche einzeln bleiben. Die letzte passende Regel gilt; Systemdateien bleiben immer einzeln.",
+      warn: "Falsche Regeln können ein Spiel hinterlassen, das nicht startet. Behalten Sie eine Kopie.",
+      pickTitle: "Packstrategie (TOML-Datei)",
+      clear: "Entfernen",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -619,6 +628,13 @@ const de: Messages = {
         <ol>
           <li>Liest zstd- und LZ4-Pakete; „Packen“ installiert es in fakelib/.</li>
           <li>Schalten Sie das fakelib-Update von ShadowMount+ aus, sonst ersetzt es die Runtime und das Spiel kann seine Pakete nicht lesen.</li>
+        </ol>
+
+        <h3>Packstrategie</h3>
+        <ol>
+          <li>zstd- und LZ4-Packen folgen einer gemeinsamen Packstrategie: Sie legt fest, welche Dateien gepackt werden und welche einzeln bleiben. zstd und LZ4 sind nur die Packformate.</li>
+          <li>Nur beim Packen: Wählen Sie unter <b>Eigene Regeln (TOML)</b> ein Profil im Format von ampr_pack.py und Lazy_AMPR, auf diesem oder einem anderen Gerät.</li>
+          <li>Die letzte passende Regel gilt; Systemdateien bleiben immer einzeln. Falsche Regeln können ein Spiel hinterlassen, das nicht startet.</li>
         </ol>
       </>
     ),
@@ -676,21 +692,15 @@ const de: Messages = {
     files: (n) => `${num(n)} ${plural(n, FILES)}`,
     contentId: "Content-ID",
     noAmpr: "eboot.bin importiert libSceAmpr nicht",
-    runtime: {
-      forge_release: "Forge-Release",
-      forge_trace: "alte LZ4-Trace-Runtime",
-      zstd: "ampr-emu-ng",
-      other: "andere",
-      none: "keine",
-    },
-    packed: "Gepackt",
+    traceRuntime: "Alte LZ4-Trace-Runtime",
+    noRuntime: "Keine Runtime",
+    packed: (kind) => `Gepackt (${kind})`,
     zstdKept: "zstd-Asset-Pakete: Eine Konvertierung behält sie",
     damaged: "Beschädigte Pakete",
-    plain: "Ungepackt",
+    unpacked: "Ungepackt",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} ${plural(files, FILES)} in ${num(volumes)} ${plural(volumes, { one: "Volume", other: "Volumes" })}` +
       (percent === null ? "" : `, ${num(percent)} % der Größe`),
-    runtimeIs: (label) => `Runtime: ${label}`,
     index: {
       stale: "ampr_emu.index veraltet: Eine Konvertierung erneuert sie",
       damaged: "ampr_emu.index beschädigt: Eine Konvertierung schreibt sie neu",
@@ -701,7 +711,7 @@ const de: Messages = {
         ? `eine Konvertierung installiert das mitgelieferte ampr_emu ${version}`
         : a === "replace"
           ? `eine Konvertierung ersetzt die Runtime durch das mitgelieferte ampr_emu ${version}`
-          : `ampr_emu ${version}: Eine Konvertierung behält es`,
+          : `eine Konvertierung behält es`,
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/, allein eingebunden" : "fakelib/"}, ${num(n)} ${plural(n, { one: "Backport-Bibliothek", other: "Backport-Bibliotheken" })}`,
     findings: "Befunde der Vorabprüfung",
@@ -804,8 +814,7 @@ const de: Messages = {
       },
       pkg: { tone: "good", text: "Empfohlen. Läuft wie ein natives Spiel, aber nur, wenn Ihre Firmware es zulässt." },
       lz4: {
-        tone: "warn",
-        text: "Experimentell. Ein Spielordner, dessen Assets in LZ4-Volumes gepackt sind, die der mitgelieferte AMPR-Emulator (ampr_emu) während des Spiels entpackt. Nur für Spiele mit AMPR.",
+        text: "Ein Spielordner, dessen Assets in LZ4-Volumes gepackt sind, die der mitgelieferte AMPR-Emulator (ampr_emu) während des Spiels entpackt. Nur für Spiele mit AMPR.",
       },
     },
     innerFfpkg: { text: "Das eigene Dateisystem der PS5 (UFS2)." },

@@ -25,6 +25,7 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
                          [--lz4-level 0|3..12] [--lz4-runtime ng|ampr_emu]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc --zstd-pack
                          [--zstd-level 1..22]
+                         (with --to lz4, --lz4-pack or --zstd-pack: [--pack-profile <toml>])
        ps5-dump-forge convert <zstd_packed> --to <format> --zstd-unpack
        ps5-dump-forge serve [--port N] --root <dir> [--root <dir>]...
 
@@ -80,6 +81,10 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --lz4-runtime
             with --to lz4 or --lz4-pack: the runtime installed, ng (ampr-emu-ng, default;
             reads LZ4 and zstd packs) or ampr_emu (the bundled upstream release build)
+  --pack-profile
+            with --to lz4, --lz4-pack or --zstd-pack: a TOML pack profile (ampr_pack.py's
+            format, as Lazy_AMPR's): its [[rule]]s pick the packed files instead of the
+            built-in packing strategy (the last matching rule wins; keys Forge doesn't use are logged)
   --lz4-unpack
             unpack LZ4 packs to plain files first, for any target but lz4 (which always
             unpacks first)
@@ -130,6 +135,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let (mut lz4_unpack, mut lz4_pack) = (false, false);
     let (mut lz4_level, mut lz4_runtime) = (None, None);
     let (mut zstd_pack, mut zstd_level, mut zstd_unpack) = (false, None, false);
+    let mut pack_profile = None;
     let mut password_stdin = false;
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
@@ -190,6 +196,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                         .ok_or("--zstd-level takes 1 through 22")?,
                 )
             }
+            "--pack-profile" => pack_profile = Some(PathBuf::from(value("--pack-profile")?)),
             "-o" | "--output" => output = Some(PathBuf::from(value("-o")?)),
             "--threads" => {
                 threads = Some(
@@ -252,6 +259,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             if lz4_runtime.is_some() && !packing {
                 return Err("--lz4-runtime only goes with --to lz4 or --lz4-pack".into());
             }
+            if pack_profile.is_some() && !(packing || zstd_pack) {
+                return Err(
+                    "--pack-profile only goes with --to lz4, --lz4-pack or --zstd-pack".into(),
+                );
+            }
             if zstd_level.is_some() && !zstd_pack {
                 return Err("--zstd-level only goes with --zstd-pack".into());
             }
@@ -303,6 +315,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     edit_rebuild: false,
                     install: None,
                     delete_source,
+                    pack_profile,
                     archive_password: None,
                 },
                 password_stdin,
@@ -651,13 +664,17 @@ fn grouped(n: u64) -> String {
 
 /// The one `inspect` line for a source's LZ4 facts.
 fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts, zstd_packed: bool) -> String {
+    // The runtime with the version it names itself with, as the source card's tile names it.
+    let named = |name: &str| match &f.runtime_version {
+        Some(v) => format!("{name} {v}"),
+        None => name.to_owned(),
+    };
     let runtime = match f.runtime.as_str() {
-        "forge_release" => "Forge release",
+        "forge_release" | "other" => named("ampr_emu"),
         // Forge's old trace runtime: still told apart, so a conversion replaces it.
-        "forge_trace" => "Forge trace",
-        "zstd" => "zstd",
-        "other" => "other",
-        _ => "none",
+        "forge_trace" => "Forge trace".to_owned(),
+        "zstd" => named("ampr-emu-ng"),
+        _ => "none".to_owned(),
     };
     let state = if let Some(p) = &f.packed {
         let share = p

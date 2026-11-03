@@ -36,7 +36,9 @@ const MAX_INDEX_CHECK: u64 = 64 << 20;
 pub(crate) struct Runtime {
     /// Which one it is ([`RuntimeKind::None`] without one).
     pub kind: RuntimeKind,
-    /// The ampr_emu version it names itself with, when it does ([`runtime::version_of`]).
+    /// The version it names itself with, when it does: ampr_emu's ([`runtime::version_of`]),
+    /// ampr-emu-ng's ([`runtime::ng_version_of`]) for [`RuntimeKind::Zstd`]. Only an
+    /// [`RuntimeKind::Other`]'s decides an action.
     pub version: Option<String>,
     /// It holds the pack format ([`runtime::reads_packs`]).
     pub packs: bool,
@@ -121,11 +123,18 @@ pub(crate) fn runtime_of(tree: &mut dyn SourceTree) -> Runtime {
         return unknown;
     }
     match tree.read_range(RUNTIME, 0, size as usize) {
-        Ok(bytes) if bytes.len() as u64 == size => Runtime {
-            kind: runtime::classify(&bytes),
-            version: runtime::version_of(&bytes),
-            packs: runtime::reads_packs(&bytes),
-        },
+        Ok(bytes) if bytes.len() as u64 == size => {
+            let kind = runtime::classify(&bytes);
+            Runtime {
+                kind,
+                version: if kind == RuntimeKind::Zstd {
+                    runtime::ng_version_of(&bytes)
+                } else {
+                    runtime::version_of(&bytes)
+                },
+                packs: runtime::reads_packs(&bytes),
+            }
+        }
         _ => unknown,
     }
 }
@@ -141,8 +150,6 @@ pub(crate) struct Packs {
     pub packed: bool,
     /// ... and the tree [`open`] returned has them decoded.
     pub unpacked: bool,
-    /// For zstd packing of an LZ4-packed source: the paths its LZ4 packs held.
-    pub lz4_packed: Option<BTreeSet<String>>,
     /// The tree [`open`] returned has the source's zstd packs decoded.
     pub zstd_unpacked: bool,
 }
@@ -173,8 +180,27 @@ pub(crate) fn open(
     if packs.packed && wants_unpack(req) {
         let tree = ps5_dump_forge_lz4::reader::unpack(source).context("opening the LZ4 packs")?;
         ctx.log(format!("LZ4: {}", tree.describe()));
-        if req.zstd_pack {
-            packs.lz4_packed = Some(tree.packed_paths().map(str::to_owned).collect());
+        let (same, other) = (tree.identical_paths(), tree.differing_paths());
+        if !same.is_empty() || !other.is_empty() {
+            let mut parts = Vec::new();
+            if !same.is_empty() {
+                parts.push(format!("{} identical (plain copy kept)", same.len()));
+            }
+            if !other.is_empty() {
+                parts.push(format!("{} different (packed copy used)", other.len()));
+            }
+            let paths: Vec<&str> = same
+                .iter()
+                .chain(other)
+                .take(10)
+                .map(String::as_str)
+                .collect();
+            ctx.log(format!(
+                "LZ4: {} files both packed and on disk: {}: {}",
+                same.len() + other.len(),
+                parts.join(", "),
+                paths.join(", ")
+            ));
         }
         source = Box::new(tree);
         packs.unpacked = true;
@@ -710,8 +736,88 @@ fn read_all(tree: &mut dyn SourceTree, path: &str, size: u64) -> anyhow::Result<
     Ok(bytes)
 }
 
-/// The pack list, in `records` (final index) order: the built-in guess (the keep-loose list and
-/// root files stay loose), then auto-loose samples the large files left to pack (from `tree`).
+/// The most a pack profile may hold.
+const MAX_PROFILE: u64 = 1 << 20;
+
+/// The request's pack profile, read (here or on another device) and parsed: `None` without one
+/// or when it fails, every problem a finding (`pack rules <file>: ...`); the keys it ignores
+/// are logged once.
+// ponytail: read once here, not guarded as a job path: a change after preflight isn't seen.
+pub(crate) fn pack_profile(
+    req: &ConvertRequest,
+    ctx: &Ctx,
+    findings: &mut Vec<String>,
+) -> Option<ps5_dump_forge_lz4::Profile> {
+    let path = req.pack_profile.as_deref()?;
+    let shown = path.display();
+    let text = match read_profile(path) {
+        Ok(t) => t,
+        Err(e) => {
+            findings.push(format!("pack rules {shown}: {e:#}"));
+            return None;
+        }
+    };
+    match ps5_dump_forge_lz4::parse_profile(&text) {
+        Ok(p) => {
+            if !p.ignored.is_empty() {
+                ctx.log(format!(
+                    "pack rules: ignored keys: {}",
+                    p.ignored.join(", ")
+                ));
+            }
+            Some(p)
+        }
+        Err(errs) => {
+            findings.extend(errs.iter().map(|e| format!("pack rules {shown}: {e}")));
+            None
+        }
+    }
+}
+
+/// A profile's text: a regular file (not a link) of at most [`MAX_PROFILE`] bytes, UTF-8.
+fn read_profile(path: &std::path::Path) -> anyhow::Result<String> {
+    let too_big = || anyhow::anyhow!("more than {} KiB", MAX_PROFILE >> 10);
+    let bytes = if crate::net::is_network(path) {
+        let (dir, name) = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+            (Some(dir), Some(name)) => (dir, name),
+            _ => anyhow::bail!("not a file"),
+        };
+        crate::net::read_small(dir, name, MAX_PROFILE)?
+            .ok_or_else(|| anyhow::anyhow!("not a regular file of at most 1 MiB (or missing)"))?
+    } else {
+        let meta = path.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("a link: give the file it points to");
+        }
+        if !meta.is_file() {
+            anyhow::bail!("not a regular file");
+        }
+        if meta.len() > MAX_PROFILE {
+            return Err(too_big());
+        }
+        // A link or FIFO swapped in after the lstat: opened without following or blocking,
+        // then judged by the opened file itself.
+        let file = crate::scan::open_nofollow(path)?;
+        let opened = file.metadata()?;
+        if !opened.is_file() {
+            anyhow::bail!("not a regular file");
+        }
+        if opened.len() > MAX_PROFILE {
+            return Err(too_big());
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(file, MAX_PROFILE + 1), &mut bytes)?;
+        if bytes.len() as u64 > MAX_PROFILE {
+            return Err(too_big());
+        }
+        bytes
+    };
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("not UTF-8 text"))
+}
+
+/// The pack list, in `records` (final index) order: the request's pack profile or the built-in
+/// guess (the keep-loose list and root files stay loose), then auto-loose samples the large
+/// files left to pack (from `tree`).
 fn plan(
     tree: &mut dyn SourceTree,
     records: &[(String, u64)],
@@ -719,15 +825,35 @@ fn plan(
     ctx: &Ctx,
     findings: &mut Vec<String>,
 ) -> anyhow::Result<PackPlan> {
+    let profile = pack_profile(req, ctx, findings);
+    if req.pack_profile.is_some() && profile.is_none() {
+        // A profile that doesn't read or parse refuses the job (its findings): nothing is
+        // sampled and no built-in strategy is logged. Every file loose, never packed.
+        let files = (records.iter())
+            .map(|(path, size)| PackFile {
+                path: path.clone(),
+                size: *size,
+                spec: None,
+            })
+            .collect();
+        return Ok(PackPlan {
+            files,
+            level: req.lz4_level,
+        });
+    }
     let mut files: Vec<PackFile> = records
         .iter()
         .map(|(path, size)| PackFile {
             path: path.clone(),
             size: *size,
-            spec: ps5_dump_forge_lz4::select(path, *size),
+            spec: ps5_dump_forge_lz4::select(path, *size, profile.as_ref()),
         })
         .collect();
-    auto_loose(tree, &mut files, req.lz4_level, ctx)?;
+    let rules = profile
+        .as_ref()
+        .map_or_else(Default::default, |p| p.auto_loose);
+    let ruled: Vec<bool> = files.iter().map(|f| f.spec.is_some()).collect();
+    auto_loose(tree, &mut files, req.lz4_level, &rules, ctx)?;
     // Names the runtime cannot take, and names the pack files will take.
     let bad: Vec<String> = files
         .iter()
@@ -748,11 +874,25 @@ fn plan(
         &taken,
     ));
     let packed = files.iter().filter(|f| f.spec.is_some()).count();
-    ctx.log(format!(
-        "LZ4 rules: the built-in guess; {packed} files to pack, {} loose; level {}",
-        files.len() - packed,
-        req.lz4_level
-    ));
+    match (&req.pack_profile, &profile) {
+        (Some(path), Some(p)) => ctx.log(format!(
+            "pack rules: {}: {} rules; {packed} files packed, {} loose; LZ4 level {}",
+            path.display(),
+            p.rules().len(),
+            files.len() - packed,
+            req.lz4_level
+        )),
+        _ => ctx.log(format!(
+            "packing strategy: built-in; {packed} files to pack, {} loose; level {}",
+            files.len() - packed,
+            req.lz4_level
+        )),
+    }
+    let loose: Vec<(&str, u64, bool)> = (files.iter().zip(&ruled))
+        .filter(|(f, _)| f.spec.is_none())
+        .map(|(f, r)| (f.path.as_str(), f.size, *r))
+        .collect();
+    ctx.log(loose_line(&loose, profile.as_ref(), true));
     Ok(PackPlan {
         files,
         level: req.lz4_level,
@@ -768,6 +908,93 @@ fn first_ten(paths: &[String]) -> String {
     s
 }
 
+/// Decimal GB with one decimal, MB under 1 GB.
+fn gb(bytes: u64) -> String {
+    match bytes as f64 {
+        b if b >= 1e9 => format!("{:.1} GB", b / 1e9),
+        b => format!("{:.1} MB", b / 1e6),
+    }
+}
+
+/// The packing strategy's "kept loose" log line: the loose files as `(path, size, auto)`, `auto`
+/// when auto-loose kept a file the rules would pack (LZ4 only, `auto_loose` true), counted by
+/// the reason each stays loose (`rules::loose_reason`, or with a profile: the profile or
+/// `always_loose`).
+pub(crate) fn loose_line(
+    loose: &[(&str, u64, bool)],
+    profile: Option<&ps5_dump_forge_lz4::Profile>,
+    auto_loose: bool,
+) -> String {
+    use ps5_dump_forge_lz4::rules::{Loose, loose_reason};
+    let (mut root, mut suffix, mut prot, mut auto) = (0u64, 0u64, 0u64, 0u64);
+    let (mut sys, mut sys_n, mut prof, mut prof_n, mut empty) = (0u64, 0, 0u64, 0, 0);
+    let mut by_suffix: HashMap<&str, u64> = HashMap::new();
+    for &(path, size, a) in loose {
+        if a {
+            auto += size;
+        } else if profile.is_some() {
+            if ps5_dump_forge_lz4::always_loose(path) {
+                (sys, sys_n) = (sys + size, sys_n + 1);
+            } else if size == 0 {
+                empty += 1;
+            } else {
+                (prof, prof_n) = (prof + size, prof_n + 1);
+            }
+        } else {
+            match loose_reason(path) {
+                Some(Loose::Root) => root += size,
+                Some(Loose::Suffix(s)) => {
+                    suffix += size;
+                    *by_suffix.entry(s).or_default() += size;
+                }
+                Some(Loose::Protected) => prot += size,
+                None => empty += 1,
+            }
+        }
+    }
+    let total: u64 = loose.iter().map(|l| l.1).sum();
+    let mut s = format!(
+        "packing strategy: kept loose {} files, {}: ",
+        loose.len(),
+        gb(total)
+    );
+    if profile.is_some() {
+        s.push_str(&format!(
+            "the profile {prof_n} files, {}, system and runtime files (always_loose) {sys_n} files, {}",
+            gb(prof),
+            gb(sys)
+        ));
+    } else {
+        let mut top: Vec<(&str, u64)> = by_suffix.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let mut names: Vec<String> = top
+            .iter()
+            .take(5)
+            .map(|(n, b)| format!("{n} {}", gb(*b)))
+            .collect();
+        if top.len() > 5 {
+            names.push("...".into());
+        }
+        let names = match names.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", names.join(", ")),
+        };
+        s.push_str(&format!(
+            "root files {}, keep-loose suffixes {}{names}, protected folders and names {}",
+            gb(root),
+            gb(suffix),
+            gb(prot)
+        ));
+    }
+    if auto_loose {
+        s.push_str(&format!(", auto-loose {}", gb(auto)));
+    }
+    if empty > 0 {
+        s.push_str(&format!(", {empty} empty files"));
+    }
+    s
+}
+
 /// Upstream's auto-loose over the pack list: every file it applies to is sampled (a few
 /// blocks spread over it, encoded as the writer would) and kept loose when the sample barely
 /// shrinks. Counted as preflight progress.
@@ -775,19 +1002,15 @@ fn auto_loose(
     tree: &mut dyn SourceTree,
     files: &mut [PackFile],
     level: u8,
+    rules: &ps5_dump_forge_lz4::AutoLoose,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let picks: Vec<(usize, Vec<u64>)> = files
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
-            let spec = f
-                .spec
-                .filter(|s| ps5_dump_forge_lz4::auto_loose_applies(f.size, s))?;
-            Some((
-                i,
-                ps5_dump_forge_lz4::sample_indices(f.size, spec.block_shift),
-            ))
+            let spec = f.spec.filter(|s| rules.applies(f.size, s))?;
+            Some((i, rules.sample_indices(f.size, spec.block_shift)))
         })
         .collect();
     if picks.is_empty() {
@@ -833,7 +1056,7 @@ fn auto_loose(
             s.savings() * 100.0,
             s.raw_ratio() * 100.0
         );
-        if s.keeps_loose() {
+        if rules.keeps_loose(&s) {
             loose.push(line);
             files[*i].spec = None;
         } else {
@@ -908,52 +1131,6 @@ impl SourceTree for Overlay {
 
     fn empty_dirs(&self) -> &[String] {
         &self.empty_dirs
-    }
-
-    fn describe(&self) -> String {
-        self.inner.describe()
-    }
-}
-
-/// A borrowed view of `inner` holding only `files` (the loose ones), so they are extracted
-/// through the same hashing tree the packer reads afterwards.
-pub(crate) struct Only<'a> {
-    inner: &'a mut dyn SourceTree,
-    files: Vec<SourceFile>,
-}
-
-impl<'a> Only<'a> {
-    pub(crate) fn new(inner: &'a mut dyn SourceTree, keep: impl Fn(&str) -> bool) -> Self {
-        let files = inner
-            .files()
-            .iter()
-            .filter(|f| keep(&f.path))
-            .cloned()
-            .collect();
-        Self { inner, files }
-    }
-}
-
-impl SourceTree for Only<'_> {
-    fn files(&self) -> &[SourceFile] {
-        &self.files
-    }
-
-    fn read(&mut self, path: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
-        self.inner.read(path)
-    }
-
-    fn read_range(
-        &mut self,
-        path: &str,
-        offset: u64,
-        len: usize,
-    ) -> ps5upload_fpkg::Result<Vec<u8>> {
-        self.inner.read_range(path, offset, len)
-    }
-
-    fn empty_dirs(&self) -> &[String] {
-        self.inner.empty_dirs()
     }
 
     fn describe(&self) -> String {

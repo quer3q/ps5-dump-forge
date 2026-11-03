@@ -324,7 +324,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     confirm (In place: written straight into the path, no undo; Rebuild: a new image beside, put in its
     place; an interrupted edit is put back first; close the game first; Cancel and a primary Apply).
 - **Lead word** (`Lead` in `target.tsx`): a note with a tone shows its first word in colour: `good`
-  ("Recommended") in `--good` (`.lead-good`), `warn` ("Experimental") in `--warn` (`.lead-warn`). Text colour only
+  ("Recommended") in `--good` (`.lead-good`), `warn` ("Some", "Needs") in `--warn` (`.lead-warn`). Text colour only
   (≥ 9:1 on `--card` and `--inset`); the word itself carries the meaning.
 - **Tags** (`.tag`, `.tag.fmt`, semantic colours): 22px pills, 12px/500.
 - **Format names** go without the dot in the UI (ffpkg, exfat, ffpfs, ffpfsc, fpkg; Folder and LZ4 as
@@ -339,14 +339,18 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   "at the archive's root") · solid · password-protected as its note, and the part names as a `.path`
   note when there are several.
   `.tile.wide` spans the row (Edit's Game facts also add Content ID and the Forge version that made
-  the image, both mono; the `LZ4 (AMPR)` tile: Packed, Damaged packs or Plain (with the runtime); its note
-  says when the game doesn't use AMPR and adds what a conversion does to the runtime (installs or replaces with the bundled ampr_emu, or keeps
-  another build's named version) and a stale, damaged or missing `ampr_emu.index`; an index to refresh
-  or a runtime to install also makes the tile show; a zstd packed source shows a `zstd` tile in its
-  place, Packed with the runtime). A packed source's tile (LZ4 or zstd) is `.tile.neon.packed` wherever it
+  the image, both mono; the AMPR tile (LZ4 and zstd alike): the game's runtime with its version as the title
+  (`ampr-emu-ng 0.2.0`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
+  Packed (zstd), Damaged packs or Unpacked as the value; its note
+  says when the game doesn't use AMPR and adds what a conversion does to the runtime (installs or replaces with the bundled ampr_emu, or
+  "a conversion keeps it" for another build with a version, the title already naming it) and a stale, damaged or missing
+  `ampr_emu.index`; a game with no runtime shows no notes (the title "No runtime" is the whole message); an index to refresh
+  or a runtime to install also makes the tile show; a zstd packed source's note says a conversion keeps its
+  packs). A packed source's tile (LZ4 or zstd) is `.tile.neon.packed` wherever it
   shows: static green and cyan straps over `--inset`, a `--pk-line` ring with a faint `--pk-glow`, the
   state in `--pk-ink` (`--pk-ink` 10.4:1, `--fg` 12.5:1, `--muted` 5.0:1 on the brightest strap); damaged
-  packs (`.tile.damaged`) get no straps and the state in `--warn`.
+  packs (`.tile.damaged`) get no straps and the state in `--warn`; Unpacked (`.tile.unpacked`) is greyed:
+  a dashed `--line-hi` border and the state in `--muted`.
 - **Findings** (`ul.findings`): `li` warns (amber), `li.block` fails every target (red), `li.info` is
   good news (blue). Under Build, `.note-line` (`.warn`, `.block`, `.good`, `.muted` with an info icon)
   says why it is off or what to expect.

@@ -199,7 +199,7 @@ pub struct ConvertRequest {
     #[serde(default)]
     pub lz4_runtime: Lz4Runtime,
     /// Pack the game into zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, zstd, 256 KiB chunks;
-    /// `docs/PAK.md`) and install the zstd runtime. Into a `Folder` or an `Exfat`, `Ffpkg`,
+    /// `docs/zstd.md`) and install the zstd runtime. Into a `Folder` or an `Exfat`, `Ffpkg`,
     /// `Ffpfs` or `Ffpfsc` image (straight in, after a measure pass; not `Pkg`), for a title
     /// that imports libSceAmpr, and with no LZ4 option; anything else fails preflight.
     #[serde(default)]
@@ -214,6 +214,14 @@ pub struct ConvertRequest {
     /// LZ4 option fails preflight.
     #[serde(default)]
     pub zstd_unpack: bool,
+    /// With an LZ4 pack ([`Format::Lz4`] or [`Lz4Mode::Pack`]) or [`Self::zstd_pack`]: a TOML
+    /// pack profile (upstream `ampr_pack.py`'s format) whose `[[rule]]`s pick the packed files
+    /// in place of the built-in packing strategy. A file here or on another device the job can read (a
+    /// paired peer's `flink://`, a saved NAS's path); a regular file of at most 1 MiB, read and
+    /// parsed once in preflight. Unused keys are logged, not refused. With anything else it
+    /// fails preflight.
+    #[serde(default)]
+    pub pack_profile: Option<PathBuf>,
     /// File changes applied in place, in order (an edit job when not empty).
     #[serde(default)]
     pub edits: Vec<Edit>,
@@ -597,7 +605,8 @@ pub struct Lz4Facts {
     pub runtime: String,
     /// The ampr_emu version of the release runtime Forge ships.
     pub shipped_runtime_version: &'static str,
-    /// The ampr_emu version the game's own runtime names itself with, when it does.
+    /// The version the game's own runtime names itself with, when it does: ampr_emu's, or
+    /// ampr-emu-ng's when `runtime` is `zstd` (`runtime::ng_version_of`).
     pub runtime_version: Option<String>,
     /// What a plain conversion does to the runtime (by user decision): `install` (none there),
     /// `replace` (Forge's trace runtime, ampr-emu-ng, an older ampr_emu or one naming no

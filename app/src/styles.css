@@ -457,7 +457,7 @@ p.lz4-why { margin: 6px 0 0; } /* p: over .hint's 2px, which comes later */
 .build-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
 .build-row .primary { height: 38px; padding: 0 22px; margin-inline-start: auto; }
 .desc { margin-top: 9px; font-size: 13px; }
-/* A note's leading "Recommended" / "Experimental" (Lead in target.tsx): text colour only,
+/* A note's leading "Recommended" / "Some" (Lead in target.tsx): text colour only,
    >= 9:1 on --card and --inset. */
 .lead-good { color: var(--good); }
 .lead-warn { color: var(--warn); }
@@ -563,6 +563,9 @@ button.link .icon { width: 15px; height: 15px; }
 /* Damaged packs: no straps, the state in the warning colour (its text says it). */
 .tile.damaged { border-color: rgba(255, 181, 71, 0.3); }
 .tile.damaged .value { color: var(--warn); }
+/* Unpacked: greyed, a dashed --line-hi border and the state in --muted (its text says it). */
+.tile.unpacked { border-style: dashed; border-color: var(--line-hi); }
+.tile.unpacked .value { color: var(--muted); }
 
 /* Collapsible lists (DLC, backport files, job logs, folders checked). */
 .folds { display: flex; flex-direction: column; gap: 8px; }

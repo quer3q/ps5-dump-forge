@@ -1,4 +1,4 @@
-//! zstd packs in a conversion (`docs/PAK.md`): the tree the job writes (the zstd
+//! zstd packs in a conversion (`docs/zstd.md`): the tree the job writes (the zstd
 //! runtime installed, a fresh `ampr_emu.index` listing every file, loose and packed), which
 //! files go into the packs, and the packing (`ps5-dump-forge-zstd` does the bytes; this is the
 //! job's glue). Into a folder, or straight into an image through a measure pass
@@ -14,7 +14,7 @@ use ps5_dump_forge_zstd::{CHUNK_SIZE, INDEX_HEADER_SIZE, VOLUME_HEADER_SIZE, VOL
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
 use crate::jobs::Ctx;
-use crate::lz4::{Packs, Prepared};
+use crate::lz4::Prepared;
 use crate::preflight::listing;
 use crate::{ConvertRequest, Format};
 
@@ -142,7 +142,7 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     findings
 }
 
-/// The tree a zstd pack job writes and its [`Plan`] (`packs` from [`crate::lz4::open`],
+/// The tree a zstd pack job writes and its [`Plan`] (`tree` from [`crate::lz4::open`],
 /// which decoded any LZ4 or zstd packs; the backport already left out). The zstd runtime
 /// replaces whatever is at `fakelib/libSceAmpr.sprx`; the journal, logs and old index are left
 /// out and a fresh `ampr_emu.index` (`mtime`: the job's timestamp) lists every file written,
@@ -150,7 +150,6 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
 pub(crate) fn prepare(
     req: &ConvertRequest,
     mut tree: Box<dyn SourceTree>,
-    packs: Packs,
     mtime: i64,
     ctx: &Ctx,
 ) -> anyhow::Result<(Prepared, Option<Plan>)> {
@@ -214,31 +213,45 @@ pub(crate) fn prepare(
         path: INDEX.into(),
         size: index.len() as u64,
     });
-    // Pack what LZ4 packs: the game reads only AMPR files through the runtime and opens the
-    // rest (configs, container indexes, media) with plain libc I/O the runtime does not
-    // serve. An LZ4-packed source keeps its packed set; any other source takes LZ4's rules
-    // (the built-in guess, then the keep-loose list).
-    let rules = match &packs.lz4_packed {
-        Some(set) => format!("the source's LZ4 packs ({} files)", set.len()),
-        None => "LZ4's built-in guess".into(),
-    };
+    // The packing strategy, shared with LZ4 Pack: the game reads only AMPR files through the
+    // runtime and opens the rest (configs, container indexes, media) with plain libc I/O the
+    // runtime does not serve. Every source, an LZ4-packed one too (by user decision), takes the
+    // built-in packing strategy (the keep-loose list and root files stay loose). A pack
+    // profile, given, decides instead (`rules::select`; a `store` file is packed as any other:
+    // a chunk zstd can't shrink is kept raw anyway).
+    let mut findings = Vec::new();
+    let profile = crate::lz4::pack_profile(req, ctx, &mut findings);
+    if !findings.is_empty() {
+        return Ok((refused(tree, findings), None));
+    }
     let packed: Vec<SourceFile> = (files.iter())
         .filter(|f| {
             !loose(&f.path)
-                && match &packs.lz4_packed {
-                    Some(set) => set.contains(&f.path),
-                    None => ps5_dump_forge_lz4::select(&f.path, f.size).is_some(),
-                }
+                && ps5_dump_forge_lz4::select(&f.path, f.size, profile.as_ref()).is_some()
         })
         .cloned()
         .collect();
-    ctx.log(format!(
-        "zstd rules: {rules}; {} files to pack, {} loose; zstd level {}, {} KiB chunks",
-        packed.len(),
-        files.len() - packed.len(),
-        req.zstd_level,
-        CHUNK_SIZE >> 10
-    ));
+    let (n, loose_n) = (packed.len(), files.len() - packed.len());
+    match (&req.pack_profile, &profile) {
+        (Some(path), Some(p)) => ctx.log(format!(
+            "pack rules: {}: {} rules; {n} files packed, {loose_n} loose; zstd level {}, {} KiB chunks",
+            path.display(),
+            p.rules().len(),
+            req.zstd_level,
+            CHUNK_SIZE >> 10
+        )),
+        _ => ctx.log(format!(
+            "packing strategy: built-in; {n} files to pack, {loose_n} loose; zstd level {}, {} KiB chunks",
+            req.zstd_level,
+            CHUNK_SIZE >> 10
+        )),
+    }
+    let set: HashSet<&str> = packed.iter().map(|f| f.path.as_str()).collect();
+    let loose: Vec<(&str, u64, bool)> = (files.iter())
+        .filter(|f| !set.contains(f.path.as_str()))
+        .map(|f| (f.path.as_str(), f.size, false))
+        .collect();
+    ctx.log(crate::lz4::loose_line(&loose, profile.as_ref(), false));
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
     generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::zstd()));
     generated.insert(INDEX.into(), Cow::Owned(index));

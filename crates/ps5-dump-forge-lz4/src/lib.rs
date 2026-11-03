@@ -10,7 +10,7 @@ pub mod runtime;
 pub mod tree;
 pub mod writer;
 
-pub use rules::{Sample, always_loose, auto_loose_applies, keep_loose, sample_indices, select};
+pub use rules::{AutoLoose, Profile, Sample, always_loose, keep_loose, parse_profile, select};
 
 /// What the rules decide for one packed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

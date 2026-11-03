@@ -115,14 +115,14 @@ const ko: Messages = {
       },
       zstd: { tagline: "AMPR를 쓰는 게임용, ampr-emu-ng 사용", cells: ["로딩 최대 80% 빠름", "게임 크기를 최대 절반으로"] },
       lz4: {
-        tagline: "실험적, AMPR을 사용하는 게임용",
+        tagline: "AMPR을 사용하는 게임용",
         cells: ["로딩 30–40% 빠름(업스트림 수치)", "게임 크기의 약 절반(업스트림 수치)"],
       },
       ffpkg: { tagline: "ShadowMountPlus에 권장", cells: ["이미지 최고 속도", FLAT] },
       exfat: { tagline: "호환성", cells: ["이미지 최고 속도", FLAT] },
-      ffpfs: { tagline: "실험적", cells: ["이미지 최고 속도", FLAT] },
+      ffpfs: { tagline: "비압축 PFS", cells: ["이미지 최고 속도", FLAT] },
       ffpfsc: {
-        tagline: "가장 작음, 실험적",
+        tagline: "가장 작음",
         cells: ["150–250 MB/s, 끊김이 있을 수 있음", "압축 수준에 따라 다름, 보통 30–60% 작음"],
       },
       folder: { tagline: "일반 게임 파일", cells: ["드라이브 최고 속도", FLAT] },
@@ -134,7 +134,7 @@ const ko: Messages = {
       ["스트리밍", "어떤 원본에서 어떤 대상으로든 임시 복사본 없이 처리합니다. ffpfsc 안의 이미지나 아카이브 안의 게임도 마찬가지입니다."],
       ["아카이브", "게임이 든 .zip, .7z, .rar 를 폴더처럼 탐색, 변환, 패킹합니다."],
       ["USB 및 SD 카드", "exFAT 또는 FAT32로 포맷된 USB 메모리와 카드에 기록합니다."],
-      ["패킹", "zstd 또는 LZ4(실험적) 에셋 팩을 스마트 복구와 함께 만듭니다."],
+      ["패킹", "zstd 또는 LZ4 에셋 팩을 스마트 복구와 함께 만듭니다."],
       ["저장소", "게임 라이브러리와 이름 변경·이동·삭제를 할 수 있는 파일 탐색기."],
       ["안전", "요청하지 않으면 게임을 절대 변경하지 않으며, 불필요한 파일은 건너뛰고 잘못된 파일 이름은 미리 알려 줍니다."],
     ],
@@ -146,7 +146,7 @@ const ko: Messages = {
     upstream: (app) =>
       `업스트림 수치: ampr_emu와 Lazy_AMPR 개발자가 보고한 값이며 ${app}에서 측정한 값이 아닙니다. 게임에 따라 달라집니다. ampr_emu 0.4.2.1은 업스트림 테스트 빌드이며, 알려진 문제로 일부 게임이 저장 중에 비정상 종료됩니다.`,
     bundled: "LZ4로 패킹된 폴더는 drakmor의 ampr_emu 0.4.2.1(GPL-3.0)로 실행되며, 수정 없이 번들되어 있습니다. 소스 코드:",
-    lazy: "LZ4 패킹은 Nazky의 Lazy_AMPR를 기반으로 합니다:",
+    lazy: "패킹 전략은 Nazky의 Lazy_AMPR를 기반으로 합니다:",
     ng: "zstd 및 LZ4 팩은 ampr-emu-ng에서 실행됩니다. 소스:",
     logo: "로고는 Xxcco가 만들었습니다:",
     unrar:
@@ -355,6 +355,7 @@ const ko: Messages = {
       zstdPack: (level: string) => `zstd 패킹 · ${level}`,
       level: (n: number) => `레벨 ${num(n)}`,
       zstdUnpack: "zstd 언패킹",
+      withRules: (tag) => `${tag} · 사용자 규칙`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "편집",
@@ -546,7 +547,7 @@ const ko: Messages = {
       ng: { tone: "good", text: "권장. zstd와 LZ4 팩을 읽습니다." },
       ampr_emu: { text: "업스트림 ampr_emu." },
     },
-    ngNote: "ampr-emu-ng가 필요합니다: 패킹하면 fakelib/에 설치됩니다. ShadowMount+의 fakelib 업데이트를 끄세요. 켜 두면 런타임이 교체됩니다.",
+    ngNote: "필요한 런타임: ampr-emu-ng. 패킹하면 fakelib/에 설치됩니다. ShadowMount+의 fakelib 업데이트를 끄세요. 켜 두면 런타임이 교체됩니다.",
     installsRuntime: (version) => `여기에는 ampr_emu가 없습니다: 패킹하면 ampr_emu ${version} 버전이 설치됩니다.`,
     freshIndex: (state) =>
       `${state === "stale" ? "ampr_emu.index가 오래되었습니다" : state === "damaged" ? "ampr_emu.index가 손상되었습니다" : "ampr_emu.index가 없습니다"}: 패킹하면 새로 씁니다.`,
@@ -570,6 +571,14 @@ const ko: Messages = {
       ? <>이 게임을 이미 <b>{fmt}</b> 형식으로 쓰고 있습니다. 다시 패킹하면 사본이 하나 더 만들어집니다.</>
       : <>이 게임을 이미 <b>{fmt}</b> 형식으로 쓰고 있습니다. 다시 언패킹하면 사본이 하나 더 만들어집니다.</>,
     source: "소스",
+    rules: {
+      title: "사용자 규칙(TOML)",
+      titleWith: (name) => `사용자 규칙(TOML): ${name}`,
+      info: "ampr_emu의 ampr_pack.py와 Lazy_AMPR 형식의 패킹 전략 프로필로, 어떤 파일을 팩에 넣고 어떤 파일을 따로 둘지 정합니다. 마지막으로 일치하는 규칙이 적용되며, 시스템 파일은 항상 따로 남습니다.",
+      warn: "규칙이 잘못되면 게임이 시작되지 않을 수 있습니다. 사본을 보관하세요.",
+      pickTitle: "패킹 전략(TOML 파일)",
+      clear: "지우기",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -596,6 +605,13 @@ const ko: Messages = {
         <ol>
           <li>zstd와 LZ4 팩을 읽습니다. 패킹하면 fakelib/에 설치됩니다.</li>
           <li>ShadowMount+의 fakelib 업데이트를 끄세요. 켜 두면 런타임이 교체되어 게임이 팩을 읽지 못합니다.</li>
+        </ol>
+
+        <h3>패킹 전략</h3>
+        <ol>
+          <li>zstd와 LZ4 패킹은 같은 패킹 전략을 따르며, 어떤 파일을 팩에 넣고 어떤 파일을 따로 둘지 정합니다. zstd와 LZ4는 팩 형식일 뿐입니다.</li>
+          <li>패킹 전용: <b>사용자 규칙(TOML)</b>에서 ampr_pack.py와 Lazy_AMPR 형식의 프로필을 이 기기나 다른 기기에서 고릅니다.</li>
+          <li>마지막으로 일치하는 규칙이 적용되며, 시스템 파일은 항상 따로 남습니다. 규칙이 잘못되면 게임이 시작되지 않을 수 있습니다.</li>
         </ol>
       </>
     ),
@@ -650,22 +666,16 @@ const ko: Messages = {
     files: (n) => `파일 ${num(n)}개`,
     contentId: "콘텐츠 ID",
     noAmpr: "eboot.bin이 libSceAmpr를 가져오지 않음",
-    runtime: {
-      forge_release: "Forge 릴리스",
-      forge_trace: "이전 LZ4 트레이스 런타임",
-      zstd: "ampr-emu-ng",
-      other: "기타",
-      none: "없음",
-    },
-    packed: "패킹됨",
+    traceRuntime: "이전 LZ4 트레이스 런타임",
+    noRuntime: "런타임 없음",
+    packed: (kind) => `패킹됨 (${kind})`,
     zstdKept: "zstd 에셋 팩: 변환해도 유지됩니다",
     damaged: "손상된 팩",
-    plain: "일반",
+    unpacked: "패킹 안 됨",
     packedDetail: (files, volumes, percent) =>
       percent === null
         ? `파일 ${num(files)}개, 볼륨 ${num(volumes)}개`
         : `파일 ${num(files)}개, 볼륨 ${num(volumes)}개, 크기의 ${num(percent)}%`,
-    runtimeIs: (label) => `런타임: ${label}`,
     index: {
       stale: "ampr_emu.index 오래됨: 변환 시 갱신",
       damaged: "ampr_emu.index 손상됨: 변환 시 다시 씀",
@@ -676,7 +686,7 @@ const ko: Messages = {
         ? `변환 시 번들된 ampr_emu ${version} 버전 설치`
         : a === "replace"
           ? `변환 시 번들된 ampr_emu ${version} 버전으로 런타임 교체`
-          : `ampr_emu ${version} 버전: 변환 시 유지`,
+          : `변환 시 유지`,
     backportLibs: (exclusive, n) =>
       exclusive
         ? `fakelib2/(단독 마운트), 백포트 라이브러리 ${num(n)}개`
@@ -778,8 +788,7 @@ const ko: Messages = {
       },
       pkg: { tone: "good", text: "권장. 네이티브 게임처럼 실행되지만 펌웨어가 허용하는 경우에만 가능합니다." },
       lz4: {
-        tone: "warn",
-        text: "실험적. 에셋을 LZ4 볼륨으로 패킹한 게임 폴더입니다. 게임이 실행되는 동안 번들된 AMPR 에뮬레이터(ampr_emu)가 압축을 풉니다. AMPR을 사용하는 게임 전용입니다.",
+        text: "에셋을 LZ4 볼륨으로 패킹한 게임 폴더입니다. 게임이 실행되는 동안 번들된 AMPR 에뮬레이터(ampr_emu)가 압축을 풉니다. AMPR을 사용하는 게임 전용입니다.",
       },
     },
     innerFfpkg: { text: "PS5 고유의 파일 시스템(UFS2)입니다." },

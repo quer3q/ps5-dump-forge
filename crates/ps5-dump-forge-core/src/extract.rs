@@ -5,11 +5,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Context, bail};
 use ps5upload_fpkg::source::SourceTree;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::convert::launch_order;
 use crate::finalize::Part;
 use crate::jobs::Ctx;
 use crate::preflight::listing;
@@ -160,6 +163,8 @@ pub fn extraction_findings(
 pub(crate) struct Dest {
     root: at::Dir,
     created: HashSet<String>,
+    /// The folder the last file was created in, and its handle.
+    last: Option<(String, Arc<at::Dir>)>,
 }
 
 impl Dest {
@@ -172,6 +177,7 @@ impl Dest {
         Ok(Self {
             root,
             created: HashSet::new(),
+            last: None,
         })
     }
 
@@ -203,10 +209,29 @@ impl Dest {
         Ok(cur)
     }
 
-    fn create(&mut self, rel: &str) -> anyhow::Result<File> {
+    /// The folder `rel` goes into, created as needed, and its last component. Files come
+    /// grouped by folder: the last one's handle is kept, not opened again component by
+    /// component for every file.
+    fn parent<'p>(&mut self, rel: &'p str) -> anyhow::Result<(Arc<at::Dir>, &'p str)> {
         let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
-        let dir = self.dir(parent)?;
+        if self.last.as_ref().is_none_or(|(at, _)| at != parent) {
+            let dir = self.dir(parent)?;
+            self.last = Some((parent.to_string(), Arc::new(dir)));
+        }
+        let (_, dir) = self.last.as_ref().expect("set above");
+        Ok((Arc::clone(dir), name))
+    }
+
+    fn create(&mut self, rel: &str) -> anyhow::Result<File> {
+        let (dir, name) = self.parent(rel)?;
         at::create(&dir, name).with_context(|| format!("creating {rel}"))
+    }
+
+    /// Moves the root file `staged` to `rel` (its folders made as needed), never over an entry.
+    fn put_in_place(&mut self, staged: &str, rel: &str) -> anyhow::Result<()> {
+        let (dir, name) = self.parent(rel)?;
+        at::rename(&self.root, staged, &dir, name)
+            .with_context(|| format!("putting {rel} in place"))
     }
 
     /// A new file at the root (the LZ4 pack files), exclusive and not through a link.
@@ -332,6 +357,28 @@ mod at {
         Ok(File::from(fd(rc)?))
     }
 
+    /// Renames `from` in `from_dir` to `to` in `to_dir`, never over an entry there. The
+    /// target is in this job's own folder, which nothing else writes: a check, then a rename.
+    pub(super) fn rename(from_dir: &Dir, from: &str, to_dir: &Dir, to: &str) -> io::Result<()> {
+        let (from, to) = (c(from.as_bytes())?, c(to.as_bytes())?);
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let flag = libc::AT_SYMLINK_NOFOLLOW;
+        // SAFETY: open directory descriptors, valid C strings; `st` is only written.
+        if unsafe { libc::fstatat(to_dir.as_raw_fd(), to.as_ptr(), st.as_mut_ptr(), flag) } == 0 {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOENT) {
+            return Err(e);
+        }
+        let (fd, td) = (from_dir.as_raw_fd(), to_dir.as_raw_fd());
+        // SAFETY: as above.
+        if unsafe { libc::renameat(fd, from.as_ptr(), td, to.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(super) fn clone(dir: &Dir) -> io::Result<Dir> {
         dir.try_clone()
     }
@@ -391,6 +438,10 @@ mod at {
         opts.open(dir.join(name))
     }
 
+    pub(super) fn rename(from_dir: &Dir, from: &str, to_dir: &Dir, to: &str) -> io::Result<()> {
+        crate::finalize::rename_no_replace(&from_dir.join(from), &to_dir.join(to))
+    }
+
     pub(super) fn clone(dir: &Dir) -> io::Result<Dir> {
         Ok(dir.clone())
     }
@@ -406,7 +457,12 @@ mod at {
 
 /// Copies every file and empty directory of `tree` into the `part` folder. Returns the
 /// bytes written. Names must have passed [`extraction_findings`].
-pub(crate) fn write(tree: &mut dyn SourceTree, part: &Part, ctx: &Ctx) -> anyhow::Result<u64> {
+pub(crate) fn write(
+    tree: &mut dyn SourceTree,
+    part: &Part,
+    stage: &str,
+    ctx: &Ctx,
+) -> anyhow::Result<u64> {
     let files = tree.files().to_vec();
     let empty_dirs = tree.empty_dirs().to_vec();
     let total = files
@@ -414,18 +470,178 @@ pub(crate) fn write(tree: &mut dyn SourceTree, part: &Part, ctx: &Ctx) -> anyhow
         .try_fold(0u64, |sum, f| sum.checked_add(f.size))
         .context("total size overflows")?;
     let mut dest = Dest::open(part)?;
+    let (launch_dirs, dirs): (Vec<&String>, Vec<&String>) =
+        empty_dirs.iter().partition(|d| launch_order(d) != 0);
+    for dir in dirs {
+        ctx.check()?;
+        dest.dir(dir)?;
+    }
+    let mut staged = Vec::new();
+    let failed = Mutex::new(None);
+    let (send, recv) = mpsc::sync_channel::<Small>(WRITERS * 2);
+    // Held by the writers only: once they all end (a panic too), a send fails, not blocks.
+    let recv = Arc::new(Mutex::new(recv));
+    let (failed_ref, cancel) = (&failed, ctx.cancel);
+    let fed = std::thread::scope(|s| {
+        for _ in 0..WRITERS {
+            let recv = Arc::clone(&recv);
+            s.spawn(move || {
+                // The lock is held only while waiting for the next file.
+                while let Ok(small) = { recv.lock().expect("not poisoned").recv() } {
+                    // After a failure the rest are drained, not written.
+                    if failed_ref.lock().expect("not poisoned").is_some() {
+                        continue;
+                    }
+                    if let Err(e) = write_small(small, cancel) {
+                        failed_ref.lock().expect("not poisoned").get_or_insert(e);
+                    }
+                }
+            });
+        }
+        drop(recv);
+        let fed = feed(
+            tree,
+            &files,
+            &mut dest,
+            &send,
+            failed_ref,
+            &mut staged,
+            stage,
+            ctx,
+        );
+        drop(send);
+        fed
+    });
+    fed?;
+    if let Some(e) = failed.into_inner().expect("not poisoned") {
+        return Err(e);
+    }
+    // Every other file is written and synced and the writers joined: only now do the launch
+    // files get their names, `sce_sys/` first, then `eboot.bin` (`launch_order`).
+    // The sync first, so the other files' directory entries are durable before any launch
+    // name appears.
+    if !staged.is_empty() || !launch_dirs.is_empty() {
+        dest.sync(ctx)?;
+    }
+    staged.sort_by_key(|(_, rel): &(String, String)| launch_order(rel));
+    for (tmp, rel) in &staged {
+        ctx.check()?;
+        dest.put_in_place(tmp, rel)?;
+    }
+    for dir in launch_dirs {
+        ctx.check()?;
+        dest.dir(dir)?;
+    }
+    dest.sync(ctx)?;
+    ctx.progress(stage, total, total);
+    Ok(total)
+}
+
+/// Files up to this size are read whole by [`write`] and created, written, synced and closed
+/// by [`WRITERS`] threads, each file still synced before the folder's final sync. For a few
+/// KiB the create and the sync cost far more than the bytes (macOS APFS ~80 us and ~25 us,
+/// and on the PS5 a fsync per file too), and one at a time a 100k-file game spent its write
+/// stage waiting on them. At most `WRITERS * 3 + 1` such files are held at once (52 MiB).
+const SMALL: u64 = CHUNK;
+const WRITERS: usize = 4;
+
+/// A small file for the writers: its folder's handle, its name there, its game path.
+struct Small {
+    dir: Arc<at::Dir>,
+    name: String,
+    path: String,
+    bytes: Vec<u8>,
+}
+
+/// One writer's file: created exclusively, written, synced as [`write`] syncs any file (on
+/// FreeBSD through U4's retries, a retried sync a failure, as `SyncEvery::finish` does).
+fn write_small(small: Small, cancel: &AtomicBool) -> anyhow::Result<()> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    let path = &small.path;
+    let mut out =
+        at::create(&small.dir, &small.name).with_context(|| format!("creating {path}"))?;
+    out.write_all(&small.bytes)
+        .with_context(|| format!("writing {path}"))?;
+    #[cfg(not(target_os = "freebsd"))]
+    sync_file(&out).with_context(|| format!("syncing {path}"))?;
+    #[cfg(target_os = "freebsd")]
+    {
+        let synced = crate::durable::sync_retry(&out, false, cancel);
+        if synced.with_context(|| format!("syncing {path}"))? == crate::durable::Synced::Retried {
+            return Err(crate::durable::retried_sync()).with_context(|| format!("syncing {path}"));
+        }
+    }
+    Ok(())
+}
+
+/// [`write`]'s reading side: every file in the tree's order, a small one read whole and handed
+/// to the writers, a larger one streamed into its file here. A launch file (`launch_order`)
+/// goes under a temporary name at the root, pushed to `staged` with its path, for [`write`]
+/// to put in place last. Stops at the first error, here or in a writer (`failed`).
+#[allow(clippy::too_many_arguments)]
+fn feed(
+    tree: &mut dyn SourceTree,
+    files: &[ps5upload_fpkg::source::SourceFile],
+    dest: &mut Dest,
+    send: &mpsc::SyncSender<Small>,
+    failed: &Mutex<Option<anyhow::Error>>,
+    staged: &mut Vec<(String, String)>,
+    stage: &str,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let total = files.iter().map(|f| f.size).sum();
     let mut done = 0u64;
+    // The tree's own root names, so a temporary one never takes a name it writes.
+    let roots: HashSet<&str> = (files.iter().map(|f| f.path.as_str()))
+        .map(|p| p.split('/').next().unwrap_or(p))
+        .collect();
+    let mut target = |file: &ps5upload_fpkg::source::SourceFile| {
+        if launch_order(&file.path) == 0 {
+            return file.path.clone();
+        }
+        let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+        let tmp = std::iter::repeat_with(|| crate::temp_file::temp_name(name))
+            .find(|t| !roots.contains(t.as_str()))
+            .expect("an endless supply");
+        staged.push((tmp.clone(), file.path.clone()));
+        tmp
+    };
     // The job's one cadence (U5): what one file measured carries over to the next. Each file
     // is synced when it is complete, so no dirty bytes carry across files.
     #[cfg(target_os = "freebsd")]
     let mut cadence = crate::durable::Cadence::new();
-    for file in &files {
+    for file in files {
         ctx.check()?;
+        if failed.lock().expect("not poisoned").is_some() {
+            return Ok(());
+        }
+        if file.size <= SMALL {
+            let mut bytes = Vec::with_capacity(file.size as usize);
+            copy(tree, file, &mut bytes, &mut done, total, stage, ctx)?;
+            let rel = target(file);
+            let (dir, name) = dest.parent(&rel)?;
+            let name = name.to_string();
+            let path = file.path.clone();
+            if send
+                .send(Small {
+                    dir,
+                    name,
+                    path,
+                    bytes,
+                })
+                .is_err()
+            {
+                bail!("the file writers stopped");
+            }
+            continue;
+        }
         #[cfg_attr(target_os = "freebsd", allow(unused_mut))]
-        let mut out = dest.create(&file.path)?;
+        let mut out = dest.create(&target(file))?;
         #[cfg(target_os = "freebsd")]
         let mut out = crate::durable::SyncEvery::new(out, &mut cadence, ctx.cancel);
-        copy(tree, file, &mut out, &mut done, total, ctx)?;
+        copy(tree, file, &mut out, &mut done, total, stage, ctx)?;
         #[cfg(not(target_os = "freebsd"))]
         sync_file(&out).with_context(|| format!("syncing {}", file.path))?;
         #[cfg(target_os = "freebsd")]
@@ -435,13 +651,7 @@ pub(crate) fn write(tree: &mut dyn SourceTree, part: &Part, ctx: &Ctx) -> anyhow
             crate::convert::log_cadence(&mut cadence, ctx);
         }
     }
-    for dir in &empty_dirs {
-        ctx.check()?;
-        dest.dir(dir)?;
-    }
-    dest.sync(ctx)?;
-    ctx.progress("write", total, total);
-    Ok(total)
+    Ok(())
 }
 
 /// [`write`] into a folder on a peer: each file through a temporary name, sent, synced,
@@ -449,27 +659,30 @@ pub(crate) fn write(tree: &mut dyn SourceTree, part: &Part, ctx: &Ctx) -> anyhow
 pub(crate) fn write_remote(
     tree: &mut dyn SourceTree,
     dest: &mut crate::remote::RemoteDir,
+    stage: &str,
     ctx: &Ctx,
 ) -> anyhow::Result<u64> {
-    let files = tree.files().to_vec();
+    let mut files = tree.files().to_vec();
+    // Stable: every other file keeps the tree's order, `sce_sys/` comes before `eboot.bin`.
+    files.sort_by_key(|f| launch_order(&f.path));
     let empty_dirs = tree.empty_dirs().to_vec();
     let total = files
         .iter()
         .try_fold(0u64, |sum, f| sum.checked_add(f.size))
         .context("total size overflows")?;
     let mut done = 0u64;
-    for file in &files {
-        ctx.check()?;
-        dest.write_new(&file.path, &mut |out| {
-            copy(tree, file, out, &mut done, total, ctx)
-                .map_err(|e| std::io::Error::other(format!("{e:#}")))
-        })?;
-    }
     for dir in &empty_dirs {
         ctx.check()?;
         dest.dir(dir)?;
     }
-    ctx.progress("write", total, total);
+    for file in &files {
+        ctx.check()?;
+        dest.write_new(&file.path, &mut |out| {
+            copy(tree, file, out, &mut done, total, stage, ctx)
+                .map_err(|e| std::io::Error::other(format!("{e:#}")))
+        })?;
+    }
+    ctx.progress(stage, total, total);
     Ok(total)
 }
 
@@ -480,6 +693,7 @@ fn copy(
     out: &mut dyn Write,
     done: &mut u64,
     total: u64,
+    stage: &str,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let mut offset = 0u64;
@@ -505,7 +719,7 @@ fn copy(
             .with_context(|| format!("writing {}", file.path))?;
         offset += buf.len() as u64;
         *done += buf.len() as u64;
-        ctx.progress("write", *done, total);
+        ctx.progress(stage, *done, total);
     }
     Ok(())
 }
@@ -543,7 +757,86 @@ mod tests {
             path: "a.bin".into(),
             size: 10,
         };
-        let err = write(&mut Greedy(vec![file]), &part, &ctx).unwrap_err();
+        let err = write(&mut Greedy(vec![file]), &part, "write", &ctx).unwrap_err();
         assert!(err.to_string().contains("gave 11 bytes"), "{err}");
+        drop(part);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ShadowMount+ takes a folder with `sce_sys/` and `eboot.bin` for a game.
+    /// The source is read in its own order, the launch files first here, and neither name
+    /// may be in the folder while any file is still being read.
+    #[test]
+    fn launch_files_appear_after_every_other_file() {
+        use ps5upload_fpkg::source::SourceFile;
+        struct Watch(
+            Vec<SourceFile>,
+            Vec<String>,
+            std::path::PathBuf,
+            Vec<String>,
+        );
+        impl SourceTree for Watch {
+            fn files(&self) -> &[SourceFile] {
+                &self.0
+            }
+            fn read(&mut self, _: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
+                unreachable!()
+            }
+            fn read_range(
+                &mut self,
+                p: &str,
+                _: u64,
+                len: usize,
+            ) -> ps5upload_fpkg::Result<Vec<u8>> {
+                for seen in ["eboot.bin", "sce_sys"] {
+                    if self.2.join(seen).symlink_metadata().is_ok() {
+                        self.3.push(format!("{seen} while reading {p}"));
+                    }
+                }
+                Ok(vec![p.len() as u8; len])
+            }
+            fn empty_dirs(&self) -> &[String] {
+                &self.1
+            }
+            fn describe(&self) -> String {
+                "watch".into()
+            }
+        }
+        assert_eq!(crate::convert::launch_order("a/eboot.bin"), 0);
+        assert_eq!(crate::convert::launch_order("sce_sysx"), 0);
+        let dir = crate::test_dir("launch-last");
+        let part = Part::create_dir(&dir.join("out.part")).unwrap();
+        // eboot.bin is larger than a writer's file, so it would be written here at once.
+        let sizes = [
+            ("eboot.bin", SMALL + 1),
+            ("sce_sys/param.json", 10),
+            ("a.bin", 10),
+            ("b/c", SMALL + 1),
+            ("sce_sys/icon0.png", 10),
+            ("d", 10),
+        ];
+        let files = sizes.map(|(path, size)| SourceFile {
+            path: path.into(),
+            size,
+        });
+        let dirs = vec!["e".into(), "sce_sys/about".into()];
+        let mut tree = Watch(files.to_vec(), dirs, part.path().to_path_buf(), Vec::new());
+        let emit: Box<dyn Fn(crate::Event) + Send + Sync> = Box::new(|_| {});
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let ctx = Ctx::new(1, &emit, &cancel);
+        write(&mut tree, &part, "write", &ctx).unwrap();
+        assert_eq!(tree.3, Vec::<String>::new());
+        for (path, size) in sizes {
+            let bytes = std::fs::read(part.path().join(path)).unwrap();
+            assert_eq!(bytes, vec![path.len() as u8; size as usize], "{path}");
+        }
+        assert!(part.path().join("sce_sys/about").is_dir());
+        let names = std::fs::read_dir(part.path()).unwrap();
+        let names = names.map(|e| e.unwrap().file_name().into_string().unwrap());
+        let mut root: Vec<String> = names.collect();
+        root.sort();
+        assert_eq!(root, ["a.bin", "b", "d", "e", "eboot.bin", "sce_sys"]);
+        drop(part);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
