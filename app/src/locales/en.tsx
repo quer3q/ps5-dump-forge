@@ -126,14 +126,14 @@ const en = {
       },
       zstd: { tagline: "For games that use AMPR, with ampr-emu-ng", cells: ["Up to 80% faster loading", "Up to half the game size"] },
       lz4: {
-        tagline: "Experimental, for games that use AMPR",
+        tagline: "For games that use AMPR",
         cells: ["30–40% faster loading, upstream's numbers", "About half the game size, upstream's numbers"],
       },
       ffpkg: { tagline: "Recommended for ShadowMountPlus", cells: ["Full image speed", FLAT] },
       exfat: { tagline: "Compatibility", cells: ["Full image speed", FLAT] },
-      ffpfs: { tagline: "Experimental", cells: ["Full image speed", FLAT] },
+      ffpfs: { tagline: "Uncompressed PFS", cells: ["Full image speed", FLAT] },
       ffpfsc: {
-        tagline: "Smallest, experimental",
+        tagline: "Smallest",
         cells: ["150–250 MB/s, may stutter", "Depends on the compression level, usually 30–60% less"],
       },
       folder: { tagline: "Plain game files", cells: ["Full drive speed", FLAT] },
@@ -146,7 +146,7 @@ const en = {
       ["Streamed", "from any source to any target: no temporary copy, not even the image inside an ffpfsc or a game in an archive."],
       ["Archives", "a .zip, .7z or .rar holding one game is browsed, converted or packed like a folder."],
       ["USB and SD cards", "written onto sticks and cards formatted exFAT or FAT32."],
-      ["Pack", "zstd or LZ4 (experimental) asset packs with smart healing."],
+      ["Pack", "zstd or LZ4 asset packs with smart healing."],
       ["Storage", "a Library of your games and a File explorer to rename, move and delete."],
       ["Safe", "your game is never changed unless you ask; junk files are skipped and bad file names reported up front."],
     ] as Features,
@@ -826,8 +826,7 @@ const en = {
       },
       pkg: { tone: "good", text: "Recommended. Runs like a native game, but only if your firmware allows it." },
       lz4: {
-        tone: "warn",
-        text: "Experimental. A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs. Only for games that use AMPR.",
+        text: "A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs. Only for games that use AMPR.",
       },
     } satisfies Record<Format, Note>,
     /** The inner `.ffpkg`'s line: the format's own, less what a read-only `.ffpfsc` doesn't give. */

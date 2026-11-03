@@ -324,7 +324,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     confirm (In place: written straight into the path, no undo; Rebuild: a new image beside, put in its
     place; an interrupted edit is put back first; close the game first; Cancel and a primary Apply).
 - **Lead word** (`Lead` in `target.tsx`): a note with a tone shows its first word in colour: `good`
-  ("Recommended") in `--good` (`.lead-good`), `warn` ("Experimental") in `--warn` (`.lead-warn`). Text colour only
+  ("Recommended") in `--good` (`.lead-good`), `warn` ("Some", "Needs") in `--warn` (`.lead-warn`). Text colour only
   (≥ 9:1 on `--card` and `--inset`); the word itself carries the meaning.
 - **Tags** (`.tag`, `.tag.fmt`, semantic colours): 22px pills, 12px/500.
 - **Format names** go without the dot in the UI (ffpkg, exfat, ffpfs, ffpfsc, fpkg; Folder and LZ4 as

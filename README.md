@@ -1,7 +1,7 @@
 <p align="center"><img src="app/src-tauri/icons/128x128@2x.png" width="128" alt="PS5 Dump Forge"></p>
 
 Runs on PS5, Windows, macOS and Linux, and can convert and edit any format: game `folders`, `exfat`, `ffpkg`, `ffpfs`,
-`ffpfsc` and `FPKG (pkg)` packages, straight from `zip`, `7z` and `rar` too, with `zstd` and experimental `LZ4` asset packs for AMPR games.
+`ffpfsc` and `FPKG (pkg)` packages, straight from `zip`, `7z` and `rar` too, with `zstd` and `LZ4` asset packs for AMPR games.
 
 Also supports **transfers and on-the-fly conversion** on all platforms, with the interface translated into **11 languages**.
 
@@ -17,7 +17,7 @@ Also supports **transfers and on-the-fly conversion** on all platforms, with the
 - **Any source to any target**, streamed straight through: no temporary copy, not even the image inside a `.ffpfsc` or a game in an archive.
 - **Every format ShadowMountPlus mounts**, created and read back, plus the debug FPKG.
 - **Archives as sources**: a `.zip`, `.7z` or `.rar` holding one game is browsed, converted or packed like a folder.
-- **Pack**: compress an AMPR game's assets into zstd packs, or experimental LZ4 packs, and unpack them again; a packed game converts to any format like any other.
+- **Pack**: compress an AMPR game's assets into zstd packs or LZ4 packs, and unpack them again; a packed game converts to any format like any other.
 - **Storage**: a **Library** of your games to convert and edit, and a **File explorer** to rename, move and delete files and folders, on a computer a paired PS5's too, with drag and drop between them.
 - **Package installer on the PS5**: lists every `.pkg` on the console's storage and drives and installs one; a `.pkg` on a computer installs on a paired PS5 from Connect, read over the network.
 - **Edit** a dump or image: browse its files, rename, delete, add or replace files and folders, then apply the changes in place or by rebuilding the image; extract files and folders from any source. The game card shows the cover, title, required firmware, backport firmware (`fakelib/`), embedded DLC and `param.json`; leftover `.part` files from interrupted jobs are listed under it when there are any.
@@ -50,7 +50,7 @@ runs. Choose the kind of packs:
 - **zstd** (the default): zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`) at **Fast** (zstd 5), **Medium** (9)
   or **Max** (19), into a game folder or straight into an `.ffpkg`, `.exfat` or `.ffpfs`. A zstd packed game gets
   **Unpack** instead, into a folder, `.ffpkg`, `.exfat`, `.ffpfs` or fpkg.
-- **LZ4** (experimental): ampr_emu's LZ4 packs (`ampr_assets.index` + `ampr_assets-NNN.pak`) at **Fast** (LZ4),
+- **LZ4**: ampr_emu's LZ4 packs (`ampr_assets.index` + `ampr_assets-NNN.pak`) at **Fast** (LZ4),
   **Medium** (LZ4 HC 9) or **Max** (LZ4 HC 12), into an LZ4 packed folder or straight into an `.ffpkg`, `.exfat`
   or `.ffpfs`. The runtime is **ampr-emu-ng** (the default) or the bundled
   [ampr_emu](https://github.com/drakmor/ampr_emu) 0.4.2.1, an upstream test build with which some games crash

@@ -9,7 +9,7 @@ Everything is in the app's **Pack** tab (**How pack works** there shows the step
 the kind of packs first:
 
 - **zstd** (the default): zstd packs, `ampr_zstd.index` + `ampr_zstd-NNN.pak` (`docs/zstd.md` has the format).
-- **LZ4** (experimental): ampr_emu's asset packs, `ampr_assets.index` + `ampr_assets-NNN.pak`.
+- **LZ4**: ampr_emu's asset packs, `ampr_assets.index` + `ampr_assets-NNN.pak`.
 
 Both are read by **ampr-emu-ng**, the bundled runtime Pack installs by default. An LZ4 Pack can install the
 bundled upstream [ampr_emu](https://github.com/drakmor/ampr_emu) 0.4.2.1 instead.
