@@ -760,11 +760,7 @@ function Facts({ ins, full, rest }: { ins: Inspection; full: boolean; rest?: boo
         </dd>
       </div>
       {full && ins.archive && <ArchiveTile facts={ins.archive} />}
-      {ins.zstd_packed ? (
-        <ZstdTile ins={ins} />
-      ) : (
-        ins.lz4 && lz4Shown(ins.lz4) && <Lz4Tile facts={ins.lz4} />
-      )}
+      {(ins.zstd_packed || (ins.lz4 && lz4Shown(ins.lz4))) && <AmprTile ins={ins} />}
       {full && (
         <div className="tile wide">
           <dt>{t.contentId}</dt>
@@ -799,54 +795,70 @@ function ArchiveTile({ facts }: { facts: NonNullable<Inspection["archive"]> }) {
   );
 }
 
-/** LZ4 asset packs, as the CLI's `inspect` line says it ("LZ4 (AMPR): packed, …"): the state
- * as the value, the details under it. Packed gets the green neon straps; damaged packs keep
- * the warning colour and no straps. */
-function Lz4Tile({ facts }: { facts: Lz4Facts }) {
+/** An AMPR game's runtime and packs (LZ4 or zstd), as the CLI's `inspect` line says them: the
+ * runtime with its version as the title, the state as the value, the details under it. Packed
+ * gets the green neon straps, damaged packs the warning colour, Unpacked a greyed look. */
+function AmprTile({ ins }: { ins: Inspection }) {
   const t = useMessages().common;
-  const { state, detail } = lz4State(facts);
-  // After the state's detail (core's English when the packs are damaged, isolated for RTL).
-  const notes: string[] = [];
-  if (!facts.imports_ampr) notes.push(t.noAmpr);
-  const runtime = facts.imports_ampr ? runtimeAction(facts) : null;
-  if (runtime) notes.push(runtime);
-  const index = facts.index;
-  if (index && index !== "ok") notes.push(t.index[index]);
-  const look = facts.packed ? " neon packed" : facts.manifest_error !== null ? " damaged" : "";
+  const facts = ins.lz4;
+  const zstd = ins.zstd_packed;
+  const damaged = !zstd && !!facts && facts.manifest_error !== null;
+  // No runtime (none in fakelib/, or no facts at all): the title says it all, no notes (by user
+  // decision). A zstd-packed game's note otherwise: its packs and runtime are kept as they are.
+  const noRuntime = !facts || facts.runtime === "none";
+  const notes: string[] = zstd && !noRuntime ? [t.zstdKept] : [];
+  let detail: ReactNode = null;
+  if (!zstd && facts) {
+    if (facts.packed) {
+      const p = facts.packed;
+      detail = t.packedDetail(p.files, p.volumes, p.stored_percent);
+    } else if (damaged) {
+      // Core's English, isolated for RTL.
+      detail = <bdi>{facts.manifest_error}</bdi>;
+    }
+    // No runtime: the title says it all, so no notes (by user decision).
+    if (facts.runtime !== "none") {
+      if (!facts.imports_ampr) notes.push(t.noAmpr);
+      const runtime = facts.imports_ampr ? runtimeAction(facts) : null;
+      if (runtime) notes.push(runtime);
+      const index = facts.index;
+      if (index && index !== "ok") notes.push(t.index[index]);
+    }
+  }
+  const packed = zstd ? "zstd" : facts?.packed ? "LZ4" : null;
+  const state = packed ? t.packed(packed) : damaged ? t.damaged : t.unpacked;
+  const look = packed ? " neon packed" : damaged ? " damaged" : " unpacked";
   return (
     <div className={`tile wide${look}`}>
-      <dt>LZ4 (AMPR)</dt>
+      <dt>{facts ? <bdi>{runtimeName(facts)}</bdi> : t.noRuntime}</dt>
       <dd>
         <span className="value">{state}</span>
-        <span className="note">
-          {facts.manifest_error !== null ? <bdi>{detail}</bdi> : detail}
-          {notes.map((n) => ` · ${n}`).join("")}
-        </span>
+        {(detail !== null || notes.length > 0) && (
+          <span className="note">
+            {detail}
+            {notes.map((n, i) => (i > 0 || detail !== null ? ` · ${n}` : n)).join("")}
+          </span>
+        )}
       </dd>
     </div>
   );
 }
 
-/** A zstd packed source (`ampr_zstd.index` at the root): the LZ4 tile's packed look,
- * in its place (its AMPR facts would say "Plain"); the runtime as the LZ4 tile names it. */
-function ZstdTile({ ins }: { ins: Inspection }) {
-  const t = useMessages().common;
-  const notes = [t.zstdKept];
-  if (ins.lz4 && ins.lz4.runtime !== "none") notes.push(t.runtimeIs(t.runtime[ins.lz4.runtime]));
-  return (
-    <div className="tile wide neon packed">
-      <dt>zstd</dt>
-      <dd>
-        <span className="value">{t.packed}</span>
-        <span className="note">{notes.join(" · ")}</span>
-      </dd>
-    </div>
-  );
+/** The game's runtime with the version it names itself with: "ampr-emu-ng 0.2.0",
+ * "ampr_emu 0.4.2.1", "ampr_emu" (no version readable), the old trace runtime, "No runtime". */
+function runtimeName(f: Lz4Facts): string {
+  const t = msg().common;
+  const v = f.runtime_version ? ` ${f.runtime_version}` : "";
+  if (f.runtime === "zstd") return `ampr-emu-ng${v}`;
+  if (f.runtime === "forge_release" || f.runtime === "other") return `ampr_emu${v}`;
+  if (f.runtime === "forge_trace") return t.traceRuntime;
+  return t.noRuntime;
 }
 
 /** What a conversion does to an AMPR game's runtime, as the CLI's `inspect` says it: installs
- * or replaces with the bundled ampr_emu, or keeps the game's own (named only when it is another
- * build: Forge's release runtime is the bundled one). Null when there is nothing to say. */
+ * or replaces with the bundled ampr_emu, or keeps the game's own (said only when it is another
+ * build: Forge's release runtime is the bundled one; the tile's title names it). Null when
+ * there is nothing to say. */
 function runtimeAction(f: Lz4Facts): string | null {
   const t = msg().common;
   const shipped = f.shipped_runtime_version;
@@ -867,17 +879,6 @@ function lz4Shown(f: Lz4Facts): boolean {
     (!!index && index !== "ok") ||
     (f.imports_ampr && f.runtime_action === "install")
   );
-}
-
-/** "Packed" / "Damaged packs" / "Plain", and what backs it (read at call time). */
-export function lz4State(f: Lz4Facts): { state: string; detail: string } {
-  const t = msg().common;
-  if (f.packed) {
-    const p = f.packed;
-    return { state: t.packed, detail: t.packedDetail(p.files, p.volumes, p.stored_percent) };
-  }
-  if (f.manifest_error !== null) return { state: t.damaged, detail: f.manifest_error };
-  return { state: t.plain, detail: t.runtimeIs(t.runtime[f.runtime]) };
 }
 
 /** Which fakelib folder a backport ships, and how many backport libraries it has. */

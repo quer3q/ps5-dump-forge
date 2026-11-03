@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
@@ -10,6 +11,7 @@ use anyhow::{Context, bail};
 use ps5_dump_forge_fpkg::FpkgSource;
 use ps5_dump_forge_pfs::{FfpfscInfo, PfsHeader, PfsSource, WrapOptions, WrapReport};
 use ps5upload_fpkg::exfat::{ExFat, ExFatSource};
+use ps5upload_fpkg::source::SourceFile;
 use ps5upload_fpkg::source::SourceTree;
 use ps5upload_fpkg::ufs2_source::Ufs2Source;
 use ps5upload_fpkg::{PkgFile, ReadSeek};
@@ -35,6 +37,74 @@ const _: () = assert!(
 
 fn maker() -> Option<String> {
     Some(format!("{MAKER_PREFIX}{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// When a folder output puts `path` in place: everything else (0), then `sce_sys/` (1), then
+/// the root `eboot.bin` (2). ShadowMount+ takes a folder holding both for a game, so a folder
+/// written part way (a `.part`, or one on a peer or NAS written in place) never reads as one.
+/// A plain local folder (`extract::write`) keeps the source's read order (a solid archive is
+/// decoded once): it writes these under temporary names and renames them last. A remote or
+/// packed folder reads them in a last pass of their own.
+pub(crate) fn launch_order(path: &str) -> u8 {
+    if path == "eboot.bin" {
+        2
+    } else if path == "sce_sys" || path.starts_with("sce_sys/") {
+        1
+    } else {
+        0
+    }
+}
+
+/// The files and empty folders of a tree that `keep` takes, in the tree's order.
+struct Only<T> {
+    inner: T,
+    files: Vec<SourceFile>,
+    empty_dirs: Vec<String>,
+}
+
+impl<'a, T: DerefMut<Target = dyn SourceTree + 'a>> Only<T> {
+    fn new(inner: T, keep: impl Fn(&str) -> bool) -> Self {
+        let files: Vec<SourceFile> = inner
+            .files()
+            .iter()
+            .filter(|f| keep(&f.path))
+            .cloned()
+            .collect();
+        let empty_dirs = inner
+            .empty_dirs()
+            .iter()
+            .filter(|d| keep(d))
+            .cloned()
+            .collect();
+        Self {
+            inner,
+            files,
+            empty_dirs,
+        }
+    }
+}
+
+impl<'a, T: DerefMut<Target = dyn SourceTree + 'a> + Send> SourceTree for Only<T> {
+    fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
+    fn read(&mut self, path: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn read_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: usize,
+    ) -> ps5upload_fpkg::Result<Vec<u8>> {
+        self.inner.read_range(path, offset, len)
+    }
+    fn empty_dirs(&self) -> &[String] {
+        &self.empty_dirs
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
 }
 
 /// What a source path is, by what it is on disk and then by its extension.
@@ -597,6 +667,19 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 .to_string(),
         ]));
     }
+    if req.pack_profile.is_some()
+        && (req.install.is_some()
+            || !req.transfer.is_empty()
+            || !req.extract.is_empty()
+            || !req.edits.is_empty()
+            || !(crate::lz4::packing(req) || req.zstd_pack))
+    {
+        return Err(preflight_failed(vec![
+            "pack rules go only with an LZ4 or zstd pack: not an unpack, a plain conversion, \
+             an edit, an extract, a transfer or an install"
+                .to_string(),
+        ]));
+    }
     // A package handed to the PS5's installer, nothing converted.
     if req.install.is_some() {
         return crate::install::run(req, ctx);
@@ -758,7 +841,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         };
         (prepared, None)
     } else if req.zstd_pack {
-        crate::zstd_pack::prepare(req, source, packs, mtime, ctx)?
+        crate::zstd_pack::prepare(req, source, mtime, ctx)?
     } else {
         (crate::lz4::prepare(req, source, packs, mtime, ctx)?, None)
     };
@@ -1039,8 +1122,21 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     let (part, image, bytes, wrapped) = match &plan {
         Plan::Folder if remote_out => {
             let mut dir = crate::remote::RemoteDir::create(&out)?;
-            let bytes = crate::extract::write_remote(&mut hashing, &mut dir, ctx).map_err(kept)?;
-            (Written::Folder(dir), None, bytes, None)
+            // ponytail: a peer renames only the files it saw created, so the launch files
+            // aren't staged there: they are read and written last, in a pass of their own (a
+            // solid archive source is decoded again for them).
+            let mut first = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
+                launch_order(p) == 0
+            });
+            let first = crate::extract::write_remote(&mut first, &mut dir, "write", ctx);
+            let mut last = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
+                launch_order(p) != 0
+            });
+            let last = first.and_then(|first| {
+                let last = crate::extract::write_remote(&mut last, &mut dir, "write", ctx)?;
+                Ok(first.saturating_add(last))
+            });
+            (Written::Folder(dir), None, last.map_err(kept)?, None)
         }
         Plan::Folder => {
             #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
@@ -1049,7 +1145,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
             if let Some(dest) = &dest {
                 part.set_dest(dest);
             }
-            let bytes = crate::extract::write(&mut hashing, &part, ctx)?;
+            let bytes = crate::extract::write(&mut hashing, &part, "write", ctx)?;
             (Written::Local(part), None, bytes, None)
         }
         Plan::Lz4(pack) => {
@@ -1064,18 +1160,19 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 }
                 Written::Local(part)
             };
-            // The loose files through a view of the one hashing tree, then the packed ones:
-            // each file is read once, front to back, and keeps its digest.
+            // Loose files, then packs, then sce_sys and eboot.bin through the same hashing tree.
             let packed: std::collections::HashSet<&str> = pack
                 .files
                 .iter()
                 .filter(|f| f.spec.is_some())
                 .map(|f| f.path.as_str())
                 .collect();
-            let mut loose = crate::lz4::Only::new(&mut hashing, |p| !packed.contains(p));
+            let mut loose = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
+                !packed.contains(p) && launch_order(p) == 0
+            });
             let loose = match &mut part {
-                Written::Folder(dir) => crate::extract::write_remote(&mut loose, dir, ctx),
-                Written::Local(local) => crate::extract::write(&mut loose, local, ctx),
+                Written::Folder(dir) => crate::extract::write_remote(&mut loose, dir, "write", ctx),
+                Written::Local(local) => crate::extract::write(&mut loose, local, "write", ctx),
                 Written::Remote(_) => unreachable!("a folder is written"),
             }
             .map_err(kept)?;
@@ -1090,7 +1187,21 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 &mut cadence,
             )
             .map_err(kept)?;
-            (part, None, loose.saturating_add(stored), None)
+            let mut last = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
+                !packed.contains(p) && launch_order(p) != 0
+            });
+            let last = match &mut part {
+                Written::Folder(dir) => crate::extract::write_remote(&mut last, dir, "pack", ctx),
+                Written::Local(local) => crate::extract::write(&mut last, local, "pack", ctx),
+                Written::Remote(_) => unreachable!("a folder is written"),
+            }
+            .map_err(kept)?;
+            (
+                part,
+                None,
+                loose.saturating_add(stored).saturating_add(last),
+                None,
+            )
         }
         Plan::Zstd(zstd) => {
             let mut part = if remote_out {
@@ -1104,13 +1215,15 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 }
                 Written::Local(part)
             };
-            // The loose files through a view of the hashing tree, then the packed ones.
+            // Loose files, then packs, then sce_sys and eboot.bin through the same hashing tree.
             let packed: std::collections::HashSet<&str> =
                 zstd.files.iter().map(|f| f.path.as_str()).collect();
-            let mut loose = crate::lz4::Only::new(&mut hashing, |p| !packed.contains(p));
+            let mut loose = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
+                !packed.contains(p) && launch_order(p) == 0
+            });
             let loose = match &mut part {
-                Written::Folder(dir) => crate::extract::write_remote(&mut loose, dir, ctx),
-                Written::Local(local) => crate::extract::write(&mut loose, local, ctx),
+                Written::Folder(dir) => crate::extract::write_remote(&mut loose, dir, "write", ctx),
+                Written::Local(local) => crate::extract::write(&mut loose, local, "write", ctx),
                 Written::Remote(_) => unreachable!("a folder is written"),
             }
             .map_err(kept)?;
@@ -1123,7 +1236,21 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 &mut cadence,
             )
             .map_err(kept)?;
-            (part, None, loose.saturating_add(stored), None)
+            let mut last = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
+                !packed.contains(p) && launch_order(p) != 0
+            });
+            let last = match &mut part {
+                Written::Folder(dir) => crate::extract::write_remote(&mut last, dir, "pack", ctx),
+                Written::Local(local) => crate::extract::write(&mut last, local, "pack", ctx),
+                Written::Remote(_) => unreachable!("a folder is written"),
+            }
+            .map_err(kept)?;
+            (
+                part,
+                None,
+                loose.saturating_add(stored).saturating_add(last),
+                None,
+            )
         }
         Plan::Image(_) | Plan::Ffpfsc(..) => {
             let (part, file, size, wrapped) = match &measured {

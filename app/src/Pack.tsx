@@ -6,9 +6,10 @@ import { useEffect, useRef, useState } from "react";
 
 import { msg, useMessages } from "./i18n";
 
-import { api, errorText, type ConvertRequest, type Format, type Inspection, type JobId, type Lz4Runtime } from "./api";
+import { api, errorText, pick, type ConvertRequest, type Format, type Inspection, type JobId, type Lz4Runtime } from "./api";
 import {
   ARCHIVE_KINDS,
+  basename,
   CardHead,
   classify,
   Dots,
@@ -19,6 +20,7 @@ import {
   KINDS,
   kindLabel,
   onDeleted,
+  PathLine,
   pickSource as openPicker,
   SourceCard,
 } from "./common";
@@ -91,6 +93,8 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
   const [fullVerify, setFullVerify] = useState(false);
   /** Delete the source once the job is Ok; off by default, kept across sources. */
   const [deleteSource, setDeleteSource] = useState(false);
+  /** A TOML pack-rules file (any device), sent with Pack only; kept across sources and kinds. */
+  const [rules, setRules] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false); // state lags a fast double click
@@ -223,8 +227,10 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
       ...(password !== null && { archive_password: password }),
     };
     const level = LEVEL_OF[engine][levels[engine]];
-    if (engine === "zstd") return packed ? { ...base, zstd_unpack: true } : { ...base, zstd_pack: true, zstd_level: level };
-    return packed ? { ...base, lz4: "unpack" } : { ...base, lz4: "pack", lz4_level: level, lz4_runtime: lz4Runtime };
+    if (packed) return engine === "zstd" ? { ...base, zstd_unpack: true } : { ...base, lz4: "unpack" };
+    const withRules = { ...base, ...(rules !== null && { pack_profile: rules }) };
+    if (engine === "zstd") return { ...withRules, zstd_pack: true, zstd_level: level };
+    return { ...withRules, lz4: "pack", lz4_level: level, lz4_runtime: lz4Runtime };
   };
   const start = async () => {
     if (!source || !usable || blockReason || inspecting || submittingRef.current) return;
@@ -356,6 +362,7 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                   <Lead note={{ tone: "warn", text: t.ngNote }} />
                 </p>
               )}
+              {!packed && <RulesField value={rules} onChange={setRules} />}
               <VerifySwitch checked={fullVerify} onChange={setFullVerify} />
               <DeleteSourceSwitch checked={deleteSource} onChange={setDeleteSource} nas={isNas(source)} />
               <OutputField out={out} source={source} prefix="p" />
@@ -511,6 +518,44 @@ function RuntimeField(props: { value: Lz4Runtime; onChange: (r: Lz4Runtime) => v
       <p className="muted hint">
         <Lead note={t.runtimeNotes[props.value]} />
       </p>
+    </div>
+  );
+}
+
+/** Pack's custom rules: a TOML profile on any device, folded; the fold opens itself once one is set. */
+function RulesField(props: { value: string | null; onChange: (p: string | null) => void }) {
+  const t = useMessages().pack.rules;
+  const c = useMessages().common;
+  const [open, setOpen] = useState(props.value !== null);
+  const choose = async () => {
+    const p = await pick({ directory: false, title: t.pickTitle, extensions: ["toml"], nasExtensions: ["toml"], nas: true, devices: true });
+    if (p === null) return;
+    props.onChange(p);
+    setOpen(true);
+  };
+  const name = props.value === null ? null : basename(props.value) || props.value;
+  return (
+    <div className="field">
+      <details className="fold rules" open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
+        <summary>{name === null ? t.title : t.titleWith(name)}</summary>
+        <p className="muted hint">{t.info}</p>
+        <p className="note-line warn">
+          <Icon name="warn" />
+          <span>{t.warn}</span>
+        </p>
+        {props.value !== null && <PathLine path={props.value} />}
+        <div className="row">
+          <button type="button" className="small" onClick={() => void choose()}>
+            <Icon name="file" />
+            {c.pickButton}
+          </button>
+          {props.value !== null && (
+            <button type="button" className="small" onClick={() => props.onChange(null)}>
+              {t.clear}
+            </button>
+          )}
+        </div>
+      </details>
     </div>
   );
 }

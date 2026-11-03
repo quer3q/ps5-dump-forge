@@ -95,6 +95,9 @@ export interface ConvertRequest {
   zstd_level?: number;
   /** The Pack tab's zstd: write a zstd packed source's files back as plain files into `format`. */
   zstd_unpack?: boolean;
+  /** With an LZ4 pack or `zstd_pack`: a TOML pack profile (here, on a paired peer or a NAS)
+   * whose rules pick the packed files; missing or null: the built-in packing strategy. */
+  pack_profile?: string | null;
   /** For an archive source: the password inspect accepted. Never echoed back (the job list
    * from the server has none). */
   archive_password?: string | null;
@@ -211,7 +214,8 @@ export interface Lz4Facts {
   /** The ampr_emu version of the runtimes Forge ships (and installs on unpatch), e.g.
    * "0.4.2.1"; missing from an older backend. */
   shipped_runtime_version?: string;
-  /** The ampr_emu version the game's own runtime names itself with, when it does. */
+  /** The version the game's own runtime names itself with, when it does: ampr_emu's, or
+   * ampr-emu-ng's when runtime is "zstd" (the source card's AMPR tile title). */
   runtime_version?: string | null;
   /** What a plain conversion does to the runtime: "install" (none there), "replace" (Forge's
    * trace runtime, an older ampr_emu or one naming no version: the bundled one goes in) or

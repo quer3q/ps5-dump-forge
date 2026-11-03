@@ -157,7 +157,7 @@ const pt: Messages = {
     upstream: (app) =>
       `Números dos autores: o que os autores do ampr_emu e do Lazy_AMPR relatam, sem medição do ${app}; variam de jogo para jogo. O ampr_emu 0.4.2.1 é uma versão de teste dos autores; problema conhecido: alguns jogos travam ao salvar.`,
     bundled: "Pastas empacotadas com LZ4 rodam no ampr_emu 0.4.2.1 de drakmor (GPL-3.0), incluído sem modificações. Código-fonte:",
-    lazy: "O empacotamento LZ4 se baseia no Lazy_AMPR de Nazky:",
+    lazy: "A estratégia de empacotamento se baseia no Lazy_AMPR de Nazky:",
     ng: "Os pacotes zstd e LZ4 rodam no ampr-emu-ng. Código-fonte:",
     logo: "O logotipo é de Xxcco:",
     unrar:
@@ -387,6 +387,7 @@ const pt: Messages = {
       zstdPack: (level: string) => `zstd: empacotar · ${level}`,
       level: (n: number) => `nível ${num(n)}`,
       zstdUnpack: "zstd: desempacotar",
+      withRules: (tag) => `${tag} · regras próprias`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Editar",
@@ -605,6 +606,14 @@ const pt: Messages = {
       Este jogo já está sendo gravado como <b>{fmt}</b>; clicar em {a === "pack" ? "“Empacotar”" : "“Desempacotar”"} de novo gera uma segunda cópia.
     </>,
     source: "Origem",
+    rules: {
+      title: "Regras próprias (TOML)",
+      titleWith: (name) => `Regras próprias (TOML): ${name}`,
+      info: "Um perfil da estratégia de empacotamento no formato do ampr_pack.py do ampr_emu e do Lazy_AMPR decide quais arquivos são empacotados e quais ficam soltos. Vale a última regra que corresponde; os arquivos do sistema sempre ficam soltos.",
+      warn: "Regras erradas podem deixar um jogo que não inicia. Guarde uma cópia.",
+      pickTitle: "Estratégia de empacotamento (arquivo TOML)",
+      clear: "Limpar",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -631,6 +640,13 @@ const pt: Messages = {
         <ol>
           <li>Lê pacotes zstd e LZ4; Empacotar o instala em fakelib/.</li>
           <li>Desative a atualização de fakelib do ShadowMount+, senão ela substitui o runtime e o jogo não consegue ler seus pacotes.</li>
+        </ol>
+
+        <h3>Estratégia de empacotamento</h3>
+        <ol>
+          <li>Empacotar em zstd e em LZ4 segue uma mesma estratégia de empacotamento: ela decide quais arquivos são empacotados e quais ficam soltos. zstd e LZ4 são apenas os formatos dos pacotes.</li>
+          <li>Só ao empacotar: em <b>Regras próprias (TOML)</b>, escolha um perfil no formato do ampr_pack.py e do Lazy_AMPR, neste dispositivo ou em outro.</li>
+          <li>Vale a última regra que corresponde; os arquivos do sistema sempre ficam soltos. Regras erradas podem deixar um jogo que não inicia.</li>
         </ol>
       </>
     ),
@@ -685,21 +701,15 @@ const pt: Messages = {
     files: (n) => `${num(n)} ${plural(n, FILES)}`,
     contentId: "ID do conteúdo",
     noAmpr: "eboot.bin não importa libSceAmpr",
-    runtime: {
-      forge_release: "de release do Forge",
-      forge_trace: "runtime de rastreamento do LZ4 antigo",
-      zstd: "ampr-emu-ng",
-      other: "outro",
-      none: "nenhum",
-    },
-    packed: "Empacotado",
+    traceRuntime: "Runtime de rastreamento do LZ4 antigo",
+    noRuntime: "Sem runtime",
+    packed: (kind) => `Empacotado (${kind})`,
     zstdKept: "pacotes de assets zstd: a conversão os mantém",
     damaged: "Pacotes danificados",
-    plain: "Não empacotado",
+    unpacked: "Não empacotado",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} ${plural(files, FILES)} em ${num(volumes)} ${plural(volumes, { one: "volume", many: "volumes", other: "volumes" })}` +
       (percent === null ? "" : `, ${num(percent)}% do tamanho`),
-    runtimeIs: (label) => `runtime ${label}`,
     index: {
       stale: "ampr_emu.index desatualizado: uma conversão o renova",
       damaged: "ampr_emu.index danificado: uma conversão o regrava",
@@ -710,7 +720,7 @@ const pt: Messages = {
         ? `uma conversão instala o ampr_emu ${version} incluído`
         : a === "replace"
           ? `uma conversão troca o runtime pelo ampr_emu ${version} incluído`
-          : `ampr_emu ${version}: uma conversão o mantém`,
+          : `uma conversão o mantém`,
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/, montado sozinho" : "fakelib/"}, ${num(n)} ${plural(n, { one: "biblioteca", many: "bibliotecas", other: "bibliotecas" })} de backport`,
     findings: "Avisos da pré-verificação",

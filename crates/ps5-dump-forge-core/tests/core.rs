@@ -67,6 +67,7 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         edit_rebuild: false,
         install: None,
         delete_source: false,
+        pack_profile: None,
         archive_password: None,
     }
 }
@@ -832,7 +833,7 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// [`game`] as a libSceAmpr title, with assets in a subfolder (the built-in guess packs
+/// [`game`] as a libSceAmpr title, with assets in a subfolder (the built-in packing strategy packs
 /// those, and `data/big.bin`; root files, `sce_sys` and empty files stay loose).
 fn ampr_game(root: &Path) {
     game(root);
@@ -1163,10 +1164,7 @@ fn folder_to_lz4_and_back() {
         ["scan", "preflight", "write", "pack", "verify", "finalize"]
     );
     assert!(logged(&events, ps5_dump_forge_lz4::runtime::WARNING));
-    assert!(
-        logged(&events, "LZ4 rules: the built-in guess"),
-        "{events:?}"
-    );
+    assert!(logged(&events, "packing strategy: built-in"), "{events:?}");
     assert!(
         logged(&events, "wrote LZ4 packs: 3 files packed into 1 volumes"),
         "{events:?}"

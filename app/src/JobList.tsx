@@ -101,7 +101,8 @@ function packTag(t: T, p: { kind: "lz4" | "zstd"; id: "pack" | "unpack" }, r: Co
   const n = p.kind === "lz4" ? (r.lz4_level ?? 0) : (r.zstd_level ?? DEFAULT_ZSTD_LEVEL);
   const preset = (Object.keys(LEVEL_OF[p.kind]) as PackLevel[]).find((l) => LEVEL_OF[p.kind][l] === n);
   const level = preset ? msg().pack.levels[preset] : t.packTag.level(n);
-  return p.kind === "lz4" ? t.packTag.lz4Pack(level) : t.packTag.zstdPack(level);
+  const tag = p.kind === "lz4" ? t.packTag.lz4Pack(level) : t.packTag.zstdPack(level);
+  return r.pack_profile ? t.packTag.withRules(tag) : tag;
 }
 
 /** The target as its pill shows it: a pack into a folder writes an LZ4 packed folder. */

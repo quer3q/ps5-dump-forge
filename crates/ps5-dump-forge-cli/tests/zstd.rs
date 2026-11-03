@@ -110,7 +110,7 @@ fn zstd_pack_to_a_folder_reads_back() {
         "{stderr}"
     );
 
-    // Loose, as LZ4's built-in guess keeps them: eboot, sce_sys, root files, empty files, the
+    // Loose, as the built-in packing strategy keeps them: eboot, sce_sys, root files, empty files, the
     // runtime (ZSTD bytes), the indexes and the volume.
     for loose in [
         "eboot.bin",

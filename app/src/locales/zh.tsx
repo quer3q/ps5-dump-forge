@@ -144,7 +144,7 @@ const zh: Messages = {
     upstream: (app) =>
       `上游数据：来自 ampr_emu 和 Lazy_AMPR 作者的报告，并非 ${app} 实测；具体因游戏而异。ampr_emu 0.4.2.1 是上游的测试版本；已知问题：部分游戏在存档时崩溃。`,
     bundled: "LZ4 打包后的游戏使用 drakmor 的 ampr_emu 0.4.2.1（GPL-3.0）运行；该运行时原样内置，未作修改。源代码：",
-    lazy: "LZ4 打包基于 Nazky 的 Lazy_AMPR：",
+    lazy: "打包策略基于 Nazky 的 Lazy_AMPR：",
     ng: "zstd 和 LZ4 包运行于 ampr-emu-ng。源代码：",
     logo: "标志由 Xxcco 设计：",
     unrar:
@@ -350,6 +350,7 @@ const zh: Messages = {
       zstdPack: (level: string) => `zstd 打包 · ${level}`,
       level: (n: number) => `级别 ${num(n)}`,
       zstdUnpack: "zstd 解包",
+      withRules: (tag) => `${tag} · 自定义规则`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "编辑",
@@ -558,6 +559,14 @@ const zh: Messages = {
       已有任务正在将此游戏输出为 <b>{fmt}</b>；再次{a === "pack" ? "打包" : "解包"}会生成第二份副本。
     </>,
     source: "源",
+    rules: {
+      title: "自定义规则（TOML）",
+      titleWith: (name) => `自定义规则（TOML）：${name}`,
+      info: "使用 ampr_emu 的 ampr_pack.py 与 Lazy_AMPR 格式的打包策略配置文件，决定哪些文件打包、哪些保持独立。以最后一条匹配的规则为准；系统文件始终保持独立。",
+      warn: "规则有误可能导致游戏无法启动。请保留一份副本。",
+      pickTitle: "打包策略（TOML 文件）",
+      clear: "清除",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -584,6 +593,13 @@ const zh: Messages = {
         <ol>
           <li>可读取 zstd 和 LZ4 包；打包时会将其安装到 fakelib/。</li>
           <li>请关闭 ShadowMount+ 的 fakelib 更新，否则它会替换运行时，游戏将无法读取它的包。</li>
+        </ol>
+
+        <h3>打包策略</h3>
+        <ol>
+          <li>zstd 与 LZ4 打包遵循同一套打包策略，决定哪些文件打包、哪些保持独立。zstd 与 LZ4 只是包的格式。</li>
+          <li>仅限打包：在<b>自定义规则（TOML）</b>中，从本设备或其他设备选择 ampr_pack.py 与 Lazy_AMPR 格式的配置文件。</li>
+          <li>以最后一条匹配的规则为准；系统文件始终保持独立。规则有误可能导致游戏无法启动。</li>
         </ol>
       </>
     ),
@@ -638,20 +654,14 @@ const zh: Messages = {
     files: (n) => `${num(n)} 个文件`,
     contentId: "内容 ID",
     noAmpr: "eboot.bin 未导入 libSceAmpr",
-    runtime: {
-      forge_release: "Forge 正式版",
-      forge_trace: "旧版 LZ4 追踪运行时",
-      zstd: "ampr-emu-ng",
-      other: "其他",
-      none: "无",
-    },
-    packed: "已打包",
+    traceRuntime: "旧版 LZ4 追踪运行时",
+    noRuntime: "无运行时",
+    packed: (kind) => `已打包 (${kind})`,
     zstdKept: "zstd 资源包：转换时会保留",
     damaged: "包已损坏",
-    plain: "未打包",
+    unpacked: "未打包",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} 个文件，位于 ${num(volumes)} 个卷中` + (percent === null ? "" : `，为原大小的 ${num(percent)}%`),
-    runtimeIs: (label) => `运行时：${label}`,
     index: {
       stale: "ampr_emu.index 已过期：转换时会更新",
       damaged: "ampr_emu.index 已损坏：转换时会重写",
@@ -662,7 +672,7 @@ const zh: Messages = {
         ? `转换时会安装内置的 ampr_emu ${version}`
         : a === "replace"
           ? `转换时会用内置的 ampr_emu ${version} 替换运行时`
-          : `ampr_emu ${version}：转换时会保留`,
+          : `转换时会保留`,
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/，单独挂载" : "fakelib/"}，${num(n)} 个向下移植库`,
     findings: "预检发现的问题",

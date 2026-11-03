@@ -99,7 +99,7 @@ fn survey(dir: &str) -> Result<()> {
             .rsplit_once('.')
             .map_or("", |x| x.1)
             .to_ascii_lowercase();
-        let m = if select(&f.path, f.size).is_some() {
+        let m = if select(&f.path, f.size, None).is_some() {
             &mut packed
         } else {
             &mut loose
@@ -107,7 +107,7 @@ fn survey(dir: &str) -> Result<()> {
         let e: &mut (u64, u64) = m.entry(ext).or_default();
         e.0 += 1;
         e.1 += f.size;
-        if select(&f.path, f.size).is_some() {
+        if select(&f.path, f.size, None).is_some() {
             println!("PACK {:>14} {}", f.size, f.path);
         }
     }

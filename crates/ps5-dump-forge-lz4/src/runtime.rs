@@ -1,5 +1,5 @@
 //! The embedded `ampr_emu` runtimes (the unmodified upstream 0.4.2.1 release build, see
-//! `vendor/ampr_emu/README.md`, and the ampr-emu-ng 0.1.0 release, `vendor/ampr-emu-ng/README.md`)
+//! `vendor/ampr_emu/README.md`, and the ampr-emu-ng 0.2.0 release, `vendor/ampr-emu-ng/README.md`)
 //! and recognition of a runtime found in a game folder, by SHA-256 of the whole file (the old
 //! trace build and the old local ampr-emu-ng build too, no longer shipped), or for ampr-emu-ng
 //! by its zstd index magic.
@@ -28,7 +28,7 @@ pub fn release() -> &'static [u8] {
 }
 
 /// ampr-emu-ng, the user's runtime: reads zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`,
-/// `docs/PAK.md`) and LZ4 packs. The v0.1.0 release build, byte for byte.
+/// `docs/zstd.md`) and LZ4 packs. The v0.2.0 release build, byte for byte.
 pub fn zstd() -> &'static [u8] {
     static CELL: OnceLock<Vec<u8>> = OnceLock::new();
     unpacked(&CELL, ZSTD_PACKED, ZSTD_LEN)
@@ -43,8 +43,11 @@ const RELEASE_SHA256: &str = "69e6c4d5e4f5fb83c9e01815db5861c4c75734acbf4595cafa
 /// The tracing runtime (upstream's `test-debug-pack` build) Forge once installed: no longer
 /// shipped, still recognized so that a conversion replaces it.
 const TRACE_SHA256: &str = "b44a986f2fa9903e74a34cbbd4681e899cd99196613652cd073ed11f2ca947c2";
-/// [`zstd()`]: ampr-emu-ng v0.1.0's `libSceAmpr.sprx` (`vendor/ampr-emu-ng/SHA256SUMS`).
-const ZSTD_SHA256: &str = "69ee3b420c6798fa1b5fb5a9fed75479403bc8a64fe382db301477b1bf705956";
+/// [`zstd()`]: ampr-emu-ng v0.2.0's `libSceAmpr.sprx` (`vendor/ampr-emu-ng/SHA256SUMS`).
+const ZSTD_SHA256: &str = "7acb2173d9691b5dfb94ea4007660920b7250111c5fd7a86c6eb91b763ad3d76";
+/// The v0.1.0 release, no longer shipped; games carrying it still read zstd and LZ4 packs.
+const PREVIOUS_ZSTD_SHA256: &str =
+    "69ee3b420c6798fa1b5fb5a9fed75479403bc8a64fe382db301477b1bf705956";
 /// The local ampr-emu-ng build Forge embedded before the v0.1.0 release (679712 bytes): no
 /// longer shipped, still recognized so that a game carrying it keeps it.
 const OLD_ZSTD_SHA256: &str = "0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7";
@@ -86,7 +89,7 @@ fn by_hash(hash: &str, bytes: &[u8]) -> RuntimeKind {
     match hash {
         RELEASE_SHA256 => RuntimeKind::ForgeRelease,
         TRACE_SHA256 => RuntimeKind::ForgeTrace,
-        ZSTD_SHA256 | OLD_ZSTD_SHA256 => RuntimeKind::Zstd,
+        ZSTD_SHA256 | PREVIOUS_ZSTD_SHA256 | OLD_ZSTD_SHA256 => RuntimeKind::Zstd,
         _ if reads_zstd(bytes) => RuntimeKind::Zstd,
         _ => RuntimeKind::Other,
     }
@@ -116,6 +119,27 @@ pub fn version_of(bytes: &[u8]) -> Option<String> {
         found = Some(v.to_owned());
     }
     found
+}
+
+/// The version ampr-emu-ng names itself with (`ampr-emu-ng 0.2.0` in its binary): the dotted
+/// number after the first `ampr-emu-ng ` that is followed by one. `None` for a build that names
+/// none that way.
+pub fn ng_version_of(bytes: &[u8]) -> Option<String> {
+    const MARK: &[u8] = b"ampr-emu-ng ";
+    bytes
+        .windows(MARK.len())
+        .enumerate()
+        .filter(|(_, w)| *w == MARK)
+        .find_map(|(at, _)| {
+            let rest = &bytes[at + MARK.len()..];
+            let end = rest
+                .iter()
+                .position(|b| !(b.is_ascii_digit() || *b == b'.'))
+                .unwrap_or(rest.len());
+            let v = std::str::from_utf8(&rest[..end]).ok()?;
+            let numbers = v.split('.').all(|p| p.parse::<u64>().is_ok());
+            (numbers && v.contains('.')).then(|| v.to_owned())
+        })
 }
 
 /// Whether a runtime holds the pack format's magics (`AMPRPAK4` manifest, `AMPRDAT3` volumes),
@@ -153,7 +177,7 @@ mod tests {
         assert_eq!(sha256_hex(release()), RELEASE_SHA256);
         assert_eq!(RELEASE_SHA256.len(), 64);
         assert_eq!(TRACE_SHA256.len(), 64);
-        assert_eq!(zstd().len(), 667408);
+        assert_eq!(zstd().len(), 678416);
         assert_eq!(sha256_hex(zstd()), ZSTD_SHA256);
         assert_eq!(OLD_ZSTD_SHA256.len(), 64);
         assert!(
@@ -163,6 +187,8 @@ mod tests {
         );
         assert!(reads_zstd(zstd()));
         assert_eq!(version_of(zstd()), None);
+        assert_eq!(ng_version_of(zstd()).as_deref(), Some("0.2.0"));
+        assert_eq!(ng_version_of(release()), None);
     }
 
     #[test]
@@ -171,6 +197,7 @@ mod tests {
         assert_eq!(classify(zstd()), RuntimeKind::Zstd);
         // The old local ampr-emu-ng build (no longer in the repo) is known by its hash alone.
         assert_eq!(by_hash(OLD_ZSTD_SHA256, b"x"), RuntimeKind::Zstd);
+        assert_eq!(by_hash(PREVIOUS_ZSTD_SHA256, b"x"), RuntimeKind::Zstd);
         assert_eq!(by_hash(ZSTD_SHA256, b"x"), RuntimeKind::Zstd);
         assert_eq!(by_hash(TRACE_SHA256, b"x"), RuntimeKind::ForgeTrace);
         // Another ampr-emu-ng build: the zstd magic and the pack magics, any hash.

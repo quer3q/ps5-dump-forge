@@ -253,7 +253,7 @@ mod tests {
         bytes[116..120].copy_from_slice(&header.to_le_bytes());
     }
 
-    /// The layout of docs/PAK.md written without `validate` (or `Chunk::pack`'s
+    /// The layout of docs/zstd.md written without `validate` (or `Chunk::pack`'s
     /// checks): what a faulty writer would emit, for the decoder to refuse.
     fn raw(index: &Index) -> Vec<u8> {
         let paths: Vec<u8> = index.files.iter().flat_map(|f| f.path.bytes()).collect();

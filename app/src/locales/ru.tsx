@@ -148,7 +148,7 @@ const ru: Messages = {
     upstream: (app) =>
       `Данные авторов: то, что сообщают авторы ampr_emu и Lazy_AMPR, ${app} их не измерял; результат зависит от игры. ampr_emu 0.4.2.1 — тестовая сборка авторов; известная проблема: некоторые игры падают при сохранении.`,
     bundled: "Папки, упакованные LZ4, работают на ampr_emu 0.4.2.1 от drakmor (GPL-3.0), включённой без изменений. Исходный код:",
-    lazy: "Упаковка LZ4 основана на Lazy_AMPR от Nazky:",
+    lazy: "Стратегия упаковки основана на Lazy_AMPR от Nazky:",
     ng: "Пакеты zstd и LZ4 работают на ampr-emu-ng. Исходный код:",
     logo: "Автор логотипа — Xxcco:",
     unrar:
@@ -399,6 +399,7 @@ const ru: Messages = {
       zstdPack: (level: string) => `zstd: упаковка · ${level}`,
       level: (n: number) => `уровень ${num(n)}`,
       zstdUnpack: "zstd: распаковка",
+      withRules: (tag) => `${tag} · свои правила`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Правка",
@@ -615,6 +616,14 @@ const ru: Messages = {
       Эта игра уже записывается в <b>{fmt}</b>; повторная {a === "pack" ? "упаковка" : "распаковка"} создаст вторую копию.
     </>,
     source: "Источник",
+    rules: {
+      title: "Свои правила (TOML)",
+      titleWith: (name) => `Свои правила (TOML): ${name}`,
+      info: "Профиль стратегии упаковки в формате ampr_pack.py из ampr_emu и Lazy_AMPR решает, какие файлы упаковать, а какие оставить отдельными. Действует последнее подходящее правило; системные файлы всегда остаются отдельными.",
+      warn: "Неверные правила могут оставить игру, которая не запустится. Сохраните копию.",
+      pickTitle: "Стратегия упаковки (файл TOML)",
+      clear: "Очистить",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -641,6 +650,13 @@ const ru: Messages = {
         <ol>
           <li>Читает пакеты zstd и LZ4; упаковка устанавливает её в fakelib/.</li>
           <li>Отключите обновление fakelib в ShadowMount+, иначе оно заменит среду выполнения и игра не прочитает свои пакеты.</li>
+        </ol>
+
+        <h3>Стратегия упаковки</h3>
+        <ol>
+          <li>Упаковка zstd и LZ4 следует одной стратегии упаковки: она решает, какие файлы упаковать, а какие оставить отдельными. zstd и LZ4 задают только формат пакетов.</li>
+          <li>Только для упаковки: в разделе <b>Свои правила (TOML)</b> выберите профиль в формате ampr_pack.py и Lazy_AMPR, на этом или на другом устройстве.</li>
+          <li>Действует последнее подходящее правило; системные файлы всегда остаются отдельными. Неверные правила могут оставить игру, которая не запустится.</li>
         </ol>
       </>
     ),
@@ -695,21 +711,15 @@ const ru: Messages = {
     files: (n) => `${num(n)} ${plural(n, { one: "файл", few: "файла", many: "файлов", other: "файла" })}`,
     contentId: "ID контента",
     noAmpr: "eboot.bin не импортирует libSceAmpr",
-    runtime: {
-      forge_release: "релизная Forge",
-      forge_trace: "старая среда для трейсинга LZ4",
-      zstd: "ampr-emu-ng",
-      other: "другая",
-      none: "нет",
-    },
-    packed: "Упакован",
+    traceRuntime: "Старая среда для трейсинга LZ4",
+    noRuntime: "Нет среды выполнения",
+    packed: (kind) => `Упакован (${kind})`,
     zstdKept: "пакеты ресурсов zstd: конвертация их сохранит",
     damaged: "Пакеты повреждены",
-    plain: "Без упаковки",
+    unpacked: "Не упакован",
     packedDetail: (files, volumes, percent) =>
       `${num(files)} ${plural(files, { one: "файл", few: "файла", many: "файлов", other: "файла" })} в ${num(volumes)} ${plural(volumes, { one: "томе", other: "томах" })}` +
       (percent === null ? "" : `, ${num(percent)}% размера`),
-    runtimeIs: (label) => `среда выполнения: ${label}`,
     index: {
       stale: "ampr_emu.index устарел: конвертация обновит его",
       damaged: "ampr_emu.index повреждён: конвертация перезапишет его",
@@ -720,7 +730,7 @@ const ru: Messages = {
         ? `конвертация установит встроенную ampr_emu ${version}`
         : a === "replace"
           ? `конвертация заменит среду выполнения встроенной ampr_emu ${version}`
-          : `ampr_emu ${version}: конвертация её сохранит`,
+          : `конвертация её сохранит`,
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/, монтируется отдельно" : "fakelib/"}, ${num(n)} ${plural(n, { one: "библиотека", few: "библиотеки", many: "библиотек", other: "библиотеки" })} бэкпорта`,
     findings: "Замечания предпроверки",

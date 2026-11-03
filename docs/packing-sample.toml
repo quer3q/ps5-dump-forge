@@ -1,0 +1,63 @@
+# A sample packing strategy for a generic AMPR game (docs/packing.md explains every key).
+# Layout assumed: game assets under data/, voice and music under data/audio/, videos under
+# data/video/, configs anywhere. Adjust the paths to your game and keep a copy of it.
+#
+# Use: Pack tab > Custom rules (TOML) > Pick, or
+#   ps5-dump-forge convert <game_dir> --to folder --zstd-pack --pack-profile packing-sample.toml
+#
+# The last matching [[rule]] wins. Globs are case-sensitive and `*` crosses `/`, so
+# "*.ini" matches an .ini file in any folder. eboot.bin, executables, sce_sys/, sce_module/,
+# fakelib*/ and the AMPR files always stay loose, whatever the rules say.
+
+[pack]
+# Files no rule matches stay loose: root files, anything outside data/.
+default_action = "loose"
+default_block_size = "64KiB"
+# LZ4 only: a compressed file of 64 MiB or more whose sampled blocks barely shrink stays loose.
+auto_loose_large_files = true
+auto_loose_min_file_size = "64MiB"
+# Upstream ampr_pack.py tuning: Forge ignores this key and logs it as an ignored key.
+workers = 8
+
+# Every game asset under data/ is packed and compressed.
+[[rule]]
+action = "compress"
+include = "data/*"
+
+# Voice and music are read in small random pieces: a smaller block (LZ4 only) and the hot flag.
+[[rule]]
+action = "compress"
+include = "data/audio/*"
+block_size = "32KiB"
+hot = true
+layout = "random"
+
+# Already-compressed archives: packed, but stored without compression (LZ4 keeps the chunks raw).
+[[rule]]
+action = "store"
+include = ["data/*.zip", "data/*.7z", "data/*.zst", "data/*.gz"]
+
+# Kept loose: anything the game opens, stats or lists before it starts AMPR, or reads with plain
+# file reads. Unreal containers and project files (.pak, .utoc, .ucas, .uproject, .uplugin),
+# Wwise banks and streams (.bnk, .wem), data and text files, configs and videos. Packing these is
+# the usual cause of a game that won't start. The rule is last, so it wins over the ones above.
+[[rule]]
+action = "loose"
+include = [
+    "data/video/*",
+    "*.pak",
+    "*.utoc",
+    "*.ucas",
+    "*.uproject",
+    "*.uplugin",
+    "*.bnk",
+    "*.wem",
+    "*.dat",
+    "*.ini",
+    "*.json",
+    "*.txt",
+    "*.cfg",
+    "*.xml",
+    "*.bik",
+    "*.mp4",
+]

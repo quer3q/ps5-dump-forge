@@ -152,7 +152,7 @@ const ja: Messages = {
     upstream: (app) =>
       `上流の数値：ampr_emu と Lazy_AMPR の作者による報告値で、${app} が測定したものではありません。ゲームによって異なります。ampr_emu 0.4.2.1 は上流のテストビルドです。既知の問題：一部のゲームでセーブ時にクラッシュします。`,
     bundled: "LZ4 でパックしたフォルダーは drakmor 氏の ampr_emu 0.4.2.1（GPL-3.0、無改変で同梱）で動作します。ソースコード：",
-    lazy: "LZ4 パックは Nazky 氏の Lazy_AMPR を基にしています：",
+    lazy: "パック戦略は Nazky 氏の Lazy_AMPR を基にしています：",
     ng: "zstd と LZ4 のパックは ampr-emu-ng で動作します。ソース：",
     logo: "ロゴは Xxcco 氏の作品です：",
     unrar:
@@ -361,6 +361,7 @@ const ja: Messages = {
       zstdPack: (level: string) => `zstd パック · ${level}`,
       level: (n: number) => `レベル ${num(n)}`,
       zstdUnpack: "zstd アンパック",
+      withRules: (tag) => `${tag} · カスタムルール`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "編集",
@@ -580,6 +581,14 @@ const ja: Messages = {
         このゲームはすでに <b>{fmt}</b> として書き込み中です。もう一度アンパックすると 2 つ目のコピーが作成されます。
       </>,
     source: "ソース",
+    rules: {
+      title: "カスタムルール（TOML）",
+      titleWith: (name) => `カスタムルール（TOML）：${name}`,
+      info: "ampr_emu の ampr_pack.py と Lazy_AMPR の形式のパック戦略プロファイルで、パックするファイルと個別に残すファイルを決めます。一致した最後のルールが優先されます。システムファイルは常に個別に残ります。",
+      warn: "ルールが誤っていると、ゲームが起動しなくなることがあります。コピーを残してください。",
+      pickTitle: "パック戦略（TOML ファイル）",
+      clear: "クリア",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -606,6 +615,13 @@ const ja: Messages = {
         <ol>
           <li>zstd と LZ4 のパックを読み込みます。パックすると fakelib/ にインストールされます。</li>
           <li>ShadowMount+ の fakelib 更新をオフにしてください。オンのままだとランタイムが置き換えられ、ゲームがパックを読み込めなくなります。</li>
+        </ol>
+
+        <h3>パック戦略</h3>
+        <ol>
+          <li>zstd と LZ4 のパックは同じパック戦略に従い、パックするファイルと個別に残すファイルを決めます。zstd と LZ4 はパックの形式にすぎません。</li>
+          <li>パックのみ：<b>カスタムルール（TOML）</b>で、ampr_pack.py と Lazy_AMPR の形式のプロファイルを、このデバイスまたは別のデバイスから選びます。</li>
+          <li>一致した最後のルールが優先され、システムファイルは常に個別に残ります。ルールが誤っていると、ゲームが起動しなくなることがあります。</li>
         </ol>
       </>
     ),
@@ -660,22 +676,16 @@ const ja: Messages = {
     files: (n) => `${num(n)} 個のファイル`,
     contentId: "コンテンツ ID",
     noAmpr: "eboot.bin は libSceAmpr をインポートしていません",
-    runtime: {
-      forge_release: "Forge リリース版",
-      forge_trace: "旧 LZ4 トレース用ランタイム",
-      zstd: "ampr-emu-ng",
-      other: "その他",
-      none: "なし",
-    },
-    packed: "パック済み",
+    traceRuntime: "旧 LZ4 トレース用ランタイム",
+    noRuntime: "ランタイムなし",
+    packed: (kind) => `パック済み (${kind})`,
     zstdKept: "zstd のアセットパック：変換しても保持されます",
     damaged: "パックが破損",
-    plain: "通常",
+    unpacked: "未パック",
     packedDetail: (files, volumes, percent) =>
       percent === null
         ? `${num(files)} 個のファイル、${num(volumes)} 個のボリューム`
         : `${num(files)} 個のファイル、${num(volumes)} 個のボリューム、サイズの ${num(percent)}%`,
-    runtimeIs: (label) => `ランタイム：${label}`,
     index: {
       stale: "ampr_emu.index が古い：変換で更新されます",
       damaged: "ampr_emu.index が破損：変換で書き直されます",
@@ -686,7 +696,7 @@ const ja: Messages = {
         ? `変換で同梱の ampr_emu ${version} がインストールされます`
         : a === "replace"
           ? `変換でランタイムが同梱の ampr_emu ${version} に置き換わります`
-          : `ampr_emu ${version}：変換後もそのまま残ります`,
+          : `変換後もそのまま残ります`,
     backportLibs: (exclusive, n) =>
       exclusive
         ? `fakelib2/（単独でマウント）、バックポートライブラリ ${num(n)} 個`

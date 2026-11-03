@@ -4,7 +4,7 @@
 
 import type { ReactNode } from "react";
 
-import type { Format, KrakenLevel, Lz4Facts, Lz4Runtime } from "../api";
+import type { Format, KrakenLevel, Lz4Runtime } from "../api";
 import type { Features, Rating, Row } from "../Formats";
 import type { ClientText } from "../http-client";
 import { dotted, num, plural } from "../i18n";
@@ -158,7 +158,7 @@ const en = {
     upstream: (app: string) =>
       `Upstream's numbers: what the authors of ampr_emu and Lazy_AMPR report, not measured by ${app}; they vary by game. ampr_emu 0.4.2.1 is an upstream test build; known issue: some games crash when saving.`,
     bundled: "LZ4 packed folders run on ampr_emu 0.4.2.1 by drakmor (GPL-3.0), bundled unmodified. Source:",
-    lazy: "LZ4 packing builds on Lazy_AMPR by Nazky:",
+    lazy: "The packing strategy builds on Lazy_AMPR by Nazky:",
     ng: "zstd and LZ4 packs run on ampr-emu-ng. Source:",
     logo: "The logo is by Xxcco:",
     unrar:
@@ -388,6 +388,7 @@ const en = {
       zstdPack: (level: string) => `zstd pack · ${level}`,
       level: (n: number) => `level ${num(n)}`,
       zstdUnpack: "zstd unpack",
+      withRules: (tag: string) => `${tag} · custom rules`,
     },
     /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Edit",
@@ -605,6 +606,14 @@ const en = {
       Already writing this game as <b>{fmt}</b>; {a === "pack" ? "Pack" : "Unpack"} again makes a second copy.
     </>,
     source: "Source",
+    rules: {
+      title: "Custom rules (TOML)",
+      titleWith: (name: string) => `Custom rules (TOML): ${name}`,
+      info: "A profile of the packing strategy in the format of ampr_emu's ampr_pack.py and Lazy_AMPR decides which files are packed and which stay loose. The last matching rule wins; system files always stay loose.",
+      warn: "Wrong rules can leave a game that won't start. Keep a copy.",
+      pickTitle: "Packing strategy (TOML file)",
+      clear: "Clear",
+    },
   },
   // PackHelp.tsx
   packHelp: {
@@ -631,6 +640,13 @@ const en = {
         <ol>
           <li>Reads zstd and LZ4 packs; Pack installs it in fakelib/.</li>
           <li>Turn off ShadowMount+'s fakelib update, or it replaces the runtime and the game can't read its packs.</li>
+        </ol>
+
+        <h3>Packing strategy</h3>
+        <ol>
+          <li>zstd and LZ4 Pack share one packing strategy: it decides which files are packed and which stay loose. zstd and LZ4 are only the pack formats.</li>
+          <li>Pack only: under <b>Custom rules (TOML)</b>, pick a profile in the format of ampr_pack.py and Lazy_AMPR, on this device or another one.</li>
+          <li>The last matching rule wins; system files always stay loose. Wrong rules can leave a game that won't start.</li>
         </ol>
       </>
     ),
@@ -686,21 +702,15 @@ const en = {
     files: (n: number) => `${num(n)} ${plural(n, { one: "file", other: "files" })}`,
     contentId: "Content ID",
     noAmpr: "eboot.bin does not import libSceAmpr",
-    runtime: {
-      forge_release: "Forge release",
-      forge_trace: "old LZ4 trace runtime",
-      zstd: "ampr-emu-ng",
-      other: "other",
-      none: "none",
-    } satisfies Record<Lz4Facts["runtime"], string>,
-    packed: "Packed",
+    traceRuntime: "Old LZ4 trace runtime",
+    noRuntime: "No runtime",
+    packed: (kind: "LZ4" | "zstd") => `Packed (${kind})`,
     zstdKept: "zstd asset packs: a conversion keeps them",
     damaged: "Damaged packs",
-    plain: "Plain",
+    unpacked: "Unpacked",
     packedDetail: (files: number, volumes: number, percent: number | null) =>
       `${num(files)} ${plural(files, { one: "file", other: "files" })} in ${num(volumes)} ${plural(volumes, { one: "volume", other: "volumes" })}` +
       (percent === null ? "" : `, ${num(percent)}% of size`),
-    runtimeIs: (label: string) => `runtime ${label}`,
     index: {
       stale: "ampr_emu.index out of date: a conversion refreshes it",
       damaged: "ampr_emu.index damaged: a conversion rewrites it",
@@ -712,7 +722,7 @@ const en = {
         ? `a conversion installs the bundled ampr_emu ${version}`
         : a === "replace"
           ? `a conversion replaces the runtime with the bundled ampr_emu ${version}`
-          : `ampr_emu ${version}: a conversion keeps it`,
+          : `a conversion keeps it`,
     backportLibs: (exclusive: boolean, n: number) =>
       `${exclusive ? "fakelib2/, mounted alone" : "fakelib/"}, ${num(n)} backport ${plural(n, { one: "library", other: "libraries" })}`,
     findings: "Preflight findings",

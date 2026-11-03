@@ -210,7 +210,7 @@ which makes debug `.pkg` installs possible.
 Thanks again to **[drakmor](https://github.com/drakmor)** for **[ampr_emu](https://github.com/drakmor/ampr_emu)**
 (GPL-3.0-or-later), the runtime that first made LZ4 asset packs work: its 0.4.2.1 release runtime is embedded
 unmodified, with its source archive in `vendor/ampr_emu/`. **[Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR)**
-by Nazky was a reference for the pack rules (no code taken). The LZ4 library (BSD-2-Clause) that
+by Nazky was a reference for the packing strategy (no code taken). The LZ4 library (BSD-2-Clause) that
 Forge and ampr_emu compile in, and the HDE64 notice, are in `THIRD-PARTY-NOTICES.md`.
 
 Thanks to **[Xxcco](https://github.com/Xxcco)** for the logo.

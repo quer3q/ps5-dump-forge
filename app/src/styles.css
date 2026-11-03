@@ -563,6 +563,9 @@ button.link .icon { width: 15px; height: 15px; }
 /* Damaged packs: no straps, the state in the warning colour (its text says it). */
 .tile.damaged { border-color: rgba(255, 181, 71, 0.3); }
 .tile.damaged .value { color: var(--warn); }
+/* Unpacked: greyed, a dashed --line-hi border and the state in --muted (its text says it). */
+.tile.unpacked { border-style: dashed; border-color: var(--line-hi); }
+.tile.unpacked .value { color: var(--muted); }
 
 /* Collapsible lists (DLC, backport files, job logs, folders checked). */
 .folds { display: flex; flex-direction: column; gap: 8px; }
