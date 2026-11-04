@@ -84,8 +84,8 @@ pub enum Format {
     Pkg,
     /// An LZ4 packed folder: a plain folder (no extension) whose assets sit in AMPR LZ4 packs
     /// (`ampr_assets.index`, `ampr_assets-000.pak`, ...) that the injected
-    /// `fakelib/libSceAmpr.sprx` reads. Only for a title that imports `libSceAmpr`. The same
-    /// as `Folder` with [`Lz4Mode::Pack`] (kept for older requests).
+    /// `fakelib/libSceAmpr.sprx` reads; a title that doesn't import `libSceAmpr` only with
+    /// [`Lz4Runtime::Ng`]. The same as `Folder` with [`Lz4Mode::Pack`] (kept for older requests).
     Lz4,
 }
 
@@ -200,8 +200,9 @@ pub struct ConvertRequest {
     pub lz4_runtime: Lz4Runtime,
     /// Pack the game into zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, zstd, 256 KiB chunks;
     /// `docs/zstd.md`) and install the zstd runtime. Into a `Folder` or an `Exfat`, `Ffpkg`,
-    /// `Ffpfs` or `Ffpfsc` image (straight in, after a measure pass; not `Pkg`), for a title
-    /// that imports libSceAmpr, and with no LZ4 option; anything else fails preflight.
+    /// `Ffpfs` or `Ffpfsc` image (straight in, after a measure pass; not `Pkg`), for any title (one
+    /// that doesn't import libSceAmpr gets ampr-emu-ng too), with no LZ4 option; anything else
+    /// fails preflight.
     #[serde(default)]
     pub zstd_pack: bool,
     /// With [`Self::zstd_pack`]: the zstd level, 1 through 22, [`DEFAULT_ZSTD_LEVEL`] when

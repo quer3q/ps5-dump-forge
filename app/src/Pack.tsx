@@ -1,4 +1,4 @@
-// Pack: game packs for a title that uses AMPR, by one of two kinds: zstd (the default) or LZ4;
+// Pack: game packs for any game (one without AMPR gets ampr-emu-ng injected), by one of two kinds: zstd (the default) or LZ4;
 // ampr-emu-ng reads both, LZ4 may run on upstream ampr_emu instead. A source
 // already packed by the kind chosen gets Unpack instead. Jobs join the list below.
 
@@ -62,14 +62,14 @@ const packedBy = (e: Engine, ins: Inspection | null): boolean =>
   e === "zstd" ? !!ins?.zstd_packed : !!ins?.lz4?.packed;
 
 /** Why packs of kind `e` can't be used on this game (shown in place of the settings); null when
- * they can: Unpack for a game packed by `e`, else Pack for a plain game that uses AMPR. */
+ * they can: Unpack for a game packed by `e`, else Pack for a plain game (one that doesn't use
+ * AMPR gets ampr-emu-ng injected, by user decision). */
 function whyNot(e: Engine, ins: Inspection | null): string | null {
   const t = msg().pack;
   if (!ins) return null;
   if (ins.patch) return t.patch;
   if (packedBy(e, ins)) return null;
   if (ins.additional_content) return t.additionalContent;
-  if (!ins.lz4?.imports_ampr) return t.noAmprGame(e);
   return null;
 }
 
@@ -113,6 +113,8 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
   const action: PackAction = packed ? "unpack" : "pack";
   const notForGame = whyNot(engine, ins);
   const usable = !!ins && notForGame === null;
+  // A game without AMPR: Pack injects ampr-emu-ng (core does, for any such game), LZ4 with ng only.
+  const forced = usable && !packed && !ins.lz4?.imports_ampr;
   const fmt = targetOf(engine, ins);
   const out = useOutput(fmt, props.jobs, setError);
   // This render's kind and targets, for an inspection that began on an older render.
@@ -230,7 +232,8 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
     if (packed) return engine === "zstd" ? { ...base, zstd_unpack: true } : { ...base, lz4: "unpack" };
     const withRules = { ...base, ...(rules !== null && { pack_profile: rules }) };
     if (engine === "zstd") return { ...withRules, zstd_pack: true, zstd_level: level };
-    return { ...withRules, lz4: "pack", lz4_level: level, lz4_runtime: lz4Runtime };
+    // A game without AMPR gets ampr-emu-ng, whatever runtime was picked.
+    return { ...withRules, lz4: "pack", lz4_level: level, lz4_runtime: forced ? "ng" : lz4Runtime };
   };
   const start = async () => {
     if (!source || !usable || blockReason || inspecting || submittingRef.current) return;
@@ -262,7 +265,7 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
   // ampr_emu.index written afresh by Pack (a packed game keeps its own).
   const shipped = lz4?.shipped_runtime_version;
   const lz4Act = lz4?.pack_runtime_action ?? null;
-  const installsNg = !packed && (engine === "zstd" || lz4Runtime === "ng");
+  const installsNg = !packed && (engine === "zstd" || lz4Runtime === "ng" || forced);
   const runtimeNote =
     blockReason || !usable || engine === "zstd" || installsNg
       ? null
@@ -323,6 +326,12 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
               <span>{notForGame}</span>
             </p>
           )}
+          {forced && !blockReason && (
+            <p className="note-line muted">
+              <Icon name="info" />
+              <span>{t.noAmprRuntime}</span>
+            </p>
+          )}
           {usable && (
             <>
               <span className="label target-label" id="p-format-label">{t.target}</span>
@@ -354,13 +363,18 @@ export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void }) {
                   onChange={(l) => setLevels((v) => ({ ...v, [engine]: l }))}
                 />
               )}
-              {engine === "lz4" && !packed && (
+              {engine === "lz4" && !packed && !forced && (
                 <RuntimeField value={lz4Runtime} onChange={setLz4Runtime} version={shipped ?? null} />
               )}
               {installsNg && (
                 <p className="muted hint">
                   <Lead note={{ tone: "warn", text: t.ngNote }} />
                 </p>
+              )}
+              {/* The built-in packing strategy (by user decision): everything but system files where
+                  ampr-emu-ng goes in, the compatibility LZ4 strategy with ampr_emu; a TOML file instead. */}
+              {!packed && rules === null && (
+                <p className="muted hint">{t.strategy(installsNg ? "everything" : "compatibility")}</p>
               )}
               {!packed && <RulesField value={rules} onChange={setRules} />}
               <VerifySwitch checked={fullVerify} onChange={setFullVerify} />

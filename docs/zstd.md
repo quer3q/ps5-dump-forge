@@ -108,7 +108,8 @@ ends; every volume holds at least one chunk.
 
 Chunk `i` of a file decodes to `min(262144, size - i * 262144)` bytes. A raw
 chunk's stored_size equals that; a zstd chunk's is strictly smaller. A
-store-only file has raw chunks only. A zstd chunk is exactly one zstd frame:
+store-only file has raw chunks only (Forge no longer writes one; readers still
+accept the flag). A zstd chunk is exactly one zstd frame:
 content size in the frame header, frame checksum on (the integrity check),
 no dictionary, window at most 256 KiB (`window_log` 18). Every chunk decodes
 on its own (own frame, absolute offset), so contiguous chunks within one
@@ -122,27 +123,19 @@ packs the `files` the caller chose from a `SourceTree` (the caller writes the
 loose files and owns creating, syncing and cleaning up outputs through
 `PackOutput`). Per file, in (path_hash, path) order:
 
-1. Compress every 256 KiB chunk with zstd at `level` (1..=22) and count the
-   stored bytes (a chunk whose frame is not smaller than raw counts raw).
-2. If the file saves less than 1% (`stored * 100 > size * 99`), it is
-   store-only.
-3. Append each chunk to the open volume (raw for a store-only file or a chunk
-   zstd doesn't shrink); a chunk that would pass `VOLUME_LIMIT` starts the
-   next volume.
+1. Compress every 256 KiB chunk with zstd at `level` (1..=22).
+2. Append each chunk to the open volume (raw when zstd doesn't shrink it); a
+   chunk that would pass `VOLUME_LIMIT` starts the next volume.
 
-Steps 1 and 3 are one pass for most files: pass 1 keeps the encoded chunks (up
-to 32 MiB), and once the bytes stored so far plus the raw bytes left can't
-exceed 99% of the size, the file can't be store-only, so the kept chunks are
-written and the pass goes on writing. A store-only file, or one whose kept
-chunks outgrew the 32 MiB before that point, is read again (and compressed
-again unless store-only). The result is the same either way.
+One pass per file. No file is store-only: the old rule (a file saving under
+1% stored whole and raw, read a second time) is gone; the chunk rule already
+keeps incompressible data raw.
 
 Chunks go in batches of one per compression thread (`threads`, 0 = every
 core, at most 32); this thread reads the next batch while the pool compresses
 one, and each thread keeps its zstd context from chunk to chunk. The output
-does not depend on the thread count. Progress counts each file twice (a pass
-it doesn't need counts as done when skipped), so it ends at twice the packed
-bytes. Volume headers are written last (`reopen`, the first 64 bytes only),
+does not depend on the thread count. Progress counts each file twice (one
+pass, counted as two), so it ends at twice the packed bytes. Volume headers are written last (`reopen`, the first 64 bytes only),
 once the count is known, then `ampr_zstd.index`. A file listed at another size
 than the source's, or that reads short while packing, fails the pack;
 `cancel` stops it between batches.
@@ -152,7 +145,7 @@ than the source's, or that reads short while packing, fails the pack;
 `writer::measure(source, files, level, threads, progress, cancel)` runs the
 same compression as `pack_with` without writing: every chunk's codec and
 stored size go into the returned `Index` (a fresh archive id), no byte is
-kept, and a store-only file's second pass reads nothing. Memory is the index
+kept. Memory is the index
 (16 B per chunk) plus the compression's own.
 
 `tree::PackedTree` serves the output `pack_with` would write as a

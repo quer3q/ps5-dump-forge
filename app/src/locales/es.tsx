@@ -127,9 +127,9 @@ const es: Messages = {
         tagline: "El mejor, si tu firmware lo permite",
         cells: ["Nativa, velocidad completa", "Entre 30 y 60% menos, según el juego"],
       },
-      zstd: { tagline: "Para juegos con AMPR, con ampr-emu-ng", cells: ["Carga hasta un 80 % más rápida", "Hasta la mitad del tamaño del juego"] },
+      zstd: { tagline: "Con ampr-emu-ng", cells: ["Carga hasta un 80 % más rápida", "Hasta la mitad del tamaño del juego"] },
       lz4: {
-        tagline: "Para juegos que usan AMPR",
+        tagline: "Con ampr-emu-ng o ampr_emu",
         cells: ["Carga entre 30 y 40% más rápida, según sus autores", "Más o menos la mitad del juego, según sus autores"],
       },
       ffpkg: { tagline: "Recomendado para ShadowMountPlus", cells: ["Velocidad completa de imagen", FLAT] },
@@ -559,7 +559,8 @@ const es: Messages = {
         : packed
           ? "Vuelve a escribir los paquetes LZ4 como archivos normales."
           : "Puede que algunos juegos no arranquen. Empaqueta los recursos del juego en volúmenes LZ4.",
-    noAmprGame: (e) => `Este juego no usa AMPR, así que los paquetes ${e === "zstd" ? "zstd" : "LZ4"} no se pueden usar.`,
+    noAmprRuntime: "Este juego no tiene runtime de AMPR: Pack inyecta ampr-emu-ng.",
+    strategy: (s) => `Estrategia de empaquetado: ${s === "everything" ? "empaquetar todo salvo los archivos del sistema" : "estrategia LZ4 de compatibilidad"}.`,
     patch: "Un paquete de parche no se puede empaquetar.",
     additionalContent: "El contenido adicional (sin eboot.bin) no se puede empaquetar.",
     unreadable: "No se puede iniciar: no se pudo leer el origen (consulta “Origen”).",
@@ -625,7 +626,7 @@ const es: Messages = {
       <>
         <h3>zstd</h3>
         <ol>
-          <li>Empaqueta los recursos del juego en volúmenes zstd, en una carpeta o una imagen. Solo para juegos que usan AMPR.</li>
+          <li>Empaqueta los recursos del juego en volúmenes zstd, en una carpeta o una imagen.</li>
           <li><b>Rápido</b> (zstd 5) es veloz; <b>Medio</b> (9) y <b>Máximo</b> (19) son más pequeños y más lentos.</li>
           <li>Un juego empaquetado muestra <b>Desempaquetar</b>: vuelven los archivos normales.</li>
         </ol>
@@ -646,7 +647,8 @@ const es: Messages = {
 
         <h3>Estrategia de empaquetado</h3>
         <ol>
-          <li>Empaquetar en zstd y en LZ4 sigue una misma estrategia de empaquetado: decide qué archivos se empaquetan y cuáles quedan sueltos. zstd y LZ4 son solo los formatos de los paquetes.</li>
+          <li><b>Empaquetar todo salvo los archivos del sistema</b> (zstd, y LZ4 con ampr-emu-ng): todos los archivos salvo eboot.bin, ejecutables y módulos, sce_sys, sce_module y fakelib; ampr-emu-ng sirve el resto, audio y vídeo incluidos.</li>
+          <li><b>Estrategia LZ4 de compatibilidad</b> (LZ4 con ampr_emu): las configuraciones, los medios y los demás archivos que el juego lee directamente quedan sueltos.</li>
           <li>Solo al empaquetar: en <b>Reglas propias (TOML)</b>, elige un perfil en el formato de ampr_pack.py y Lazy_AMPR, en este dispositivo o en otro.</li>
           <li>Gana la última regla que coincide; los archivos del sistema siempre quedan sueltos. Unas reglas erróneas pueden dejar un juego que no arranca.</li>
         </ol>
@@ -676,6 +678,12 @@ const es: Messages = {
     cantList: "No se puede abrir esta carpeta:",
     cancel: "Cancelar",
     chooseFolder: "Elegir esta carpeta",
+    netOnlyHere: "Archivos comprimidos y fpkg: solo desde este dispositivo.",
+    shortcuts: "Accesos directos",
+    addShortcut: "Añadir acceso directo",
+    removeShortcut: "Quitar acceso directo",
+    shortcutsFull: "9 accesos directos como máximo: quita uno primero.",
+    removeShortcutNamed: (name: string) => `Quitar acceso directo ${name}`,
   },
   // common.tsx
   common: {
@@ -829,7 +837,7 @@ const es: Messages = {
       },
       pkg: { tone: "good", text: "Recomendado. Funciona como un juego nativo, pero solo si tu firmware lo permite." },
       lz4: {
-        text: "Una carpeta de juego con sus recursos empaquetados en volúmenes LZ4, que el emulador AMPR incluido (ampr_emu) desempaqueta mientras el juego se ejecuta. Solo para juegos que usan AMPR.",
+        text: "Una carpeta de juego con sus recursos empaquetados en volúmenes LZ4, que el emulador AMPR incluido (ampr_emu) desempaqueta mientras el juego se ejecuta.",
       },
     },
     innerFfpkg: { text: "El sistema de archivos propio de la PS5 (UFS2)." },

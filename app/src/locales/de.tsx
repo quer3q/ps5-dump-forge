@@ -113,9 +113,9 @@ const de: Messages = {
         tagline: "Am besten, wenn Ihre Firmware es erlaubt",
         cells: ["Nativ, volles Tempo", "30–60 % kleiner, je nach Spiel"],
       },
-      zstd: { tagline: "Für Spiele mit AMPR, mit ampr-emu-ng", cells: ["Bis zu 80 % schnelleres Laden", "Bis zu halb so groß wie das Spiel"] },
+      zstd: { tagline: "Mit ampr-emu-ng", cells: ["Bis zu 80 % schnelleres Laden", "Bis zu halb so groß wie das Spiel"] },
       lz4: {
-        tagline: "Für Spiele mit AMPR",
+        tagline: "Mit ampr-emu-ng oder ampr_emu",
         cells: ["30–40 % schnelleres Laden, laut den Autoren", "Etwa halb so groß wie das Spiel, laut den Autoren"],
       },
       ffpkg: { tagline: "Empfohlen für ShadowMountPlus", cells: ["Volles Image-Tempo", FLAT] },
@@ -543,7 +543,8 @@ const de: Messages = {
         : packed
           ? "Schreibt die LZ4-Pakete als normale Dateien zurück."
           : "Manche Spiele starten eventuell nicht. Packt die Assets des Spiels in LZ4-Volumes.",
-    noAmprGame: (e) => `Dieses Spiel nutzt kein AMPR, daher sind ${e === "zstd" ? "zstd" : "LZ4"}-Pakete nicht nutzbar.`,
+    noAmprRuntime: "Dieses Spiel hat keine AMPR-Laufzeit: Pack fügt ampr-emu-ng ein.",
+    strategy: (s) => `Packstrategie: ${s === "everything" ? "alles außer Systemdateien packen" : "kompatible LZ4-Strategie"}.`,
     patch: "Ein Patch-Paket lässt sich nicht packen.",
     additionalContent: "Zusatzinhalte (ohne eboot.bin) lassen sich nicht packen.",
     unreadable: "Start nicht möglich: Die Quelle konnte nicht gelesen werden (siehe „Quelle“).",
@@ -611,7 +612,7 @@ const de: Messages = {
       <>
         <h3>zstd</h3>
         <ol>
-          <li>Packt die Assets des Spiels in zstd-Volumes, in einen Ordner oder ein Image. Nur für Spiele mit AMPR.</li>
+          <li>Packt die Assets des Spiels in zstd-Volumes, in einen Ordner oder ein Image.</li>
           <li><b>Schnell</b> (zstd 5) ist flott; <b>Mittel</b> (9) und <b>Maximal</b> (19) sind kleiner, aber langsamer.</li>
           <li>Ein gepacktes Spiel zeigt <b>Entpacken</b>: Die normalen Dateien kommen zurück.</li>
         </ol>
@@ -632,7 +633,8 @@ const de: Messages = {
 
         <h3>Packstrategie</h3>
         <ol>
-          <li>zstd- und LZ4-Packen folgen einer gemeinsamen Packstrategie: Sie legt fest, welche Dateien gepackt werden und welche einzeln bleiben. zstd und LZ4 sind nur die Packformate.</li>
+          <li><b>Alles außer Systemdateien packen</b> (zstd, und LZ4 mit ampr-emu-ng): jede Datei außer eboot.bin, Programmen und Modulen, sce_sys, sce_module und fakelib; ampr-emu-ng liefert den Rest, Audio und Video eingeschlossen.</li>
+          <li><b>Kompatible LZ4-Strategie</b> (LZ4 mit ampr_emu): Konfigurationen, Medien und andere Dateien, die ein Spiel direkt liest, bleiben einzeln.</li>
           <li>Nur beim Packen: Wählen Sie unter <b>Eigene Regeln (TOML)</b> ein Profil im Format von ampr_pack.py und Lazy_AMPR, auf diesem oder einem anderen Gerät.</li>
           <li>Die letzte passende Regel gilt; Systemdateien bleiben immer einzeln. Falsche Regeln können ein Spiel hinterlassen, das nicht startet.</li>
         </ol>
@@ -661,6 +663,12 @@ const de: Messages = {
     cantList: "Dieser Ordner kann nicht geöffnet werden:",
     cancel: "Abbrechen",
     chooseFolder: "Diesen Ordner wählen",
+    netOnlyHere: "Archive und fpkg nur von diesem Gerät.",
+    shortcuts: "Verknüpfungen",
+    addShortcut: "Verknüpfung hinzufügen",
+    removeShortcut: "Verknüpfung entfernen",
+    shortcutsFull: "Höchstens 9 Verknüpfungen: entferne zuerst eine.",
+    removeShortcutNamed: (name: string) => `Verknüpfung ${name} entfernen`,
   },
   // common.tsx
   common: {
@@ -814,7 +822,7 @@ const de: Messages = {
       },
       pkg: { tone: "good", text: "Empfohlen. Läuft wie ein natives Spiel, aber nur, wenn Ihre Firmware es zulässt." },
       lz4: {
-        text: "Ein Spielordner, dessen Assets in LZ4-Volumes gepackt sind, die der mitgelieferte AMPR-Emulator (ampr_emu) während des Spiels entpackt. Nur für Spiele mit AMPR.",
+        text: "Ein Spielordner, dessen Assets in LZ4-Volumes gepackt sind, die der mitgelieferte AMPR-Emulator (ampr_emu) während des Spiels entpackt.",
       },
     },
     innerFfpkg: { text: "Das eigene Dateisystem der PS5 (UFS2)." },

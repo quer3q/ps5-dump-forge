@@ -42,6 +42,8 @@ pub(crate) struct Runtime {
     pub version: Option<String>,
     /// It holds the pack format ([`runtime::reads_packs`]).
     pub packs: bool,
+    /// It is the bundled ampr-emu-ng byte for byte ([`runtime::zstd`]).
+    pub bundled: bool,
 }
 
 /// What a conversion does to the source's runtime (by user decision).
@@ -79,11 +81,13 @@ impl Runtime {
         }
     }
 
-    /// The action for LZ4 Pack with the runtime the request chose: ampr-emu-ng goes in unless
-    /// it is there; ampr_emu follows [`Self::action`] into packs (ampr-emu-ng replaced too).
+    /// The action for LZ4 Pack with the runtime the request chose: the bundled ampr-emu-ng goes in
+    /// unless it is there byte for byte (an older ampr-emu-ng doesn't serve the fully packed LZ4
+    /// game pack everything except system files makes, so it is replaced, as zstd Pack does);
+    /// ampr_emu follows [`Self::action`] into packs (ampr-emu-ng replaced too).
     pub(crate) fn pack_action(&self, choice: Lz4Runtime) -> RuntimeAction {
         match (choice, self.kind) {
-            (Lz4Runtime::Ng, RuntimeKind::Zstd) => RuntimeAction::Keep,
+            (Lz4Runtime::Ng, RuntimeKind::Zstd) if self.bundled => RuntimeAction::Keep,
             (Lz4Runtime::Ng, RuntimeKind::None) => RuntimeAction::Install,
             (Lz4Runtime::Ng, _) => RuntimeAction::Replace,
             (Lz4Runtime::AmprEmu, _) => self.action(true, true),
@@ -112,6 +116,7 @@ pub(crate) fn runtime_of(tree: &mut dyn SourceTree) -> Runtime {
         kind: RuntimeKind::Other,
         version: None,
         packs: false,
+        bundled: false,
     };
     let Some(size) = size_of(tree, RUNTIME) else {
         return Runtime {
@@ -133,6 +138,7 @@ pub(crate) fn runtime_of(tree: &mut dyn SourceTree) -> Runtime {
                     runtime::version_of(&bytes)
                 },
                 packs: runtime::reads_packs(&bytes),
+                bundled: bytes == runtime::zstd(),
             }
         }
         _ => unknown,
@@ -293,12 +299,18 @@ pub(crate) fn prepare(
     if req.zstd_unpack && !packs.zstd_unpacked {
         findings.push("zstd unpack: the source holds no zstd packs (ampr_zstd.index)".into());
     }
+    // A title without AMPR is packed too (by user decision), with ampr-emu-ng only: ShadowMount+
+    // loads it, and only it serves a game that never calls the AMPR API.
     if target && size_of(tree.as_ref(), "eboot.bin").is_some() && !ampr {
-        findings.push(
-            "eboot.bin does not import libSceAmpr: LZ4 packs only work for a title that uses \
-             AMPR"
-                .into(),
-        );
+        if req.lz4_runtime != Lz4Runtime::Ng {
+            findings.push(
+                "eboot.bin does not import libSceAmpr: its LZ4 packs need the ampr-emu-ng runtime \
+                 (ng), not ampr_emu"
+                    .into(),
+            );
+        } else {
+            ctx.log("LZ4: eboot.bin does not import libSceAmpr; injecting ampr-emu-ng");
+        }
     }
     if !findings.is_empty() {
         return Ok(Prepared {
@@ -314,12 +326,13 @@ pub(crate) fn prepare(
     if target && !ng {
         ctx.log(runtime::WARNING);
     }
-    // Pack installs the chosen runtime whatever `eboot.bin` says (the check above refuses a
-    // non-AMPR one). Unpacked, the zstd runtime has nothing left to read: the release one
-    // replaces it.
+    // Pack installs the chosen runtime whatever `eboot.bin` says (the check above lets a
+    // non-AMPR title through only to ampr-emu-ng). Unpacked, an
+    // AMPR title's zstd runtime has nothing left to read: the release one replaces it; a title
+    // without AMPR keeps what it has (`action(false, ..)`: untouched), as an LZ4 Unpack does.
     let action = match kind {
         _ if target => rt.pack_action(req.lz4_runtime),
-        RuntimeKind::Zstd if packs.zstd_unpacked => RuntimeAction::Replace,
+        RuntimeKind::Zstd if packs.zstd_unpacked && ampr => RuntimeAction::Replace,
         _ => rt.action(ampr, false),
     };
     let installed: Option<&'static [u8]> = match action {
@@ -821,9 +834,16 @@ fn read_profile(path: &std::path::Path) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("not UTF-8 text"))
 }
 
-/// The pack list, in `records` (final index) order: the request's pack profile or the built-in
-/// guess (the keep-loose list and root files stay loose), then auto-loose samples the large
-/// files left to pack (from `tree`).
+/// The built-in packing strategies' names (by user decision), as the logs give them: zstd Pack and
+/// LZ4 Pack with ampr-emu-ng take [`EVERYTHING`], LZ4 Pack with ampr_emu [`COMPATIBILITY`].
+pub(crate) const EVERYTHING: &str = "pack everything except system files";
+pub(crate) const COMPATIBILITY: &str = "compatibility LZ4 strategy";
+
+/// The pack list, in `records` (final index) order: the request's pack profile or a built-in
+/// strategy. With ampr-emu-ng ([`Lz4Runtime::Ng`]) everything but system files is packed
+/// (`rules::select_everything`, no auto-loose, as zstd Pack); with ampr_emu the compatibility
+/// LZ4 strategy (the keep-loose list and root files stay loose), then auto-loose samples the
+/// large files left to pack (from `tree`). A profile's rules and auto-loose keys decide either way.
 fn plan(
     tree: &mut dyn SourceTree,
     records: &[(String, u64)],
@@ -847,19 +867,27 @@ fn plan(
             level: req.lz4_level,
         });
     }
+    let everything = req.lz4_runtime == Lz4Runtime::Ng;
     let mut files: Vec<PackFile> = records
         .iter()
         .map(|(path, size)| PackFile {
             path: path.clone(),
             size: *size,
-            spec: ps5_dump_forge_lz4::select(path, *size, profile.as_ref()),
+            spec: if everything {
+                ps5_dump_forge_lz4::select_everything(path, *size, profile.as_ref())
+            } else {
+                ps5_dump_forge_lz4::select(path, *size, profile.as_ref())
+            },
         })
         .collect();
-    let rules = profile
-        .as_ref()
-        .map_or_else(Default::default, |p| p.auto_loose);
     let ruled: Vec<bool> = files.iter().map(|f| f.spec.is_some()).collect();
-    auto_loose(tree, &mut files, req.lz4_level, &rules, ctx)?;
+    match &profile {
+        Some(p) => auto_loose(tree, &mut files, req.lz4_level, &p.auto_loose, ctx)?,
+        None if !everything => {
+            auto_loose(tree, &mut files, req.lz4_level, &Default::default(), ctx)?
+        }
+        None => {}
+    }
     // Names the runtime cannot take, and names the pack files will take.
     let bad: Vec<String> = files
         .iter()
@@ -889,7 +917,12 @@ fn plan(
             req.lz4_level
         )),
         _ => ctx.log(format!(
-            "packing strategy: built-in; {packed} files to pack, {} loose; level {}",
+            "packing strategy: {}; {packed} files to pack, {} loose; level {}",
+            if everything {
+                EVERYTHING
+            } else {
+                COMPATIBILITY
+            },
             files.len() - packed,
             req.lz4_level
         )),
@@ -898,7 +931,11 @@ fn plan(
         .filter(|(f, _)| f.spec.is_none())
         .map(|(f, r)| (f.path.as_str(), f.size, *r))
         .collect();
-    ctx.log(loose_line(&loose, profile.as_ref(), true));
+    ctx.log(if everything && profile.is_none() {
+        everything_loose_line(&loose, profile.as_ref())
+    } else {
+        loose_line(&loose, profile.as_ref(), true)
+    });
     Ok(PackPlan {
         files,
         level: req.lz4_level,
@@ -999,6 +1036,26 @@ pub(crate) fn loose_line(
         s.push_str(&format!(", {empty} empty files"));
     }
     s
+}
+
+/// The "kept loose" line of pack everything except system files: without a profile only system
+/// and runtime files (`always_loose`) and empty files stay loose (`rules::select_everything`).
+pub(crate) fn everything_loose_line(
+    loose: &[(&str, u64, bool)],
+    profile: Option<&ps5_dump_forge_lz4::Profile>,
+) -> String {
+    if profile.is_some() {
+        return loose_line(loose, profile, false);
+    }
+    let bytes: u64 = loose.iter().map(|l| l.1).sum();
+    let empty = loose.iter().filter(|l| l.1 == 0).count();
+    format!(
+        "packing strategy: kept loose {} files, {}: system and runtime files (always_loose) {}, \
+         {empty} empty files",
+        loose.len(),
+        gb(bytes),
+        loose.len() - empty
+    )
 }
 
 /// Upstream's auto-loose over the pack list: every file it applies to is sampled (a few

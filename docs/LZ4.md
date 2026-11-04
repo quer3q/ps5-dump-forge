@@ -1,8 +1,8 @@
 # Pack: zstd and LZ4 asset packs
 
-An optional transform for games that load through `libSceAmpr` (the title's `eboot.bin` imports it): the
-game's assets are compressed into a few pack volumes, and a runtime that Forge installs at
-`fakelib/libSceAmpr.sprx` reads them back on the console while the game runs. The result is a plain game
+An optional transform for any game: the game's assets are compressed into a few pack volumes, and a
+runtime that Forge installs at `fakelib/libSceAmpr.sprx` reads them back on the console while the game runs.
+A game whose `eboot.bin` doesn't import `libSceAmpr` gets ampr-emu-ng too (ShadowMount+ loads it). The result is a plain game
 **folder**, or an image holding one. Packs are not an image format: ShadowMountPlus mounts no "pack images".
 
 Everything is in the app's **Pack** tab (**How pack works** there shows the steps in short, offline). Choose
@@ -15,8 +15,8 @@ Both are read by **ampr-emu-ng**, the bundled runtime Pack installs by default. 
 bundled upstream [ampr_emu](https://github.com/drakmor/ampr_emu) 0.4.2.1 instead.
 
 A plain game gets **Pack**; a game already packed by the kind chosen gets **Unpack**. A game packed by the
-other kind is repacked: Pack decodes its packs and packs it again by the packing strategy. A game that doesn't use AMPR, a patch package and
-additional content get a note and no action.
+other kind is repacked: Pack decodes its packs and packs it again by the packing strategy. A patch package and additional content get a note and
+no action.
 
 > **ShadowMount+ can replace the runtime.** Its fakelib update replaces ampr-emu-ng, and the game then
 > can't read its packs: turn that update off for packed games. The Pack tab
@@ -31,23 +31,31 @@ Which files are packed and which stay loose is the **packing strategy**, the sam
 zstd and LZ4 are only the pack formats. Executables (`eboot.bin`, `.elf`, `.self`, `.prx`, `.sprx`),
 `sce_sys`, `sce_module`, `fakelib` and empty files always stay loose.
 
-The **built-in packing strategy** packs everything but the game's root files and the keep-loose list.
-The runtime serves only AMPR reads, so anything the game reads other than through AMPR (plain reads, mmap)
-stays loose, as does anything it reads before it has started AMPR. The **keep-loose list** (any depth, any
+There are two built-in strategies, picked by the runtime the packs get:
+
+- **Pack everything except system files** (zstd Pack, and LZ4 Pack with ampr-emu-ng): every other file is
+  packed, root files, configs, audio and video included. ampr-emu-ng serves plain and libc reads, directory
+  listings and mmap of packed files, so nothing else has to stay loose. No auto-loose.
+- **Compatibility LZ4 strategy** (LZ4 Pack with ampr_emu): packs everything but the game's root files and the
+  keep-loose list. Upstream ampr_emu serves only AMPR reads, so anything the game reads other than through
+  AMPR (plain reads, mmap) stays loose, as does anything it reads before it has started AMPR.
+
+The compatibility strategy's **keep-loose list** (any depth, any
 case for the new names and folders): container indexes (`.pak`, `.utoc`), configs and text (`.ini`,
 `.json`, ...), Unreal project files (`.uproject`, `.uplugin`, `.upluginmanifest`), images, video (`.bik`,
 `.mpg`, `.mpeg`, `.m2v`, ...), audio, the protected folders (`sce_module`, `system`, `save`, `fakelib*`, ..., in any letter case), every
 file in a video folder (`video`, `videos`, `movie`, `movies`, `cutscene`, `cutscenes`, `fmv`; not
 `cinematic*`) and Insomniac's extensionless boot and streaming containers, by file name (`bootload_*`,
 `critbootload`, `soundbank`, `soundbank.*`, `soundbank_*`, `wem`, `wem.*`, `wem_*`, `screenreaderwem*`,
-`movie`, `movie_*`, `movies`, `movies_*`). An LZ4-packed source repacked as zstd is unpacked and then packed by the same
-strategy (or a TOML profile); its LZ4 packs' old set is not reused.
+`movie`, `movie_*`, `movies`, `movies_*`). A source packed by the other kind is unpacked and then packed by the strategy
+of the kind chosen (or a TOML profile); its old packs' set is not reused.
 
-Each Pack job logs why files stayed loose, for example:
+Each Pack job logs its strategy and why files stayed loose, for example (compatibility LZ4 strategy):
 
     packing strategy: kept loose 812 files, 31.4 GB: root files 0.2 GB, keep-loose suffixes 27.9 GB (.bnk 12.0 GB, .pak 9.1 GB, .wem 4.0 GB, .mp4 2.1 GB, .json 0.4 MB, ...), protected folders and names 3.3 GB, auto-loose 0.0 MB
 
-(`auto-loose` for LZ4 only; decimal GB, MB under 1 GB). With a profile it counts the files and bytes the
+(`auto-loose` for the compatibility strategy only; decimal GB, MB under 1 GB; pack everything except
+system files counts only system and runtime files and empty files). With a profile it counts the files and bytes the
 profile kept loose and those the always-loose files did instead. A large keep-loose suffix or folder there
 is where a profile could pack more.
 
@@ -100,11 +108,12 @@ ps5-dump-forge convert <game> --to lz4 [--lz4-level 0|3..12] [--lz4-runtime ng|a
 ps5-dump-forge convert <game> --to ffpkg --lz4-pack [--lz4-level N]   # also exfat, ffpfs, ffpfsc
 ```
 
-Which files to pack follows the packing strategy (above). Then, for LZ4 only, **auto-loose** (as upstream's packer): a file of 64 MiB or more left to compress is sampled (32 blocks spread
+Which files to pack follows the packing strategy (above). Then, for the compatibility LZ4 strategy and for any LZ4 Pack with a TOML profile (its `auto_loose_*`
+keys), **auto-loose** (as upstream's packer): a file of 64 MiB or more left to compress is sampled (32 blocks spread
 across it, at most 16 MiB) and stays loose when the samples save under 5% or 90% of them stay uncompressed.
 
 The runtime (**Runtime** in the tab, `--lz4-runtime`): **ampr-emu-ng** (`ng`, the default) is installed
-unless the game already has it. **ampr_emu** installs the bundled release runtime where there is none and
+unless the game already has the bundled build byte for byte (an older ampr-emu-ng is replaced). **ampr_emu** installs the bundled release runtime where there is none and
 replaces an older one, one whose version can't be read, one that can't read packs and ampr-emu-ng; ampr_emu
 at Forge's version or newer that reads packs stays. The old journal and logs are left out and
 `ampr_emu.index` is always written afresh.
@@ -155,9 +164,11 @@ which. The source is left as it is.
 
 ## Things to know
 
-- **Only AMPR titles.** A game whose `eboot.bin` does not import `libSceAmpr` is refused (the **Pack** tab
-  says "This game doesn't use AMPR, so zstd packs can't be used.", or LZ4 packs; Convert shows no AMPR
-  notes for it). A game without its own ampr_emu is fine: Pack installs a runtime.
+- **Any game.** A game whose `eboot.bin` does not import `libSceAmpr` is packed too: Pack injects
+  ampr-emu-ng at `fakelib/libSceAmpr.sprx` (an LZ4 Pack of such a game needs the ampr-emu-ng runtime; the
+  Pack tab picks it and hides the choice), and ShadowMount+ loads it, so the game's packed files are served. The Pack tab says "This game
+  has no AMPR runtime: Pack injects ampr-emu-ng." The CLI does the same; there an LZ4 pack of such a game
+  with `--lz4-runtime ampr_emu` is refused. Convert shows no AMPR notes for it.
 - **Pack never changes your source**: it writes a new folder or image. Delete (in Edit or Storage) is what
   removes a game.
 - **Checks are CRCs.** The packs' checksums detect corruption; they do not authenticate anything.

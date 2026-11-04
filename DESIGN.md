@@ -340,7 +340,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   note when there are several.
   `.tile.wide` spans the row (Edit's Game facts also add Content ID and the Forge version that made
   the image, both mono; the AMPR tile (LZ4 and zstd alike): the game's runtime with its version as the title
-  (`ampr-emu-ng 0.2.0`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
+  (`ampr-emu-ng 0.3.0`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
   Packed (zstd), Damaged packs or Unpacked as the value; its note
   says when the game doesn't use AMPR and adds what a conversion does to the runtime (installs or replaces with the bundled ampr_emu, or
   "a conversion keeps it" for another build with a version, the title already naming it) and a stale, damaged or missing

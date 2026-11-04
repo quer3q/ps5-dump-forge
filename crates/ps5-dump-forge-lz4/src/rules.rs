@@ -581,7 +581,8 @@ impl Compiled {
     }
 }
 /// `None` keeps the file loose. Empty files and `always_loose` paths are loose before anything
-/// else. Without a profile, the built-in packing strategy: the keep-loose list and root files
+/// else. Without a profile, the compatibility LZ4 strategy (LZ4 Pack with upstream ampr_emu, which
+/// serves only AMPR reads, by user decision): the keep-loose list and root files
 /// stay loose, everything else is packed with 64 KiB blocks. With one, its rules decide
 /// ([`profile_spec`]): the keep-loose list doesn't apply and root files are the profile's call.
 pub fn select(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSpec> {
@@ -592,6 +593,18 @@ pub fn select(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSp
         None => (!fallback_loose(path)).then(plain_spec),
         // A profile is the user's call: only `always_loose` (system and runtime files) wins.
         Some(p) => profile_spec(path, p),
+    }
+}
+
+/// Pack everything except system files (by user decision: zstd Pack, and LZ4 Pack with
+/// ampr-emu-ng): without a profile every non-empty file is packed except `always_loose`
+/// (executables, `sce_sys`, `sce_module`, `fakelib*`, the runtime's own files): ampr-emu-ng serves
+/// a fully packed game (plain and libc I/O, directory listings, mmap), so media, configs and root
+/// files go into the packs too. A profile decides as in [`select`].
+pub fn select_everything(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSpec> {
+    match profile {
+        None => (size > 0 && !always_loose(path)).then(plain_spec),
+        Some(_) => select(path, size, profile),
     }
 }
 

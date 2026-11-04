@@ -155,12 +155,10 @@ pub(crate) fn prepare(
 ) -> anyhow::Result<(Prepared, Option<Plan>)> {
     let mut findings = request_findings(req);
     let eboot = tree.files().iter().any(|f| f.path == "eboot.bin");
+    // A title without AMPR is packed too (by user decision): ShadowMount+ loads the injected
+    // ampr-emu-ng.
     if eboot && !crate::lz4::imports_ampr(tree.as_mut()) {
-        findings.push(
-            "eboot.bin does not import libSceAmpr: zstd packs only work for a title that uses \
-             AMPR"
-                .into(),
-        );
+        ctx.log("zstd: eboot.bin does not import libSceAmpr; injecting ampr-emu-ng");
     }
     // Every root entry, a folder too (`ampr_zstd.index/x` or an empty one would block the file).
     let mut taken: Vec<String> = (tree.files().iter().map(|f| f.path.as_str()))
@@ -213,12 +211,11 @@ pub(crate) fn prepare(
         path: INDEX.into(),
         size: index.len() as u64,
     });
-    // The packing strategy, shared with LZ4 Pack: the game reads only AMPR files through the
-    // runtime and opens the rest (configs, container indexes, media) with plain libc I/O the
-    // runtime does not serve. Every source, an LZ4-packed one too (by user decision), takes the
-    // built-in packing strategy (the keep-loose list and root files stay loose). A pack
-    // profile, given, decides instead (`rules::select`; a `store` file is packed as any other:
-    // a chunk zstd can't shrink is kept raw anyway).
+    // Pack everything except system files (`rules::select_everything`): all but `always_loose`,
+    // root files, media and configs included; ampr-emu-ng serves plain and libc I/O on packed
+    // files. Every source, an LZ4-packed one too (by user decision), takes it. A pack profile,
+    // given, decides instead (a `store` file is packed as any other: a chunk zstd can't shrink
+    // is kept raw anyway).
     let mut findings = Vec::new();
     let profile = crate::lz4::pack_profile(req, ctx, &mut findings);
     if !findings.is_empty() {
@@ -227,7 +224,8 @@ pub(crate) fn prepare(
     let packed: Vec<SourceFile> = (files.iter())
         .filter(|f| {
             !loose(&f.path)
-                && ps5_dump_forge_lz4::select(&f.path, f.size, profile.as_ref()).is_some()
+                && ps5_dump_forge_lz4::select_everything(&f.path, f.size, profile.as_ref())
+                    .is_some()
         })
         .cloned()
         .collect();
@@ -241,7 +239,8 @@ pub(crate) fn prepare(
             CHUNK_SIZE >> 10
         )),
         _ => ctx.log(format!(
-            "packing strategy: built-in; {n} files to pack, {loose_n} loose; zstd level {}, {} KiB chunks",
+            "packing strategy: {}; {n} files to pack, {loose_n} loose; zstd level {}, {} KiB chunks",
+            crate::lz4::EVERYTHING,
             req.zstd_level,
             CHUNK_SIZE >> 10
         )),
@@ -251,7 +250,7 @@ pub(crate) fn prepare(
         .filter(|f| !set.contains(f.path.as_str()))
         .map(|f| (f.path.as_str(), f.size, false))
         .collect();
-    ctx.log(crate::lz4::loose_line(&loose, profile.as_ref(), false));
+    ctx.log(crate::lz4::everything_loose_line(&loose, profile.as_ref()));
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
     generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::zstd()));
     generated.insert(INDEX.into(), Cow::Owned(index));
@@ -297,11 +296,10 @@ pub(crate) fn pack<O: PackOutput>(
         .count();
     let secs = started.elapsed().as_secs_f64().max(1e-3);
     ctx.log(format!(
-        "wrote zstd packs: {} files packed into {} volumes, {} stored raw; {} chunks, {zstd} \
+        "wrote zstd packs: {} files packed into {} volumes; {} chunks, {zstd} \
          zstd; stored {}% of {raw} bytes; zstd level {}; {:.0} MB/s on {} threads",
         index.files.len(),
         index.volume_sizes.len(),
-        index.files.iter().filter(|f| f.store_only).count(),
         index.chunks.len(),
         crate::convert::percent(stored, raw),
         plan.level,
@@ -325,7 +323,7 @@ pub(crate) fn measure(
         "zstd into an image: packing straight into it, no temporary folder; the packed files \
          are read again to write them",
     );
-    // Each file counts twice (the store-only test, then the compression).
+    // Each file counts twice (one pass, counted as two: the writer's progress).
     let total = plan.packed_bytes().saturating_mul(2);
     ctx.expect_rest(total.saturating_add(crate::convert::after_measure(tree, req)));
     ctx.progress("measure", 0, total);

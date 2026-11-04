@@ -124,9 +124,9 @@ const en = {
         tagline: "Best, if your firmware allows",
         cells: ["Native, full speed", "30–60% less, depending on the game"],
       },
-      zstd: { tagline: "For games that use AMPR, with ampr-emu-ng", cells: ["Up to 80% faster loading", "Up to half the game size"] },
+      zstd: { tagline: "With ampr-emu-ng", cells: ["Up to 80% faster loading", "Up to half the game size"] },
       lz4: {
-        tagline: "For games that use AMPR",
+        tagline: "With ampr-emu-ng or ampr_emu",
         cells: ["30–40% faster loading, upstream's numbers", "About half the game size, upstream's numbers"],
       },
       ffpkg: { tagline: "Recommended for ShadowMountPlus", cells: ["Full image speed", FLAT] },
@@ -562,7 +562,8 @@ const en = {
         : packed
           ? "Writes the LZ4 packs back as plain files."
           : "Some games may not start. Packs the game's assets into LZ4 volumes.",
-    noAmprGame: (e: Engine) => `This game doesn't use AMPR, so ${e === "zstd" ? "zstd" : "LZ4"} packs can't be used.`,
+    noAmprRuntime: "This game has no AMPR runtime: Pack injects ampr-emu-ng.",
+    strategy: (s: "everything" | "compatibility") => `Packing strategy: ${s === "everything" ? "pack everything except system files" : "compatibility LZ4 strategy"}.`,
     patch: "A patch package can't be packed.",
     additionalContent: "Additional content (no eboot.bin) can't be packed.",
     unreadable: "Can't start: the source couldn't be read (see Source).",
@@ -623,7 +624,7 @@ const en = {
       <>
         <h3>zstd</h3>
         <ol>
-          <li>Packs the game's assets into zstd volumes, into a folder or an image. Only for games that use AMPR.</li>
+          <li>Packs the game's assets into zstd volumes, into a folder or an image.</li>
           <li><b>Fast</b> (zstd 5) is quick; <b>Medium</b> (9) and <b>Max</b> (19) are smaller, slower.</li>
           <li>A packed game shows <b>Unpack</b>: the plain files come back.</li>
         </ol>
@@ -644,7 +645,8 @@ const en = {
 
         <h3>Packing strategy</h3>
         <ol>
-          <li>zstd and LZ4 Pack share one packing strategy: it decides which files are packed and which stay loose. zstd and LZ4 are only the pack formats.</li>
+          <li><b>Pack everything except system files</b> (zstd, and LZ4 with ampr-emu-ng): every file but eboot.bin, executables and modules, sce_sys, sce_module and fakelib; ampr-emu-ng serves the rest, audio and video included.</li>
+          <li><b>Compatibility LZ4 strategy</b> (LZ4 with ampr_emu): configs, media and the other files a game reads directly stay loose.</li>
           <li>Pack only: under <b>Custom rules (TOML)</b>, pick a profile in the format of ampr_pack.py and Lazy_AMPR, on this device or another one.</li>
           <li>The last matching rule wins; system files always stay loose. Wrong rules can leave a game that won't start.</li>
         </ol>
@@ -671,6 +673,12 @@ const en = {
     cantList: "Can't open this folder:",
     cancel: "Cancel",
     chooseFolder: "Choose this folder",
+    netOnlyHere: "Archives and fpkg open from this device only.",
+    shortcuts: "Shortcuts",
+    addShortcut: "Add shortcut",
+    removeShortcut: "Remove shortcut",
+    shortcutsFull: "9 shortcuts at most: remove one first.",
+    removeShortcutNamed: (name: string) => `Remove shortcut ${name}`,
   },
   // common.tsx
   common: {
@@ -826,7 +834,7 @@ const en = {
       },
       pkg: { tone: "good", text: "Recommended. Runs like a native game, but only if your firmware allows it." },
       lz4: {
-        text: "A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs. Only for games that use AMPR.",
+        text: "A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs.",
       },
     } satisfies Record<Format, Note>,
     /** The inner `.ffpkg`'s line: the format's own, less what a read-only `.ffpfsc` doesn't give. */

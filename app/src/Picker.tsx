@@ -40,6 +40,40 @@ export interface Listing {
 /** Where the last browse ended, for the next one (kept until the page closes). */
 let lastDir: string | null = null;
 
+/** The user's shortcut folders (issue #18, by user decision): any device's folder paths, newest
+ * last, in `localStorage` (a saved choice beside the UI language). Unreadable or invalid storage is
+ * no shortcuts, never an error. */
+const SHORTCUTS = "forge.shortcuts";
+const MAX_SHORTCUTS = 9;
+
+function readShortcuts(): string[] {
+  try {
+    const v: unknown = JSON.parse(localStorage.getItem(SHORTCUTS) ?? "[]");
+    if (!Array.isArray(v)) return [];
+    const paths = v.filter((p): p is string => typeof p === "string" && p !== "");
+    const kept = paths.filter((p, i) => paths.lastIndexOf(p) === i).slice(-MAX_SHORTCUTS);
+    // An older build kept up to 20: the stored list is cut to the newest 9 too.
+    if (kept.length !== v.length) writeShortcuts(kept);
+    return kept;
+  } catch {
+    return [];
+  }
+}
+
+function writeShortcuts(paths: string[]) {
+  try {
+    localStorage.setItem(SHORTCUTS, JSON.stringify(paths));
+  } catch {
+    // Storage blocked or full: the shortcuts last until the picker closes.
+  }
+}
+
+/** A folder's last component (another device's paths take `/`), else the path itself (a root). */
+function lastPart(path: string): string {
+  const parts = path.split(isNet(path) ? /\// : SEPARATORS).filter(Boolean);
+  return parts.length > (isNet(path) ? 2 : 0) ? parts[parts.length - 1] : path;
+}
+
 /** Connect's saved devices, as its state lists them. */
 export interface SavedDevices {
   devices: { key_id: string; name: string; online: boolean }[];
@@ -216,6 +250,8 @@ function Picker({
   const [listing, setListing] = useState<Listing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rootPaths, setRoots] = useState<string[]>([]);
+  // Read once as the picker opens; written on each change.
+  const [shortcuts, setShortcuts] = useState(readShortcuts);
   // A listing is on its way: what shows is still the previous folder's, so it can't be chosen.
   const [pending, setPending] = useState(true);
   const seq = useRef(0);
@@ -324,12 +360,17 @@ function Picker({
   };
 
   const here = listing?.path ?? null;
-  // On a saved NAS or another Forge only what core reads there (`nasExtensions`).
+  // On a saved NAS or another Forge core reads only `nasExtensions`: the rest (archives, .pkg) is
+  // listed greyed out, not pickable, with one short note (issue #20).
   const files = here !== null && isNet(here) && o.nasExtensions ? { ...o, extensions: o.nasExtensions } : o;
-  const entries = listing ? listing.entries.filter((e) => shows(files, e)) : [];
+  const off = (e: Entry) => files !== o && !shows(files, e);
+  // Greyed rows after the rest, so they never push a pickable one past MAX_ROWS.
+  const listed = listing ? listing.entries.filter((e) => shows(o, e)) : [];
+  const entries = files === o ? listed : [...listed.filter((e) => !off(e)), ...listed.filter(off)];
   const atTop = here === null || here === dev.root;
   // At most MAX_ROWS rows (as the explorers), one Tab stop among them: the row last focused, else the first.
   const rows = entries.slice(0, MAX_ROWS);
+  const anyOff = rows.some(off);
   const stop = cursor !== null && (cursor === UP ? !atTop : rows.some((e) => e.path === cursor)) ? cursor : atTop ? rows[0]?.path : UP;
   const top = t.drives;
   // Another device's tab starts at its root, named by the device.
@@ -343,6 +384,63 @@ function Picker({
     setTab(i);
     setListing(null);
     void go(null);
+  };
+
+  // Shortcuts shown only while reachable here, as a start folder is: a net one on the tab whose
+  // root holds it, or, without tabs, under a root listed at the top (a peer's only for a picker
+  // that offers devices, a NAS's only for one that offers NAS devices).
+  // The tab a shortcut opens on (-1: no tabs), or null: not reachable here.
+  const tabOfShortcut = (p: string): number | null => {
+    if (!isNet(p)) return tabs.length > 0 ? 0 : -1;
+    if (o.local) return null;
+    if (tabs.length > 0) {
+      const i = tabs.findIndex((d) => d.root !== null && within(p, d.root));
+      return i > 0 ? i : null;
+    }
+    if (/^flink:\/\//i.test(p) ? !o.devices : !offered(o)) return null;
+    return rootPaths.some((r) => within(p, r)) ? -1 : null;
+  };
+  const shown = shortcuts.flatMap((path) => {
+    const i = tabOfShortcut(path);
+    return i === null ? [] : [{ path, i }];
+  });
+  // At 9, a new one takes the place of the oldest this picker can't show (an offline device's), so
+  // hidden shortcuts never block one. ponytail: that one goes without a word; a list per device if it matters.
+  const hidden = shortcuts.find((p) => !shown.some((x) => x.path === p));
+  const full = shortcuts.length >= MAX_SHORTCUTS && hidden === undefined;
+  const pinned = here !== null && shortcuts.includes(here);
+  const save = (next: string[]) => {
+    setShortcuts(next);
+    writeShortcuts(next);
+  };
+  // The foot button: the folder shown becomes a shortcut (none past MAX_SHORTCUTS), or stops being one.
+  const pin = () => {
+    if (here === null) return;
+    if (pinned) return save(shortcuts.filter((p) => p !== here));
+    if (full) return;
+    const kept = shortcuts.length >= MAX_SHORTCUTS ? shortcuts.filter((p) => p !== hidden) : shortcuts;
+    const next = [...kept, here];
+    save(next);
+    // The button goes off with the 9th that it can't make room for: focus stays in the dialog.
+    if (next.length >= MAX_SHORTCUTS && next.every((p) => p === here || shown.some((x) => x.path === p))) box.current?.focus();
+  };
+  // A chip's x: the shortcut goes, focus stays in the dialog (Escape, the trap).
+  const unpin = (path: string) => {
+    save(shortcuts.filter((p) => p !== path));
+    box.current?.focus();
+  };
+  const openShortcut = (path: string, i: number) => {
+    if (i >= 0 && i !== tabAt.current) {
+      tabAt.current = i;
+      setTab(i);
+      setListing(null);
+    }
+    void go(path);
+  };
+  const shortcutName = (path: string, i: number) => {
+    const d = i > 0 ? tabs[i] : null;
+    if (d && path === d.root) return d.label;
+    return d ? `${d.label}: ${lastPart(path)}` : lastPart(path);
   };
 
   return (
@@ -416,6 +514,36 @@ function Picker({
               </Fragment>
             ))}
           </nav>
+          {shown.length > 0 && (
+            <div className="pick-shortcuts" role="group" aria-label={t.shortcuts}>
+              {shown.map(({ path, i }) => {
+                const name = shortcutName(path, i);
+                return (
+                  <span key={path} className={path === here ? "pick-shortcut here" : "pick-shortcut"}>
+                    <button type="button" className="pick-shortcut-go" title={path} onClick={() => openShortcut(path, i)}>
+                      <Icon name="folder" />
+                      <span className="pick-shortcut-name">{name}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="pick-shortcut-x"
+                      aria-label={t.removeShortcutNamed(name)}
+                      title={t.removeShortcut}
+                      onClick={() => unpin(path)}
+                    >
+                      <Icon name="x" />
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          {anyOff && (
+            <p className="note-line muted">
+              <Icon name="info" />
+              <span>{t.netOnlyHere}</span>
+            </p>
+          )}
           <ul className="rows pick-list" ref={list} aria-label={here ?? top} aria-busy={pending}>
             {!atTop && (
               <li>
@@ -433,25 +561,34 @@ function Picker({
                 </button>
               </li>
             )}
-            {rows.map((e) => (
-              <li key={e.path}>
-                <button
-                  type="button"
-                  className={chosen.includes(e.path) ? "pick-row entry chosen" : "pick-row entry"}
-                  tabIndex={stop === e.path ? 0 : -1}
-                  onFocus={() => setCursor(e.path)}
-                  aria-pressed={multiple && !e.dir ? chosen.includes(e.path) : undefined}
-                  onClick={() => (e.dir ? go(e.path) : multiple ? toggle(e.path) : done(e.path))}
-                >
-                  <Icon name={e.nas ? "drive" : e.dir ? "folder" : chosen.includes(e.path) ? "check" : fileIcon(o, e.name)} />
-                  <span className={here === null ? "pick-name mono" : "pick-name"}>
-                    {here === null ? e.path : e.name}
-                  </span>
-                  {e.size !== null && <span className="muted">{prettyBytes(e.size)}</span>}
-                  {e.nas && <span className="muted">{e.name}</span>}
-                </button>
-              </li>
-            ))}
+            {rows.map((e) => {
+              const no = off(e);
+              return (
+                <li key={e.path}>
+                  <button
+                    type="button"
+                    className={no ? "pick-row entry off" : chosen.includes(e.path) ? "pick-row entry chosen" : "pick-row entry"}
+                    tabIndex={stop === e.path ? 0 : -1}
+                    onFocus={() => setCursor(e.path)}
+                    aria-pressed={multiple && !e.dir && !no ? chosen.includes(e.path) : undefined}
+                    aria-disabled={no || undefined}
+                    onClick={() => {
+                      if (no) return;
+                      if (e.dir) void go(e.path);
+                      else if (multiple) toggle(e.path);
+                      else done(e.path);
+                    }}
+                  >
+                    <Icon name={e.nas ? "drive" : e.dir ? "folder" : chosen.includes(e.path) ? "check" : fileIcon(o, e.name)} />
+                    <span className={here === null ? "pick-name mono" : "pick-name"}>
+                      {here === null ? e.path : e.name}
+                    </span>
+                    {e.size !== null && <span className="muted">{prettyBytes(e.size)}</span>}
+                    {e.nas && <span className="muted">{e.name}</span>}
+                  </button>
+                </li>
+              );
+            })}
             {(listing?.truncated || rows.length < entries.length) && <li className="muted">{t.truncated(rows.length < entries.length ? MAX_ROWS : 10000)}</li>}
             {!listing && !error && (
               <li className="muted">
@@ -472,6 +609,16 @@ function Picker({
           )}
         </div>
         <div className="row end pick-foot">
+          <button
+            type="button"
+            className="pick-pin"
+            disabled={here === null || pending || error !== null || (!pinned && full)}
+            title={!pinned && full ? t.shortcutsFull : undefined}
+            onClick={pin}
+          >
+            <Icon name={pinned ? "minus" : "folder-plus"} />
+            {pinned ? t.removeShortcut : t.addShortcut}
+          </button>
           <button type="button" ref={cancel} onClick={() => done(null)}>
             {t.cancel}
           </button>

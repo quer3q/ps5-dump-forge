@@ -934,12 +934,6 @@ fn zstd_pack_refusals_and_packed_sources() {
         },
         "the zstd level is 1 through 22, not 23",
     );
-    let plain = root.join("plain");
-    game(&plain);
-    refused(
-        zstd_request(&plain, &root.join("d")),
-        "does not import libSceAmpr",
-    );
 
     let packed = root.join("packed");
     let (events, result) = run(zstd_request(&src, &packed));
@@ -1164,7 +1158,10 @@ fn folder_to_lz4_and_back() {
         ["scan", "preflight", "write", "pack", "verify", "finalize"]
     );
     assert!(logged(&events, ps5_dump_forge_lz4::runtime::WARNING));
-    assert!(logged(&events, "packing strategy: built-in"), "{events:?}");
+    assert!(
+        logged(&events, "packing strategy: compatibility LZ4 strategy"),
+        "{events:?}"
+    );
     assert!(
         logged(&events, "wrote LZ4 packs: 3 files packed into 1 volumes"),
         "{events:?}"
@@ -1404,7 +1401,7 @@ fn lz4_refusals() {
         "LZ4 level 2 is not 0 (fast) or 3 through 12",
     );
 
-    // A title that does not use AMPR.
+    // A title that does not use AMPR: its packs need ampr-emu-ng (`request` picks ampr_emu).
     let plain = root.join("plain");
     game(&plain);
     let no_ampr = "does not import libSceAmpr";
