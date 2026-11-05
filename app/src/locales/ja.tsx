@@ -663,6 +663,7 @@ const ja: Messages = {
     emptyTitle: "ゲームのフォルダー、イメージまたはアーカイブを選んでください",
     accepted: "対応するソース",
     unknownTitle: "不明なタイトル",
+    unsigned: (n: number) => `${num(n)} 個の実行ファイルが署名されていないため、ゲームは起動しません。ゲームを変換すると署名されます。`,
     patch: "パッチ",
     additionalContent: "追加コンテンツ",
     reading: "ソースを読み込み中",

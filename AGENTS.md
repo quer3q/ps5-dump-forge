@@ -21,7 +21,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   them, U3), `awake.rs` (`awake()`: one refcounted U8 guard for jobs, paired peers and browser
   uploads/downloads), BLAKE3 verification (`verify.rs`: 8 MiB slice hashes on a pool of up to 8 threads (hashed inline if none starts),
   at most 64 files and 64 MiB of partial slices held at once, past that a file hashed by a second read; fast
-  sample or full), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
+  sample or full), `fself.rs` (`Signed`: unsigned PS5 ELF executables served as fake-signed SELFs, make_fself's bytes;
+  `unsigned`), `inspect.rs` (cover, firmware, backport firmware from executables, embedded DLC; default and
   generated output names), `prefetch.rs` (read-ahead thread), `delete.rs` (Edit's and Storage's delete,
   Storage's move; `in_use`, the job-path guard; a `flink://` path handed to its peer, `delete_remote`/`move_remote`), `listing.rs` (`list_dir`; `list_explorer`, the PS5 explorer's ShadowMount+ rule), `library_roots.rs` (PS5 filesystem classifier, the chosen-folder refusal
   list) and `library.rs` (`scan_library`, `library_cover`; `scan_packages`, the Package installer's `.pkg` walk).
@@ -351,6 +352,19 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   created). The folder writer (`extract::write`) reads files of at most 4 MiB whole on the job thread and has 4
   threads create, write, sync and close them (at most 13 files in flight; joined before the folder's sync, so the
   macOS F_FULLFSYNC barrier and FreeBSD's per-file `sync_retry` hold); larger files take the old path.
+- Every conversion fake-signs a plain ELF executable (user request, from a Borderlands 4 dump that never started; core `fself.rs`): a file with an
+  executable extension (`sdk::is_executable`; a `.bin` only when named `eboot*`, so data `.bin` files aren't opened), the ELF magic and `e_type` `0xFE10`/`0xFE18` (`fakelib*` included)
+  doesn't launch, so `Inspection.unsigned` lists it (CLI `unsigned:` line; the source card's warn note
+  `common.unsigned`, not for a patch) and a conversion or Pack job (not an edit, Extract, transfer or install)
+  serves it through `fself::Signed` right after the backport step, before the AMPR index: byte for byte
+  ampr-emu-ng's `make_fself.py --ptype fake` (pinned by a BLAKE3 test), planned from the headers (one 16 KiB read at 0, so a remote source fetches no read-ahead window), the segments
+  copied as the file is written; log `fself: signing N unsigned executables: ...`, one it can't plan kept as it is
+  (`fself: can't sign ...`). `ampr_emu.index`'s records of a signed file that list its ELF size get the SELF size
+  in place (a plain u64, no checksum; log `fself: ampr_emu.index: N records set to the signed sizes`), so a
+  packed game converted as it is signs too (by user decision; executables are `always_loose`, and the LZ4
+  manifest's loose records may differ from the disk) and an unpacked game's otherwise exact index stays exact.
+  ponytail: the ex-info's SHA-256 of the whole ELF sits in front, so each ELF is read twice (a solid archive
+  decodes it again); an executable inside a third-party pack isn't seen.
 - Every conversion repairs an AMPR title (`eboot.bin` imports libSceAmpr; by user decision): any target, Convert,
   CLI, server and Pack jobs alike (`lz4::plain` for a request without LZ4 options, `prepare`'s full path otherwise).
   Edit jobs are the exception (their own index rule, runtime never swapped; see the Edit tab below).
@@ -378,7 +392,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   Into a `.pkg` no index is built here: the old one (an AMPR title's), the journal and logs are left out and the
   builder writes it after its SDK filtering (below), so leftovers it drops can't fail preflight. A packed source
   (LZ4 or zstd) gets the runtime action and keeps its index, manifest, journal and logs byte for byte; a replaced
-  runtime then differs from the LZ4 manifest's loose record, which `reader::unpack` lets pass for `RUNTIME` only.
+  runtime (or a signed executable) then differs from the LZ4 manifest's loose record, which `reader::unpack` lets pass
+  for any loose record (the runtime reads loose files from the disk).
   `Lz4Facts.index` (`ok`/`stale`/`damaged`/`missing`; `None` when packed, when the action is `Untouched`, or for an
   archive's index over 16 MiB) is that comparison. Edit's game facts, Convert, the Pack tab and the CLI say a
   conversion refreshes it.

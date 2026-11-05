@@ -626,6 +626,14 @@ fn inspect(path: &Path, password: Option<&ArchivePassword>, json: bool) -> ExitC
     if let Some(line) = found.lz4.as_ref().map(|f| lz4_line(f, found.zstd_packed)) {
         text += &format!("{line}\n");
     }
+    if !found.unsigned.is_empty() {
+        let n = found.unsigned.len();
+        let more = if n > 5 { ", ..." } else { "" };
+        text += &format!(
+            "unsigned:   {n} executables (a conversion signs them): {}{more}\n",
+            found.unsigned[..n.min(5)].join(", ")
+        );
+    }
     if !found.dlcs.is_empty() {
         text += &format!("dlc:        {}\n", found.dlcs.len());
         for d in &found.dlcs {

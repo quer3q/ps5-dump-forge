@@ -33,6 +33,7 @@ mod jobs;
 mod zstd_pack;
 pub use awake::{Awake, awake};
 mod awake;
+mod fself;
 mod library;
 mod library_roots;
 mod listing;
@@ -574,6 +575,9 @@ pub struct Inspection {
     /// A patch package (`.pkg` starting `\x7FLIH`): `files` are the ones it carries whole;
     /// browsed and extracted from only, never converted or edited.
     pub patch: bool,
+    /// PS5 executables (fakelib's included) that are plain ELF, not fake-signed SELF: the
+    /// console won't launch the game. A conversion signs them. Empty for a patch package.
+    pub unsigned: Vec<String>,
 }
 
 /// What an archive source is.

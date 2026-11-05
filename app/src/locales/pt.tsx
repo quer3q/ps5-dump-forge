@@ -688,6 +688,12 @@ const pt: Messages = {
     emptyTitle: "Escolha uma pasta, imagem ou arquivo compactado de jogo",
     accepted: "Origens aceitas",
     unknownTitle: "Título desconhecido",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} executável não está assinado, então o jogo não vai iniciar. Ao converter o jogo, ele é assinado.`,
+        many: `${num(n)} de executáveis não estão assinados, então o jogo não vai iniciar. Ao converter o jogo, eles são assinados.`,
+        other: `${num(n)} executáveis não estão assinados, então o jogo não vai iniciar. Ao converter o jogo, eles são assinados.`,
+      }),
     patch: "Patch",
     additionalContent: "Conteúdo adicional",
     reading: "Lendo a origem",

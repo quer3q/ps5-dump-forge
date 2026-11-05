@@ -641,6 +641,7 @@ const zh: Messages = {
     emptyTitle: "请选择游戏文件夹、镜像或压缩包",
     accepted: "支持的源",
     unknownTitle: "未知游戏",
+    unsigned: (n: number) => `${num(n)} 个可执行文件未签名，游戏无法启动。转换游戏时会为其签名。`,
     patch: "补丁",
     additionalContent: "附加内容",
     reading: "正在读取源",

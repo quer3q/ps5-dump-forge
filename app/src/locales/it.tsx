@@ -682,6 +682,12 @@ const it: Messages = {
     emptyTitle: "Scegli una cartella, un'immagine o un archivio di gioco",
     accepted: "Sorgenti accettate",
     unknownTitle: "Titolo sconosciuto",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} eseguibile non è firmato, quindi il gioco non si avvierà. La conversione del gioco lo firma.`,
+        many: `${num(n)} di eseguibili non sono firmati, quindi il gioco non si avvierà. La conversione del gioco li firma.`,
+        other: `${num(n)} eseguibili non sono firmati, quindi il gioco non si avvierà. La conversione del gioco li firma.`,
+      }),
     patch: "Patch",
     additionalContent: "Contenuto aggiuntivo",
     reading: "Lettura della sorgente",

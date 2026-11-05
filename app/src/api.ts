@@ -305,6 +305,9 @@ export interface Inspection {
   /** A patch package (`.pkg` starting `\x7FLIH`): `files` are the ones it carries whole;
    * browsed and extracted from only. Missing from an older backend. */
   patch?: boolean;
+  /** PS5 executables that are plain ELF, not signed: the console won't start the game; a
+   * conversion signs them. Missing from an older backend. */
+  unsigned?: string[];
 }
 
 /** One job in `GET /api/jobs` (http build): what a reloaded page rebuilds its list from. */

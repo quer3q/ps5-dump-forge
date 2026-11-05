@@ -653,6 +653,7 @@ const ko: Messages = {
     emptyTitle: "게임 폴더, 이미지 또는 압축 파일을 선택하세요",
     accepted: "지원하는 소스",
     unknownTitle: "알 수 없는 게임",
+    unsigned: (n: number) => `실행 파일 ${num(n)}개가 서명되지 않아 게임이 시작되지 않습니다. 게임을 변환하면 서명됩니다.`,
     patch: "패치",
     additionalContent: "추가 콘텐츠",
     reading: "소스 읽는 중",

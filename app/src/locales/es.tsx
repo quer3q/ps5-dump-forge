@@ -694,6 +694,12 @@ const es: Messages = {
     emptyTitle: "Elige una carpeta, imagen o archivo comprimido de juego",
     accepted: "Orígenes admitidos",
     unknownTitle: "Título desconocido",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} ejecutable no está firmado, así que el juego no arrancará. Al convertir el juego, se firma.`,
+        many: `${num(n)} de ejecutables no están firmados, así que el juego no arrancará. Al convertir el juego, se firman.`,
+        other: `${num(n)} ejecutables no están firmados, así que el juego no arrancará. Al convertir el juego, se firman.`,
+      }),
     patch: "Parche",
     additionalContent: "Contenido adicional",
     reading: "Leyendo el origen",

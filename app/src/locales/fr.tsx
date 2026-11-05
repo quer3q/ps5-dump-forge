@@ -676,6 +676,12 @@ const fr: Messages = {
     emptyTitle: "Choisissez un dossier de jeu, une image ou une archive",
     accepted: "Sources acceptées",
     unknownTitle: "Titre inconnu",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} exécutable n’est pas signé : le jeu ne démarrera pas. La conversion du jeu le signe.`,
+        many: `${num(n)} d’exécutables ne sont pas signés : le jeu ne démarrera pas. La conversion du jeu les signe.`,
+        other: `${num(n)} exécutables ne sont pas signés : le jeu ne démarrera pas. La conversion du jeu les signe.`,
+      }),
     patch: "Correctif",
     additionalContent: "Contenu additionnel",
     reading: "Lecture de la source",

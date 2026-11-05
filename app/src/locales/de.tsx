@@ -679,6 +679,11 @@ const de: Messages = {
     emptyTitle: "Wählen Sie einen Spielordner, ein Image oder ein Archiv",
     accepted: "Unterstützte Quellen",
     unknownTitle: "Unbekannter Titel",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} ausführbare Datei ist nicht signiert, daher startet das Spiel nicht. Beim Konvertieren wird sie signiert.`,
+        other: `${num(n)} ausführbare Dateien sind nicht signiert, daher startet das Spiel nicht. Beim Konvertieren werden sie signiert.`,
+      }),
     patch: "Patch",
     additionalContent: "Zusatzinhalt",
     reading: "Quelle wird gelesen",

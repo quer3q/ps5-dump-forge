@@ -14,7 +14,7 @@ pub(crate) const PROCESS_PARAM_MAGIC: u32 = 0x4942_524F;
 pub(crate) const MODULE_PARAM_MAGIC: u32 = 0x3C13_F4BF;
 /// The PS5 SDK word, from the param's magic.
 const PS5_SDK_AT: usize = 0xC;
-const ELF: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+pub(crate) const ELF: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 /// Fake-signed SELFs, PS5 and PS4: the ELF header and program headers follow the segment
 /// table, and each segment's data sits where its table entry says.
 const SELF_PS5: [u8; 4] = [0x54, 0x14, 0xF5, 0xEE];
@@ -25,7 +25,7 @@ const HEAD: usize = 0x1_0000;
 const EXTENSIONS: &[&str] = &["bin", "elf", "self", "prx", "sprx"];
 /// ponytail: the first this many files with an ELF or SELF magic are parsed (a game has a
 /// few dozen); data `.bin` files are passed over by a 4-byte read and do not count.
-const MAX_EXECUTABLES: usize = 4096;
+pub(crate) const MAX_EXECUTABLES: usize = 4096;
 /// SELF entry properties: its data is encrypted or compressed, so not readable in place.
 const SELF_ENCRYPTED: u64 = 1 << 1;
 const SELF_COMPRESSED: u64 = 1 << 3;
@@ -77,7 +77,7 @@ pub(crate) fn firmware(sdk: u32) -> Option<String> {
 }
 
 /// `N` bytes at `at`, every bound checked (offsets come from the file).
-fn le<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+pub(crate) fn le<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
     bytes.get(at..at.checked_add(N)?)?.try_into().ok()
 }
 

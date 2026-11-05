@@ -660,6 +660,12 @@ export function SourceCard(props: {
             props.error && <p className="bad backend">{props.error}</p>
           )}
           {ins && (props.compact ? <CompactSummary ins={ins} /> : <InspectSummary ins={ins} full={props.full} />)}
+          {ins && !ins.patch && !!ins.unsigned?.length && (
+            <p className="note-line warn interrupted-note">
+              <Icon name="warn" />
+              <span>{t.unsigned(ins.unsigned.length)}</span>
+            </p>
+          )}
           {props.children}
         </>
       )}

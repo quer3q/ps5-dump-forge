@@ -538,6 +538,36 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     convert(req, ctx)
 }
 
+/// `source` with its unsigned PS5 executables served as fake-signed SELFs (the console won't
+/// launch a plain ELF), `ampr_emu.index`'s records of them resized; a repair, never a finding.
+/// A packed game too: its packs hold no executable the loader opens, and the LZ4 manifest's
+/// loose records may differ from the disk.
+fn sign_executables(source: Box<dyn SourceTree>, ctx: &Ctx) -> Box<dyn SourceTree> {
+    let (tree, signed, refused) = crate::fself::Signed::new(source);
+    for (path, why) in refused {
+        ctx.log(format!("fself: can't sign {path}: {why}; left as it is"));
+    }
+    if !signed.is_empty() {
+        let mut line = format!(
+            "fself: signing {} unsigned executables: {}",
+            signed.len(),
+            signed[..signed.len().min(10)].join(", ")
+        );
+        if signed.len() > 10 {
+            line.push_str(&format!(" and {} more", signed.len() - 10));
+        }
+        ctx.log(line);
+    }
+    if tree.resized > 0 {
+        ctx.log(format!(
+            "fself: {}: {} records set to the signed sizes",
+            ps5_dump_forge_lz4::INDEX,
+            tree.resized
+        ));
+    }
+    Box::new(tree)
+}
+
 /// `--remove-backport`: `source` without fakelib's backport libraries, when they can go (else a
 /// finding, or a log line when there are none).
 fn leave_out_backport(
@@ -831,6 +861,13 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     // Before anything sizes or writes the source, so every target (`.pkg` included) and the
     // verification see the tree without it.
     let source = leave_out_backport(req, source, &info, &packs, ctx, &mut findings);
+    // Unsigned executables served fake-signed, before the AMPR index sees their sizes. A
+    // rebuild writes the edit as asked.
+    let source = if rebuild {
+        source
+    } else {
+        sign_executables(source, ctx)
+    };
     // The LZ4 options, before anything sizes or writes the tree (`.pkg` included). A rebuild
     // keeps the runtime, the journal and logs; `fold` refreshed the index.
     let (prepared, mut zstd) = if rebuild {

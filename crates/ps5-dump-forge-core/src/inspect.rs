@@ -262,6 +262,11 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         lz4_facts(tree.as_mut(), &mut findings)
     };
     let zstd_packed = crate::zstd_pack::packed(tree.as_mut());
+    let unsigned = if patch {
+        Vec::new()
+    } else {
+        crate::fself::unsigned(tree.as_mut())
+    };
     let files: Vec<InspectFile> = tree
         .files()
         .iter()
@@ -303,6 +308,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
                 .symlink_metadata()
                 .is_ok(),
         patch,
+        unsigned,
     })
 }
 
@@ -466,6 +472,10 @@ fn archive_reads(files: &[SourceFile]) -> BTreeMap<String, u64> {
             sum += n;
             keep.insert(f.path.clone(), n);
         }
+    }
+    // Past the budget, each executable's header (64 B) for `fself::unsigned`.
+    for f in files.iter().filter(|f| crate::fself::executable(&f.path)) {
+        keep.entry(f.path.clone()).or_insert(f.size.min(0x40));
     }
     keep
 }
@@ -1111,6 +1121,13 @@ mod tests {
         assert!(!keep.contains_key(&index.path), "{keep:?}");
         let keep = archive_reads(&[index.clone(), file("eboot.bin", 1 << 20)]);
         assert!(keep.contains_key(&index.path), "{keep:?}");
+        // Past the budget an executable still gets its header, for the unsigned check.
+        let keep = archive_reads(&[
+            file("eboot.bin", ARCHIVE_READ_BUDGET + 1),
+            file("data/level.bin", 1 << 30),
+        ]);
+        assert_eq!(keep.get("eboot.bin"), Some(&0x40), "{keep:?}");
+        assert!(!keep.contains_key("data/level.bin"), "{keep:?}");
     }
 
     #[test]

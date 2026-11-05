@@ -2358,3 +2358,52 @@ fn delete_source_refused_keeps_the_source_and_the_job_done() {
     assert!(src.join("eboot.bin").is_file());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A minimal unsigned PS5 executable: an x86-64 ELF of `e_type` 0xFE10 with one PT_LOAD.
+fn unsigned_eboot() -> Vec<u8> {
+    let mut f: Vec<u8> = (0..0x200u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut put = |at: usize, b: &[u8]| f[at..at + b.len()].copy_from_slice(b);
+    put(0, b"\x7fELF");
+    put(4, &[2, 1, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0]);
+    put(0x10, &0xFE10u16.to_le_bytes());
+    put(0x12, &0x3Eu16.to_le_bytes());
+    put(0x14, &1u32.to_le_bytes());
+    put(0x20, &0x40u64.to_le_bytes()); // e_phoff
+    put(0x28, &0u64.to_le_bytes()); // e_shoff
+    for (at, v) in [
+        (0x34, 0x40u16),
+        (0x36, 0x38),
+        (0x38, 1),
+        (0x3A, 0x40),
+        (0x3C, 0),
+    ] {
+        put(at, &v.to_le_bytes());
+    }
+    put(0x40, &1u32.to_le_bytes()); // PT_LOAD
+    put(0x44, &5u32.to_le_bytes()); // p_flags
+    put(0x48, &0x100u64.to_le_bytes()); // p_offset
+    put(0x50, &0x40_0000u64.to_le_bytes()); // p_vaddr
+    put(0x58, &0x40_0000u64.to_le_bytes()); // p_paddr
+    put(0x60, &0x100u64.to_le_bytes()); // p_filesz
+    put(0x68, &0x100u64.to_le_bytes()); // p_memsz
+    put(0x70, &0x4000u64.to_le_bytes()); // p_align
+    f
+}
+
+#[test]
+fn a_conversion_fake_signs_an_unsigned_eboot() {
+    let root = dir("fself-convert");
+    let src = root.join("src");
+    game(&src);
+    let elf = unsigned_eboot();
+    write(&src, "eboot.bin", &elf);
+    let found = inspect(&src).unwrap();
+    assert_eq!(found.unsigned, vec!["eboot.bin".to_string()]);
+    let out = root.join("out");
+    run(request(&src, Format::Folder, &out)).1.unwrap();
+    let signed = std::fs::read(out.join("eboot.bin")).unwrap();
+    assert_eq!(signed[..4], [0x4f, 0x15, 0x3d, 0x1d]);
+    // The segment's bytes are carried; the source is untouched.
+    assert!(signed.windows(0x100).any(|w| w == &elf[0x100..0x200]));
+    assert_eq!(std::fs::read(src.join("eboot.bin")).unwrap(), elf);
+}

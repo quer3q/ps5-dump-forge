@@ -169,6 +169,8 @@ BSD-3-Clause or GPL-2.0), `lz4_flex` 0.14.0 (MIT), `crc32fast` 1.5.3 and `cfg-if
 Apache-2.0), `iced-x86` 1.21.0 (MIT), `lazy_static` 1.5.1 (MIT or Apache-2.0) and `spin` 0.9.9 (MIT).
 Forge's pack format code is written from the documented format and checked against upstream's Python
 tools (`scripts/check-lz4.sh`); no ampr_emu code is compiled into Forge.
+Core's `fself.rs` is a Rust port of the fake-signed SELF layout that ampr-emu-ng's `tools/make_fself.py`
+(GPL-3.0-or-later) writes, checked byte for byte against that script's output.
 
 - Upstream: https://github.com/drakmor/ampr_emu, tag `0.4.2.1`, by drakmor
 - License: GNU General Public License, version 3 or (at your option) any later version.

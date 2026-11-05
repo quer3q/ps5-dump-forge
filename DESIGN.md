@@ -282,6 +282,8 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
     Game facts, param.json and Details, long contents in a scrolling `.fold-box`; then leftovers. Its head
     holds Delete (a trash `.small.danger.icon-only`; none for a NAS's or a peer's game). An
     interrupted edit (`<image>.forge-undo` beside it) adds a `.note-line.warn` (`.interrupted-note`).
+    Any source card (Convert, Edit, Pack) with unsigned executables (`Inspection.unsigned`, not a patch)
+    shows one `.note-line.warn` (`.interrupted-note`) under its summary: a conversion signs them.
   - **Explorer** (`.explorer` card), top to bottom: "Game files" with the file count as a `.tag` (an
     archive, a NAS's or a peer's game adds a note-line: browsed, not edited); the pending bar (below); Up and the
     crumbs (`.explorer-nav`, "Game" / …, the current folder `aria-current`); the toolbar

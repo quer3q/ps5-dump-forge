@@ -689,6 +689,11 @@ const en = {
     emptyTitle: "Choose a game folder, image or archive",
     accepted: "Accepted sources",
     unknownTitle: "Unknown title",
+    unsigned: (n: number) =>
+      plural(n, {
+        one: `${num(n)} executable isn't signed, so the game won't start. Converting the game signs it.`,
+        other: `${num(n)} executables aren't signed, so the game won't start. Converting the game signs them.`,
+      }),
     patch: "Patch",
     additionalContent: "Additional content",
     reading: "Reading the source",
