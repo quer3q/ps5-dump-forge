@@ -338,16 +338,16 @@ fn home_folder() -> Option<PathBuf> {
     std::env::home_dir().map(|h| dunce::simplified(&h).to_path_buf())
 }
 
-/// The picker's volume roots (Windows: drives C: to Z:; ponytail: A: and B: are left out, a
-/// floppy probe can stall) that open and that `list_dir` doesn't refuse. Existence only: each
-/// root is opened, not read, on a thread of its own, 1.5 s for all, so a stale mapped drive or
-/// an optical drive without a disc is left out instead of holding the picker.
+/// The picker's volume roots (Windows: drives A: to Z:) that open and that `list_dir` doesn't
+/// refuse. Existence only: each root is opened, not read, on a thread of its own, 1.5 s for all,
+/// so a drive that stalls (a stale mapped drive, an empty floppy or optical drive) is left out by
+/// the deadline instead of holding the picker.
 // ponytail: a root still stalled at the deadline leaves its thread running.
 #[tauri::command]
 async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
     blocking(app, |_, _| {
         let candidates: Vec<PathBuf> = if cfg!(windows) {
-            ('C'..='Z')
+            ('A'..='Z')
                 .map(|d| PathBuf::from(format!("{d}:\\")))
                 .collect()
         } else {
@@ -359,6 +359,8 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
         for (i, path) in candidates.iter().cloned().enumerate() {
             let tx = tx.clone();
             std::thread::spawn(move || {
+                #[cfg(windows)]
+                quiet_drive_errors();
                 let refused = path.parent().is_some() && folder_refusal(&path).is_some();
                 let _ = tx.send((i, !refused && std::fs::read_dir(&path).is_ok()));
             });
@@ -379,6 +381,19 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
             .collect())
     })
     .await
+}
+
+/// This thread's opens of an empty drive (floppy, card reader, optical) fail at once instead of
+/// asking for a disk (`SEM_FAILCRITICALERRORS`).
+#[cfg(windows)]
+fn quiet_drive_errors() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadErrorMode(new_mode: u32, old_mode: *mut u32) -> i32;
+    }
+    let mut old = 0;
+    // SAFETY: plain Win32 call; `old` is a valid out pointer.
+    unsafe { SetThreadErrorMode(0x0001, &mut old) };
 }
 
 #[tauri::command]

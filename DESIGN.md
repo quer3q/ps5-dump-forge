@@ -342,7 +342,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   note when there are several.
   `.tile.wide` spans the row (Edit's Game facts also add Content ID and the Forge version that made
   the image, both mono; the AMPR tile (LZ4 and zstd alike): the game's runtime with its version as the title
-  (`ampr-emu-ng 0.3.0`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
+  (`ampr-emu-ng 0.3.1`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
   Packed (zstd), Damaged packs or Unpacked as the value; its note
   says when the game doesn't use AMPR and adds what a conversion does to the runtime (installs or replaces with the bundled ampr_emu, or
   "a conversion keeps it" for another build with a version, the title already naming it) and a stale, damaged or missing
@@ -569,7 +569,7 @@ The web build names the product "Dump Forge" (the PS5 tile's name); the desktop 
   `.bad.pick-error` (`role="alert"`) with the reason, and its last crumb stays a button that tries
   again. Without device tabs each saved NAS is a root after the drives (drive icon, its name muted).
   The desktop app always uses this modal (no system dialog; its local roots: the home folder and the
-  volume folders, on Windows each drive C: to Z: that lists); it has no NAS source button (removed by user request: a NAS is browsed on its
+  volume folders, on Windows each drive A: to Z: that lists); it has no NAS source button (removed by user request: a NAS is browsed on its
   tab while it is online).
   While a paired peer or saved NAS is online the same modal, in both builds, leads with device tabs
   (`.seg.pick-tabs`: the view switch's size, wraps; `TabList`, arrow keys): This device, then each online

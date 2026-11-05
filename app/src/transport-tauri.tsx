@@ -9,7 +9,7 @@ import { picker, type Listing, type SavedDevices } from "./Picker";
 import type { DropEvent, Transport, Unlisten } from "./transport";
 
 /** This device's roots in the picker: the home folder and the volume folders there are (Windows:
- * each drive C: to Z:), checked for existence only by `local_roots`; a root lists when opened. */
+ * each drive A: to Z:), checked for existence only by `local_roots`; a root lists when opened. */
 async function localRoots(): Promise<Listing> {
   const [home, vols] = await Promise.all([invoke<string | null>("home_folder"), invoke<string[]>("local_roots")]);
   const paths = home === null ? vols : [home, ...vols];
