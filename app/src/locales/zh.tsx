@@ -111,9 +111,9 @@ const zh: Messages = {
         tagline: "最佳，前提是固件允许",
         cells: ["原生，全速", "减少 30–60%，视游戏而定"],
       },
-      zstd: { tagline: "适用于使用 AMPR 的游戏，需 ampr-emu-ng", cells: ["加载速度最多快 80%", "最多可缩小到游戏的一半"] },
+      zstd: { tagline: "需 ampr-emu-ng", cells: ["加载速度最多快 80%", "最多可缩小到游戏的一半"] },
       lz4: {
-        tagline: "适用于使用 AMPR 的游戏",
+        tagline: "需 ampr-emu-ng 或 ampr_emu",
         cells: ["加载快 30–40%（上游数据）", "约为游戏大小的一半（上游数据）"],
       },
       ffpkg: { tagline: "ShadowMountPlus 推荐格式", cells: ["镜像全速", FLAT] },
@@ -516,7 +516,8 @@ const zh: Messages = {
         : packed
           ? "将 LZ4 包还原为普通文件。"
           : "部分游戏可能无法启动。将游戏资源打包为 LZ4 卷。",
-    noAmprGame: (e) => `该游戏未使用 AMPR，因此无法使用 ${e === "zstd" ? "zstd" : "LZ4"} 包。`,
+    noAmprRuntime: "该游戏没有 AMPR 运行时：Pack 会注入 ampr-emu-ng。",
+    strategy: (s) => `打包策略：${s === "everything" ? "打包除系统文件外的全部文件" : "兼容 LZ4 策略"}。`,
     patch: "补丁包无法打包。",
     additionalContent: "附加内容（没有 eboot.bin）无法打包。",
     unreadable: "无法开始：无法读取源（见“源”）。",
@@ -576,7 +577,7 @@ const zh: Messages = {
       <>
         <h3>zstd</h3>
         <ol>
-          <li>将游戏资源打包为 zstd 卷，输出到文件夹或镜像。仅适用于使用 AMPR 的游戏。</li>
+          <li>将游戏资源打包为 zstd 卷，输出到文件夹或镜像。</li>
           <li><b>快速</b>（zstd 5）速度快；<b>中等</b>（9）和<b>最大</b>（19）体积更小，速度更慢。</li>
           <li>已打包的游戏会显示<b>解包</b>：还原为普通文件。</li>
         </ol>
@@ -597,7 +598,8 @@ const zh: Messages = {
 
         <h3>打包策略</h3>
         <ol>
-          <li>zstd 与 LZ4 打包遵循同一套打包策略，决定哪些文件打包、哪些保持独立。zstd 与 LZ4 只是包的格式。</li>
+          <li><b>打包除系统文件外的全部文件</b>（zstd，以及使用 ampr-emu-ng 的 LZ4）：打包除 eboot.bin、可执行文件与模块、sce_sys、sce_module 和 fakelib 以外的所有文件，其余文件（包括音频和视频）由 ampr-emu-ng 提供。</li>
+          <li><b>兼容 LZ4 策略</b>（使用 ampr_emu 的 LZ4）：配置、媒体等游戏直接读取的文件保持独立。</li>
           <li>仅限打包：在<b>自定义规则（TOML）</b>中，从本设备或其他设备选择 ampr_pack.py 与 Lazy_AMPR 格式的配置文件。</li>
           <li>以最后一条匹配的规则为准；系统文件始终保持独立。规则有误可能导致游戏无法启动。</li>
         </ol>
@@ -623,6 +625,12 @@ const zh: Messages = {
     cantList: "无法打开此文件夹：",
     cancel: "取消",
     chooseFolder: "选择此文件夹",
+    netOnlyHere: "压缩包和 fpkg 只能从本设备打开。",
+    shortcuts: "快捷方式",
+    addShortcut: "添加快捷方式",
+    removeShortcut: "移除快捷方式",
+    shortcutsFull: "最多 9 个快捷方式：请先移除一个。",
+    removeShortcutNamed: (name: string) => `移除快捷方式 ${name}`,
   },
   // common.tsx
   common: {
@@ -769,7 +777,7 @@ const zh: Messages = {
       },
       pkg: { tone: "good", text: "推荐。像原生游戏一样运行，但前提是你的固件允许。" },
       lz4: {
-        text: "资源被打包为 LZ4 卷的游戏文件夹，由内置的 AMPR 模拟器（ampr_emu）在游戏运行时解包。仅适用于使用 AMPR 的游戏。",
+        text: "资源被打包为 LZ4 卷的游戏文件夹，由内置的 AMPR 模拟器（ampr_emu）在游戏运行时解包。",
       },
     },
     innerFfpkg: { text: "PS5 自身的文件系统（UFS2）。" },

@@ -1057,11 +1057,34 @@ button.pick-row .icon { color: var(--muted); }
 /* A file selected for "Choose N files": tinted, ringed, and a check in place of its icon. */
 button.pick-row.chosen { background: var(--view-files-tint); box-shadow: inset 0 0 0 1px var(--view-files-line); }
 button.pick-row.chosen .icon { color: var(--view-files-ink); }
+/* A file core can't read on another device (an archive, a .pkg): greyed (button off), one short note above the list. */
+button.pick-row.off { color: var(--muted); }
+.pick-panel > .note-line { margin: 0 0 10px; }
 .pick-name { flex: 1; min-width: 0; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .pick-name.mono { font-size: 12px; }
 button.pick-row > .muted { font-size: 12px; font-variant-numeric: tabular-nums; }
 .modal p.pick-error { margin: 10px 0 0; font-size: 12.5px; }
 .pick-foot { margin-top: 16px; }
+/* Shortcuts (issue #18): a row of quiet 28px pills (40px on touch) between the crumbs and the list,
+   each a name button and a remove x in one ring; the folder shown's chip in the File explorer blue.
+   Add shortcut / Remove shortcut leads the foot; no more than 9. */
+.pick-shortcuts { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; flex: none; max-height: 72px; overflow-y: auto; }
+.pick-shortcut { display: inline-flex; max-width: 100%; min-width: 0; overflow: hidden; border: 1px solid var(--line-hi); border-radius: 14px; }
+.pick-shortcut.here { background: var(--view-files-tint); border-color: var(--view-files-line); }
+.pick-shortcut > button { height: 28px; margin: 0; border: 0; border-radius: 0; background: transparent; font-size: 12.5px; color: var(--fg-2); }
+.pick-shortcut > button:hover { background: var(--raise); color: var(--fg); }
+.pick-shortcut > button:focus-visible { outline-offset: -2px; }
+.pick-shortcut-go { min-width: 0; padding: 0; padding-inline: 10px 6px; gap: 6px; }
+.pick-shortcut-go .icon, .pick-shortcut-x .icon { width: 14px; height: 14px; color: var(--muted); flex: none; }
+.pick-shortcut-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
+.pick-shortcut-x { width: 28px; padding: 0; justify-content: center; }
+[dir="rtl"] .pick-shortcut-name { direction: ltr; unicode-bidi: isolate; }
+.pick-foot .pick-pin { margin-inline-end: auto; }
+@media (max-width: 599px), (pointer: coarse) {
+  .pick-shortcut { border-radius: 20px; }
+  .pick-shortcut > button { height: 40px; }
+  .pick-shortcut-x { width: 40px; }
+}
 /* The picker's device tabs (This device, each online peer or NAS): the Storage view switch's size. */
 .seg.pick-tabs { display: flex; flex-wrap: wrap; align-self: flex-start; max-width: 100%; padding: 2px; margin-top: 12px; border-radius: 16px; }
 .pick-tabs .seg-opt { display: block; line-height: 26px; height: 26px; padding: 0 12px; font-size: 12.5px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }

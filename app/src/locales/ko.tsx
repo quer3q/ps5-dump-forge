@@ -113,9 +113,9 @@ const ko: Messages = {
         tagline: "펌웨어가 허용한다면 최선",
         cells: ["네이티브, 최고 속도", "게임에 따라 30–60% 작음"],
       },
-      zstd: { tagline: "AMPR를 쓰는 게임용, ampr-emu-ng 사용", cells: ["로딩 최대 80% 빠름", "게임 크기를 최대 절반으로"] },
+      zstd: { tagline: "ampr-emu-ng 사용", cells: ["로딩 최대 80% 빠름", "게임 크기를 최대 절반으로"] },
       lz4: {
-        tagline: "AMPR을 사용하는 게임용",
+        tagline: "ampr-emu-ng 또는 ampr_emu 사용",
         cells: ["로딩 30–40% 빠름(업스트림 수치)", "게임 크기의 약 절반(업스트림 수치)"],
       },
       ffpkg: { tagline: "ShadowMountPlus에 권장", cells: ["이미지 최고 속도", FLAT] },
@@ -521,7 +521,8 @@ const ko: Messages = {
         : packed
           ? "LZ4 팩을 일반 파일로 되돌립니다."
           : "일부 게임은 시작되지 않을 수 있습니다. 게임 에셋을 LZ4 볼륨으로 패킹합니다.",
-    noAmprGame: (e) => `이 게임은 AMPR을 사용하지 않으므로 ${e === "zstd" ? "zstd" : "LZ4"} 팩을 쓸 수 없습니다.`,
+    noAmprRuntime: "이 게임에는 AMPR 런타임이 없습니다: Pack이 ampr-emu-ng를 주입합니다.",
+    strategy: (s) => `패킹 전략: ${s === "everything" ? "시스템 파일만 빼고 모두 패킹" : "호환 LZ4 전략"}.`,
     patch: "패치 패키지는 패킹할 수 없습니다.",
     additionalContent: "추가 콘텐츠(eboot.bin 없음)는 패킹할 수 없습니다.",
     unreadable: "시작할 수 없습니다: 소스를 읽지 못했습니다(‘소스’ 참고).",
@@ -588,7 +589,7 @@ const ko: Messages = {
       <>
         <h3>zstd</h3>
         <ol>
-          <li>게임 에셋을 zstd 볼륨으로 패킹해 폴더나 이미지에 씁니다. AMPR을 사용하는 게임 전용입니다.</li>
+          <li>게임 에셋을 zstd 볼륨으로 패킹해 폴더나 이미지에 씁니다.</li>
           <li><b>빠름</b>(zstd 5)은 빠르고, <b>보통</b>(9)과 <b>최대</b>(19)는 더 작지만 더 느립니다.</li>
           <li>패킹된 게임에는 <b>언패킹</b>이 표시되며, 일반 파일로 되돌립니다.</li>
         </ol>
@@ -609,7 +610,8 @@ const ko: Messages = {
 
         <h3>패킹 전략</h3>
         <ol>
-          <li>zstd와 LZ4 패킹은 같은 패킹 전략을 따르며, 어떤 파일을 팩에 넣고 어떤 파일을 따로 둘지 정합니다. zstd와 LZ4는 팩 형식일 뿐입니다.</li>
+          <li><b>시스템 파일만 빼고 모두 패킹</b> (zstd, 그리고 ampr-emu-ng를 쓰는 LZ4): eboot.bin, 실행 파일과 모듈, sce_sys, sce_module, fakelib을 뺀 모든 파일을 팩에 넣고, 오디오와 비디오를 포함한 나머지는 ampr-emu-ng가 제공합니다.</li>
+          <li><b>호환 LZ4 전략</b> (ampr_emu를 쓰는 LZ4): 설정, 미디어 등 게임이 직접 읽는 파일은 따로 둡니다.</li>
           <li>패킹 전용: <b>사용자 규칙(TOML)</b>에서 ampr_pack.py와 Lazy_AMPR 형식의 프로필을 이 기기나 다른 기기에서 고릅니다.</li>
           <li>마지막으로 일치하는 규칙이 적용되며, 시스템 파일은 항상 따로 남습니다. 규칙이 잘못되면 게임이 시작되지 않을 수 있습니다.</li>
         </ol>
@@ -635,6 +637,12 @@ const ko: Messages = {
     cantList: "이 폴더를 열 수 없습니다:",
     cancel: "취소",
     chooseFolder: "이 폴더 선택",
+    netOnlyHere: "압축 파일과 fpkg는 이 기기에서만 열 수 있습니다.",
+    shortcuts: "바로 가기",
+    addShortcut: "바로 가기 추가",
+    removeShortcut: "바로 가기 삭제",
+    shortcutsFull: "바로 가기는 최대 9개입니다. 먼저 하나를 삭제하세요.",
+    removeShortcutNamed: (name: string) => `바로 가기 ${name} 삭제`,
   },
   // common.tsx
   common: {
@@ -788,7 +796,7 @@ const ko: Messages = {
       },
       pkg: { tone: "good", text: "권장. 네이티브 게임처럼 실행되지만 펌웨어가 허용하는 경우에만 가능합니다." },
       lz4: {
-        text: "에셋을 LZ4 볼륨으로 패킹한 게임 폴더입니다. 게임이 실행되는 동안 번들된 AMPR 에뮬레이터(ampr_emu)가 압축을 풉니다. AMPR을 사용하는 게임 전용입니다.",
+        text: "에셋을 LZ4 볼륨으로 패킹한 게임 폴더입니다. 게임이 실행되는 동안 번들된 AMPR 에뮬레이터(ampr_emu)가 압축을 풉니다.",
       },
     },
     innerFfpkg: { text: "PS5 고유의 파일 시스템(UFS2)입니다." },

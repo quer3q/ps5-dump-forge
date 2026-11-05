@@ -1,15 +1,20 @@
 # Custom pack rules (TOML)
 
-Without a profile Forge uses its built-in packing strategy: root files and the keep-loose list
-(container indexes, configs, media, protected and video folders, Insomniac's containers) stay
-loose, everything else is packed ([LZ4.md](LZ4.md#packing-strategy) has the whole list). A TOML
-profile replaces that strategy with your own rules, for zstd and LZ4 Pack alike. The format is
+Without a profile Forge uses one of two built-in packing strategies. **Pack everything except
+system files** (zstd Pack, and LZ4 Pack with ampr-emu-ng) packs every file except the system files
+(`eboot.bin`, `*.elf`, `*.self`, `*.prx`, `*.sprx`, `sce_sys/`, `sce_module/`, `fakelib*/`, the
+runtime's own files): ampr-emu-ng serves a fully packed game. The **compatibility LZ4 strategy**
+(LZ4 Pack with ampr_emu) keeps root files and the keep-loose list (container indexes, configs,
+media, protected and video folders, Insomniac's containers) loose and packs everything else
+([LZ4.md](LZ4.md#packing-strategy) has the whole list). A TOML profile replaces either strategy
+with your own rules, for zstd and LZ4 Pack alike. The format is
 upstream ampr_emu's `ampr_pack.py` profile, as the Lazy_AMPR community profiles write it:
 <https://github.com/Nazky/Lazy_AMPR/tree/main/toml_profiles>. A commented sample for a generic
 AMPR game: [packing-sample.toml](packing-sample.toml).
 
-**Wrong rules can leave a game that won't start.** Anything the game reads other than through
-AMPR (plain reads, mmap), or before AMPR starts, must stay loose. Keep a copy of the game.
+**Wrong rules can leave a game that won't start.** Anything the game reads before the runtime
+starts must stay loose; with ampr_emu also anything it reads other than through AMPR (plain reads,
+mmap), which ampr-emu-ng serves from the packs. Keep a copy of the game.
 
 ## How to use it
 
@@ -110,7 +115,10 @@ A zstd Pack with a profile logs, for example:
     pack rules: <file>: 7 rules; 4810 files packed, 312 loose; zstd level 5, 256 KiB chunks
     packing strategy: kept loose 312 files, 3.1 GB: the profile 280 files, 3.0 GB, system and runtime files (always_loose) 32 files, 100.0 MB
 
-LZ4 names its level instead (`LZ4 level 0`) and adds `, auto-loose <size>` to the second line.
-Without a profile the first line reads `packing strategy: built-in; ...` and the second counts
-the built-in reasons (root files, keep-loose suffixes with the top 5, protected folders and
-names): a large one there is where a profile could pack more.
+With a profile, LZ4 names its level instead (`LZ4 level 0`) and adds `, auto-loose <size>` to the
+second line.
+Without a profile the first line names the strategy: `packing strategy: pack everything except
+system files; ...` (its second line counting system files and empty files only) or `packing
+strategy: compatibility LZ4 strategy; ...` (its second line counting the reasons: root files,
+keep-loose suffixes with the top 5, protected folders and names, auto-loose: a large one there is
+where a profile could pack more).

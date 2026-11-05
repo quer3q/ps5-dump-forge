@@ -50,7 +50,7 @@ fn fixture(root: &Path) -> BTreeMap<String, Vec<u8>> {
         ("data/empty.bin", Vec::new()),
         (
             "readme.txt",
-            b"a root file: LZ4's guess keeps it loose".to_vec(),
+            b"a root file: packed unless LZ4 runs ampr_emu".to_vec(),
         ),
     ]
     .into_iter()
@@ -102,20 +102,19 @@ fn zstd_pack_to_a_folder_reads_back() {
             .any(|e| e["kind"] == "log" && e["line"].as_str().unwrap().contains(want))
     };
     assert!(
-        logged("wrote zstd packs: 2 files packed into 1 volumes"),
+        logged("wrote zstd packs: 3 files packed into 1 volumes"),
         "{events:?}"
     );
     assert!(
-        stderr.contains("ok: zstd packs: ampr_zstd.index (2 packed files)"),
+        stderr.contains("ok: zstd packs: ampr_zstd.index (3 packed files)"),
         "{stderr}"
     );
 
-    // Loose, as the built-in packing strategy keeps them: eboot, sce_sys, root files, empty files, the
-    // runtime (ZSTD bytes), the indexes and the volume.
+    // Loose, as zstd's packing strategy keeps them: eboot, sce_sys, empty files, the runtime
+    // (ZSTD bytes), the indexes and the volume. Root files are packed.
     for loose in [
         "eboot.bin",
         "sce_sys/param.json",
-        "readme.txt",
         "data/empty.bin",
         "ampr_zstd.index",
         "ampr_zstd-000.pak",
@@ -123,7 +122,7 @@ fn zstd_pack_to_a_folder_reads_back() {
         assert!(out.join(loose).is_file(), "{loose}");
     }
     assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == zstd());
-    let packed = ["data/level1.bin", "data/noise.bin"];
+    let packed = ["data/level1.bin", "data/noise.bin", "readme.txt"];
     for path in packed {
         assert!(!out.join(path).exists(), "{path} is packed");
     }
@@ -158,7 +157,15 @@ fn zstd_pack_to_a_folder_reads_back() {
         3,
         "700 KB of text is three zstd chunks"
     );
-    assert!(record("data/noise.bin").store_only);
+    // No store-only files: noise is packed as raw chunks.
+    let noise = record("data/noise.bin");
+    assert!(!noise.store_only);
+    let first = noise.first_chunk as usize;
+    assert!(
+        index.chunks[first..first + 2]
+            .iter()
+            .all(|c| c.codec == Codec::Raw)
+    );
 
     // ampr_emu.index lists every game file, loose and packed, and the runtime.
     let bytes = std::fs::read(out.join("ampr_emu.index")).unwrap();

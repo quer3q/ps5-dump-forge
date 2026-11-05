@@ -1,9 +1,9 @@
 <p align="center"><img src="app/src-tauri/icons/128x128@2x.png" width="128" alt="PS5 Dump Forge"></p>
 
-Runs on PS5, Windows, macOS and Linux, and can convert and edit any format: game `folders`, `exfat`, `ffpkg`, `ffpfs`,
-`ffpfsc` and `FPKG (pkg)` packages, straight from `zip`, `7z` and `rar` too, with `zstd` and `LZ4` asset packs for AMPR games.
+Runs on PS5, Windows, macOS and Linux, and converts and edits every format: game `folders`, `exfat`, `ffpkg`, `ffpfs`,
+`ffpfsc` and `FPKG (pkg)` packages, straight from `zip`, `7z` and `rar` too, and packs games into `zstd` and `LZ4` asset packs.
 
-Also supports **transfers and on-the-fly conversion** on all platforms, with the interface translated into **11 languages**.
+It also transfers files and converts on the fly between devices on every platform, and its interface is translated into 11 languages.
 
 | Platform | Runs on | You get |
 |---|---|---|
@@ -14,15 +14,13 @@ Also supports **transfers and on-the-fly conversion** on all platforms, with the
 
 ## Features
 
-- **Any source to any target**, streamed straight through: no temporary copy, not even the image inside a `.ffpfsc` or a game in an archive.
-- **Every format ShadowMountPlus mounts**, created and read back, plus the debug FPKG.
+- **Any source to any target**, streamed straight through without a temporary copy, even for the image inside a `.ffpfsc` or a game in an archive.
 - **Archives as sources**: a `.zip`, `.7z` or `.rar` holding one game is browsed, converted or packed like a folder.
-- **Pack**: compress an AMPR game's assets into zstd packs or LZ4 packs, and unpack them again; a packed game converts to any format like any other.
-- **Storage**: a **Library** of your games to convert and edit, and a **File explorer** to rename, move and delete files and folders, on a computer a paired PS5's too, with drag and drop between them.
+- **Pack**: compress a game's assets into zstd packs or LZ4 packs, and unpack them again; a packed game converts to any format like any other.
+- **Storage**: a **Library** of your games to convert and edit, and a **File explorer** to rename, move and delete files and folders (on a computer, a paired PS5's too), with drag and drop between them.
 - **Package installer on the PS5**: lists every `.pkg` on the console's storage and drives and installs one; a `.pkg` on a computer installs on a paired PS5 from Connect, read over the network.
 - **Edit** a dump or image: browse its files, rename, delete, add or replace files and folders, then apply the changes in place or by rebuilding the image; extract files and folders from any source. The game card shows the cover, title, required firmware, backport firmware (`fakelib/`), embedded DLC and `param.json`; leftover `.part` files from interrupted jobs are listed under it when there are any.
-- **Connect, transfers and on-the-fly conversion**: another Forge or a NAS (SMB, FTP, NFS), found by **Autodiscovery**, is a source and an output: convert straight between devices or copy files, nothing staged here.
-- **One-click install on the PS5** from the desktop app: the console downloads the matching Dump Forge release from GitHub and starts it. Any other ELF payload can be sent the same way.
+- **Connect, transfers and on-the-fly conversion**: another Forge or a NAS (SMB, FTP, NFS), found by **Autodiscovery**, is a source and an output. Convert straight between devices or copy files; nothing is staged on this device.
 - **Additional content**: a DLC or an update (no `eboot.bin`, a valid `param.json`) is labelled everywhere, editable, and packs into a debug FPKG.
 - **Fast**: (and furious).
 
@@ -35,43 +33,23 @@ folder.
   folder onto another, streamed over the network: nothing is copied to this device first, a debug FPKG
   included. An image is written as a `.part`, read back over the network to verify it, then renamed into
   place; a folder is written file by file. A `.pkg` or an archive source has to be on this device.
-- **File Transfer** (Connect tab) copies files and folders from any device to a folder on any other, a peer
-  to peer copy relayed through this one. It runs beside a conversion, and every file is checked by its size
+- **File Transfer** (Connect tab) copies files and folders from any device to a folder on any other, a peer-to-peer
+  copy relayed through this one. It runs beside a conversion, and every file is checked by its size
   when it lands. A name already there is replaced only once you confirm.
 - **Phones and browsers**: in the web UI, File Transfer uploads files from the browser's device or downloads one
   to it.
 
 ## Pack: zstd and LZ4 asset packs
 
-Only for games whose `eboot.bin` imports `libSceAmpr` (AMPR titles). The app's **Pack** tab compresses a game's
-assets into packs that a runtime installed at `fakelib/libSceAmpr.sprx` reads back on the console while the game
-runs. Choose the kind of packs:
-
-- **zstd** (the default): zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`) at **Fast** (zstd 5), **Medium** (9)
-  or **Max** (19), into a game folder or straight into an `.ffpkg`, `.exfat` or `.ffpfs`. A zstd packed game gets
-  **Unpack** instead, into a folder, `.ffpkg`, `.exfat`, `.ffpfs` or fpkg.
-- **LZ4**: ampr_emu's LZ4 packs (`ampr_assets.index` + `ampr_assets-NNN.pak`) at **Fast** (LZ4),
-  **Medium** (LZ4 HC 9) or **Max** (LZ4 HC 12), into an LZ4 packed folder or straight into an `.ffpkg`, `.exfat`
-  or `.ffpfs`. The runtime is **ampr-emu-ng** (the default) or the bundled
-  [ampr_emu](https://github.com/drakmor/ampr_emu) 0.4.2.1, an upstream test build with which some games crash
-  when saving. An LZ4 packed game gets **Unpack**.
-
-Both kinds are read by **ampr-emu-ng**, the bundled runtime that Pack installs (an LZ4 Pack with ampr_emu
-excepted). ShadowMount+ can update `fakelib/` and replace it: turn that off for packed games.
+The app's **Pack** tab compresses a game's assets into packs that a runtime installed at
+`fakelib/libSceAmpr.sprx` reads back on the console while the game runs. It works for any game.
 
 ## Storage
 
 The **Storage** tab holds the **Library** (the games found in a folder you choose, or on the PS5's drives)
-and a **File explorer**. Both open a game in Edit or Convert, and the Library deletes one after you confirm. The
-File explorer renames, moves and deletes at once (a delete after you confirm): a delete is permanent (no Trash), a
-move stays on the same drive and replaces a name already there (a folder merged) only once you confirm, and anything an unfinished job uses is refused. On the
-PS5, images ShadowMountPlus has mounted are tagged **Mounted** in the File explorer and can't be edited, renamed,
-moved or deleted, and both views show the console's free space.
+and a **File explorer**. Both open a game in Edit or Convert, and the Library deletes one after you confirm.
 
-On the PS5, the **Package installer** view lists every `.pkg` on the console's storage and drives, with its title,
-version and kind (game, patch, additional content). **Install** (also on a `.pkg` row of the File explorer)
-asks first, then hands the package to the console's installer, which fetches it from Dump Forge: keep Dump Forge
-running until the job ends. If the game is already installed, the console deletes that copy first.
+On the PS5, the **Package installer** view lists every `.pkg` on the console's storage and drives, with its title.
 
 ## Editing a game
 
@@ -80,18 +58,13 @@ The **Edit** tab lists a game's files. Rename or delete them, and add files or f
 A file of the same name is replaced once you confirm. Nothing changes until **Apply**: **Undo** takes back the
 last change (a drop of several files is one) and **Discard all** drops them all. New, replaced and renamed entries are badged.
 
-Before you press Apply the tab says how the changes will go in:
+Before you press Apply, the tab says how the changes will go in:
 
 - **In place**: written straight into the image. `.exfat` and `.ffpkg` take any change that fits the image's
-  free space (an image never grows); `.ffpfs` takes deletes, renames and replacements that fit in the old
-  file's space. The undo file needs room beside the image. An image
-  marked unclean, or a `.ffpkg` not laid out the way Forge writes one, takes Rebuild instead. If the check after writing fails, or the computer or console stops part way, the image is put back
-  from an undo file beside it (`<image>.forge-undo`); one left by a crash is restored on the next edit.
+  free space (an image never grows).
 - **Rebuild**: a new image of the same format is written beside the original from the original plus your
-  changes, verified, then put in its place. It needs free space beside the original for the new image (the tab says how much: for `.ffpfsc` and `.pkg`
-  it can be more than the original's size). It is
-  the only way for `.ffpfsc` and `.pkg`, and the way when the changes don't fit in place.
-- **Changed directly**: a game folder is changed file by file, with no undo file.
+  changes, verified, then put in its place.
+- **Changed directly**: a game folder is changed file by file, with no way to roll back.
 
 ## Connect
 
@@ -106,13 +79,13 @@ on a phone, and File Transfer can upload to or download from the device serving 
 
 In the desktop app, **Dump Forge on PS5** installs Dump Forge on a console in one click: type its address and press
 **Install on PS5**, and the app downloads the release matching it (or the latest) from GitHub and sends it to the
-console's ELF loader, which starts it (the console needs no internet). **Send a payload** sends any other ELF file from the computer the same way. It needs an ELF loader
-that listens on the network (port 9021).
+console's ELF loader, which starts it (the console needs no internet). **Send a payload** sends any other ELF
+file from the computer the same way. Both need an ELF loader that listens on the network (port 9021).
 
 ## Download and run
 
-Every release archive on the Releases page holds the app and the `ps5-dump-forge` command-line tool. Nothing to install; the app writes nothing beyond its own
-WebView data, so keep it in any folder you can write to. At every start the app and the console's page check GitHub
+Every release archive on the Releases page holds the app and the `ps5-dump-forge` command-line tool. There is
+nothing to install, and the app writes only its own WebView data, so keep it in any folder you can write to. At every start the app and the console's page check GitHub
 for a newer release and offer it (on the PS5, **Update** downloads it and hands it to the ELF loader).
 
 ### PS5 (jailbroken, with an ELF loader)

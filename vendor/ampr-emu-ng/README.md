@@ -1,35 +1,27 @@
-# ampr-emu-ng 0.2.0 (release binaries and source)
+# ampr-emu-ng v0.3.0 (release binaries and source)
 
-The release assets of ampr-emu-ng v0.2.0, the AMPR emulation runtime (a Rust hard fork of ampr_emu)
+The unmodified v0.3.0 release of ampr-emu-ng, the AMPR emulation runtime (a Rust hard fork of ampr_emu)
 that reads zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, format in `docs/zstd.md`) and LZ4 packs
-(`AMPRPAK4`), plus the tagged source archive.
+(`AMPRPAK4`), plus the tag's source archive. It serves fully packed games of either format (everything but
+executables, `sce_sys`, `sce_module` and `fakelib`: the "pack everything except system files" strategy).
 
 | | |
 |---|---|
 | Upstream | https://github.com/quer3q/ampr-emu-ng |
-| Release / tag | `v0.2.0` (https://github.com/quer3q/ampr-emu-ng/releases/tag/v0.2.0), commit `fd058e43a49a490a5770374e84aec77648831b6a` |
-| Published | 2026-11-02 |
-| Downloaded | 2026-11-03 |
-| Local changes | none: every file is the release asset byte for byte |
+| Release | https://github.com/quer3q/ampr-emu-ng/releases/tag/v0.3.0 |
+| Tag | `v0.3.0` (tag object `a34443bbaa3b2db49bb4832d8c7bdd39c324461f`, commit `cd0c11efeedec45f2ed01715ff33c00898d40240`) |
+| Local changes | none: the binaries are the release assets byte for byte |
 
 | File here | Upstream asset | Bytes | SHA-256 |
 |---|---|---:|---|
-| `libSceAmpr.sprx` | `libSceAmpr.sprx` (release build) | 678416 | `7acb2173d9691b5dfb94ea4007660920b7250111c5fd7a86c6eb91b763ad3d76` |
-| `libSceAmpr-debug.sprx` | `libSceAmpr-debug.sprx` (debug build) | 747184 | `15fd9e82561f1dcd181126672164aabc8a8954db0d5d79d13641706bfdb31881` |
-| `SHA256SUMS` | `SHA256SUMS` (the two `.sprx` above) | 170 | `6624abfa1f5615f42971abe5177de52b703ccb265ddb1bd5756c2b91568ac633` |
-| `ampr-emu-ng-0.2.0-src.tar.gz` | `archive/refs/tags/v0.2.0.tar.gz` | 433150 | `4736daf60620d3addbce8b4dd806439ff84a733d5d9b1c260b4e52a30653a305` |
+| `libSceAmpr.sprx` | `libSceAmpr.sprx` (release build) | 694192 | `5f39ca8ebe169aa15d8a8ba8ec2f9cd4195f509d55daaf4b4edbfa80b145035c` |
+| `libSceAmpr-debug.sprx` | `libSceAmpr-debug.sprx` (debug build) | 776112 | `d6655263b85ecf27fc12736a9a290088be34f1d184164747160b1d14768dcb6a` |
+| `SHA256SUMS` | `SHA256SUMS` | 170 | `4d105f156e4182ec07e0af70e0b59ec1e28309976450a88606465e08c8216a8b` |
+| `ampr-emu-ng-0.3.0-src.tar.gz` | `git archive --prefix=ampr-emu-ng-0.3.0/ v0.3.0`, gzip -n -9 | 475823 | `1a800b44b22c65cd58bd116450dd0b4cd85ef9474079166e67a8058cbcc7289a` |
 
-Check: `shasum -a 256 -c SHA256SUMS` in this folder. The release binary carries the strings
-`ampr-emu-ng 0.2.0`, `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3`.
-
-Download URLs:
-
-```text
-https://github.com/quer3q/ampr-emu-ng/releases/download/v0.2.0/libSceAmpr.sprx
-https://github.com/quer3q/ampr-emu-ng/releases/download/v0.2.0/libSceAmpr-debug.sprx
-https://github.com/quer3q/ampr-emu-ng/releases/download/v0.2.0/SHA256SUMS
-https://github.com/quer3q/ampr-emu-ng/archive/refs/tags/v0.2.0.tar.gz
-```
+The three release files match the digests GitHub lists for the assets. Check: `shasum -a 256 -c SHA256SUMS`
+in this folder. The release binary carries the strings `ampr-emu-ng 0.3.0`, `AMPRZPK1`, `AMPRPAK4` and
+`AMPRDAT3`.
 
 ## Used by the build
 
@@ -41,17 +33,22 @@ default), and keeps it there and in a zstd-packed game converted as it is. Every
 convert, an LZ4 Unpack, an LZ4 Pack with `ampr_emu`, a zstd Unpack) replaces it with the upstream release
 runtime (`vendor/ampr_emu/`).
 
-The v0.1.0 release's SHA-256 (`69ee3b420c6798fa1b5fb5a9fed75479403bc8a64fe382db301477b1bf705956`)
-stays pinned as `PREVIOUS_ZSTD_SHA256` so games carrying it are still recognized as ampr-emu-ng.
-The local build Forge embedded before v0.1.0 (`vendor/ampr_emu/libSceAmpr-zstd.sprx`, 679712 bytes,
-SHA-256 `0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7`) is no longer in the repo; its
-hash stays pinned (`OLD_ZSTD_SHA256`) so a game carrying it is recognized as ampr-emu-ng (kept or replaced by
-the rule above). Any other build holding the `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng
-too. The debug build is kept for bring-up only and is never embedded.
+Older ampr-emu-ng builds stay pinned in `runtime.rs` so games carrying one are still recognized as
+ampr-emu-ng (kept or replaced by the rule above):
+
+| Pin | Build | SHA-256 |
+|---|---|---|
+| `NG_6972875_SHA256` | local build of commit 6972875 (after v0.2.0, 690736 bytes), embedded before v0.3.0 | `dc7d59d551071dc7ad2002865efe9e54ea0393523d1258ec1ce9fc7389a45bc4` |
+| `V020_ZSTD_SHA256` | v0.2.0 release | `7acb2173d9691b5dfb94ea4007660920b7250111c5fd7a86c6eb91b763ad3d76` |
+| `PREVIOUS_ZSTD_SHA256` | v0.1.0 release | `69ee3b420c6798fa1b5fb5a9fed75479403bc8a64fe382db301477b1bf705956` |
+| `OLD_ZSTD_SHA256` | local build embedded before v0.1.0 (`vendor/ampr_emu/libSceAmpr-zstd.sprx`, 679712 bytes) | `0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7` |
+
+Any other build holding the `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng too. The
+debug build is kept for bring-up only and is never embedded.
 
 ## Corresponding source
 
-`ampr-emu-ng-0.2.0-src.tar.gz` is the tagged source archive, kept as the corresponding source of the
+`ampr-emu-ng-0.3.0-src.tar.gz` is the `v0.3.0` tag's source archive, kept as the corresponding source of the
 binaries so nothing depends on upstream staying online (by user decision: vendored, never downloaded at
 build or check time). `ps5/build-docker.sh` in it builds `libSceAmpr.sprx` and `libSceAmpr-debug.sprx`. The
 exact environment of the release build is not recorded; this is not a claim that the archive reproduces
@@ -67,6 +64,6 @@ the binaries byte for byte.
 ## Upgrading
 
 Replace the files with a newer release's assets, check them with `shasum -a 256 -c SHA256SUMS`, and update
-this README (version, tag commit, dates, sizes, hashes, URLs) and the pin in `runtime.rs` (`ZSTD_SHA256` and
-the size in `pinned_sizes_and_hashes`) together. Keep the replaced release's hash pinned beside
-`OLD_ZSTD_SHA256` so games carrying it are still kept.
+this README (version, tag, dates, sizes, hashes, URLs) and the pin in `runtime.rs` (`ZSTD_SHA256` and the
+size and version in `pinned_sizes_and_hashes`) together. Keep the replaced build's hash pinned with the
+others above so games carrying it are still kept.

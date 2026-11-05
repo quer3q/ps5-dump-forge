@@ -128,7 +128,7 @@ pub(crate) fn encode_chunk(raw: Vec<u8>, level: u8) -> Result<(Codec, Vec<u8>)> 
 
 /// Most compression threads a pack uses, one per chunk of a batch. At most two batches are
 /// held raw (one compressing, the next read meanwhile: 16 MiB) and one encoded (8 MiB), beside
-/// a file's held chunks ([`HELD_BYTES`]) and the zstd contexts, at most 32 x 5.75 MiB (184 MiB
+/// the zstd contexts, at most 32 x 5.75 MiB (184 MiB
 /// at levels 16..=22 with the 256 KiB window; 72 MiB at level 5).
 // ponytail: 32, not every core of a bigger machine, so the contexts stay well inside a job's
 // 512 MiB.
@@ -192,14 +192,14 @@ fn raw_bytes(raw: &[Vec<u8>]) -> u64 {
 
 /// Compresses `file` from offset 0, one chunk per thread of `pool` at a time, while this
 /// thread (the only one that reads `source`) reads the next batch. `consume` sees each batch
-/// in index order with its raw byte count, and returns false to stop.
+/// in index order with its raw byte count.
 fn compressed<S: SourceTree + ?Sized>(
     source: &mut S,
     file: &SourceFile,
     level: u8,
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
-    mut consume: impl FnMut(Vec<(Codec, Vec<u8>)>, u64) -> Result<bool>,
+    mut consume: impl FnMut(Vec<(Codec, Vec<u8>)>, u64) -> Result<()>,
 ) -> Result<()> {
     let width = pool.current_num_threads();
     cancelled(cancel)?;
@@ -223,9 +223,7 @@ fn compressed<S: SourceTree + ?Sized>(
         let encoded = encoded.expect("the scope ran the task")?;
         raw = next?;
         offset += raw_bytes(&raw);
-        if !consume(encoded, bytes)? {
-            break;
-        }
+        consume(encoded, bytes)?;
     }
     Ok(())
 }
@@ -264,19 +262,13 @@ struct Volumes<'a, O: PackOutput> {
     open: Option<(String, O::W, u64)>,
     sizes: Vec<u64>,
     chunks: Vec<Chunk>,
-    /// A measure pass: the output discards everything, and a chunk may be placed by its
-    /// size alone (no bytes).
-    measure: bool,
 }
 
 impl<O: PackOutput> Volumes<'_, O> {
+    /// One encoded chunk, `data` as stored.
     fn put(&mut self, codec: Codec, data: &[u8]) -> Result<()> {
-        self.place(codec, data.len() as u64, data)
-    }
-
-    /// A chunk of `size` stored bytes: `data`, or no bytes at all in a measure pass.
-    fn place(&mut self, codec: Codec, size: u64, data: &[u8]) -> Result<()> {
-        if size == 0 || size > CHUNK_SIZE || (data.len() as u64 != size && !self.measure) {
+        let size = data.len() as u64;
+        if size == 0 || size > CHUNK_SIZE {
             return Err(bad("invalid encoded chunk size"));
         }
         if self
@@ -337,25 +329,9 @@ impl<O: PackOutput> Volumes<'_, O> {
     }
 }
 
-/// Encoded chunks a file's first pass keeps (bytes, plus [`HELD_ENTRY`] each), so a file that
-/// is not store-only is written from them without reading or compressing it again.
-// ponytail: 32 MiB; a file whose first 1% of savings needs more encoded bytes than that
-// (about 3 GiB at 2:1, 300 MiB at 10% savings) is read and compressed twice, as before.
-const HELD_BYTES: usize = 32 << 20;
-/// What one held chunk costs beside its bytes: its entry and its allocation.
-const HELD_ENTRY: usize = 64;
-
-/// True once `stored` bytes so far plus `left` raw bytes (a chunk never stores more than its
-/// raw bytes) make `size` save at least 1%: then the file can't be store-only
-/// (`stored * 100 > size * 99`, exact in u128).
-fn not_store_only(stored: u64, left: u64, size: u64) -> bool {
-    (u128::from(stored) + u128::from(left)) * 100 <= u128::from(size) * 99
-}
-
-/// Packs one file. Pass 1 compresses it and counts the stored bytes for the store-only rule,
-/// holding up to `held_bound` of encoded chunks. Once the file can't be store-only and every
-/// chunk so far is held, the held chunks are written and pass 1 goes on writing: one read and
-/// one compression. Otherwise pass 2 reads it again, raw for a store-only file, else compressed.
+/// Packs one file in one pass: every chunk compressed, a chunk zstd doesn't shrink kept raw.
+/// No file is store-only (the old rule stored a file saving under 1% whole and raw; dropped
+/// on this branch: the chunk rule already keeps incompressible data raw).
 fn pack_file<S: SourceTree + ?Sized, O: PackOutput>(
     source: &mut S,
     file: &SourceFile,
@@ -363,99 +339,33 @@ fn pack_file<S: SourceTree + ?Sized, O: PackOutput>(
     pool: &rayon::ThreadPool,
     volumes: &mut Volumes<O>,
     progress: &mut Progress,
-    held_bound: usize,
 ) -> Result<FileRecord> {
-    let cancel = progress.cancel;
     let first_chunk = volumes.chunks.len() as u32;
-    let (mut stored, mut seen) = (0u64, 0u64);
-    let (mut held, mut held_bytes, mut overflow) = (Vec::new(), 0usize, false);
-    let mut writing = false;
-    compressed(source, file, level, pool, cancel, |encoded, bytes| {
-        if writing {
+    compressed(
+        source,
+        file,
+        level,
+        pool,
+        progress.cancel,
+        |encoded, bytes| {
             for (codec, data) in encoded {
                 volumes.put(codec, &data)?;
             }
-            // Read and compressed once for both passes.
+            // Read and compressed once; progress still counts each file twice (core's estimate).
             progress.add(2 * bytes);
-            return Ok(true);
-        }
-        seen += bytes;
-        progress.add(bytes);
-        for (codec, mut data) in encoded {
-            let size = data.len() as u64;
-            stored += size;
-            if volumes.measure {
-                // Only its size is needed.
-                data = Vec::new();
-            }
-            let cost = data.capacity() + HELD_ENTRY;
-            if overflow || held_bytes + cost > held_bound {
-                overflow = true;
-                held = Vec::new();
-            } else {
-                held_bytes += cost;
-                held.push((codec, size, data));
-            }
-        }
-        if !not_store_only(stored, file.size - seen, file.size) {
-            return Ok(true);
-        }
-        if overflow {
-            // Pass 2 starts over from offset 0; the rest of pass 1 isn't needed.
-            progress.add(file.size - seen);
-            return Ok(false);
-        }
-        for (codec, size, data) in std::mem::take(&mut held) {
-            volumes.place(codec, size, &data)?;
-        }
-        // Pass 2 of the bytes so far is the write just done.
-        progress.add(seen);
-        writing = true;
-        Ok(true)
-    })?;
-    let store_only = !writing && !not_store_only(stored, 0, file.size);
-    if store_only {
-        let width = pool.current_num_threads();
-        let mut offset = 0;
-        while offset < file.size && volumes.measure {
-            // Raw chunks: their sizes follow from the file's, nothing is read.
-            let size = (file.size - offset).min(CHUNK_SIZE);
-            volumes.place(Codec::Raw, size, &[])?;
-            offset += size;
-            progress.add(size);
-        }
-        while offset < file.size {
-            cancelled(cancel)?;
-            let raw = read_batch(source, file, offset, width)?;
-            for data in &raw {
-                volumes.put(Codec::Raw, data)?;
-            }
-            offset += raw_bytes(&raw);
-            progress.add(raw_bytes(&raw));
-        }
-    } else if overflow {
-        compressed(source, file, level, pool, cancel, |encoded, bytes| {
-            for (codec, data) in encoded {
-                volumes.put(codec, &data)?;
-            }
-            progress.add(bytes);
-            Ok(true)
-        })?;
-    }
-    // Else written while compressing, or empty.
+            Ok(())
+        },
+    )?;
     Ok(FileRecord {
         path: file.path.clone(),
         logical_size: file.size,
         first_chunk,
-        store_only,
+        store_only: false,
     })
 }
 
 /// Writes only `files`, which must be entries from `source.files()`. The caller
-/// handles loose files and output cleanup on error. The exact 1% store-only rule needs a file
-/// measured before it is written: a file is written from its first pass while the encoded
-/// chunks fit a bounded buffer, else read again (a store-only file always is), so memory stays
-/// bounded. Compresses on every core (at most [`MAX_THREADS`]).
+/// handles loose files and output cleanup on error. Compresses on every core (at most [`MAX_THREADS`]).
 pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
     source: &mut S,
     files: &[SourceFile],
@@ -474,8 +384,7 @@ pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
 }
 
 /// [`pack`], reporting the raw bytes done so far to `progress` after each batch (each file
-/// counts twice, once per pass; a pass it doesn't need counts as done when it is skipped, so
-/// they end at twice the packed bytes) and stopping with [`Error::Cancelled`]
+/// counts twice, so they end at twice the packed bytes) and stopping with [`Error::Cancelled`]
 /// once `cancel` is set. `threads` compress (0: every core), at most [`MAX_THREADS`], one per
 /// chunk of a batch. The output does not depend on `threads`.
 pub fn pack_with<S: SourceTree + ?Sized, O: PackOutput>(
@@ -487,26 +396,7 @@ pub fn pack_with<S: SourceTree + ?Sized, O: PackOutput>(
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
 ) -> Result<Index> {
-    pack_held(
-        source, files, level, threads, output, progress, cancel, HELD_BYTES,
-    )
-}
-
-/// [`pack_with`] with `held_bound` bytes of encoded chunks held per file (tests try others).
-#[allow(clippy::too_many_arguments)]
-fn pack_held<S: SourceTree + ?Sized, O: PackOutput>(
-    source: &mut S,
-    files: &[SourceFile],
-    level: u8,
-    threads: usize,
-    output: &mut O,
-    progress: &mut dyn FnMut(u64),
-    cancel: &AtomicBool,
-    held_bound: usize,
-) -> Result<Index> {
-    pack_run(
-        source, files, level, threads, output, progress, cancel, held_bound, false,
-    )
+    pack_run(source, files, level, threads, output, progress, cancel)
 }
 
 /// An output that keeps nothing, for [`measure`].
@@ -541,8 +431,7 @@ impl PackOutput for Nowhere {
 }
 
 /// [`pack_with`] without writing: the same compression, every chunk's codec and stored size
-/// recorded, no byte kept. A store-only file's second pass reads nothing (its raw chunks'
-/// sizes follow from its size). The [`Index`] it returns (a fresh archive ID) is what
+/// recorded, no byte kept. The [`Index`] it returns (a fresh archive ID) is what
 /// [`crate::tree::PackedTree`] serves the packs from; memory is the index (16 B per chunk)
 /// and the compression's own.
 pub fn measure<S: SourceTree + ?Sized>(
@@ -561,8 +450,6 @@ pub fn measure<S: SourceTree + ?Sized>(
         &mut Nowhere,
         progress,
         cancel,
-        HELD_BYTES,
-        true,
     )
 }
 
@@ -575,8 +462,6 @@ fn pack_run<S: SourceTree + ?Sized, O: PackOutput>(
     output: &mut O,
     progress: &mut dyn FnMut(u64),
     cancel: &AtomicBool,
-    held_bound: usize,
-    measure: bool,
 ) -> Result<Index> {
     let mut progress = Progress {
         done: 0,
@@ -599,7 +484,6 @@ fn pack_run<S: SourceTree + ?Sized, O: PackOutput>(
         open: None,
         sizes: Vec::new(),
         chunks: Vec::new(),
-        measure,
     };
     let mut records = Vec::with_capacity(ordered.len());
     for file in ordered {
@@ -610,7 +494,6 @@ fn pack_run<S: SourceTree + ?Sized, O: PackOutput>(
             &pool,
             &mut volumes,
             &mut progress,
-            held_bound,
         )?);
     }
     // A cancel during the last batch still stops the pack before its index is written.
@@ -777,7 +660,7 @@ mod tests {
         parts.concat()
     }
 
-    /// Store-only and not, decided early, late and at the 1% edge.
+    /// Compressible, incompressible and mixed files.
     fn sample() -> Vec<(String, Vec<u8>)> {
         let edge = |zeros: usize| {
             let mut last = noise(CHUNK, 9);
@@ -884,7 +767,6 @@ mod tests {
             open: Some((name, writer, at)),
             sizes: Vec::new(),
             chunks: Vec::new(),
-            measure: false,
         };
         volumes.put(Codec::Raw, &[1; 100]).unwrap();
         // Ends exactly at VOLUME_LIMIT: still volume 0.
@@ -933,13 +815,13 @@ mod tests {
             .filter(|(_, bytes)| !bytes.is_empty())
             .collect();
         let total: u64 = files.iter().map(|(_, bytes)| bytes.len() as u64).sum();
-        for held in [0, HELD_BYTES] {
+        {
             let mut source = Mem::new(&files);
             let listed = source.files().to_vec();
             let mut output = Output::default();
             let cancel = AtomicBool::new(false);
             let mut last = 0;
-            let result = pack_held(
+            let result = pack_with(
                 &mut source,
                 &listed,
                 5,
@@ -952,12 +834,11 @@ mod tests {
                     }
                 },
                 &cancel,
-                held,
             );
-            assert!(matches!(result, Err(Error::Cancelled)), "{held} held");
+            assert!(matches!(result, Err(Error::Cancelled)));
             // The flag went up only at the very end.
-            assert_eq!(last, 2 * total, "{held} held");
-            assert!(!output.0.contains_key("ampr_zstd.index"), "{held} held");
+            assert_eq!(last, 2 * total);
+            assert!(!output.0.contains_key("ampr_zstd.index"));
         }
     }
 }

@@ -39,7 +39,8 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --to      folder, exfat, ffpkg (what ShadowMountPlus recommends), ffpfs (PFS image),
             ffpfsc (compressed PFS container, mounted read-only), or pkg = debug FPKG
             (shown as .fpkg in the app; the file still ends in .pkg), or lz4 = an LZ4 packed
-            folder (AMPR asset packs; titles that import libSceAmpr; named like a folder)
+            folder (AMPR asset packs; a title that doesn't import libSceAmpr takes only
+            --lz4-runtime ng; named like a folder)
   --inner   with --to ffpfsc: the image inside (default ffpkg)
   -o        output path (default: named from the title id, next to the source); an
             output's name without its extension must stay within 63 bytes (58 for
@@ -69,7 +70,7 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             pack the assets into zstd packs (ampr_zstd.index + ampr_zstd-NNN.pak, zstd in 256 KiB
             chunks) and install the zstd runtime at fakelib/libSceAmpr.sprx: --to folder,
             exfat, ffpkg, ffpfs or ffpfsc (not pkg; into an image straight in, the packed
-            files read twice), titles that import libSceAmpr; no LZ4 option. The runtime is
+            files read twice), any title (ampr-emu-ng injected); no LZ4 option. The runtime is
             ampr-emu-ng: turn off ShadowMount+'s fakelib update, or it replaces the runtime
   --zstd-level
             with --zstd-pack: zstd level, 1 (fastest) to 22 (smallest), default 5
@@ -80,7 +81,9 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             with --to lz4 or --lz4-pack: 0 fast (default), 3..12 LZ4 HC (9 medium, 12 max)
   --lz4-runtime
             with --to lz4 or --lz4-pack: the runtime installed, ng (ampr-emu-ng, default;
-            reads LZ4 and zstd packs) or ampr_emu (the bundled upstream release build)
+            reads LZ4 and zstd packs; packs everything except system files) or ampr_emu
+            (the bundled upstream release build; the compatibility LZ4 strategy keeps root
+            files, configs, containers and media loose)
   --pack-profile
             with --to lz4, --lz4-pack or --zstd-pack: a TOML pack profile (ampr_pack.py's
             format, as Lazy_AMPR's): its [[rule]]s pick the packed files instead of the

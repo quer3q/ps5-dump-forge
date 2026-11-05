@@ -119,9 +119,9 @@ const ja: Messages = {
         tagline: "ファームウェアが対応していれば最適",
         cells: ["ネイティブ、フルスピード", "ゲームにより 30〜60% 小さい"],
       },
-      zstd: { tagline: "AMPR を使うゲーム向け、ampr-emu-ng で動作", cells: ["読み込みが最大 80% 高速", "ゲームのサイズを最大で半分に"] },
+      zstd: { tagline: "ampr-emu-ng で動作", cells: ["読み込みが最大 80% 高速", "ゲームのサイズを最大で半分に"] },
       lz4: {
-        tagline: "AMPR を使うゲーム向け",
+        tagline: "ampr-emu-ng または ampr_emu で動作",
         cells: ["読み込みが 30〜40% 速い（上流の数値）", "ゲームの約半分のサイズ（上流の数値）"],
       },
       ffpkg: { tagline: "ShadowMountPlus に推奨", cells: ["イメージとしてフルスピード", FLAT] },
@@ -527,7 +527,8 @@ const ja: Messages = {
         : packed
           ? "LZ4 パックを通常のファイルに戻します。"
           : "一部のゲームは起動しない場合があります。ゲームのアセットを LZ4 ボリュームにパックします。",
-    noAmprGame: (e) => `このゲームは AMPR を使用していないため、${e === "zstd" ? "zstd" : "LZ4"} パックは使えません。`,
+    noAmprRuntime: "このゲームには AMPR ランタイムがありません。Pack が ampr-emu-ng を注入します。",
+    strategy: (s) => `パック方式: ${s === "everything" ? "システムファイル以外をすべてパック" : "互換 LZ4 方式"}。`,
     patch: "パッチパッケージはパックできません。",
     additionalContent: "追加コンテンツ（eboot.bin なし）はパックできません。",
     unreadable: "開始できません：ソースを読み込めませんでした（「ソース」を参照）。",
@@ -598,7 +599,7 @@ const ja: Messages = {
       <>
         <h3>zstd</h3>
         <ol>
-          <li>ゲームのアセットを zstd ボリュームにパックし、フォルダーかイメージに書き込みます。AMPR を使うゲーム専用です。</li>
+          <li>ゲームのアセットを zstd ボリュームにパックし、フォルダーかイメージに書き込みます。</li>
           <li><b>高速</b>（zstd 5）は速く、<b>標準</b>（9）と<b>最大</b>（19）はより小さく、より遅くなります。</li>
           <li>パック済みのゲームには<b>アンパック</b>が表示され、通常のファイルに戻せます。</li>
         </ol>
@@ -619,7 +620,8 @@ const ja: Messages = {
 
         <h3>パック戦略</h3>
         <ol>
-          <li>zstd と LZ4 のパックは同じパック戦略に従い、パックするファイルと個別に残すファイルを決めます。zstd と LZ4 はパックの形式にすぎません。</li>
+          <li><b>システムファイル以外をすべてパック</b> (zstd、および ampr-emu-ng を使う LZ4): eboot.bin、実行ファイルとモジュール、sce_sys、sce_module、fakelib 以外のすべてのファイルをパックし、音声や動画を含む残りは ampr-emu-ng が提供します。</li>
+          <li><b>互換 LZ4 方式</b> (ampr_emu を使う LZ4): 設定、メディアなどゲームが直接読むファイルは個別に残します。</li>
           <li>パックのみ：<b>カスタムルール（TOML）</b>で、ampr_pack.py と Lazy_AMPR の形式のプロファイルを、このデバイスまたは別のデバイスから選びます。</li>
           <li>一致した最後のルールが優先され、システムファイルは常に個別に残ります。ルールが誤っていると、ゲームが起動しなくなることがあります。</li>
         </ol>
@@ -645,6 +647,12 @@ const ja: Messages = {
     cantList: "このフォルダーを開けません：",
     cancel: "キャンセル",
     chooseFolder: "このフォルダーを選択",
+    netOnlyHere: "アーカイブと fpkg はこのデバイスからのみ開けます。",
+    shortcuts: "ショートカット",
+    addShortcut: "ショートカットに追加",
+    removeShortcut: "ショートカットを削除",
+    shortcutsFull: "ショートカットは 9 個までです。先に 1 つ削除してください。",
+    removeShortcutNamed: (name: string) => `ショートカット ${name} を削除`,
   },
   // common.tsx
   common: {
@@ -799,7 +807,7 @@ const ja: Messages = {
       },
       pkg: { tone: "good", text: "推奨。ネイティブのゲームと同様に動作します（ファームウェアが対応している場合のみ）。" },
       lz4: {
-        text: "アセットを LZ4 ボリュームにパックしたゲームフォルダーで、ゲームの実行中に同梱の AMPR エミュレーター（ampr_emu）が展開します。AMPR を使うゲーム専用です。",
+        text: "アセットを LZ4 ボリュームにパックしたゲームフォルダーで、ゲームの実行中に同梱の AMPR エミュレーター（ampr_emu）が展開します。",
       },
     },
     innerFfpkg: { text: "PS5 本来のファイルシステム（UFS2）です。" },
