@@ -83,12 +83,12 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, the packing strategy (`rules.rs`, shared by zstd and LZ4 Pack), LZ4 blocks through
   the C liblz4 (`block.rs`, `lz4-sys`: `LZ4_compress_default` at level 0, `LZ4_compress_HC` at 3..=12,
   `LZ4_decompress_safe`), the embedded runtimes (`runtime.rs`: the release runtime `runtime::release()` and ampr-emu-ng
-  v0.3.1 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
+  v0.3.2 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
   once on first use into a `OnceLock`; sizes and SHA-256 pinned (`pinned_sizes_and_hashes`); `classify` also recognizes by pinned
-  SHA-256 the old trace build and the old ng builds (`OLD_ZSTD_SHA256`, `NG_6972875_SHA256`, `V020_ZSTD_SHA256`, `V030_ZSTD_SHA256`, `PREVIOUS_ZSTD_SHA256`), none shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
+  SHA-256 the old trace build and the old ng builds (`OLD_ZSTD_SHA256`, `NG_6972875_SHA256`, `V020_ZSTD_SHA256`, `V030_ZSTD_SHA256`, `V031_ZSTD_SHA256`, `PREVIOUS_ZSTD_SHA256`), none shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
   runtime swap). `tree.rs` is `PackedTree`, the packs served as a `SourceTree` from a `writer::measure` pass.
   `vendor/ampr_emu/`: the upstream 0.4.2.1 release `.sprx` + the source archive. `vendor/ampr-emu-ng/`: the
-  ampr-emu-ng v0.3.1 release (tag commit c9721cc; `libSceAmpr.sprx`, embedded as `runtime::zstd()`;
+  ampr-emu-ng v0.3.2 release (tag commit c221a30; `libSceAmpr.sprx`, embedded as `runtime::zstd()`;
   `libSceAmpr-debug.sprx`, never embedded; `SHA256SUMS`, the release's) + the tag's source archive.
 - `crates/ps5-dump-forge-zstd`: zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak` volumes of at most 4 GiB -
   64 KiB, 256 KiB chunks, one zstd frame or raw each): the format (encode + validating decode), the
@@ -243,7 +243,13 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   serialized or logged; with none given, `archive::password` tries `KNOWN_PASSWORDS` (by user decision: six
   release-site passwords, in order; one fits when the game folder's `param.json` reads, and when that
   file is in the clear, the game's smallest encrypted file too; `Entry::encrypted`) for inspection, naming and
-  jobs alike, and only when none fits is the error "needs a password" (the UI's prompt); CLI `--password-stdin` / `FORGE_ARCHIVE_PASSWORD`. Multi-part: `.partN.rar`, `.rar`+`.rNN`,
+  jobs alike, and only when none fits is the error "needs a password" (the UI's prompt); CLI
+  `--password-stdin` / `FORGE_ARCHIVE_PASSWORD`. Inspecting reads the password check and its files in one
+  pass; the last 4 archives opened keep the password that opened them and their `param.json`
+  (`archive::OPENED`, keyed by every part's stamp, one check per archive at a time, a job's wait
+  cancellable; a typed password is handed only to a request giving it), so naming and a job's start read
+  nothing more (issue #30; an archive with several game folders still reads their `param.json` to find
+  the game). Multi-part: `.partN.rar`, `.rar`+`.rNN`,
   `.7z.NNN`/`.zip.NNN`, split `.z01`…`.zip`; first part only, missing parts named. 7z Deflate is refused: its
   `deflate` feature would switch the workspace's `flate2` to zlib-rs, replacing `.ffpfsc`'s miniz_oxide.
   Memory (by user decision): a job stays within 512 MiB except for the archive's own dictionary,
@@ -275,9 +281,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - zstd packs (`core/src/zstd_pack.rs`, `ps5-dump-forge-zstd`; spec `docs/zstd.md`; named zstd, files on disk AMPR
   style, by user decision: `ampr_zstd.index` (`AMPRZPK1`) + `ampr_zstd-NNN.pak` (`AMPRZDT1`, from 000)): volumes
   (zstd, 256 KiB chunks, a chunk kept raw when zstd doesn't shrink it) that ampr-emu-ng (`runtime::zstd()`,
-  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.3.1 release, size and SHA-256
+  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.3.2 release, size and SHA-256
   pinned (`ZSTD_SHA256`); the user's runtime, which reads LZ4 packs too and serves a fully packed zstd or LZ4 game;
-  the v0.3.0 release (`V030_ZSTD_SHA256`), the local 6972875 build embedded before v0.3.0 (`NG_6972875_SHA256`), the v0.2.0 release
+  the v0.3.1 release (`V031_ZSTD_SHA256`), the v0.3.0 release (`V030_ZSTD_SHA256`), the local 6972875 build embedded before v0.3.0 (`NG_6972875_SHA256`), the v0.2.0 release
   (`V020_ZSTD_SHA256`), the v0.1.0 release (`PREVIOUS_ZSTD_SHA256`) and the old local build (`OLD_ZSTD_SHA256`),
   their files removed, are still recognized by their hashes, so a game carrying it keeps it, and any other build holding the
   `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng too) reads.
@@ -304,7 +310,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   packages that index as it is (vendor patch 0030: `source::lz4_packed` answers true for it). Remove backport is
   refused in the UI for a packed source (`convert.zstdBackport`/`lz4Backport`: unpack first). Its label is
   shown wherever the LZ4 one is: the source card's AMPR tile (`AmprTile`, one for LZ4 and zstd, by user
-  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.3.1`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
+  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.3.2`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
   the value Packed (zstd) / Packed (LZ4) in the green neon look, Damaged packs as before, Unpacked greyed
   `.tile.unpacked`), the Library's **zstd** chip and card/row badge.
   UI (by user decision): the **Pack** tab (`app/src/Pack.tsx`, after Edit; **How pack works** in `PackHelp.tsx`)
@@ -412,8 +418,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (default `loose`), `default_block_size`, the `auto_loose_*` keys; a rule's `action` compress|store|loose,
   `include`/`exclude` (Python `fnmatchcase`: `*` crosses `/`), `block_size`, `layout`, `hot`; the last matching
   rule wins. Every other key (`[groups]`, lanes, dedupe, a typo) is ignored, one log line `pack rules: ignored
-  keys: ...`; `include_from`/`exclude_from` are findings. With a profile only `rules::always_loose` (system and
-  runtime files) overrides it; the keep-loose list doesn't apply (the user's call; Pack warns). zstd: `store` packs
+  keys: ...`; `include_from`/`exclude_from` read pattern files beside the profile (inside its folder, 1 MiB
+  each, 16 MiB and 200,000 patterns in all, 10,000 with a wildcard). With a profile only
+  `rules::always_loose` (system and runtime files) overrides it; the keep-loose list doesn't apply (the
+  user's call; Pack warns). zstd: `store` packs
   as compress (chunks that don't shrink are raw anyway), no auto-loose. Log `pack rules: <file>: N rules; M files
   packed, K loose; ...`.
   `--lz4-unpack` (automatic when the target is lz4) restores the logical assets; the runtime follows the runtime
@@ -1397,7 +1405,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - zstd packs (`docs/zstd.md`): `ampr_zstd.index` (`AMPRZPK1`, version 1, 128-byte header, file, chunk and volume
   records, FNV-1a 64 path hashes, CRC-32 over header and tables) and `ampr_zstd-NNN.pak` volumes (`AMPRZDT1`, from 000; 64-byte header with
   the index's archive id, at most 4 GiB - 64 KiB, at most 4,096); 256 KiB chunks, each one zstd frame or raw
-  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.3.1, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
+  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.3.2, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
 
 ## Commands
 ```sh

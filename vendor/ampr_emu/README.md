@@ -40,7 +40,7 @@ this is not a claim that the binaries can be reproduced from the archive.
 ## ampr-emu-ng
 
 ampr-emu-ng (a Rust hard fork of ampr_emu, GPL-3.0-or-later) reads zstd packs and LZ4 packs. Forge embeds its
-v0.3.1 release build from `vendor/ampr-emu-ng/` (see the README there: files, hashes, when it is installed
+v0.3.2 release build from `vendor/ampr-emu-ng/` (see the README there: files, hashes, when it is installed
 and kept). The local build that used to sit here as `libSceAmpr-zstd.sprx` (679712 bytes, SHA-256
 `0bf2c3e39580d937c20bc320323f6394ff624fb5839fc1160ef27ceea764a4f7`) was removed; `runtime.rs` keeps its
 hash pinned so a game carrying it keeps it.

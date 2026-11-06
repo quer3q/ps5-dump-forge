@@ -1,6 +1,6 @@
-# ampr-emu-ng v0.3.1 (release binaries and source)
+# ampr-emu-ng v0.3.2 (release binaries and source)
 
-The unmodified v0.3.1 release of ampr-emu-ng, the AMPR emulation runtime (a Rust hard fork of ampr_emu)
+The unmodified v0.3.2 release of ampr-emu-ng, the AMPR emulation runtime (a Rust hard fork of ampr_emu)
 that reads zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, format in `docs/zstd.md`) and LZ4 packs
 (`AMPRPAK4`), plus the tag's source archive. It serves fully packed games of either format (everything but
 executables, `sce_sys`, `sce_module` and `fakelib`: the "pack everything except system files" strategy).
@@ -8,19 +8,19 @@ executables, `sce_sys`, `sce_module` and `fakelib`: the "pack everything except 
 | | |
 |---|---|
 | Upstream | https://github.com/quer3q/ampr-emu-ng |
-| Release | https://github.com/quer3q/ampr-emu-ng/releases/tag/v0.3.1 |
-| Tag | `v0.3.1` (tag object `72e4ce91ff1b2bd4f6262d97bb13ca927b4c08a5`, commit `c9721cc645a52913c55ce19bc48fc03c85b9d52e`) |
+| Release | https://github.com/quer3q/ampr-emu-ng/releases/tag/v0.3.2 |
+| Tag | `v0.3.2` (tag object `82cc6285a3a9f73f690137f72dd9068bf881878b`, commit `c221a30672760dbc96739a8815d9c86d1ef8daf8`) |
 | Local changes | none: the binaries are the release assets byte for byte |
 
 | File here | Upstream asset | Bytes | SHA-256 |
 |---|---|---:|---|
-| `libSceAmpr.sprx` | `libSceAmpr.sprx` (release build) | 694256 | `bdd93ce2fbcc2d0986b16d77604cc0770d994ccc124b9051ba9f53aeac39f56f` |
-| `libSceAmpr-debug.sprx` | `libSceAmpr-debug.sprx` (debug build) | 776224 | `b767fdf25b341e0fb52c5c758f58d2d1ac71251312d5eda43d61ec6ae0d57ce9` |
-| `SHA256SUMS` | `SHA256SUMS` | 170 | `9702cde0b5465ff56af905ba452a375ef91662521c984d81e1013239ea909ea1` |
-| `ampr-emu-ng-0.3.1-src.tar.gz` | `git archive --prefix=ampr-emu-ng-0.3.1/ v0.3.1`, gzip -n -9 | 478232 | `d3983124fccc0424a270266d7bfb8ce440e9ff009eb75606f1afc4d3cbc2bb64` |
+| `libSceAmpr.sprx` | `libSceAmpr.sprx` (release build) | 697072 | `9a8f553a68d4e6e6be11bd9f8d5519b5faa68560761881966abff1dd65bf19f7` |
+| `libSceAmpr-debug.sprx` | `libSceAmpr-debug.sprx` (debug build) | 779360 | `5e4f1fcbfb83c9beb06d892dcd807a7f077bd54aa57cefa1d712b6f067ddae5d` |
+| `SHA256SUMS` | `SHA256SUMS` | 170 | `ca1ac59c30c634d17071875006590577866a2e52cb0579a03610912b1ed2da93` |
+| `ampr-emu-ng-0.3.2-src.tar.gz` | `git archive --prefix=ampr-emu-ng-0.3.2/ v0.3.2`, gzip -n -9 | 480958 | `e511cb1f3ff8079510c98f40fa0e8c1ceb282f038e6419514c44fad4e3355769` |
 
 The three release files match the digests GitHub lists for the assets. Check: `shasum -a 256 -c SHA256SUMS`
-in this folder. The release binary carries the strings `ampr-emu-ng 0.3.1`, `AMPRZPK1`, `AMPRPAK4` and
+in this folder. The release binary carries the strings `ampr-emu-ng 0.3.2`, `AMPRZPK1`, `AMPRPAK4` and
 `AMPRDAT3`.
 
 ## Used by the build
@@ -38,6 +38,7 @@ ampr-emu-ng (kept or replaced by the rule above):
 
 | Pin | Build | SHA-256 |
 |---|---|---|
+| `V031_ZSTD_SHA256` | v0.3.1 release (694256 bytes) | `bdd93ce2fbcc2d0986b16d77604cc0770d994ccc124b9051ba9f53aeac39f56f` |
 | `V030_ZSTD_SHA256` | v0.3.0 release (694192 bytes) | `5f39ca8ebe169aa15d8a8ba8ec2f9cd4195f509d55daaf4b4edbfa80b145035c` |
 | `NG_6972875_SHA256` | local build of commit 6972875 (after v0.2.0, 690736 bytes), embedded before v0.3.0 | `dc7d59d551071dc7ad2002865efe9e54ea0393523d1258ec1ce9fc7389a45bc4` |
 | `V020_ZSTD_SHA256` | v0.2.0 release | `7acb2173d9691b5dfb94ea4007660920b7250111c5fd7a86c6eb91b763ad3d76` |
@@ -49,7 +50,7 @@ debug build is kept for bring-up only and is never embedded.
 
 ## Corresponding source
 
-`ampr-emu-ng-0.3.1-src.tar.gz` is the `v0.3.1` tag's source archive, kept as the corresponding source of the
+`ampr-emu-ng-0.3.2-src.tar.gz` is the `v0.3.2` tag's source archive, kept as the corresponding source of the
 binaries so nothing depends on upstream staying online (by user decision: vendored, never downloaded at
 build or check time). `ps5/build-docker.sh` in it builds `libSceAmpr.sprx` and `libSceAmpr-debug.sprx`. The
 exact environment of the release build is not recorded; this is not a claim that the archive reproduces

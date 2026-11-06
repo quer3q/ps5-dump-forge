@@ -55,6 +55,8 @@ problem in it is a preflight finding (`pack rules <file>: ...`) and nothing is w
 | `action` | `compress` | `compress`, `store`, `loose` |
 | `include` | `"**"` | a glob or a list of globs |
 | `exclude` | none | a glob or a list of globs |
+| `include_from` | none | a pattern file or a list of them, added to `include` |
+| `exclude_from` | none | a pattern file or a list of them, added to `exclude` |
 | `block_size` | `default_block_size` | a size, power of two, 16 KiB to 1 MiB |
 | `layout` | `auto` | `auto`, `random`, `mixed`, `streaming` (used as `mixed`) |
 | `hot` | `false` | boolean |
@@ -68,10 +70,18 @@ Ignored, not refused: every other table (`[groups]`, `[runtime]`, ...) and every
 them once, `pack rules: ignored keys: groups.*, pack.workers, rule.group`, so community profiles
 load as they are.
 
+Pattern files (`include_from`, `exclude_from`): each name is relative to the profile's folder,
+`/`-separated, and stays inside it (no absolute path, `.`, `..`, `\` or `:`; on this device no
+link leading out of the folder either), on whatever device the profile is on. One pattern per
+line, trimmed; blank lines and lines starting with `#` are skipped. The patterns are appended to
+the rule's `include` or `exclude`; a rule with `include_from` and no `include` gets no default
+`"**"` unless its files hold no pattern (as upstream). Each file is read in preflight, as the
+profile is: a regular file (not a link) of at most 1 MiB, UTF-8, and 16 MiB and 200,000 patterns
+(10,000 with a wildcard; exact paths are looked up, globs tried per file) for all of one
+profile's files. A missing or bad file is a finding.
+
 Refused (a finding): bad TOML, a bad value for a key above, `rule` that isn't `[[rule]]`, a rule
-with an empty `include` list, and `include_from`/`exclude_from`. The profile may sit on another
-device, so files beside it are not read: paste the list into the rule as `include = [...]` (or
-`exclude = [...]`).
+with no include patterns, and a missing or bad pattern file.
 
 ## Matching
 

@@ -368,22 +368,19 @@ fn archive_tree(
     format: ps5_dump_forge_archive::ArchiveFormat,
 ) -> anyhow::Result<(ArchiveTree, crate::ArchiveFacts)> {
     let cancel = AtomicBool::new(false);
-    let password = crate::archive::password(path, password, &cancel)?;
-    let password = password.as_deref();
-    let listing = ps5_dump_forge_archive::list(path, password)?;
-    let root = crate::library::archive_game_root(path, password, &listing, &cancel)?;
+    // The successful check's listing and game folder (its call of `extra` is the last).
+    let seen = std::cell::RefCell::new(None);
+    let extra = |listing: &ps5_dump_forge_archive::Listing, root: &str| {
+        let keep = archive_reads(&game_files(listing, root));
+        *seen.borrow_mut() = Some((listing.clone(), root.to_string()));
+        keep.into_iter()
+            .map(|(p, n)| (format!("{root}{p}"), n))
+            .collect()
+    };
+    let (_, mut bytes) = crate::archive::password_reading(path, password, &extra, &cancel)?;
+    let (listing, root) = seen.take().context("the archive was not listed")?;
     let under = |p: &str| p.strip_prefix(root.as_str()).map(str::to_string);
-    let files: Vec<SourceFile> = listing
-        .entries
-        .iter()
-        .filter(|e| !e.dir)
-        .filter_map(|e| {
-            Some(SourceFile {
-                path: under(&e.path)?,
-                size: e.size,
-            })
-        })
-        .collect();
+    let files = game_files(&listing, &root);
     let dirs = listing
         .entries
         .iter()
@@ -391,14 +388,6 @@ fn archive_tree(
         .filter_map(|e| under(&e.path))
         .filter(|d| !d.is_empty())
         .collect();
-    let keep = archive_reads(&files);
-    let mut bytes = ps5_dump_forge_archive::read_heads(
-        path,
-        password,
-        &|p, _| under(p).and_then(|p| keep.get(&p).copied()),
-        keep.values().sum(),
-        &cancel,
-    )?;
     let bytes = files
         .iter()
         .filter_map(|f| {
@@ -429,6 +418,18 @@ fn archive_tree(
         },
         facts,
     ))
+}
+
+/// The files of an archive's game folder `root`, paths relative to it.
+fn game_files(listing: &ps5_dump_forge_archive::Listing, root: &str) -> Vec<SourceFile> {
+    (listing.entries.iter().filter(|e| !e.dir))
+        .filter_map(|e| {
+            Some(SourceFile {
+                path: e.path.strip_prefix(root)?.to_string(),
+                size: e.size,
+            })
+        })
+        .collect()
 }
 
 /// The largest `ampr_emu.index` an archive's inspection reads (for [`Lz4Facts::index`]).
@@ -1085,21 +1086,20 @@ fn game_info(source: &Path, password: Option<&str>) -> anyhow::Result<GameInfo> 
 
 /// An archive's `param.json` alone, from its game folder: no other file is unpacked.
 fn archive_info(source: &Path, password: Option<&str>) -> anyhow::Result<GameInfo> {
-    let cancel = AtomicBool::new(false);
-    let password = crate::archive::password(source, password, &cancel)?;
-    let password = password.as_deref();
-    let listing = ps5_dump_forge_archive::list(source, password)?;
-    let root = crate::library::archive_game_root(source, password, &listing, &cancel)?;
-    let param = format!("{root}sce_sys/param.json");
-    let mut files = ps5_dump_forge_archive::read_files(
-        source,
-        password,
-        &|p| p == param,
-        preflight::MAX_PARAM_JSON,
-        &cancel,
-    )?;
-    Ok(files
-        .remove(&param)
+    let param = match crate::archive::cached_param(source, password) {
+        Some((_, param)) => Some(param),
+        None => {
+            let cancel = AtomicBool::new(false);
+            let none = |_: &ps5_dump_forge_archive::Listing, _: &str| BTreeMap::new();
+            let (_, heads) = crate::archive::password_reading(source, password, &none, &cancel)?;
+            // Only the game folder's param.json is read with no extra.
+            heads
+                .into_iter()
+                .find(|(p, _)| p.ends_with("sce_sys/param.json"))
+                .map(|(_, b)| b)
+        }
+    };
+    Ok(param
         .map(|b| preflight::parse_param(&b))
         .unwrap_or_default())
 }
@@ -1197,6 +1197,72 @@ mod tests {
             generated_output(&game, Format::Ffpfsc, &root, &[], None).unwrap(),
             root.join("[Astro Bot]-[PPSA01234].ffpfsc")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stored (method 0) zip of `files`, written by hand.
+    fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let (mut out, mut central) = (Vec::new(), Vec::new());
+        let u16s = |v: &mut Vec<u8>, xs: &[u16]| xs.iter().for_each(|x| v.extend(x.to_le_bytes()));
+        let u32s = |v: &mut Vec<u8>, xs: &[u32]| xs.iter().for_each(|x| v.extend(x.to_le_bytes()));
+        for (name, data) in files {
+            let (at, crc, len) = (out.len() as u32, crc32fast::hash(data), data.len() as u32);
+            u32s(&mut out, &[0x0403_4b50]);
+            u16s(&mut out, &[20, 0, 0, 0, 0x21]);
+            u32s(&mut out, &[crc, len, len]);
+            u16s(&mut out, &[name.len() as u16, 0]);
+            out.extend(name.as_bytes());
+            out.extend(*data);
+            u32s(&mut central, &[0x0201_4b50]);
+            u16s(&mut central, &[20, 20, 0, 0, 0, 0x21]);
+            u32s(&mut central, &[crc, len, len]);
+            u16s(&mut central, &[name.len() as u16, 0, 0, 0, 0]);
+            u32s(&mut central, &[0, at]);
+            central.extend(name.as_bytes());
+        }
+        let (at, len, n) = (out.len() as u32, central.len() as u32, files.len() as u16);
+        out.extend(central);
+        u32s(&mut out, &[0x0605_4b50]);
+        u16s(&mut out, &[0, 0, n, n]);
+        u32s(&mut out, &[len, at]);
+        u16s(&mut out, &[0]);
+        out
+    }
+
+    #[test]
+    fn an_archive_is_decoded_once_for_inspect_naming_and_its_password() {
+        use std::sync::atomic::Ordering;
+        let root = crate::test_dir("archive-read-once");
+        let zip = root.join("game.zip");
+        let param: &[u8] = br#"{"titleId":"PPSA01234","titleName":"Astro Bot"}"#;
+        let mut files = vec![
+            ("GAME/eboot.bin", &b"eboot"[..]),
+            ("GAME/sce_sys/param.json", param),
+        ];
+        std::fs::write(&zip, stored_zip(&files)).unwrap();
+        let passes = || crate::archive::READ_PASSES.load(Ordering::Relaxed);
+        let start = passes();
+        let found = inspect(&zip, None).unwrap();
+        assert_eq!(found.title_id.as_deref(), Some("PPSA01234"));
+        assert_eq!(passes() - start, 1, "inspect decodes once");
+        let named = generated_output(&zip, Format::Exfat, &root, &[], None).unwrap();
+        assert_eq!(named, root.join("[Astro Bot]-[PPSA01234].exfat"));
+        let cancel = AtomicBool::new(false);
+        assert_eq!(crate::archive::password(&zip, None, &cancel).unwrap(), None);
+        assert_eq!(
+            passes() - start,
+            1,
+            "naming and the password read nothing more"
+        );
+        // A changed archive is read again.
+        files.push(("GAME/data.bin", b"more"));
+        std::fs::write(&zip, stored_zip(&files)).unwrap();
+        let file = std::fs::File::options().write(true).open(&zip).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        file.set_modified(later).unwrap();
+        let named = default_output(&zip, Format::Exfat, &root, None).unwrap();
+        assert_eq!(named, root.join("PPSA01234.exfat"));
+        assert_eq!(passes() - start, 2, "a changed archive is decoded again");
         let _ = std::fs::remove_dir_all(&root);
     }
 

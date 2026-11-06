@@ -73,6 +73,7 @@ fn compile(pat: &[char]) -> Vec<Tok> {
             c => out.push(Tok::Lit(c)),
         }
     }
+    out.shrink_to_fit(); // held for the whole job, one per pattern
     out
 }
 
@@ -499,8 +500,10 @@ impl Profile {
 struct Compiled {
     /// Per rule: its include patterns that are not one exact path.
     globs: Vec<Vec<Vec<Tok>>>,
-    /// Per rule: its exclude patterns.
+    /// Per rule: its exclude patterns that are not one exact path.
     excludes: Vec<Vec<Vec<Tok>>>,
+    /// Normalized exact path -> the rules with an exclude naming exactly it.
+    exact_excludes: HashMap<String, Vec<usize>>,
     /// The rules with any `globs`, ascending.
     globbed: Vec<usize>,
     /// Normalized exact path -> the rules (ascending) with an include naming exactly it.
@@ -555,8 +558,15 @@ impl Compiled {
                 c.globbed.push(i);
             }
             c.globs.push(globs);
-            c.excludes
-                .push(r.exclude.iter().map(|p| compile(&norm(p))).collect());
+            let mut excludes = Vec::new();
+            for p in &r.exclude {
+                let toks = compile(&norm(p));
+                match literal(&toks) {
+                    Some(path) => c.exact_excludes.entry(path).or_default().push(i),
+                    None => excludes.push(toks),
+                }
+            }
+            c.excludes.push(excludes);
         }
         c
     }
@@ -566,17 +576,19 @@ impl Compiled {
         let s = norm(path);
         let hit = |ps: &[Vec<Tok>]| ps.iter().any(|t| glob_match_compiled(t, &s));
         let key: String = s.iter().collect();
+        let out = self.exact_excludes.get(&key);
+        let excluded = |r: usize| hit(&self.excludes[r]) || out.is_some_and(|rs| rs.contains(&r));
         let exact = self
             .exact
             .get(&key)
-            .and_then(|rs| rs.iter().rev().copied().find(|&r| !hit(&self.excludes[r])));
+            .and_then(|rs| rs.iter().rev().copied().find(|&r| !excluded(r)));
         // A later rule can only beat it through a glob include.
         self.globbed
             .iter()
             .rev()
             .copied()
             .take_while(|&r| exact.is_none_or(|e| r > e))
-            .find(|&r| hit(&self.globs[r]) && !hit(&self.excludes[r]))
+            .find(|&r| hit(&self.globs[r]) && !excluded(r))
             .or(exact)
     }
 }
@@ -744,6 +756,8 @@ const RULE_KEYS: &[&str] = &[
     "action",
     "include",
     "exclude",
+    "include_from",
+    "exclude_from",
     "block_size",
     "layout",
     "hot",
@@ -751,9 +765,20 @@ const RULE_KEYS: &[&str] = &[
 const DEFAULT_INDEX_NAME: &str = "ampr_assets.index";
 const IO_PAGE: u64 = 65536;
 
+/// Patterns all of a profile's pattern files may hold: a game's file count (the Library's
+/// 200,000 entries), for lists of exact paths, which are looked up in a map.
+const MAX_FILE_PATTERNS: usize = 200_000;
+/// Of those, the ones with a wildcard: each is compiled (32 bytes per character) and tried
+/// against every file, so they bound the job's memory and time.
+// ponytail: 10,000 globs; a pattern index (by literal prefix) would allow more.
+const MAX_FILE_GLOBS: usize = 10_000;
+
 struct Ctx {
     errs: Vec<String>,
     ignored: Vec<String>,
+    /// Patterns read from pattern files so far, and those with a wildcard.
+    from_files: usize,
+    globs_from_files: usize,
 }
 
 impl Ctx {
@@ -879,18 +904,82 @@ impl Ctx {
     }
 }
 
-fn parse_rule(c: &mut Ctx, n: usize, v: &Value, default_shift: u8) -> Option<Rule> {
+/// A pattern file's loader: its name as the profile wrote it -> its text, or why not.
+type ReadPatterns<'a> = dyn FnMut(&str) -> Result<String, String> + 'a;
+
+/// The patterns of a rule's `include_from` / `exclude_from` files, as upstream `ampr_pack.py`
+/// reads them: names relative to the profile's folder (absolute or escaping refused), one
+/// pattern per line, trimmed, blank lines and `#` comments skipped.
+fn pattern_files(c: &mut Ctx, t: &Table, key: &str, read: &mut ReadPatterns) -> Vec<String> {
+    let Some(v) = t.get(key) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in c.strings(&format!("rule.{key}"), v).unwrap_or_default() {
+        let inside = !name.is_empty()
+            && !name.contains(['\\', ':'])
+            && !name.starts_with('/')
+            && name.split('/').all(|p| !["", ".", ".."].contains(&p));
+        if !inside {
+            c.err(format!(
+                "`rule.{key}` entry {name:?} must be a path inside the profile's folder \
+                 (`/`-separated, no `.`, `..`, `\\` or `:`)"
+            ));
+            continue;
+        }
+        if c.from_files > MAX_FILE_PATTERNS {
+            return out;
+        }
+        match read(&name) {
+            Err(e) => c.err(format!("`rule.{key}` file {name}: {e}")),
+            Ok(text) => {
+                // Python's `splitlines`, as upstream: a lone `\r` ends a line too.
+                let lines = text.split(|ch| {
+                    matches!(
+                        ch,
+                        '\n' | '\r' | '\x0b' | '\x0c' | '\x1c'
+                            ..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}'
+                    )
+                });
+                for l in lines.map(str::trim) {
+                    if l.is_empty() || l.starts_with('#') {
+                        continue;
+                    }
+                    let glob = literal(&compile(&norm(l))).is_none();
+                    let over = if c.from_files == MAX_FILE_PATTERNS {
+                        Some(format!("more than {MAX_FILE_PATTERNS} patterns"))
+                    } else if glob && c.globs_from_files == MAX_FILE_GLOBS {
+                        Some(format!(
+                            "more than {MAX_FILE_GLOBS} patterns with a wildcard"
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(over) = over {
+                        c.err(format!("pattern files: {over} in all"));
+                        c.from_files = MAX_FILE_PATTERNS + 1; // past a cap: no file is read again
+                        return out;
+                    }
+                    c.from_files += 1;
+                    c.globs_from_files += usize::from(glob);
+                    out.push(l.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_rule(
+    c: &mut Ctx,
+    n: usize,
+    v: &Value,
+    default_shift: u8,
+    read: &mut ReadPatterns,
+) -> Option<Rule> {
     let t = c.table(&format!("rule[{n}]"), v)?;
     c.keys("rule", t, RULE_KEYS);
     let before = c.errs.len();
-    // The profile may sit on another device: pattern files beside it are not read.
-    for k in ["include_from", "exclude_from"] {
-        if t.contains_key(k) {
-            c.err(format!(
-                "`rule.{k}` is not supported: list the patterns in the rule itself"
-            ));
-        }
-    }
     let mut r = Rule {
         action: Action::Compress,
         include: Vec::new(),
@@ -918,11 +1007,17 @@ fn parse_rule(c: &mut Ctx, n: usize, v: &Value, default_shift: u8) -> Option<Rul
         Some(v) => c.strings(&format!("rule.{key}"), v).unwrap_or_default(),
         None => Vec::new(),
     };
-    r.include = match t.contains_key("include") {
-        true => list(c, "include"),
-        false => vec!["**".into()],
+    let include_from = pattern_files(c, t, "include_from", read);
+    let exclude_from = pattern_files(c, t, "exclude_from", read);
+    r.include = match (t.contains_key("include"), include_from.is_empty()) {
+        (true, _) => list(c, "include"),
+        // upstream: the default `**` only when the pattern files gave no pattern
+        (false, true) => vec!["**".into()],
+        (false, false) => Vec::new(),
     };
     r.exclude = list(c, "exclude");
+    r.include.extend(include_from);
+    r.exclude.extend(exclude_from);
     if r.include.is_empty() && c.errs.len() == before {
         c.err(format!("rule[{n}] has no include patterns"));
     }
@@ -970,12 +1065,19 @@ fn parse_auto_loose(c: &mut Ctx, t: &Table, a: &mut AutoLoose) {
 
 /// Parses and validates a profile's text; every problem is a finding. Keys and tables Forge has
 /// no use for (`[groups]`, `[runtime]`, upstream's tuning, typos) are listed in
-/// [`Profile::ignored`], not refused.
-pub fn parse_profile(text: &str) -> Result<Profile, Vec<String>> {
+/// [`Profile::ignored`], not refused. `read` loads a rule's `include_from` / `exclude_from`
+/// file: it gets the name exactly as the profile wrote it, already checked to be a relative
+/// `/`-separated path inside the profile's folder, and returns the file's text or an error.
+pub fn parse_profile(
+    text: &str,
+    read: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Profile, Vec<String>> {
     let root: Table = text.parse().map_err(|e| vec![format!("{e}")])?;
     let mut c = Ctx {
         errs: Vec::new(),
         ignored: Vec::new(),
+        from_files: 0,
+        globs_from_files: 0,
     };
     let mut p = Profile {
         default_action: Action::Loose,
@@ -1024,7 +1126,7 @@ pub fn parse_profile(text: &str) -> Result<Profile, Vec<String>> {
         Some(Value::Array(a)) => {
             for (n, v) in a.iter().enumerate() {
                 p.rules
-                    .extend(parse_rule(&mut c, n, v, p.default_block_shift));
+                    .extend(parse_rule(&mut c, n, v, p.default_block_shift, read));
             }
         }
         Some(_) => c.err("`rule` must be an array of tables ([[rule]])".into()),
@@ -1188,9 +1290,13 @@ include = [
 ]
 "#;
 
+    fn no_files(name: &str) -> Result<String, String> {
+        Err(format!("no file {name}"))
+    }
+
     #[test]
     fn community_profile_selects_and_broken_ones_are_findings() {
-        let p = parse_profile(ASTROBOT).unwrap();
+        let p = parse_profile(ASTROBOT, &mut no_files).unwrap();
         assert!(!p.auto_loose.enabled);
         for k in ["groups.*", "rule.ayout"] {
             assert!(p.ignored.iter().any(|i| i == k), "{k}: {:?}", p.ignored);
@@ -1214,7 +1320,75 @@ include = [
             "[[rule]]\naction = \"pack\"\n",
             "[pack]\nindex_name = \"other.index\"\n",
         ] {
-            assert!(parse_profile(bad).is_err(), "{bad}");
+            assert!(parse_profile(bad, &mut no_files).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pattern_files_extend_rules_and_bad_names_are_findings() {
+        let files = std::collections::HashMap::from([
+            (
+                "lists/pack.txt",
+                "# packed\r\n\r\n  data/a/**  \r\ndata/b.bin\r\n",
+            ),
+            // a lone `\r` ends a line, as in upstream's `splitlines`
+            ("skip.txt", "data/a/skip.bin\rdata/a/skip2.bin"),
+            ("none.txt", "# nothing\n\n"),
+        ]);
+        let mut read = |name: &str| {
+            files
+                .get(name)
+                .map(|t| t.to_string())
+                .ok_or_else(|| "missing".to_string())
+        };
+        let text = "[pack]\ndefault_action = \"loose\"\n[[rule]]\naction = \"compress\"\n\
+                    include_from = \"lists/pack.txt\"\nexclude_from = [\"skip.txt\"]\n";
+        let p = parse_profile(text, &mut read).unwrap();
+        assert!(p.ignored.is_empty(), "{:?}", p.ignored);
+        let f = |path: &str| select(path, 10, Some(&p));
+        assert_eq!(f("data/a/x.bin"), spec(16, false, false, false));
+        assert_eq!(f("data/b.bin"), spec(16, false, false, false));
+        assert_eq!(f("data/c.bin"), None, "no default `**` with include_from");
+        assert_eq!(f("data/a/skip.bin"), None, "exclude_from");
+        assert_eq!(
+            f("data/a/skip2.bin"),
+            None,
+            "a `\\r`-separated exact exclude"
+        );
+        let p = parse_profile("[[rule]]\ninclude_from = \"none.txt\"\n", &mut read).unwrap();
+        assert_eq!(
+            select("data/c.bin", 10, Some(&p)),
+            spec(16, false, false, false),
+            "no pattern in the files: the default `**`, as upstream"
+        );
+        let capped = |lines: String, why: &str| {
+            let errs = parse_profile("[[rule]]\ninclude_from = \"a\"\n", &mut |_| {
+                Ok(lines.clone())
+            })
+            .unwrap_err();
+            assert!(errs.iter().any(|e| e.contains(why)), "{why}: {errs:?}");
+        };
+        capped(
+            (0..=MAX_FILE_PATTERNS)
+                .map(|i| format!("d/{i}\n"))
+                .collect(),
+            "more than 200000 patterns in all",
+        );
+        capped(
+            (0..=MAX_FILE_GLOBS).map(|i| format!("d/{i}*\n")).collect(),
+            "more than 10000 patterns with a wildcard",
+        );
+        for (bad, why) in [
+            ("/abs", "must be a path inside the profile's folder"),
+            ("../x", "must be a path inside the profile's folder"),
+            ("a/./b", "must be a path inside the profile's folder"),
+            ("a\\\\b", "must be a path inside the profile's folder"),
+            ("C:x", "must be a path inside the profile's folder"),
+            ("gone.txt", "`rule.include_from` file gone.txt: missing"),
+        ] {
+            let text = format!("[[rule]]\ninclude_from = \"{bad}\"\n");
+            let errs = parse_profile(&text, &mut read).unwrap_err();
+            assert!(errs.iter().any(|e| e.contains(why)), "{bad}: {errs:?}");
         }
     }
 }

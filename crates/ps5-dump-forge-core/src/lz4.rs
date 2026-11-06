@@ -761,7 +761,8 @@ const MAX_PROFILE: u64 = 1 << 20;
 /// The request's pack profile, read (here or on another device) and parsed: `None` without one
 /// or when it fails, every problem a finding (`pack rules <file>: ...`); the keys it ignores
 /// are logged once.
-// ponytail: read once here, not guarded as a job path: a change after preflight isn't seen.
+// ponytail: the profile and its pattern files are read once here, not guarded as job paths: a
+// change after preflight isn't seen.
 pub(crate) fn pack_profile(
     req: &ConvertRequest,
     ctx: &Ctx,
@@ -776,7 +777,10 @@ pub(crate) fn pack_profile(
             return None;
         }
     };
-    match ps5_dump_forge_lz4::parse_profile(&text) {
+    let mut total = 0u64;
+    let mut read =
+        |name: &str| read_pattern_file(path, name, &mut total).map_err(|e| format!("{e:#}"));
+    match ps5_dump_forge_lz4::parse_profile(&text, &mut read) {
         Ok(p) => {
             if !p.ignored.is_empty() {
                 ctx.log(format!(
@@ -791,6 +795,48 @@ pub(crate) fn pack_profile(
             None
         }
     }
+}
+
+/// A rule's `include_from` / `exclude_from` file: `name` (relative, `/`-separated, checked by the
+/// parser) in the profile's folder, read as the profile is; locally its folder must not lead
+/// out of the profile's through a link. `total` caps the bytes of all of one profile's files.
+fn read_pattern_file(
+    profile: &std::path::Path,
+    name: &str,
+    total: &mut u64,
+) -> anyhow::Result<String> {
+    let over = || {
+        anyhow::anyhow!(
+            "pattern files: more than {} MiB in all",
+            (16 * MAX_PROFILE) >> 20
+        )
+    };
+    // past the cap nothing more is read
+    if *total > 16 * MAX_PROFILE {
+        return Err(over());
+    }
+    let dir = match profile.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    let path = if crate::net::is_network(dir) {
+        // kept `/`-separated: `Path::join` would add a `\` on Windows
+        let dir = dir.to_string_lossy();
+        std::path::PathBuf::from(format!("{}/{name}", dir.trim_end_matches('/')))
+    } else {
+        let path = dir.join(name);
+        let parent = path.parent().unwrap_or(dir);
+        if !parent.canonicalize()?.starts_with(dir.canonicalize()?) {
+            anyhow::bail!("leads outside the profile's folder");
+        }
+        path
+    };
+    let text = read_profile(&path)?;
+    *total += text.len() as u64;
+    if *total > 16 * MAX_PROFILE {
+        return Err(over());
+    }
+    Ok(text)
 }
 
 /// A profile's text: a regular file (not a link) of at most [`MAX_PROFILE`] bytes, UTF-8.
@@ -1350,6 +1396,29 @@ mod tests {
         fn describe(&self) -> String {
             "sized".into()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_pattern_file_through_a_link_out_of_its_folder_is_refused() {
+        let root = std::env::temp_dir().join(format!("forge-profile-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("rules");
+        std::fs::create_dir_all(dir.join("lists")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::write(dir.join("lists/pack.txt"), "data/*\n").unwrap();
+        std::fs::write(root.join("outside/x.txt"), "*\n").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), dir.join("out")).unwrap();
+        let profile = dir.join("p.toml");
+        let mut total = 0;
+        let read = read_pattern_file(&profile, "lists/pack.txt", &mut total).unwrap();
+        assert_eq!(read, "data/*\n");
+        let e = read_pattern_file(&profile, "out/x.txt", &mut total).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("outside the profile's folder"),
+            "{e:#}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -850,7 +850,7 @@ function AmprTile({ ins }: { ins: Inspection }) {
   );
 }
 
-/** The game's runtime with the version it names itself with: "ampr-emu-ng 0.3.1",
+/** The game's runtime with the version it names itself with: "ampr-emu-ng 0.3.2",
  * "ampr_emu 0.4.2.1", "ampr_emu" (no version readable), the old trace runtime, "No runtime". */
 function runtimeName(f: Lz4Facts): string {
   const t = msg().common;
