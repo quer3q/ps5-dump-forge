@@ -840,7 +840,15 @@ const zh: Messages = {
     savedAs: (name, dir) => `将以 ${name} 保存在 ${dir}`,
     inDir: (dir) => `位于 ${dir}`,
     generate: "根据内容生成名称",
-    generatePattern: "[游戏名称]-[游戏 ID]",
+    nameTemplate: "命名模板",
+    nameTemplateHint:
+      "可用 {id}、{title}、{version}、{kind}；{kind} 仅压缩文件夹为 lz4 或 zstd，超长时只缩短标题。",
+    nameTemplateReset: "默认",
+    templateUnknown: (token: string) => `未知占位符 {${token}}`,
+    templateUnclosed: "模板里有未闭合的 {",
+    templateNested: "占位符里不能再有 {",
+    templateChar: (c: string) => `${c} 不能出现在文件名里`,
+    templateLong: (n: number) => `模板最多 ${n} 字节`,
   },
   // UpdateToast.tsx
   update: {

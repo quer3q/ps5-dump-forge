@@ -1258,7 +1258,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - No settings and no config file: the UI keeps choices in memory until it closes (Connect's pairings,
   above, are the service's own state), except the UI language (`forge.lang` in `localStorage`; unreadable
   storage falls back to the system languages), the pickers' shortcut folders (`forge.shortcuts` in
-  `localStorage`, issue #18; unreadable storage is none) and the PS5 About notification switch (kept by the server
+  `localStorage`, issue #18; unreadable storage is none), the generated-name template
+  (`forge.nameTemplate` in `localStorage`, issue #33; unreadable or invalid storage is the built-in one)
+  and the PS5 About notification switch (kept by the server
   on the console as `notifications.off`; by user decision). Defaults: Convert's target
   fpkg (`.pkg`), exfat for a `.pkg` source (by user decision; picker order Folder, fpkg, exfat, ffpkg, ffpfsc,
   ffpfs), exfat inside a `.ffpfsc` in the UI (by user decision; core and CLI keep ffpkg; under the inner picker
@@ -1281,7 +1283,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   slices), full is opt-in (`full_verify`, `--full-verify`, the "Full verification" switch). A fast `.pkg`
   also samples the builder's own block sweep and `playgo-chunk.crc` check (vendor patch 0012, the job's seed).
 - Updates (by user decision): every start checks GitHub, always on, no setting, nothing stored (`localStorage`
-  keeps only `forge.lang` and `forge.shortcuts`); **Later** hides the toast for the session. `app/src/update.ts` (no runtime imports;
+  keeps only `forge.lang`, `forge.shortcuts` and `forge.nameTemplate`); **Later** hides the toast for the session. `app/src/update.ts` (no runtime imports;
   `scripts/check-update.mjs`): `GET api.github.com/repos/quer3q/ps5-dump-forge/releases/latest` (10 s, no
   cookies, any error = no toast), `tag_name` `vX.Y.Z` newer than the running version (a prerelease is older than
   its release) and the release lists this build's exact asset (`ps5-dump-forge-<v>-<asset>`, `state`
@@ -1371,7 +1373,12 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (longer fails with ENAMETOOLONG), so the stem (the name without its extension) is ≤ 63 bytes for
   `.exfat`/`.ffpkg`/`.ffpfs` and ≤ 58 for `.ffpfsc` (`preflight::stem_limit`); preflight refuses a longer
   typed name. Folders and `.pkg` keep to the same 63 bytes, so every output follows one rule. Generated names
-  are `[GAME_TITLE]-[TITLE_ID]` (`-2`, `-3`, ... when taken); the game title is cut first.
+  follow the built-in template `{id}-{title}-{version}-{kind}` (issue #33): the title id, an English
+  title compacted to letters and digits with each word capitalized, `-v<version>`, and `-lz4`/`-zstd`
+  only for a packed folder (an image never gets one). A user can override the assembly with
+  `forge.nameTemplate`; the field values and the shortening stay fixed. Only the title is shortened
+  (its upper-case letters, then cut at a character boundary); a fixed part that does not fit is an
+  error, never a cut version. `-2`, `-3`, ... when taken.
 - In-place edits (each format crate's `edit.rs`; every overwritten byte journaled; within 128 MiB of
   metadata, else "rebuild it instead"; timestamps of renamed entries unchanged; exFAT and UFS2 write new
   data only into free space and reuse no cluster, block or inode freed within the same plan):

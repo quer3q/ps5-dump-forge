@@ -890,7 +890,15 @@ const fr: Messages = {
     savedAs: (name, dir) => `enregistré sous ${name} dans ${dir}`,
     inDir: (dir) => `dans ${dir}`,
     generate: "Générer un nom d’après le contenu",
-    generatePattern: "[nom du jeu]-[ID du titre]",
+    nameTemplate: "Modèle de nom",
+    nameTemplateHint:
+      "Variables : {id}, {title}, {version}, {kind}. {kind} vaut lz4 ou zstd pour un dossier compressé uniquement ; un nom long raccourcit seulement le titre.",
+    nameTemplateReset: "Par défaut",
+    templateUnknown: (token: string) => `Variable inconnue {${token}}`,
+    templateUnclosed: "Le modèle a une { non fermée",
+    templateNested: "Une variable ne peut pas contenir {",
+    templateChar: (c: string) => `${c} ne peut pas figurer dans un nom de fichier`,
+    templateLong: (n: number) => `Le modèle fait au plus ${n} octets`,
   },
   // UpdateToast.tsx
   update: {

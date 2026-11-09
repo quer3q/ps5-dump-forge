@@ -908,7 +908,15 @@ const es: Messages = {
     savedAs: (name, dir) => `se guarda como ${name} en ${dir}`,
     inDir: (dir) => `en ${dir}`,
     generate: "Generar nombre según el contenido",
-    generatePattern: "[nombre del juego]-[ID del título]",
+    nameTemplate: "Plantilla de nombre",
+    nameTemplateHint:
+      "Marcadores: {id}, {title}, {version}, {kind}. {kind} es lz4 o zstd solo para una carpeta empaquetada; un nombre largo acorta solo el título.",
+    nameTemplateReset: "Predeterminada",
+    templateUnknown: (token: string) => `Marcador desconocido {${token}}`,
+    templateUnclosed: "La plantilla tiene una { sin cerrar",
+    templateNested: "Un marcador no puede contener {",
+    templateChar: (c: string) => `${c} no puede estar en un nombre de archivo`,
+    templateLong: (n: number) => `La plantilla admite como máximo ${n} bytes`,
   },
   // UpdateToast.tsx
   update: {

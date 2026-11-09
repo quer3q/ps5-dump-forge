@@ -37,6 +37,7 @@ import {
   GenerateSwitch,
   KrakenField,
   Lead,
+  NameTemplateField,
   OutputField,
   useOutput,
   DeleteSourceSwitch,
@@ -55,6 +56,8 @@ const startFormat = (path: string, isImage: boolean): Format =>
 export function Convert(props: {
   jobs: Job[];
   dispatch: (a: Action) => void;
+  /** This tab is the one shown: a shared template change renames only here. */
+  active: boolean;
   /** Show the "About" tab. */
   onCompare: () => void;
   /** A game the Library opened here; each new `id` is read once. */
@@ -88,7 +91,7 @@ export function Convert(props: {
   const submittingRef = useRef(false); // state lags a fast double click
   // Only the latest pick may land (an older inspect can finish last).
   const sourceSeq = useRef(0);
-  const out = useOutput(format, props.jobs, setError);
+  const out = useOutput(format, props.jobs, setError, { active: props.active });
   // The target now: one picked while the source was being read is the one to name.
   const formatNow = useRef(format);
   formatNow.current = format;
@@ -367,6 +370,7 @@ export function Convert(props: {
           <VerifySwitch checked={fullVerify} onChange={setFullVerify} />
           {!ins?.patch && <DeleteSourceSwitch checked={deleteSource} onChange={setDeleteSource} nas={isNas(source)} />}
           <OutputField out={out} source={source} prefix="c" />
+          <NameTemplateField out={out} />
           <div className="build-row">
             <GenerateSwitch out={out} source={source} />
             <button

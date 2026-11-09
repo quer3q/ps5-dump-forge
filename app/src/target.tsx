@@ -1,9 +1,17 @@
 // Pieces of a Target card that Convert and Pack share: format copy, the per-format settings,
 // Full verification, and the output name (generated or typed) with its folder.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import { api, errorText, pick, type Format, type InnerFormat, type KrakenLevel } from "./api";
+import {
+  api,
+  errorText,
+  pick,
+  type Format,
+  type InnerFormat,
+  type KrakenLevel,
+  type PackKind,
+} from "./api";
 import {
   basename,
   dirname,
@@ -21,6 +29,13 @@ import {
 import { useConnectState } from "./useConnectState";
 import { msg, useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
+import {
+  DEFAULT_NAME_TEMPLATE,
+  setNameTemplate,
+  templateProblem,
+  useNameTemplate,
+  type TemplateProblem,
+} from "./nameTemplate";
 import { Icon, type IconName } from "./icons";
 import type { Job } from "./jobs";
 
@@ -290,11 +305,17 @@ export function running(jobs: Job[]): string[] {
 }
 
 /**
- * The output of a screen's job: a generated name (`[GAME_NAME]-[TITLE_ID]`, the next free one)
- * or a typed one, in a folder that starts as the source's. `format` is the target this render
- * shows; calls made right after a source or format change pass the new ones themselves.
+ * The output of a screen's job: a generated name (the built-in template or the user's, the
+ * next free one) or a typed one, in a folder that starts as the source's. `format` is the
+ * target this render shows; `opts.pack` marks a packed folder's name, and `opts.active` keeps
+ * a hidden screen from renaming when the shared template changes.
  */
-export function useOutput(format: Format, jobs: Job[], onError: (e: string | null) => void) {
+export function useOutput(
+  format: Format,
+  jobs: Job[],
+  onError: (e: string | null) => void,
+  opts: { pack?: PackKind | null; active?: boolean } = {},
+) {
   useMessages().target; // the typed name's error is in the current language
   const [output, setOutput] = useState("");
   const [generate, setGenerate] = useState(true);
@@ -314,18 +335,48 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string | nul
   // This render's naming, for `opened`, which lands after an inspection began on an older render.
   const live = useRef({ generate, typed: false });
   live.current = { generate, typed: !generate && output !== "" };
+  const template = useNameTemplate();
+  const templateRef = useRef(template);
+  templateRef.current = template;
+  const packRef = useRef<PackKind | null>(opts.pack ?? null);
+  packRef.current = opts.pack ?? null;
+  const formatRef = useRef(format);
+  formatRef.current = format;
+  const jobsRef = useRef(running(jobs));
+  jobsRef.current = running(jobs);
+  // The last source named, and whether a name landed: a template change renames only those.
+  const lastSrc = useRef<string | null>(null);
+  const hasName = useRef(false);
+  const appliedTemplate = useRef(template);
 
-  // Recompute the name, keeping the folder.
-  const refresh = async (src: string, fmt: Format, gen = generate, taken = running(jobs)) => {
+  // Recompute the name, keeping the folder. `pk` is explicit where a call lands after an
+  // inspection that changed the pack kind (`opened`), not the render's older one.
+  const refresh = async (
+    src: string,
+    fmt: Format,
+    gen = generate,
+    taken = jobsRef.current,
+    pk: PackKind | null = packRef.current,
+  ) => {
     const seq = ++outputSeq.current;
+    lastSrc.current = src;
     setFailed(false);
     try {
       const out = gen
-        ? await api.generatedOutput(src, fmt, outDir.current, taken, password.current)
+        ? await api.generatedOutput(
+            src,
+            fmt,
+            outDir.current,
+            taken,
+            password.current,
+            pk,
+            templateRef.current,
+          )
         : await api.defaultOutput(src, fmt, outDir.current, password.current);
       if (seq !== outputSeq.current) return;
       if (out) outDir.current = dirname(out);
       setOutput(out);
+      hasName.current = !!out;
       if (namingError.current) {
         namingError.current = false;
         onError(null);
@@ -333,6 +384,7 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string | nul
     } catch (e) {
       // A locked archive: the screen asks for its password, then `opened` names it.
       if (seq !== outputSeq.current) return;
+      hasName.current = false;
       setFailed(true);
       if (!isPasswordRequired(errorText(e))) {
         namingError.current = true;
@@ -340,6 +392,18 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string | nul
       }
     }
   };
+
+  // The shared template changed: rename the visible screen's source once it has a name.
+  useEffect(() => {
+    if (!(opts.active ?? true)) return;
+    if (appliedTemplate.current === template) return;
+    appliedTemplate.current = template;
+    if (!generate || !lastSrc.current || !hasName.current) return;
+    outputSeq.current++;
+    hasName.current = false;
+    setOutput("");
+    void refresh(lastSrc.current, formatRef.current, true, jobsRef.current, packRef.current);
+  }, [template, opts.active]);
 
   // The name part: a typed name keeps whatever the user typed (separators included, which
   // `checkName` refuses), so the folder is never taken from typing.
@@ -359,27 +423,36 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string | nul
     target,
     choiceSeq,
     /** A new source: its folder, and a fresh name for `fmt` (none yet when null). */
-    reset(src: string, fmt: Format | null) {
+    reset(src: string, fmt: Format | null, pk: PackKind | null = packRef.current) {
       choiceSeq.current++;
       outputSeq.current++;
       password.current = null;
+      lastSrc.current = src;
+      hasName.current = false;
       // A source on another device: the user picks the output folder (core says so until then).
       outDir.current = isNetwork(src) ? "" : dirname(src);
       setOutput("");
       setFailed(false);
-      if (fmt) void refresh(src, fmt);
+      if (fmt) void refresh(src, fmt, generate, jobsRef.current, pk);
     },
     /** The source opened, with `pw` (an archive's password, or null): names use it from now
      * on; a fresh name for `fmt` now (none when null, or when a name was typed meanwhile). */
-    opened(src: string, fmt: Format | null, pw: string | null) {
+    opened(
+      src: string,
+      fmt: Format | null,
+      pw: string | null,
+      pk: PackKind | null = packRef.current,
+    ) {
       password.current = pw;
+      lastSrc.current = src;
       if (!fmt || live.current.typed) return;
       outputSeq.current++;
+      hasName.current = false;
       setOutput("");
-      void refresh(src, fmt, live.current.generate);
+      void refresh(src, fmt, live.current.generate, jobsRef.current, pk);
     },
     /** A new target: a typed name keeps its stem, a generated one is made again. */
-    retarget(src: string | null, fmt: Format) {
+    retarget(src: string | null, fmt: Format, pk: PackKind | null = packRef.current) {
       choiceSeq.current++;
       if (!src) return;
       if (!generate && name) {
@@ -391,15 +464,19 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string | nul
         return;
       }
       // Clear first: the old name has the old extension, and the job waits for a path.
+      lastSrc.current = src;
+      hasName.current = false;
       setOutput("");
-      void refresh(src, fmt);
+      void refresh(src, fmt, generate, jobsRef.current, pk);
     },
-    toggle(src: string | null, gen: boolean) {
+    toggle(src: string | null, gen: boolean, pk: PackKind | null = packRef.current) {
       choiceSeq.current++;
       setGenerate(gen);
       if (!src) return;
+      lastSrc.current = src;
+      hasName.current = false;
       setOutput("");
-      void refresh(src, format, gen);
+      void refresh(src, format, gen, jobsRef.current, pk);
     },
     type(typed: string) {
       outputSeq.current++; // a pending default must not overwrite what the user types
@@ -422,15 +499,16 @@ export function useOutput(format: Format, jobs: Job[], onError: (e: string | nul
         setOutput(joinPath(dir, name));
       } else {
         setOutput("");
-        void refresh(src, format);
+        void refresh(src, format, generate, jobsRef.current, packRef.current);
       }
     },
     /** A job started on `used`: a generated name moves on to the next free one, so the button
      * again starts another job (unless the choices changed since `choice`). */
-    next(src: string, used: string, choice: number) {
+    next(src: string, used: string, choice: number, pk: PackKind | null = packRef.current) {
       if (!generate || choice !== choiceSeq.current) return;
+      hasName.current = false;
       setOutput("");
-      void refresh(src, format, true, [...running(jobs), used]);
+      void refresh(src, format, true, [...jobsRef.current, used], pk);
     },
   };
 }
@@ -508,9 +586,99 @@ export function OutputField(props: { out: Output; source: string | null; prefix:
   );
 }
 
+/** The custom name template, under the generated name (issue #33): core fixes the field
+ * values and shortens only the title; this edits the assembly. */
+export function NameTemplateField(props: { out: Output }) {
+  const t = useMessages().target;
+  const stored = useNameTemplate();
+  const [value, setValue] = useState(stored);
+  const [problem, setProblem] = useState<TemplateProblem | null>(null);
+  const focused = useRef(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const id = "name-template";
+  useEffect(() => {
+    if (!focused.current) setValue(stored);
+  }, [stored]);
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current);
+    },
+    [],
+  );
+  if (!props.out.generate) return null;
+  const change = (v: string) => {
+    setValue(v);
+    const p = templateProblem(v);
+    setProblem(p);
+    if (timer.current) clearTimeout(timer.current);
+    if (p) return;
+    timer.current = setTimeout(() => setNameTemplate(v), 400);
+  };
+  const reset = () => {
+    if (timer.current) clearTimeout(timer.current);
+    setValue(DEFAULT_NAME_TEMPLATE);
+    setProblem(null);
+    setNameTemplate(DEFAULT_NAME_TEMPLATE);
+  };
+  return (
+    <div className="field">
+      <div className="label-row">
+        <label className="label" htmlFor={id}>
+          {t.nameTemplate}
+        </label>
+        <button className="small" type="button" onClick={reset}>
+          {t.nameTemplateReset}
+        </button>
+      </div>
+      <input
+        id={id}
+        className="mono out-input"
+        dir="ltr"
+        spellCheck={false}
+        autoCapitalize="none"
+        autoCorrect="off"
+        value={value}
+        placeholder={DEFAULT_NAME_TEMPLATE}
+        aria-invalid={problem !== null}
+        aria-describedby={problem ? `${id}-error ${id}-hint` : `${id}-hint`}
+        onChange={(e) => change(e.target.value)}
+        onFocus={() => (focused.current = true)}
+        onBlur={() => {
+          focused.current = false;
+          if (!templateProblem(value)) setNameTemplate(value);
+        }}
+      />
+      <p className="muted hint" id={`${id}-hint`}>
+        {t.nameTemplateHint}
+      </p>
+      {problem && (
+        <p className="bad field-error" id={`${id}-error`}>
+          {problemText(problem, t)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function problemText(p: TemplateProblem, t: Messages["target"]): string {
+  switch (p.kind) {
+    case "unknown":
+      return t.templateUnknown(p.token);
+    case "unclosed":
+      return t.templateUnclosed;
+    case "nested":
+      return t.templateNested;
+    case "char":
+      return t.templateChar(p.char);
+    case "long":
+      return t.templateLong(256);
+  }
+}
+
 /** "Generate name based on content", in the build row. */
 export function GenerateSwitch(props: { out: Output; source: string | null }) {
   const t = useMessages().target;
+  const template = useNameTemplate();
   const { out } = props;
   return (
     <label className="switch">
@@ -524,7 +692,11 @@ export function GenerateSwitch(props: { out: Output; source: string | null }) {
       <span>
         {t.generate}
         {/* When on, the Output box shows the generated name itself. */}
-        {!out.generate && <span className="muted mono hint">{t.generatePattern}</span>}
+        {!out.generate && (
+          <span className="muted mono hint" dir="ltr">
+            {template}
+          </span>
+        )}
       </span>
     </label>
   );

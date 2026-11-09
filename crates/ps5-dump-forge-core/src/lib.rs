@@ -113,6 +113,15 @@ pub enum Lz4Runtime {
     AmprEmu,
 }
 
+/// Which pack kind a generated output name marks: only a packed folder's name gets
+/// `-lz4` or `-zstd`; an image's name never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackKind {
+    Lz4,
+    Zstd,
+}
+
 /// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same,
 /// but `Fast` by default. The console reads every compressed level the same way; a slower one
 /// makes a slightly smaller package with every core busy for longer.
@@ -741,12 +750,13 @@ pub fn default_output_with(
 }
 
 /// The output path for `source` in `format` in `dir` (empty: the folder holding the source),
-/// named from the game: `[GAME_NAME]-[TITLE_ID]`, brackets included, e.g.
-/// `[Astro Bot]-[PPSA01234].ffpkg`. Parts the source lacks are left out. Never a path that
-/// exists or is in `taken` (outputs of jobs still running): `-2`, `-3`, ... instead. The name
-/// without its extension stays within what ShadowMountPlus mounts (63 bytes, 58 for a
-/// `.ffpfsc`, and 63 for a folder or `.pkg` too; see `preflight::stem_limit`): the game name is
-/// cut first.
+/// named from the game with the built-in template `{id}-{title}-{version}-{kind}`: the title
+/// id, the English title (only letters and digits, each word capitalized), `v` before the
+/// version, and `-lz4`/`-zstd` for a packed folder only. Parts the source lacks are left out.
+/// Never a path that exists or is in `taken` (outputs of jobs still running): `-2`, `-3`, ...
+/// instead. The name without its extension stays within what ShadowMountPlus mounts (63 bytes,
+/// 58 for a `.ffpfsc`, and 63 for a folder or `.pkg` too; see `preflight::stem_limit`): only
+/// the title is shortened to fit.
 pub fn generated_output(
     source: &Path,
     format: Format,
@@ -768,6 +778,23 @@ pub fn generated_output_with(
     password: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     inspect::generated_output(source, format, dir, taken, password)
+}
+
+/// [`generated_output_with`] with the pack kind a packed folder's name marks and a custom
+/// name template (`None` or blank: the built-in `{id}-{title}-{version}-{kind}`). The
+/// template chooses the order, separators and literal text only: the field values (English
+/// title, `v`-prefixed version, kind only for a folder) and the shortening (the title only)
+/// are fixed.
+pub fn generated_output_with_options(
+    source: &Path,
+    format: Format,
+    dir: &Path,
+    taken: &[PathBuf],
+    password: Option<&str>,
+    pack: Option<PackKind>,
+    template: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    inspect::generated_output_options(source, format, dir, taken, password, pack, template)
 }
 
 /// Leftover `*.part` files/dirs from earlier jobs in `dir`. Never deleted automatically.

@@ -896,7 +896,15 @@ const it: Messages = {
     savedAs: (name, dir) => `salvato come ${name} in ${dir}`,
     inDir: (dir) => `in ${dir}`,
     generate: "Genera il nome in base al contenuto",
-    generatePattern: "[nome del gioco]-[ID titolo]",
+    nameTemplate: "Modello del nome",
+    nameTemplateHint:
+      "Segnaposto: {id}, {title}, {version}, {kind}. {kind} è lz4 o zstd solo per una cartella compressa; un nome lungo accorcia solo il titolo.",
+    nameTemplateReset: "Predefinito",
+    templateUnknown: (token: string) => `Segnaposto sconosciuto {${token}}`,
+    templateUnclosed: "Il modello ha una { non chiusa",
+    templateNested: "Un segnaposto non può contenere {",
+    templateChar: (c: string) => `${c} non può stare in un nome di file`,
+    templateLong: (n: number) => `Il modello è al massimo ${n} byte`,
   },
   // UpdateToast.tsx
   update: {

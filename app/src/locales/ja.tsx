@@ -873,7 +873,15 @@ const ja: Messages = {
     savedAs: (name, dir) => `${dir} に ${name} として保存`,
     inDir: (dir) => `保存先：${dir}`,
     generate: "内容から名前を生成",
-    generatePattern: "[ゲーム名]-[タイトル ID]",
+    nameTemplate: "名前テンプレート",
+    nameTemplateHint:
+      "使用できるのは {id}、{title}、{version}、{kind} です。{kind} はパックしたフォルダーだけが lz4 / zstd になり、長い名前はタイトルだけを短縮します。",
+    nameTemplateReset: "デフォルト",
+    templateUnknown: (token: string) => `不明なプレースホルダー {${token}}`,
+    templateUnclosed: "テンプレートの { が閉じられていません",
+    templateNested: "プレースホルダーに { は使えません",
+    templateChar: (c: string) => `${c} はファイル名に使えません`,
+    templateLong: (n: number) => `テンプレートは最大 ${n} バイトです`,
   },
   // UpdateToast.tsx
   update: {

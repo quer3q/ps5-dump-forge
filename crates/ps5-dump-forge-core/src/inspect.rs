@@ -15,7 +15,7 @@ use unicode_normalization::{UnicodeNormalization, is_nfc};
 use crate::convert::{Kind, Nested, open_source, percent};
 use crate::preflight::{self, GameInfo, listing};
 use crate::scan::JunkFiltered;
-use crate::{Format, InspectFile, Inspection, Lz4Facts, Lz4Packed};
+use crate::{Format, InspectFile, Inspection, Lz4Facts, Lz4Packed, PackKind};
 use ps5_dump_forge_lz4::reader;
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 use serde_json::Value;
@@ -744,25 +744,6 @@ fn bcd_version(word: &str) -> String {
 /// bytes (APFS) and 255 UTF-16 units after decomposition (HFS+, exFAT, NTFS).
 const MAX_NAME_BYTES: usize = 100;
 
-/// `name` as part of a file name any destination accepts: letters, digits, spaces and
-/// `-_.,'()&+!` kept, anything else (separators, `:*?"<>|`, ™, ®) dropped, spaces
-/// collapsed, NFC, at most [`MAX_NAME_BYTES`], no dot or space at either end.
-fn file_safe(name: &str) -> String {
-    let kept: String = name
-        .nfc()
-        .filter(|c| c.is_alphanumeric() || " -_.,'()&+!".contains(*c))
-        .collect();
-    let words = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut cut = String::new();
-    for c in words.chars() {
-        if cut.len() + c.len_utf8() > MAX_NAME_BYTES {
-            break;
-        }
-        cut.push(c);
-    }
-    cut.trim_matches(|c| c == '.' || c == ' ').to_string()
-}
-
 /// Windows reads `CON.anything` as the console device, whatever the extension; likewise
 /// `COM0`-`COM9`, `LPT0`-`LPT9` and their superscript `¹²³` forms.
 fn is_reserved_on_windows(name: &str) -> bool {
@@ -861,19 +842,42 @@ fn content_id(cnt: &[u8]) -> Option<String> {
     (!id.is_empty() && id.chars().all(|c| c.is_ascii_graphic())).then_some(id)
 }
 
-/// `[GAME_NAME]-[TITLE_ID]` from the source, brackets included, e.g.
-/// `[Astro Bot]-[PPSA01234].ffpkg`; parts it lacks are left out, and with neither it is
-/// [`default_output`]'s name. An empty `dir` is the folder holding the source. `password`: an
-/// archive's (else its listing or `param.json` may be locked).
-/// ponytail: the source is opened again (a folder scanned, a package's image walked) for
-/// every generated name, each format or folder change; metadata only, cache it per source
-/// if a big game makes that slow.
+/// The built-in generated name template: the title id, the English title, the version with
+/// its `v`, and the pack kind (a packed folder only).
+pub(crate) const DEFAULT_NAME_TEMPLATE: &str = "{id}-{title}-{version}-{kind}";
+
+/// The longest custom template kept, in UTF-8 bytes.
+const MAX_TEMPLATE_BYTES: usize = 256;
+
+/// [`generated_output_options`] with the built-in template and no pack kind.
 pub(crate) fn generated_output(
     source: &Path,
     format: Format,
     dir: &Path,
     taken: &[PathBuf],
     password: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    generated_output_options(source, format, dir, taken, password, None, None)
+}
+
+/// The generated name: the game's fixed fields (`id`, English `title`, `v`-prefixed
+/// `version`, and `kind` for a packed folder only) folded through `template` (the built-in
+/// one when `None` or blank). Only the title shrinks to fit `preflight::stem_limit(format)`;
+/// the id, version, kind and the template's literal text are kept whole. An empty `dir` is the
+/// folder holding the source. `password`: an archive's (else its listing or `param.json` may be
+/// locked).
+///
+/// ponytail: the source is opened again (a folder scanned, a package's image walked) for
+/// every generated name, each format or folder change; metadata only, cache it per source
+/// if a big game makes that slow.
+pub(crate) fn generated_output_options(
+    source: &Path,
+    format: Format,
+    dir: &Path,
+    taken: &[PathBuf],
+    password: Option<&str>,
+    pack: Option<PackKind>,
+    template: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     let dir = &output_dir(source, dir)?;
     let info = match Kind::of(source)? {
@@ -883,14 +887,13 @@ pub(crate) fn generated_output(
             preflight::input(tree.as_mut()).0
         }
     };
-    let parts = NameParts::of(&info);
-    let mut stem = match parts.stem(usize::MAX) {
-        Some(stem) => stem,
-        None => default_stem(source, info.title_id)?,
-    };
-    if is_reserved_on_windows(&stem) {
-        stem.insert(0, '_');
-    }
+    let parts = NameParts::of(&info, format, pack);
+    let template = template
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(DEFAULT_NAME_TEMPLATE);
+    let tokens = parse_name_template(template)?;
+    let fallback = default_stem(source, info.title_id.clone()).ok();
+    let max = preflight::stem_limit(format);
     // The name can't be edited while it is generated, so it never names something that
     // exists or that a running job (`taken`) will publish: a rebuild becomes `-2`, `-3`, ...
     // (publishing still never replaces, should something take the name meanwhile).
@@ -900,70 +903,413 @@ pub(crate) fn generated_output(
         } else {
             format!("-{n}")
         };
-        // Within the name limit (what ShadowMountPlus can mount): the game name is cut first,
-        // the title id kept, then the suffix.
-        let max = preflight::stem_limit(format);
-        let stem = if stem.len() + suffix.len() > max {
-            let room = max.saturating_sub(suffix.len());
-            match &parts.name {
-                Some(_) => parts.stem(room).unwrap_or_default(),
-                None => cut(&stem, room).to_string(),
-            }
-        } else {
-            stem.clone()
-        };
+        // Within the name limit (what ShadowMountPlus can mount and the suffix): the title is
+        // cut first; the title id, version, kind and literal text stay.
+        let room = max.saturating_sub(suffix.len());
+        let mut stem = fit_name(&tokens, &parts, room)?;
+        if stem.is_empty() {
+            let Some(fallback) = &fallback else {
+                bail!("cannot name an output for {}", source.display());
+            };
+            stem = cut(fallback, room).to_string();
+        }
         let path = with_extension(dir, &format!("{stem}{suffix}"), format);
         if !taken.contains(&path) && !crate::net::exists(&path) {
             return Ok(path);
         }
     }
     bail!(
-        "{stem} and its -2 to -{MAX_SUFFIX} variants are all taken in {}",
+        "{template} and its -2 to -{MAX_SUFFIX} variants are all taken in {}",
         dir.display()
     )
 }
 
-/// The parts of a generated name: the game's title made file-safe (`None` when nothing of it
-/// is left) and the title id in brackets.
+/// The game's fixed fields for a generated name.
 struct NameParts {
-    name: Option<String>,
     id: Option<String>,
+    /// The English title, compacted (`None` when there is no English title).
+    title: Option<String>,
+    /// The abbreviation of the English title, for a name over its limit.
+    abbreviated: String,
+    /// `contentVersion` with its `v`; never shortened here.
+    version: Option<String>,
+    /// `lz4`/`zstd` for a packed folder only.
+    kind: Option<String>,
 }
 
 impl NameParts {
-    fn of(info: &GameInfo) -> Self {
+    fn of(info: &GameInfo, format: Format, pack: Option<PackKind>) -> Self {
+        let english = info.param_json.as_ref().and_then(english_title_name);
+        let title = english.as_deref().and_then(compact_title);
+        let abbreviated = english.as_deref().map(abbreviate_title).unwrap_or_default();
+        let version = info
+            .param_json
+            .as_ref()
+            .and_then(|p| p.get("contentVersion"))
+            .and_then(Value::as_str)
+            .and_then(clean_version);
         Self {
-            name: info
-                .param_json
-                .as_ref()
-                .and_then(title_name)
-                .map(|n| file_safe(&n))
-                .filter(|n| !n.is_empty()),
-            id: info.title_id.as_ref().map(|id| format!("[{id}]")),
+            id: info.title_id.clone(),
+            title,
+            abbreviated,
+            version,
+            kind: kind_value(format, pack).map(str::to_string),
         }
-    }
-
-    /// `[GAME_NAME]-[TITLE_ID]` within `max` bytes, the name cut first ([`stem_with`]); `None`
-    /// with neither part.
-    fn stem(&self, max: usize) -> Option<String> {
-        (self.name.is_some() || self.id.is_some())
-            .then(|| stem_with(self.name.as_deref(), self.id.as_deref().unwrap_or(""), max))
     }
 }
 
-/// `[name]-` before `id` (bracketed, or empty), the name cut to keep the whole within `max`
-/// bytes and left out if nothing of it fits.
-fn stem_with(name: Option<&str>, id: &str, max: usize) -> String {
-    let sep = usize::from(!id.is_empty());
-    let room = max.saturating_sub(id.len() + sep + 2);
-    let name = name
-        .map(|n| cut(n, room).trim_end_matches(['.', ' ']))
-        .filter(|n| !n.is_empty());
-    match name {
-        Some(n) if id.is_empty() => format!("[{n}]"),
-        Some(n) => format!("[{n}]-{id}"),
-        None => cut(id, max).to_string(),
+/// The English title in `localizedParameters` (`en-US`, then `en-GB`, then any `en*`), else
+/// `None`: a generated name's title is English or left out, never the default language.
+fn english_title_name(param: &Value) -> Option<String> {
+    let localized = param.get("localizedParameters")?.as_object()?;
+    let name = |v: &Value| v.get("titleName")?.as_str().map(str::to_string);
+    localized
+        .get("en-US")
+        .and_then(name)
+        .or_else(|| localized.get("en-GB").and_then(name))
+        .or_else(|| {
+            localized.iter().find_map(|(k, v)| {
+                if k.split('-')
+                    .next()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("en"))
+                {
+                    name(v)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+/// The English title as a name token: NFC, letters and digits only, each word's first
+/// character upper-cased and the rest lower-cased, merged; at most [`MAX_NAME_BYTES`].
+fn compact_title(title: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut word = String::new();
+    fn flush(word: &mut String, out: &mut String) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            for c in chars {
+                out.extend(c.to_lowercase());
+            }
+        }
+        word.clear();
     }
+    for c in title.nfc() {
+        if c.is_alphanumeric() {
+            word.push(c);
+        } else {
+            flush(&mut word, &mut out);
+        }
+    }
+    flush(&mut word, &mut out);
+    let mut cut = String::new();
+    for c in out.chars() {
+        if cut.len() + c.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        cut.push(c);
+    }
+    (!cut.is_empty()).then_some(cut)
+}
+
+/// The short form of `title` for a name over its limit: its upper-case letters in order
+/// (`GTA V` -> `GTAV`); with none, each word's first letter upper-cased (`the last of us`
+/// -> `TLOU`).
+fn abbreviate_title(title: &str) -> String {
+    let upper: String = title.nfc().filter(|c| c.is_uppercase()).collect();
+    if !upper.is_empty() {
+        return upper;
+    }
+    let mut out = String::new();
+    let mut start = true;
+    for c in title.nfc() {
+        if c.is_alphanumeric() {
+            if start {
+                out.extend(c.to_uppercase());
+            }
+            start = false;
+        } else {
+            start = true;
+        }
+    }
+    out
+}
+
+/// `contentVersion` as the version token: NFC and file-safe characters, one `v` prefix, no
+/// length limit (a name that does not fit fails instead of shortening it).
+fn clean_version(version: &str) -> Option<String> {
+    let cleaned: String = version
+        .nfc()
+        .filter(|c| c.is_alphanumeric() || " -_.,'()+!".contains(*c))
+        .collect();
+    let cleaned = cleaned.trim();
+    let cleaned = cleaned.trim_start_matches(['v', 'V']);
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| format!("v{cleaned}"))
+}
+
+/// The pack kind a generated name marks: a packed folder only (`Format::Lz4`, or a folder
+/// with a pack); an image never gets one.
+fn kind_value(format: Format, pack: Option<PackKind>) -> Option<&'static str> {
+    if preflight::extension(format).is_some() {
+        return None;
+    }
+    match format {
+        Format::Lz4 => Some("lz4"),
+        _ => pack.map(|p| match p {
+            PackKind::Lz4 => "lz4",
+            PackKind::Zstd => "zstd",
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameField {
+    Id,
+    Title,
+    Version,
+    Kind,
+}
+
+#[derive(Clone, Debug)]
+enum NameToken {
+    Literal(String),
+    Field(NameField),
+}
+
+/// `template` as literal/field tokens; blank is the built-in template. Literal text must be
+/// file-safe; `[]()` are literal, `{}` is the field syntax.
+fn parse_name_template(template: &str) -> anyhow::Result<Vec<NameToken>> {
+    let template = template.trim();
+    if template.is_empty() {
+        return parse_name_template(DEFAULT_NAME_TEMPLATE);
+    }
+    if template.len() > MAX_TEMPLATE_BYTES {
+        bail!("name template is over {MAX_TEMPLATE_BYTES} bytes");
+    }
+    let mut tokens = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        push_literal(&mut tokens, &rest[..open])?;
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            bail!("name template: unclosed '{{'");
+        };
+        let name = after[..close].trim();
+        if name.contains('{') {
+            bail!("name template: nested '{{'");
+        }
+        let field = match name {
+            "id" => NameField::Id,
+            "title" => NameField::Title,
+            "version" => NameField::Version,
+            "kind" => NameField::Kind,
+            _ => bail!("name template: unknown placeholder {{{name}}}"),
+        };
+        tokens.push(NameToken::Field(field));
+        rest = &after[close + 1..];
+    }
+    push_literal(&mut tokens, rest)?;
+    if tokens.is_empty() {
+        return parse_name_template(DEFAULT_NAME_TEMPLATE);
+    }
+    Ok(tokens)
+}
+
+fn push_literal(tokens: &mut Vec<NameToken>, literal: &str) -> anyhow::Result<()> {
+    if !is_nfc(literal) {
+        let normalized: String = literal.nfc().collect();
+        return push_literal(tokens, &normalized);
+    }
+    if let Some(c) = literal
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || " -_.,'()&+![]".contains(*c)))
+    {
+        bail!("name template: {c:?} can't be in a file name");
+    }
+    if !literal.is_empty() {
+        tokens.push(NameToken::Literal(literal.to_string()));
+    }
+    Ok(())
+}
+
+struct NameValues<'a> {
+    id: &'a str,
+    title: &'a str,
+    version: &'a str,
+    kind: &'a str,
+}
+
+/// Render `tokens`, dropping each empty field and one separator beside it, cleaning empty
+/// `[]()` pairs left behind, and trimming separators at either end.
+fn render_name(tokens: &[NameToken], values: &NameValues<'_>) -> String {
+    enum Seg {
+        Literal(String),
+        Value(String),
+    }
+    fn is_separator(c: char) -> bool {
+        matches!(c, '-' | '_' | '.' | ' ')
+    }
+    let mut segs: Vec<Seg> = tokens
+        .iter()
+        .map(|t| match t {
+            NameToken::Literal(s) => Seg::Literal(s.clone()),
+            NameToken::Field(f) => Seg::Value(
+                match f {
+                    NameField::Id => values.id,
+                    NameField::Title => values.title,
+                    NameField::Version => values.version,
+                    NameField::Kind => values.kind,
+                }
+                .to_string(),
+            ),
+        })
+        .collect();
+    let mut removed = false;
+    let mut i = 0;
+    while i < segs.len() {
+        if !matches!(&segs[i], Seg::Value(s) if s.is_empty()) {
+            i += 1;
+            continue;
+        }
+        removed = true;
+        let mut took = false;
+        if i > 0
+            && let Seg::Literal(s) = &mut segs[i - 1]
+            && s.chars().last().is_some_and(is_separator)
+        {
+            s.pop();
+            took = true;
+        }
+        if !took
+            && i + 1 < segs.len()
+            && let Seg::Literal(s) = &mut segs[i + 1]
+            && s.chars().next().is_some_and(is_separator)
+        {
+            s.remove(0);
+        }
+        segs.remove(i);
+    }
+    let mut merged: Vec<Seg> = Vec::new();
+    for seg in segs {
+        match (merged.last_mut(), seg) {
+            (Some(Seg::Literal(a)), Seg::Literal(b)) => a.push_str(&b),
+            (_, seg) => merged.push(seg),
+        }
+    }
+    let mut out = String::new();
+    for seg in merged {
+        match seg {
+            Seg::Literal(s) if removed => out.push_str(&clean_empty_pairs(&s)),
+            Seg::Literal(s) => out.push_str(&s),
+            Seg::Value(s) => out.push_str(&s),
+        }
+    }
+    out.trim_matches(|c: char| matches!(c, '.' | ' ' | '-' | '_'))
+        .nfc()
+        .collect()
+}
+
+/// Drop `[]` and `()` pairs that hold only whitespace (an empty field's brackets).
+fn clean_empty_pairs(s: &str) -> String {
+    let mut chars: Vec<char> = s.chars().collect();
+    loop {
+        let mut out = String::new();
+        let mut changed = false;
+        let mut i = 0;
+        while i < chars.len() {
+            if matches!(chars[i], '(' | '[') {
+                let close = if chars[i] == '(' { ')' } else { ']' };
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == close {
+                    i = j + 1;
+                    changed = true;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        if !changed {
+            return out;
+        }
+        chars = out.chars().collect();
+    }
+}
+
+/// The name within `room` bytes, shortening the title only: the full compacted title, then
+/// its abbreviation, then the abbreviation cut at a character boundary. A name whose fixed
+/// parts (id, version, kind, literal text) do not fit fails.
+fn fit_name(tokens: &[NameToken], parts: &NameParts, room: usize) -> anyhow::Result<String> {
+    let id = parts.id.as_deref().unwrap_or("");
+    let version = parts.version.as_deref().unwrap_or("");
+    let kind = parts.kind.as_deref().unwrap_or("");
+    let full = parts.title.as_deref().unwrap_or("");
+    let abbreviated = parts.abbreviated.as_str();
+    for title in [full, abbreviated] {
+        let stem = render_name(
+            tokens,
+            &NameValues {
+                id,
+                title,
+                version,
+                kind,
+            },
+        );
+        let stem = reserved_prefix(stem);
+        if stem.len() <= room {
+            return Ok(stem);
+        }
+    }
+    let mut len = abbreviated.len();
+    while len > 0 {
+        len = len.saturating_sub(1);
+        let title = cut(abbreviated, len);
+        let stem = render_name(
+            tokens,
+            &NameValues {
+                id,
+                title,
+                version,
+                kind,
+            },
+        );
+        let stem = reserved_prefix(stem);
+        if stem.len() <= room {
+            return Ok(stem);
+        }
+    }
+    let stem = render_name(
+        tokens,
+        &NameValues {
+            id,
+            title: "",
+            version,
+            kind,
+        },
+    );
+    let stem = reserved_prefix(stem);
+    if stem.len() > room {
+        bail!(
+            "the generated name needs {} bytes before the extension, at most {room}: the title \
+             id, version, pack kind and template text don't fit",
+            stem.len()
+        );
+    }
+    Ok(stem)
+}
+
+/// Prefix `_` to a Windows device name (`CON`, `COM1`, ...).
+fn reserved_prefix(mut stem: String) -> String {
+    if is_reserved_on_windows(&stem) {
+        stem.insert(0, '_');
+    }
+    stem
 }
 
 /// Where a default or generated output goes: `dir`, or, when it is empty, the folder holding
@@ -1131,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_names_fit_smp_mount_points() {
+    fn generated_names_follow_the_fixed_fields_and_template() {
         for format in [
             Format::Exfat,
             Format::Ffpkg,
@@ -1144,59 +1490,182 @@ mod tests {
         }
         assert_eq!(preflight::stem_limit(Format::Ffpfsc), 58);
 
-        let root = crate::test_dir("generated-smp-name");
+        let root = crate::test_dir("generated-names");
         let game = root.join("game");
         std::fs::create_dir_all(game.join("sce_sys")).unwrap();
         std::fs::write(game.join("eboot.bin"), b"x").unwrap();
-        let param = |name: &str| {
-            let json = format!(r#"{{"titleId":"PPSA01234","titleName":"{name}"}}"#);
-            std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
+        let param = |json: &str| std::fs::write(game.join("sce_sys/param.json"), json).unwrap();
+        let name = |format, pack, template| {
+            generated_output_options(&game, format, &root, &[], None, pack, template).unwrap()
         };
-        let stem = |p: &Path| p.file_stem().unwrap().to_str().unwrap().to_string();
-        param(&"Long Game Name ".repeat(6));
-        // An LZ4 packed folder is named as a folder: no extension.
-        assert_eq!(
-            generated_output(&game, Format::Lz4, &root, &[], None).unwrap(),
-            generated_output(&game, Format::Folder, &root, &[], None).unwrap()
+        let file = |p: &Path| p.file_name().unwrap().to_str().unwrap().to_string();
+
+        // The English title wins over the default language; compaction merges the words.
+        param(
+            r#"{"titleId":"PPSA01234","titleName":"Astro Bot",
+                "localizedParameters":{"defaultLanguage":"ja-JP",
+                  "ja-JP":{"titleName":"アストロボット"},
+                  "en-US":{"titleName":"Astro Bot"}},
+                "contentVersion":"01.000.000"}"#,
         );
-        // Every output cuts it, a folder and a .pkg too.
-        for (format, max) in [
-            (Format::Exfat, 63),
-            (Format::Ffpkg, 63),
-            (Format::Ffpfs, 63),
-            (Format::Ffpfsc, 58),
-            (Format::Pkg, 63),
-            (Format::Folder, 63),
-        ] {
-            let path = generated_output(&game, format, &root, &[], None).unwrap();
-            let s = match format {
-                Format::Folder => path.file_name().unwrap().to_str().unwrap().to_string(),
-                _ => stem(&path),
-            };
-            assert_eq!(s.len(), max, "{s}");
-            assert!(s.starts_with("[Long Game Name Long"), "{s}");
-            assert!(s.ends_with("]-[PPSA01234]"), "{s}");
-            // With a `-N` suffix the name gives up more room.
-            std::fs::write(&path, b"").unwrap();
-            let next = stem(&generated_output(&game, format, &root, &[], None).unwrap());
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-AstroBot-v01.000.000"
+        );
+        // A packed folder gets its kind; an image never does.
+        assert_eq!(
+            file(&name(Format::Lz4, None, None)),
+            "PPSA01234-AstroBot-v01.000.000-lz4"
+        );
+        assert_eq!(
+            file(&name(Format::Folder, Some(PackKind::Zstd), None)),
+            "PPSA01234-AstroBot-v01.000.000-zstd"
+        );
+        assert_eq!(
+            file(&name(Format::Exfat, Some(PackKind::Lz4), None)),
+            "PPSA01234-AstroBot-v01.000.000.exfat"
+        );
+        assert_eq!(
+            file(&name(Format::Ffpfsc, Some(PackKind::Zstd), None)),
+            "PPSA01234-AstroBot-v01.000.000.ffpfsc"
+        );
+        // The template chooses the order and separators only.
+        assert_eq!(
+            file(&name(
+                Format::Lz4,
+                Some(PackKind::Lz4),
+                Some("[{title}]-[{id}]-[{version}]-[{kind}]")
+            )),
+            "[AstroBot]-[PPSA01234]-[v01.000.000]-[lz4]"
+        );
+        assert_eq!(
+            file(&name(
+                Format::Folder,
+                None,
+                Some("[{title}]-[{id}]-[{version}]-[{kind}]")
+            )),
+            "[AstroBot]-[PPSA01234]-[v01.000.000]"
+        );
+        // No English title: the field is left out, with its separator.
+        param(
+            r#"{"titleId":"PPSA01234","titleName":"Astro",
+                "localizedParameters":{"defaultLanguage":"ja-JP",
+                  "ja-JP":{"titleName":"アストロ"}},
+                "contentVersion":"01.000.000"}"#,
+        );
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-v01.000.000"
+        );
+
+        // Compaction: strict title case, letters and digits only.
+        let with_title = |title: &str| {
+            param(&format!(
+                r#"{{"titleId":"PPSA01234","localizedParameters":{{"en-US":{{"titleName":"{title}"}}}},"contentVersion":"01.000.000"}}"#
+            ));
+        };
+        with_title("GTA V");
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-GtaV-v01.000.000"
+        );
+        with_title("the last of us");
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-TheLastOfUs-v01.000.000"
+        );
+        // Over 63 bytes: the title becomes its upper-case letters.
+        with_title("Horizon Forbidden West Complete Edition Remastered");
+        assert_eq!(
+            file(&name(Format::Lz4, Some(PackKind::Lz4), None)),
+            "PPSA01234-HFWCER-v01.000.000-lz4"
+        );
+        // With no upper-case letters, the abbreviation is the word initials.
+        with_title("the legend of zelda tears of the kingdom and more words here");
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-TLOZTOTKAMWH-v01.000.000"
+        );
+
+        // The abbreviation itself can still be too long: only the title is cut, never the version.
+        with_title(&"AAA ".repeat(20));
+        let cut = file(&name(Format::Folder, None, None));
+        assert!(cut.len() <= 63, "{cut}");
+        assert!(
+            cut.starts_with("PPSA01234-AAA") && cut.ends_with("-v01.000.000"),
+            "{cut}"
+        );
+
+        // Missing parts are omitted, and an empty field's bracket pair goes with it.
+        param(
+            r#"{"titleId":"PPSA01234","localizedParameters":{"en-US":{"titleName":"Astro Bot"}}}"#,
+        );
+        assert_eq!(
+            file(&name(Format::Folder, None, Some("{title} ({version})"))),
+            "AstroBot"
+        );
+        param(r#"{"titleId":"PPSA01234","contentVersion":"01.000.000"}"#);
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-v01.000.000"
+        );
+        param(
+            r#"{"localizedParameters":{"en-US":{"titleName":"Astro Bot"}},"contentVersion":"01.000.000"}"#,
+        );
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "AstroBot-v01.000.000"
+        );
+        // Nothing at all falls back to the source's own name, beside itself: `-2`.
+        param(r#"{"titleName":"nothing"}"#);
+        assert_eq!(file(&name(Format::Folder, None, None)), "game-2");
+
+        // A name already taken gets -2.
+        param(
+            r#"{"titleId":"PPSA01234","localizedParameters":{"en-US":{"titleName":"Astro Bot"}},
+                "contentVersion":"01.000.000"}"#,
+        );
+        let first = root.join("PPSA01234-AstroBot-v01.000.000");
+        std::fs::write(&first, b"").unwrap();
+        assert_eq!(
+            file(&name(Format::Folder, None, None)),
+            "PPSA01234-AstroBot-v01.000.000-2"
+        );
+        std::fs::remove_file(&first).unwrap();
+
+        // Only the title may shrink: a long version is an error, never truncated.
+        param(
+            r#"{"titleId":"PPSA01234","localizedParameters":{"en-US":{"titleName":"Astro Bot"}},
+                "contentVersion":"012345678901234567890123456789012345678901234567890123456789"}"#,
+        );
+        assert!(
+            generated_output_options(&game, Format::Folder, &root, &[], None, None, None).is_err()
+        );
+
+        // Template rules.
+        with_title("Astro Bot");
+        for bad in ["{bogus}", "{id", "a/b"] {
             assert!(
-                next.len() <= max && next.ends_with("]-[PPSA01234]-2"),
-                "{next}"
+                generated_output_options(&game, Format::Folder, &root, &[], None, None, Some(bad))
+                    .is_err(),
+                "{bad}"
             );
         }
-        // Cut at a character boundary, never inside one, and no trailing space.
-        param(&"ゼルダ ".repeat(12));
-        let pfsc = generated_output(&game, Format::Ffpfsc, &root, &[], None).unwrap();
-        let s = stem(&pfsc);
-        assert!(s.len() <= 58, "{s}");
-        assert!(s.starts_with("[ゼルダ ゼルダ") && !s.contains(" ]"), "{s}");
-        assert!(s.ends_with("]-[PPSA01234]"), "{s}");
-        // A short name is left whole.
-        param("Astro Bot");
         assert_eq!(
-            generated_output(&game, Format::Ffpfsc, &root, &[], None).unwrap(),
-            root.join("[Astro Bot]-[PPSA01234].ffpfsc")
+            file(&name(Format::Folder, None, Some(""))),
+            "PPSA01234-AstroBot-v01.000.000"
         );
+        // A fixed literal that is a Windows device name gets a `_`.
+        param(r#"{"titleName":"nothing"}"#);
+        assert_eq!(file(&name(Format::Folder, None, Some("CON"))), "_CON");
+
+        // A multibyte title is cut at a character boundary.
+        with_title(&"ゼルダ ".repeat(20));
+        let pfsc = name(Format::Ffpfsc, None, None);
+        let s = pfsc.file_stem().unwrap().to_str().unwrap();
+        assert!(s.len() <= 58, "{s}");
+        assert!(s.starts_with("PPSA01234-") && !s.contains(' '), "{s}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1234,7 +1703,8 @@ mod tests {
         use std::sync::atomic::Ordering;
         let root = crate::test_dir("archive-read-once");
         let zip = root.join("game.zip");
-        let param: &[u8] = br#"{"titleId":"PPSA01234","titleName":"Astro Bot"}"#;
+        let param: &[u8] =
+            br#"{"titleId":"PPSA01234","localizedParameters":{"en-US":{"titleName":"Astro Bot"}}}"#;
         let mut files = vec![
             ("GAME/eboot.bin", &b"eboot"[..]),
             ("GAME/sce_sys/param.json", param),
@@ -1246,7 +1716,7 @@ mod tests {
         assert_eq!(found.title_id.as_deref(), Some("PPSA01234"));
         assert_eq!(passes() - start, 1, "inspect decodes once");
         let named = generated_output(&zip, Format::Exfat, &root, &[], None).unwrap();
-        assert_eq!(named, root.join("[Astro Bot]-[PPSA01234].exfat"));
+        assert_eq!(named, root.join("PPSA01234-AstroBot.exfat"));
         let cancel = AtomicBool::new(false);
         assert_eq!(crate::archive::password(&zip, None, &cancel).unwrap(), None);
         assert_eq!(

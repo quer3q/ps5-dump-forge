@@ -901,7 +901,15 @@ const pt: Messages = {
     savedAs: (name, dir) => `salvo como ${name} em ${dir}`,
     inDir: (dir) => `em ${dir}`,
     generate: "Gerar o nome pelo conteúdo",
-    generatePattern: "[nome do jogo]-[ID do título]",
+    nameTemplate: "Modelo do nome",
+    nameTemplateHint:
+      "Marcadores: {id}, {title}, {version}, {kind}. {kind} é lz4 ou zstd apenas para uma pasta compactada; nomes longos encurtam apenas o título.",
+    nameTemplateReset: "Padrão",
+    templateUnknown: (token: string) => `Marcador desconhecido {${token}}`,
+    templateUnclosed: "O modelo tem uma { sem fechar",
+    templateNested: "Um marcador não pode conter {",
+    templateChar: (c: string) => `${c} não pode estar em um nome de arquivo`,
+    templateLong: (n: number) => `O modelo tem no máximo ${n} bytes`,
   },
   // UpdateToast.tsx
   update: {
