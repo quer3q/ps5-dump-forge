@@ -83,8 +83,10 @@ pub(crate) fn file_id(file: &File) -> io::Result<(u64, u128)> {
     Ok((serial, id))
 }
 
-/// `file_id`, but an id of 0 is returned as is. Only for source stamps, which also compare
-/// length and modification time; never for identities that decide what to publish or delete.
+/// `file_id`, but an id of 0 is returned as is. For source stamps, which also compare length
+/// and modification time, and for a volume root (`finalize::path_id`: a FAT/exFAT root reports
+/// 0, and only a root can then match it); never for other identities that decide what to
+/// publish or delete.
 pub(crate) fn raw_file_id(file: &File) -> io::Result<(u64, u128)> {
     let mut info = FileIdInfo::default();
     // SAFETY: an open handle; `info` is the FILE_ID_INFO the class asks for, with its size.

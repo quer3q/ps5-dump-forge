@@ -102,6 +102,26 @@ pub enum Lz4Mode {
     Pack,
 }
 
+/// The packs a Pack job makes, for its generated name's `{pack}`
+/// ([`generated_output`]): `zstd` or `LZ4`. Unpack names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackKind {
+    Zstd,
+    Lz4,
+}
+
+/// The naming template [`generated_output`] uses when none is given: `[Title]-[TITLE_ID]`.
+pub const DEFAULT_NAMING: &str = "[{title}]-[{title_id}]";
+
+/// Why `template` can't name an output (English), `None` when it can. A template is at most
+/// 128 bytes, holds `{title}` or `{title_id}`, no token but `{title}`, `{title_id}`,
+/// `{version}`, `{pack}`, `{region}` and `{fw}`, each at most once (any other `{` or `}` is refused), and its own text no control
+/// character and none of `/ \ : * ? " < > |`.
+pub fn naming_problem(template: &str) -> Option<String> {
+    inspect::parse_naming(template).err()
+}
+
 /// The runtime an LZ4 Pack installs ([`ConvertRequest::lz4_runtime`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,15 +131,6 @@ pub enum Lz4Runtime {
     Ng,
     /// The bundled upstream ampr_emu release build (`runtime::release()`).
     AmprEmu,
-}
-
-/// Which pack kind a generated output name marks: only a packed folder's name gets
-/// `-lz4` or `-zstd`; an image's name never does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PackKind {
-    Lz4,
-    Zstd,
 }
 
 /// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same,
@@ -750,20 +761,23 @@ pub fn default_output_with(
 }
 
 /// The output path for `source` in `format` in `dir` (empty: the folder holding the source),
-/// named from the game with the built-in template `{id}-{title}-{version}-{kind}`: the title
-/// id, the English title (only letters and digits, each word capitalized), `v` before the
-/// version, and `-lz4`/`-zstd` for a packed folder only. Parts the source lacks are left out.
-/// Never a path that exists or is in `taken` (outputs of jobs still running): `-2`, `-3`, ...
-/// instead. The name without its extension stays within what ShadowMountPlus mounts (63 bytes,
-/// 58 for a `.ffpfsc`, and 63 for a folder or `.pkg` too; see `preflight::stem_limit`): only
-/// the title is shortened to fit.
+/// named from the game by the `naming` template (`None`: [`DEFAULT_NAMING`], e.g.
+/// `[Astro Bot]-[PPSA01234].ffpkg`; the tokens and cleanup: `inspect::Template`). `{pack}`
+/// names `pack` ([`Format::Lz4`] counts as LZ4). A template [`naming_problem`] refuses is an
+/// error. Values the source lacks are empty; with nothing left it is the title id, else the
+/// source's own name. Never a path that exists or is in `taken` (outputs of jobs still
+/// running): `-2`, `-3`, ... instead. The name without its extension stays within what
+/// ShadowMountPlus mounts (63 bytes, 58 for a `.ffpfsc`, and 63 for a folder or `.pkg` too;
+/// see `preflight::stem_limit`): the game name is cut first, then the version left out.
 pub fn generated_output(
     source: &Path,
     format: Format,
     dir: &Path,
     taken: &[PathBuf],
+    pack: Option<PackKind>,
+    naming: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    inspect::generated_output(source, format, dir, taken, None)
+    inspect::generated_output(source, format, dir, taken, None, pack, naming)
 }
 
 /// [`generated_output`] with an archive's password (ignored for any other source). An archive
@@ -776,25 +790,10 @@ pub fn generated_output_with(
     dir: &Path,
     taken: &[PathBuf],
     password: Option<&str>,
-) -> anyhow::Result<PathBuf> {
-    inspect::generated_output(source, format, dir, taken, password)
-}
-
-/// [`generated_output_with`] with the pack kind a packed folder's name marks and a custom
-/// name template (`None` or blank: the built-in `{id}-{title}-{version}-{kind}`). The
-/// template chooses the order, separators and literal text only: the field values (English
-/// title, `v`-prefixed version, kind only for a folder) and the shortening (the title only)
-/// are fixed.
-pub fn generated_output_with_options(
-    source: &Path,
-    format: Format,
-    dir: &Path,
-    taken: &[PathBuf],
-    password: Option<&str>,
     pack: Option<PackKind>,
-    template: Option<&str>,
+    naming: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    inspect::generated_output_options(source, format, dir, taken, password, pack, template)
+    inspect::generated_output(source, format, dir, taken, password, pack, naming)
 }
 
 /// Leftover `*.part` files/dirs from earlier jobs in `dir`. Never deleted automatically.

@@ -28,7 +28,7 @@ import { Icon, type IconName } from "./icons";
 import { inspectSource as readSource } from "./password";
 import { jobType, type Action, type Job } from "./jobs";
 import { openPackHelp } from "./PackHelp";
-import { DeleteSourceSwitch, formatInfo, GenerateSwitch, Lead, NameTemplateField, OutputField, useOutput, VerifySwitch } from "./target";
+import { DeleteSourceSwitch, formatInfo, GenerateSwitch, Lead, OutputField, useOutput, VerifySwitch } from "./target";
 
 /** The kind of packs: zstd or LZ4 (ampr_emu). */
 export type Engine = "zstd" | "lz4";
@@ -73,12 +73,7 @@ function whyNot(e: Engine, ins: Inspection | null): string | null {
   return null;
 }
 
-export function Pack(props: {
-  jobs: Job[];
-  dispatch: (a: Action) => void;
-  /** This tab is the one shown: a shared template change renames only here. */
-  active: boolean;
-}) {
+export function Pack(props: { jobs: Job[]; dispatch: (a: Action) => void; active: boolean }) {
   const t = useMessages().pack;
   const c = useMessages().convert;
   const [source, setSource] = useState<string | null>(null);
@@ -120,12 +115,10 @@ export function Pack(props: {
   const usable = !!ins && notForGame === null;
   // A game without AMPR: Pack injects ampr-emu-ng (core does, for any such game), LZ4 with ng only.
   const forced = usable && !packed && !ins.lz4?.imports_ampr;
-  /** The kind a generated name marks: a packed folder only (an image or Unpack never). */
-  const packKindFor = (e: Engine, i: Inspection | null, f: Format): PackKind | null =>
-    !packedBy(e, i) && (f === "folder" || f === "lz4") ? e : null;
   const fmt = targetOf(engine, ins);
-  const pack = packKindFor(engine, ins, fmt);
-  const out = useOutput(fmt, props.jobs, setError, { pack, active: props.active });
+  /** The packs a job of kind `e` makes on this game, named last in a generated output; none to Unpack. */
+  const packOf = (e: Engine, i: Inspection | null): PackKind | null => (packedBy(e, i) ? null : e);
+  const out = useOutput(fmt, props.jobs, setError, packOf(engine, ins), props.active);
   // This render's kind and targets, for an inspection that began on an older render.
   const kind = useRef({ engine, targetOf });
   kind.current = { engine, targetOf };
@@ -144,8 +137,7 @@ export function Pack(props: {
       setPassword(opened);
       if (!name) return;
       const { engine: e, targetOf: target } = kind.current;
-      const f = whyNot(e, found) === null ? target(e, found) : null;
-      out.opened(path, f, opened, f ? packKindFor(e, found, f) : null);
+      out.opened(path, whyNot(e, found) === null ? target(e, found) : null, opened, packOf(e, found));
     } catch (e) {
       if (seq === sourceSeq.current) setInsError(errorText(e));
     } finally {
@@ -180,6 +172,7 @@ export function Pack(props: {
         setInsError(null);
         setInspecting(false);
         setError(null);
+        out.reset(source, null);
       }),
     [source],
   );
@@ -197,16 +190,13 @@ export function Pack(props: {
   const chooseEngine = (e: Engine) => {
     setEngine(e);
     setError(null);
-    if (whyNot(e, ins) === null) {
-      const f = targetOf(e, ins);
-      out.retarget(source, f, packKindFor(e, ins, f));
-    }
+    if (whyNot(e, ins) === null) out.retarget(source, targetOf(e, ins), packOf(e, ins));
   };
 
   const pickFormat = (f: Format) => {
     if (engine === "zstd") (packed ? setZstdUnpackFormat : setZstdPackFormat)(f);
     else (packed ? setLz4UnpackFormat : setLz4PackFormat)(f);
-    out.retarget(source, f, packKindFor(engine, ins, f));
+    out.retarget(source, f);
   };
 
   const { target, named } = out;
@@ -393,7 +383,6 @@ export function Pack(props: {
               <VerifySwitch checked={fullVerify} onChange={setFullVerify} />
               <DeleteSourceSwitch checked={deleteSource} onChange={setDeleteSource} nas={isNas(source)} />
               <OutputField out={out} source={source} prefix="p" />
-              <NameTemplateField out={out} />
               <div className="build-row">
                 <GenerateSwitch out={out} source={source} />
                 <button

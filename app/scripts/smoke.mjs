@@ -36,13 +36,7 @@ mkdirSync(images);
 writeFileSync(`${game}/eboot.bin`, "\x7fELF fake eboot");
 writeFileSync(
   `${game}/sce_sys/param.json`,
-  JSON.stringify({
-    titleId: "PPSA01234",
-    titleName: "Smoke Game",
-    contentVersion: "01.000.000",
-    localizedParameters: { "en-US": { titleName: "Smoke Game" } },
-    requiredSystemSoftwareVersion: "0x0700000000000000",
-  }),
+  JSON.stringify({ titleId: "PPSA01234", titleName: "Smoke Game", requiredSystemSoftwareVersion: "0x0700000000000000" }),
 );
 // Big enough that the second job is still queued behind the first when it is cancelled.
 writeFileSync(`${game}/data/a.bin`, Buffer.alloc(64 << 20, 7));
@@ -133,7 +127,7 @@ await waitFor("first restore", () => a.ev.restore.some((e) => e.replace));
 assert.deepEqual(a.ev.restore[0], { replace: true, jobs: [] });
 
 // The outputs.
-const name = "PPSA01234-SmokeGame-v01.000.000.exfat";
+const name = "[Smoke Game]-[PPSA01234].exfat";
 const out = await a.c.call("generated_output", { source: game, format: "exfat", dir: images, taken: [] });
 assert.equal(out, `${images}/${name}`);
 const out2 = await a.c.call("generated_output", { source: game, format: "exfat", dir: images, taken: [out] });

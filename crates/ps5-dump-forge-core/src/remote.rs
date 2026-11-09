@@ -508,7 +508,7 @@ const MAX_DEPTH: usize = 64;
 /// A game folder on a peer. Sizes and mtimes are listed up front and every read fails when its
 /// file's size or mtime moved since. Junk ([`is_junk`]) is skipped, as the folder scanner skips it;
 /// a link or a name a `flink://` path can't spell refuses the folder, as a local scan refuses links.
-/// A read that continues the last one fetches 64 MiB ahead (checked when fetched, as
+/// A read that continues the last one doubles its window up to 64 MiB (checked when fetched, as
 /// [`RemoteReader`]'s window is).
 pub struct RemoteTree {
     remote: Arc<dyn Remote>,
@@ -518,6 +518,8 @@ pub struct RemoteTree {
     empty_dirs: Vec<String>,
     /// Where the last read ended (path, offset): a read starting there is sequential.
     next: Option<(String, u64)>,
+    /// The last fetch's window length.
+    want: usize,
     /// Bytes read ahead of a sequential read (path, offset, bytes).
     ahead: Option<(String, u64, Vec<u8>)>,
 }
@@ -538,6 +540,7 @@ impl RemoteTree {
             seen: HashMap::new(),
             empty_dirs: Vec::new(),
             next: None,
+            want: 0,
             ahead: None,
         };
         let mut todo = vec![(String::new(), 0usize)];
@@ -654,13 +657,20 @@ impl SourceTree for RemoteTree {
             return Ok(out);
         }
         self.ahead = None;
-        // A sequential read fetches a whole window, so the peer serves it on several lanes.
+        // A growing sequential window lets the peer serve it on several lanes.
         let sequential = self
             .next
             .as_ref()
             .is_some_and(|(p, o)| p == path && *o == offset);
-        let want = if sequential { len.max(WINDOW_MAX) } else { len };
+        let want = if sequential {
+            // From at least 1 MiB, so small sequential reads (LZ4's 64 KiB chunks) reach a
+            // full window in a few fetches.
+            len.max(self.want.saturating_mul(2).clamp(WINDOW_MIN, WINDOW_MAX))
+        } else {
+            len
+        };
         let bytes = fetch(&*self.remote, &self.at(path), &stamp, offset, want)?;
+        self.want = want;
         self.next = Some((path.to_string(), offset + len.min(bytes.len()) as u64));
         if bytes.len() <= len {
             return Ok(bytes);

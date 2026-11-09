@@ -633,7 +633,7 @@ const de: Messages = {
 
         <h3>Packstrategie</h3>
         <ol>
-          <li><b>Alles außer Systemdateien packen</b> (zstd, und LZ4 mit ampr-emu-ng): jede Datei außer eboot.bin, Programmen und Modulen, sce_sys, sce_module und fakelib; ampr-emu-ng liefert den Rest, Audio und Video eingeschlossen.</li>
+          <li><b>Alles außer Systemdateien packen</b> (zstd, und LZ4 mit ampr-emu-ng): jede Datei außer eboot.bin, Programmen und Modulen, sce_sys, sce_module, fakelib und .ini-Dateien (dlc_emu.ini bleibt bearbeitbar); ampr-emu-ng liefert den Rest, Audio und Video eingeschlossen.</li>
           <li><b>Kompatible LZ4-Strategie</b> (LZ4 mit ampr_emu): Konfigurationen, Medien und andere Dateien, die ein Spiel direkt liest, bleiben einzeln.</li>
           <li>Nur beim Packen: Wählen Sie unter <b>Eigene Regeln (TOML)</b> ein Profil im Format von ampr_pack.py und Lazy_AMPR, auf diesem oder einem anderen Gerät.</li>
           <li>Die letzte passende Regel gilt; Systemdateien bleiben immer einzeln. Falsche Regeln können ein Spiel hinterlassen, das nicht startet.</li>
@@ -892,15 +892,36 @@ const de: Messages = {
     savedAs: (name, dir) => `wird als ${name} in ${dir} gespeichert`,
     inDir: (dir) => `in ${dir}`,
     generate: "Namen aus dem Inhalt erzeugen",
-    nameTemplate: "Namensvorlage",
-    nameTemplateHint:
-      "Platzhalter: {id}, {title}, {version}, {kind}. {kind} ist lz4 oder zstd nur für einen gepackten Ordner; ein langer Name kürzt nur den Titel.",
-    nameTemplateReset: "Standard",
-    templateUnknown: (token: string) => `Unbekannter Platzhalter {${token}}`,
-    templateUnclosed: "In der Vorlage ist eine { nicht geschlossen",
-    templateNested: "Ein Platzhalter kann kein { enthalten",
-    templateChar: (c: string) => `${c} darf nicht in einem Dateinamen stehen`,
-    templateLong: (n: number) => `Die Vorlage hat höchstens ${n} Bytes`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "Ausgabenamen",
+    parts: { title: "Titel", title_id: "Titel-ID", version: "Version", pack: "Pack-Art", region: "Region", fw: "Firmware" },
+    template: "Namensvorlage",
+    partsLabel: "Teil einfügen",
+    insert: (part: string) => `${part} einfügen`,
+    inUse: (part) => `${part} ist schon in der Vorlage`,
+    example: "Beispiel",
+    length: "Länge",
+    bytes: (n, max) => `${n} von ${max} Bytes.`,
+    room: (n) => plural(n, { one: `Für den Titel bleibt ${num(n)} Byte.`, other: `Für den Titel bleiben ${num(n)} Bytes.` }),
+    noRoom: "Für den Titel bleibt kein Platz: Er entfällt.",
+    versionOut: "Die Version entfällt, um Platz zu schaffen.",
+    cut: "Der Name wird bei 63 Bytes abgeschnitten.",
+    idOnly: "Der Text der Vorlage füllt die 63 Bytes, deshalb benennt die Titel-ID die Ausgabe.",
+    limit: "ShadowMount+ kann kein Image einhängen, dessen Name länger als 63 Bytes ist (58 bei ffpfsc), daher wird bei einem längeren Namen zuerst der Titel gekürzt.",
+    errors: {
+      long: (max: number) => `Eine Vorlage hat höchstens ${max} Bytes.`,
+      open: "Zu einer { fehlt die schließende }.",
+      close: "Zu einer } fehlt die öffnende {.",
+      unknown: (token: string) => `{${token}} ist kein Namensteil: Verwenden Sie Titel, Titel-ID, Version, Pack-Art, Region oder Firmware.`,
+      twice: (token) => `{${token}} steht zweimal in der Vorlage: Verwenden Sie jeden Teil nur einmal.`,
+      char: (c: string) => `Ein Name darf kein ${c} enthalten.`,
+      control: "Ein Name darf kein Steuerzeichen enthalten.",
+      needsName: "Ein Name braucht Titel oder Titel-ID.",
+    },
+    notSaved: "Nicht gespeichert: Namen folgen weiter der letzten gültigen Vorlage.",
+    reset: "Zurücksetzen",
   },
   // UpdateToast.tsx
   update: {

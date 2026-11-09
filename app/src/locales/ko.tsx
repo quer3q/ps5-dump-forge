@@ -610,7 +610,7 @@ const ko: Messages = {
 
         <h3>패킹 전략</h3>
         <ol>
-          <li><b>시스템 파일만 빼고 모두 패킹</b> (zstd, 그리고 ampr-emu-ng를 쓰는 LZ4): eboot.bin, 실행 파일과 모듈, sce_sys, sce_module, fakelib을 뺀 모든 파일을 팩에 넣고, 오디오와 비디오를 포함한 나머지는 ampr-emu-ng가 제공합니다.</li>
+          <li><b>시스템 파일만 빼고 모두 패킹</b> (zstd, 그리고 ampr-emu-ng를 쓰는 LZ4): eboot.bin, 실행 파일과 모듈, sce_sys, sce_module, fakelib, .ini 파일(dlc_emu.ini는 계속 편집 가능)을 뺀 모든 파일을 팩에 넣고, 오디오와 비디오를 포함한 나머지는 ampr-emu-ng가 제공합니다.</li>
           <li><b>호환 LZ4 전략</b> (ampr_emu를 쓰는 LZ4): 설정, 미디어 등 게임이 직접 읽는 파일은 따로 둡니다.</li>
           <li>패킹 전용: <b>사용자 규칙(TOML)</b>에서 ampr_pack.py와 Lazy_AMPR 형식의 프로필을 이 기기나 다른 기기에서 고릅니다.</li>
           <li>마지막으로 일치하는 규칙이 적용되며, 시스템 파일은 항상 따로 남습니다. 규칙이 잘못되면 게임이 시작되지 않을 수 있습니다.</li>
@@ -862,15 +862,36 @@ const ko: Messages = {
     savedAs: (name, dir) => `저장 이름: ${name}, 위치: ${dir}`,
     inDir: (dir) => `위치: ${dir}`,
     generate: "내용을 바탕으로 이름 생성",
-    nameTemplate: "이름 템플릿",
-    nameTemplateHint:
-      "사용 가능: {id}, {title}, {version}, {kind}. {kind}는 압축 폴더에만 lz4 또는 zstd로 들어가며, 이름이 길면 제목만 줄어듭니다.",
-    nameTemplateReset: "기본값",
-    templateUnknown: (token: string) => `알 수 없는 자리표시자 {${token}}`,
-    templateUnclosed: "템플릿에 닫히지 않은 { 가 있습니다",
-    templateNested: "자리표시자에는 { 를 넣을 수 없습니다",
-    templateChar: (c: string) => `${c}는 파일 이름에 쓸 수 없습니다`,
-    templateLong: (n: number) => `템플릿은 최대 ${n}바이트입니다`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "출력 이름",
+    parts: { title: "제목", title_id: "타이틀 ID", version: "버전", pack: "패킹 종류", region: "지역", fw: "펌웨어" },
+    template: "이름 템플릿",
+    partsLabel: "부분 삽입",
+    insert: (part: string) => `${part} 삽입`,
+    inUse: (part) => `${part}은(는) 이미 템플릿에 있습니다`,
+    example: "예시",
+    length: "길이",
+    bytes: (n, max) => `${max}바이트 중 ${n}바이트.`,
+    room: (n) => `제목에 ${n}바이트가 남습니다.`,
+    noRoom: "제목에 남는 공간이 없어 제목이 빠집니다.",
+    versionOut: "공간을 만들기 위해 버전이 빠집니다.",
+    cut: "이름은 63바이트에서 잘립니다.",
+    idOnly: "템플릿 텍스트가 63바이트를 모두 차지해 타이틀 ID가 출력 이름이 됩니다.",
+    limit: "ShadowMount+는 이름이 63바이트(ffpfsc는 58바이트)보다 긴 이미지를 마운트할 수 없으므로, 더 긴 이름은 제목부터 줄입니다.",
+    errors: {
+      long: (max: number) => `템플릿은 최대 ${max}바이트입니다.`,
+      open: "{에 닫는 }가 없습니다.",
+      close: "}에 여는 {가 없습니다.",
+      unknown: (token: string) => `{${token}}은(는) 이름의 부분이 아닙니다. 제목, 타이틀 ID, 버전, 패킹 종류, 지역 또는 펌웨어를 사용하세요.`,
+      twice: (token) => `{${token}}이(가) 템플릿에 두 번 있습니다. 각 부분은 한 번만 사용하세요.`,
+      char: (c: string) => `이름에 ${c}을(를) 넣을 수 없습니다.`,
+      control: "이름에 제어 문자를 넣을 수 없습니다.",
+      needsName: "이름에는 제목이나 타이틀 ID가 있어야 합니다.",
+    },
+    notSaved: "저장되지 않았습니다. 이름은 마지막으로 올바르던 템플릿을 계속 따릅니다.",
+    reset: "초기화",
   },
   // UpdateToast.tsx
   update: {

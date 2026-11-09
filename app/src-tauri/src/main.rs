@@ -1,6 +1,5 @@
 //! PS5 Dump Forge: the Tauri shell over `ps5-dump-forge-core`. No settings file: what the UI
-//! remembers lives in memory until the app closes, except its language and generated-name
-//! template (WebView localStorage).
+//! remembers lives in memory until the app closes, except its language (WebView localStorage).
 //!
 //! All file access stays in these commands; the webview only gets event listening
 //! and the app's own commands (see `build.rs` and `capabilities/default.json`).
@@ -14,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ps5_dump_forge_core::{
     ArchivePassword, ConvertRequest, EditCheck, Event, Format, HostTree, Inspection, JobId, Jobs,
-    LibraryScan, Listing, PackKind, folder_refusal,
+    LibraryScan, Listing, folder_refusal,
 };
 use ps5_dump_forge_server::connect::{self, Connect};
 use ps5_dump_forge_server::payload;
@@ -216,9 +215,10 @@ async fn default_output(
     .await
 }
 
-/// `password`: an archive's, as `inspect` takes it.
-#[allow(clippy::too_many_arguments)]
+/// `password`: an archive's, as `inspect` takes it; `pack`: a Pack job's kind; `naming`: the
+/// name's template (`None`: the default `[{title}]-[{title_id}]`; an invalid one is an error).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn generated_output(
     app: AppHandle,
     source: PathBuf,
@@ -226,19 +226,19 @@ async fn generated_output(
     dir: PathBuf,
     taken: Vec<PathBuf>,
     password: Option<ArchivePassword>,
-    pack: Option<PackKind>,
-    template: Option<String>,
+    pack: Option<ps5_dump_forge_core::PackKind>,
+    naming: Option<String>,
 ) -> Result<PathBuf, String> {
     blocking(app, move |_, _| {
         let password = password.as_ref().map(ArchivePassword::as_str);
-        ps5_dump_forge_core::generated_output_with_options(
+        ps5_dump_forge_core::generated_output_with(
             &source,
             format,
             &dir,
             &taken,
             password,
             pack,
-            template.as_deref(),
+            naming.as_deref(),
         )
         .map_err(err)
     })

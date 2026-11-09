@@ -123,9 +123,9 @@ kernel EINVAL before calling Sony). Calls are serialized and logged in the serve
 | `GET /api/session` | | `{app: "ps5-dump-forge", version, platform: "ps5"\|"host", instance, stopping, self_copy, separator: "/"\|"\\", url, connect_url, handover: true, debug, notifications: bool}` (`url`: the server's host:port, the Connect tab's IP; `connect_url`: `<url>/#connect`; `handover`: takes `quit {"if_idle": true}`; `debug`: true only in a `FORGE_DEBUG_API` PS5 build, the page then shows **Input probe**; `notifications`: job-end notices, saved on the PS5) |
 | `POST /api/notifications` | `{on: bool}` | `{on: bool}`: save the PS5 About switch for job-end notices; 500 if the save fails |
 | `GET /api/qr` | | `url` as a QR code, `image/svg+xml`; `?connect=1`: `connect_url` (the Connect tab's, web build); 404 when the server can't tell its IP |
-| `POST /api/inspect` | `{path}` | `Inspection` |
-| `POST /api/default_output` | `{source, format, dir}` | path |
-| `POST /api/generated_output` | `{source, format, dir, taken}` | path |
+| `POST /api/inspect` | `{path, password?}` | `Inspection` |
+| `POST /api/default_output` | `{source, format, dir, password?}` | path |
+| `POST /api/generated_output` | `{source, format, dir, taken, password?, pack?, naming?}` (`pack` `zstd`/`lz4` for a Pack job; `naming` a template, absent = `[{title}]-[{title_id}]`; an invalid one is 400) | path |
 | `POST /api/start_job` | `{request: ConvertRequest}` | job id (`zstd_pack` + `zstd_level` packs into a folder, `zstd_unpack` unpacks zstd packs, `lz4` `pack`/`unpack` the LZ4 ones; non-empty `edits` is an edit job of the source, in place or with `edit_rebuild`, `output` and `format` ignored; non-empty `extract` copies those game paths into the folder `output`, `format` `folder`; non-empty `transfer` is a transfer job: those files and folders (local, `flink://` or `smb://`) into the folder `output` (local or `flink://`), `source` and `format` ignored, run in the transfer slot beside the one heavy job; a job touching an unfinished job's paths of the other kind ends at once "in use by another job"; `install` (a `.pkg` here, `flink://` or on a NAS) is an install job, PS5 only, also in the transfer slot: the package served on `127.0.0.1` to the console's installer, below) |
 | `POST /api/cancel_job` | `{id}` | `null` (idempotent) |
 | `POST /api/stale_parts` | `{dirs}` | `string[]`, without running jobs' parts (an edit job's beside its source) or a staging folder an upload or unfinished job uses |

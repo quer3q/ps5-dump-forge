@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ps5_dump_forge_core::{
-    ArchivePassword, ConvertRequest, DeleteError, Event, Format, JobId, Jobs, ListEntry, PackKind,
+    ArchivePassword, ConvertRequest, DeleteError, Event, Format, JobId, Jobs, ListEntry,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -374,7 +374,9 @@ struct InspectArg {
 }
 
 /// `/api/default_output`, `/api/generated_output`: `password` for an archive that needs one
-/// (never logged or echoed).
+/// (never logged or echoed); `pack` (`"zstd"`/`"lz4"`, generated names only) for a Pack job,
+/// absent for anything else; `naming` (generated names only) the name's template
+/// (`[{title}]-[{title_id}]` when absent; one `naming_problem` refuses is a 400).
 #[derive(Deserialize)]
 struct OutputArg {
     source: PathBuf,
@@ -384,12 +386,10 @@ struct OutputArg {
     taken: Vec<PathBuf>,
     #[serde(default)]
     password: Option<ArchivePassword>,
-    /// `/api/generated_output` only: the pack kind a packed folder's name marks.
     #[serde(default)]
-    pack: Option<PackKind>,
-    /// `/api/generated_output` only: the name template (blank: the built-in one).
+    pack: Option<ps5_dump_forge_core::PackKind>,
     #[serde(default)]
-    template: Option<String>,
+    naming: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -592,17 +592,21 @@ impl Server {
             }
             (true, "generated_output") => {
                 let arg: OutputArg = parse(body)?;
+                let naming = arg.naming.as_deref();
+                if let Some(why) = naming.and_then(ps5_dump_forge_core::naming_problem) {
+                    return Err(Response::error(400, why));
+                }
                 readable(&arg.source)?;
                 let password = arg.password.as_ref().map(ArchivePassword::as_str);
                 let out = self.capped(|| {
-                    ps5_dump_forge_core::generated_output_with_options(
+                    ps5_dump_forge_core::generated_output_with(
                         &arg.source,
                         arg.format,
                         &arg.dir,
                         &arg.taken,
                         password,
                         arg.pack,
-                        arg.template.as_deref(),
+                        naming,
                     )
                 })?;
                 Ok(Response::json(&out))

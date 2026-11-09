@@ -18,6 +18,7 @@
   --good: #2fd27a;
   --bad: #ff6b6b;
   --warn: #ffb547;
+  --warn-ink: #ffcf8a;
   --focus: #9db6ff;
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -611,7 +612,7 @@ ul.findings li.info .icon { color: var(--accent-ink); }
 .note-line { display: flex; align-items: flex-start; gap: 8px; font-size: 12.5px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .note-line .icon { width: 15px; height: 15px; margin-top: 1px; }
 .note-line.block { color: var(--danger-ink); }
-.note-line.warn { color: #ffcf8a; }
+.note-line.warn { color: var(--warn-ink); }
 .note-line.good { color: var(--done-ink); }
 .field-error { margin: 6px 0 0; margin-inline-start: 14px; font-size: 12px; }
 
@@ -950,6 +951,27 @@ pre.code { padding: 14px 16px; }
 .feat-tiles { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr); }
 .field.notifications { margin-top: 16px; padding: 10px 12px; border-radius: 12px; background: var(--inset); border: 1px solid var(--line); }
 .field.notifications .bad { margin: 8px 0 0; font-size: 12.5px; }
+/* Output names: the template box, then Library-style chips in the explorer blue
+   (--view-files-ink on its tint 10.6:1) that insert a token; the example in an inset well. */
+.naming-parts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+button.naming-chip { --h: var(--view-files-ink); --h-bg: var(--view-files-tint); --h-line: var(--view-files-line); }
+/* Always in its hue (a chip here inserts, it has no pressed state); a hover rings it brighter,
+   and one whose part is in the template is aria-disabled, faded. */
+button.kind-chip.naming-chip,
+button.kind-chip.naming-chip:not([aria-pressed="true"]):hover { border-color: transparent; background: var(--h-bg); color: var(--h); box-shadow: inset 0 0 0 1px var(--h-line); }
+button.kind-chip.naming-chip:not([aria-pressed="true"]):hover:not(:disabled, [aria-disabled="true"]) { background: var(--h-bg); color: var(--h); box-shadow: inset 0 0 0 1px var(--h); }
+button.naming-chip .icon { width: 14px; height: 14px; }
+/* Two rows: Example (the sample's name, LTR, mono) and Length (the count, then one muted line). */
+.naming-example {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; align-items: baseline;
+  margin: 14px 0 0; padding: 10px 12px; border-radius: 12px; background: var(--inset);
+  border: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere;
+}
+.naming-example dd { margin: 0; color: var(--fg); font-size: 12.5px; text-align: start; }
+.naming-count { font-variant-numeric: tabular-nums; }
+.naming-why { display: block; margin-top: 2px; color: var(--muted); }
+.naming-example dd.over, .naming-example dd.over .naming-why { color: var(--warn-ink); }
+.naming-note { margin: 10px 0 0; }
 .feat-tile {
   display: flex; align-items: flex-start; gap: 12px; min-width: 0; padding: 12px 14px; border-radius: 12px;
   background: var(--inset); border: 1px solid var(--line);

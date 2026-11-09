@@ -645,7 +645,7 @@ const en = {
 
         <h3>Packing strategy</h3>
         <ol>
-          <li><b>Pack everything except system files</b> (zstd, and LZ4 with ampr-emu-ng): every file but eboot.bin, executables and modules, sce_sys, sce_module and fakelib; ampr-emu-ng serves the rest, audio and video included.</li>
+          <li><b>Pack everything except system files</b> (zstd, and LZ4 with ampr-emu-ng): every file but eboot.bin, executables and modules, sce_sys, sce_module, fakelib and .ini files (dlc_emu.ini stays editable); ampr-emu-ng serves the rest, audio and video included.</li>
           <li><b>Compatibility LZ4 strategy</b> (LZ4 with ampr_emu): configs, media and the other files a game reads directly stay loose.</li>
           <li>Pack only: under <b>Custom rules (TOML)</b>, pick a profile in the format of ampr_pack.py and Lazy_AMPR, on this device or another one.</li>
           <li>The last matching rule wins; system files always stay loose. Wrong rules can leave a game that won't start.</li>
@@ -903,15 +903,36 @@ const en = {
     savedAs: (name: string, dir: string) => `saved as ${name} in ${dir}`,
     inDir: (dir: string) => `in ${dir}`,
     generate: "Generate name based on content",
-    nameTemplate: "Name template",
-    nameTemplateHint:
-      "Placeholders: {id}, {title}, {version}, {kind}. {kind} is lz4 or zstd for a packed folder only; a long name shortens the title only.",
-    nameTemplateReset: "Default",
-    templateUnknown: (token: string) => `Unknown placeholder {${token}}`,
-    templateUnclosed: "The template has an unclosed {",
-    templateNested: "A placeholder can't hold {",
-    templateChar: (c: string) => `${c} can't be in a file name`,
-    templateLong: (n: number) => `The template is at most ${n} bytes`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "Output names",
+    template: "Name template",
+    parts: { title: "Title", title_id: "Title ID", version: "Version", pack: "Pack kind", region: "Region", fw: "Firmware" },
+    partsLabel: "Insert a part",
+    insert: (part: string) => `Insert ${part}`,
+    inUse: (part: string) => `${part} is already in the template`,
+    example: "Example",
+    length: "Length",
+    bytes: (n: number, max: number) => `${n} of ${max} bytes.`,
+    room: (n: number) => plural(n, { one: `${num(n)} byte is left for the title.`, other: `${num(n)} bytes are left for the title.` }),
+    noRoom: "No room is left for the title: it is left out.",
+    versionOut: "The version is left out to make room.",
+    cut: "The name is cut at 63 bytes.",
+    idOnly: "The template's own text fills the 63 bytes, so the title ID names the output.",
+    limit: "ShadowMount+ can't mount an image whose name is longer than 63 bytes (58 for ffpfsc), so a longer name has its title cut first.",
+    errors: {
+      long: (max: number) => `A template is at most ${max} bytes.`,
+      open: "A { has no closing }.",
+      close: "A } has no opening {.",
+      unknown: (token: string) => `{${token}} isn't a part: use Title, Title ID, Version, Pack kind, Region or Firmware.`,
+      twice: (token: string) => `{${token}} is in the template twice: use each part once.`,
+      char: (c: string) => `A name can't hold ${c}.`,
+      control: "A name can't hold a control character.",
+      needsName: "A name needs Title or Title ID.",
+    },
+    notSaved: "Not saved: names keep the last template that worked.",
+    reset: "Reset",
   },
   // UpdateToast.tsx: a newer release (checked at every start)
   update: {

@@ -212,8 +212,10 @@ mod tests {
         assert_eq!(std::fs::read(back.join("data/big.bin")).unwrap(), big);
 
         // A generated name skips one taken on the peer.
-        let generated =
-            || crate::generated_output(&src, Format::Exfat, &root.join("out").url(), &[]).unwrap();
+        let generated = || {
+            let out = root.join("out").url();
+            crate::generated_output(&src, Format::Exfat, &out, &[], None, None).unwrap()
+        };
         let first = generated();
         convert(&request(&src, "exfat", &first)).unwrap();
         let second = generated();

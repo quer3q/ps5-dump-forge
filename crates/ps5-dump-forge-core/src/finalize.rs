@@ -376,12 +376,23 @@ pub(crate) fn handle_id(file: &File) -> io::Result<FileId> {
 #[cfg(windows)]
 pub(crate) fn path_id(path: &Path) -> io::Result<(FileId, FileType)> {
     let file = open_attributes(path, false)?;
-    Ok((handle_id(&file)?, file.metadata()?.file_type()))
+    Ok((path_handle_id(path, &file)?, file.metadata()?.file_type()))
 }
 
 #[cfg(windows)]
 pub(crate) fn followed_id(path: &Path) -> io::Result<FileId> {
-    handle_id(&open_attributes(path, true)?)
+    path_handle_id(path, &open_attributes(path, true)?)
+}
+
+#[cfg(windows)]
+fn path_handle_id(path: &Path, file: &File) -> io::Result<FileId> {
+    // `G:\` or `\\?\G:\`, not a rootless `G:` (that drive's current folder).
+    if path.has_root() && path.parent().is_none() {
+        // A FAT volume root can have id 0; non-roots cannot, so it only matches that root.
+        crate::win::raw_file_id(file)
+    } else {
+        handle_id(file)
+    }
 }
 
 /// Opens a file or folder for its attributes only. It shares everything, so it never

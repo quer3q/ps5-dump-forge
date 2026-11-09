@@ -721,7 +721,7 @@ const ar: Messages = {
 
         <h3>استراتيجية الحزم</h3>
         <ol>
-          <li><b>حزم كل شيء ما عدا ملفات النظام</b> (⁦zstd⁩، و⁦LZ4⁩ مع ⁦ampr-emu-ng⁩): كل الملفات ما عدا ⁦eboot.bin⁩ والملفات التنفيذية والوحدات و⁦sce_sys⁩ و⁦sce_module⁩ و⁦fakelib⁩؛ ويقدّم ⁦ampr-emu-ng⁩ الباقي، بما فيه الصوت والفيديو.</li>
+          <li><b>حزم كل شيء ما عدا ملفات النظام</b> (⁦zstd⁩، و⁦LZ4⁩ مع ⁦ampr-emu-ng⁩): كل الملفات ما عدا ⁦eboot.bin⁩ والملفات التنفيذية والوحدات و⁦sce_sys⁩ و⁦sce_module⁩ و⁦fakelib⁩ وملفات ⁦.ini⁩ (يبقى ⁦dlc_emu.ini⁩ قابلًا للتعديل)؛ ويقدّم ⁦ampr-emu-ng⁩ الباقي، بما فيه الصوت والفيديو.</li>
           <li><b>استراتيجية ⁦LZ4⁩ للتوافق</b> (⁦LZ4⁩ مع ⁦ampr_emu⁩): تبقى الإعدادات والوسائط والملفات الأخرى التي تقرؤها اللعبة مباشرةً منفصلة.</li>
           <li>عند «حزم» فقط: من <b>قواعد مخصّصة (TOML)</b> اختر ملف تعريف بصيغة ⁦ampr_pack.py⁩ و⁦Lazy_AMPR⁩، على هذا الجهاز أو على جهاز آخر.</li>
           <li>تُطبَّق آخر قاعدة مطابقة؛ وتبقى ملفات النظام منفصلة دائمًا. قد تؤدي القواعد الخاطئة إلى لعبة لا تعمل.</li>
@@ -997,15 +997,36 @@ const ar: Messages = {
     savedAs: (name, dir) => `سيُحفظ باسم ${iso(name)} في ${iso(dir)}`,
     inDir: (dir) => `في ${iso(dir)}`,
     generate: "إنشاء اسم من المحتوى",
-    nameTemplate: "قالب الاسم",
-    nameTemplateHint:
-      "المتاح: {id} و{title} و{version} و{kind}. {kind} يكون lz4 أو zstd للمجلد المضغوط فقط؛ الاسم الطويل يختصر العنوان فقط.",
-    nameTemplateReset: "افتراضي",
-    templateUnknown: (token: string) => `عنصر غير معروف {${token}}`,
-    templateUnclosed: "في القالب { غير مغلق",
-    templateNested: "لا يمكن أن يحتوي العنصر على {",
-    templateChar: (c: string) => `لا يمكن أن يظهر ${c} في اسم ملف`,
-    templateLong: (n: number) => `القالب ${n} بايت على الأكثر`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "أسماء المخرجات",
+    parts: { title: "العنوان", title_id: "معرّف اللعبة", version: "الإصدار", pack: "نوع الحزم", region: "المنطقة", fw: "البرنامج الثابت" },
+    template: "قالب الاسم",
+    partsLabel: "إدراج جزء",
+    insert: (part: string) => `إدراج ${part}`,
+    inUse: (part) => `${part} موجود في القالب بالفعل`,
+    example: "مثال",
+    length: "الطول",
+    bytes: (n, max) => `${n} من ${max} بايت.`,
+    room: (n) => `يتبقى ${n} بايت للعنوان.`,
+    noRoom: "لا تتبقى مساحة للعنوان: يُحذف العنوان.",
+    versionOut: "يُحذف الإصدار لإفساح المجال.",
+    cut: "يُقص الاسم عند 63 بايت.",
+    idOnly: "نص القالب يملأ 63 بايت، لذا يُسمّى الإخراج بمعرّف اللعبة.",
+    limit: `لا يستطيع ${iso("ShadowMount+")} تركيب صورة يزيد اسمها على 63 بايت (58 لـ ffpfsc)، لذا يُقصَّر العنوان أولًا في الاسم الأطول.`,
+    errors: {
+      long: (max: number) => `لا يتجاوز القالب ${max} بايت.`,
+      open: `توجد ${iso("{")} بلا ${iso("}")} تغلقها.`,
+      close: `توجد ${iso("}")} بلا ${iso("{")} تفتحها.`,
+      unknown: (token: string) => `${iso(`{${token}}`)} ليس جزءًا من الاسم: استخدم العنوان أو معرّف اللعبة أو الإصدار أو نوع الحزم أو المنطقة أو البرنامج الثابت.`,
+      twice: (token) => `${iso(`{${token}}`)} مكرر في القالب: استخدم كل جزء مرة واحدة.`,
+      char: (c: string) => `لا يمكن أن يحتوي الاسم على ${iso(c)}.`,
+      control: "لا يمكن أن يحتوي الاسم على حرف تحكم.",
+      needsName: "يحتاج الاسم إلى العنوان أو معرّف اللعبة.",
+    },
+    notSaved: "لم يُحفظ: تبقى الأسماء على آخر قالب صالح.",
+    reset: "إعادة الضبط",
   },
   // UpdateToast.tsx
   update: {

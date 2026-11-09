@@ -2,7 +2,7 @@
 
 Without a profile Forge uses one of two built-in packing strategies. **Pack everything except
 system files** (zstd Pack, and LZ4 Pack with ampr-emu-ng) packs every file except the system files
-(`eboot.bin`, `*.elf`, `*.self`, `*.prx`, `*.sprx`, `sce_sys/`, `sce_module/`, `fakelib*/`, the
+(`eboot.bin`, `*.elf`, `*.self`, `*.prx`, `*.sprx`, `*.ini` (`dlc_emu.ini` stays editable), `sce_sys/`, `sce_module/`, `fakelib*/`, the
 runtime's own files): ampr-emu-ng serves a fully packed game. The **compatibility LZ4 strategy**
 (LZ4 Pack with ampr_emu) keeps root files and the keep-loose list (container indexes, configs,
 media, protected and video folders, Insomniac's containers) loose and packs everything else
@@ -100,6 +100,7 @@ and the root-file rule are all its call. Only these always stay loose, whatever 
 
 - empty files;
 - `eboot.bin` (any folder, any case) and any `.elf`, `.self`, `.prx` or `.sprx`;
+- any `.ini` (`dlc_emu.ini` and other settings stay editable);
 - anything inside a root `sce_sys/` or `sce_module/` folder or a root folder whose name starts
   with `fakelib` (any case);
 - the AMPR files: `ampr_assets.index`, `ampr_assets.index.crc`, `ampr_assets.index.runtime`,

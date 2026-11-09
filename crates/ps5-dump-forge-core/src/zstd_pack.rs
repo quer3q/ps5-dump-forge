@@ -42,7 +42,7 @@ pub(crate) fn is_pack_name(path: &str) -> bool {
 }
 
 /// Whether `path` stays loose whatever the rules say: the `always_loose` list (eboot,
-/// executables, `sce_sys/`, `sce_module/`, `fakelib*/`, the ampr_emu artifacts) plus
+/// executables, `sce_sys/`, `sce_module/`, `fakelib*/`, every `.ini`, the ampr_emu artifacts) plus
 /// `ampr_zstd.index`, `ampr_zstd-*.pak` and `ampr_emu.index`.
 pub(crate) fn loose(path: &str) -> bool {
     ps5_dump_forge_lz4::always_loose(path) || is_pack_name(path) || path == INDEX

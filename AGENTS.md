@@ -83,12 +83,12 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, the packing strategy (`rules.rs`, shared by zstd and LZ4 Pack), LZ4 blocks through
   the C liblz4 (`block.rs`, `lz4-sys`: `LZ4_compress_default` at level 0, `LZ4_compress_HC` at 3..=12,
   `LZ4_decompress_safe`), the embedded runtimes (`runtime.rs`: the release runtime `runtime::release()` and ampr-emu-ng
-  v0.3.2 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
+  v0.3.4 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
   once on first use into a `OnceLock`; sizes and SHA-256 pinned (`pinned_sizes_and_hashes`); `classify` also recognizes by pinned
-  SHA-256 the old trace build and the old ng builds (`OLD_ZSTD_SHA256`, `NG_6972875_SHA256`, `V020_ZSTD_SHA256`, `V030_ZSTD_SHA256`, `V031_ZSTD_SHA256`, `PREVIOUS_ZSTD_SHA256`), none shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
+  SHA-256 the old trace build and the old ng builds (`OLD_ZSTD_SHA256`, `NG_6972875_SHA256`, `V020_ZSTD_SHA256`, `V030_ZSTD_SHA256`, `V031_ZSTD_SHA256`, `V032_ZSTD_SHA256`, `V033_ZSTD_SHA256`, `PREVIOUS_ZSTD_SHA256`), none shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
   runtime swap). `tree.rs` is `PackedTree`, the packs served as a `SourceTree` from a `writer::measure` pass.
   `vendor/ampr_emu/`: the upstream 0.4.2.1 release `.sprx` + the source archive. `vendor/ampr-emu-ng/`: the
-  ampr-emu-ng v0.3.2 release (tag commit c221a30; `libSceAmpr.sprx`, embedded as `runtime::zstd()`;
+  ampr-emu-ng v0.3.4 release (tag commit cbdafd8; `libSceAmpr.sprx`, embedded as `runtime::zstd()`;
   `libSceAmpr-debug.sprx`, never embedded; `SHA256SUMS`, the release's) + the tag's source archive.
 - `crates/ps5-dump-forge-zstd`: zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak` volumes of at most 4 GiB -
   64 KiB, 256 KiB chunks, one zstd frame or raw each): the format (encode + validating decode), the
@@ -281,9 +281,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - zstd packs (`core/src/zstd_pack.rs`, `ps5-dump-forge-zstd`; spec `docs/zstd.md`; named zstd, files on disk AMPR
   style, by user decision: `ampr_zstd.index` (`AMPRZPK1`) + `ampr_zstd-NNN.pak` (`AMPRZDT1`, from 000)): volumes
   (zstd, 256 KiB chunks, a chunk kept raw when zstd doesn't shrink it) that ampr-emu-ng (`runtime::zstd()`,
-  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.3.2 release, size and SHA-256
+  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.3.4 release, size and SHA-256
   pinned (`ZSTD_SHA256`); the user's runtime, which reads LZ4 packs too and serves a fully packed zstd or LZ4 game;
-  the v0.3.1 release (`V031_ZSTD_SHA256`), the v0.3.0 release (`V030_ZSTD_SHA256`), the local 6972875 build embedded before v0.3.0 (`NG_6972875_SHA256`), the v0.2.0 release
+  the v0.3.3 release (`V033_ZSTD_SHA256`), the v0.3.2 release (`V032_ZSTD_SHA256`), the v0.3.1 release (`V031_ZSTD_SHA256`), the v0.3.0 release (`V030_ZSTD_SHA256`), the local 6972875 build embedded before v0.3.0 (`NG_6972875_SHA256`), the v0.2.0 release
   (`V020_ZSTD_SHA256`), the v0.1.0 release (`PREVIOUS_ZSTD_SHA256`) and the old local build (`OLD_ZSTD_SHA256`),
   their files removed, are still recognized by their hashes, so a game carrying it keeps it, and any other build holding the
   `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng too) reads.
@@ -310,7 +310,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   packages that index as it is (vendor patch 0030: `source::lz4_packed` answers true for it). Remove backport is
   refused in the UI for a packed source (`convert.zstdBackport`/`lz4Backport`: unpack first). Its label is
   shown wherever the LZ4 one is: the source card's AMPR tile (`AmprTile`, one for LZ4 and zstd, by user
-  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.3.2`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
+  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.3.4`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
   the value Packed (zstd) / Packed (LZ4) in the green neon look, Damaged packs as before, Unpacked greyed
   `.tile.unpacked`), the Library's **zstd** chip and card/row badge.
   UI (by user decision): the **Pack** tab (`app/src/Pack.tsx`, after Edit; **How pack works** in `PackHelp.tsx`)
@@ -420,7 +420,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   rule wins. Every other key (`[groups]`, lanes, dedupe, a typo) is ignored, one log line `pack rules: ignored
   keys: ...`; `include_from`/`exclude_from` read pattern files beside the profile (inside its folder, 1 MiB
   each, 16 MiB and 200,000 patterns in all, 10,000 with a wildcard). With a profile only
-  `rules::always_loose` (system and runtime files) overrides it; the keep-loose list doesn't apply (the
+  `rules::always_loose` (system and runtime files, and every `*.ini`, by user request: `dlc_emu.ini` and other settings stay editable) overrides it; the keep-loose list doesn't apply (the
   user's call; Pack warns). zstd: `store` packs
   as compress (chunks that don't shrink are raw anyway), no auto-loose. Log `pack rules: <file>: N rules; M files
   packed, K loose; ...`.
@@ -488,7 +488,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
      `--delete-source`): a conversion or an LZ4/zstd pack or unpack only (with an edit, extract, transfer or
      install a preflight finding). The job records what it read (`delete::ReadSource` in `Ctx.read`, handed
      back to `Inner::run`): a folder's `FolderListing` (every file's path, size, mtime and identity
-     (`finalize::path_id`: unix dev + ino, Windows volume serial + file index) and every empty folder, as the
+     (`finalize::path_id`: unix dev + ino, Windows volume serial + file index; an id of 0 is refused except a volume root's, which a FAT/exFAT drive reports as 0, issue #34) and every empty folder, as the
      job's scanner kept them), or an image's or archive's `SourceStamp` (an archive's every part as stamped
      when opened; parts are never looked for again after the job). Once the result is Ok (verified, output in
      place), `jobs.rs` `Inner::delete_source` checks it first, outside the job-table lock
@@ -1055,7 +1055,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (`Jobs::set_external_busy(connect.writing_hook())`); Delete and Move refuse that path too (a move's
   source and destination). This side keeps one control session per device and
   up to 8 data lanes each for reads and writes (8 MiB chunks, each BLAKE3-checked; a write sends 64 MiB, a
-  sequential read fetches 64 MiB ahead (`RemoteReader`, `RemoteTree`), each dealt to the lanes; one session
+  sequential read fetches a window ahead that doubles up to 64 MiB (`RemoteReader` from 1 MiB, `RemoteTree` from the read's size: issue #36, a packed file's 2 MiB batches no longer pull 64 MiB each), each dealt to the lanes; one session
   and lane retry). Each read re-checks size + mtime (no identity: ponytail). Small files (≤ 8 MiB, `PUT_MAX`)
   take one lane round trip each way: `Remote::read_checked` (a lane `read {path}`, the stat after the read in
   `DataHead.stat`) and `Remote::put_new` (a lane `put {tmp, path}`: created, written, synced, renamed; the
@@ -1223,7 +1223,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   "with smart healing"), Storage (Library + File explorer), Safe; `Formats.tsx` maps the icons by position, so every
   language keeps the nine in that order (typed as nine, `Features`: tsc holds every language to it). Then
   Compare formats (a row per format in its hue: fpkg, zstd packs, LZ4 packed folder, ffpkg, exfat, ffpfs, ffpfsc,
-  folder; each rating a `.chip` with an icon, never colour alone), then Credits on a card of its own. The page's QR code lives on the Connect tab (web build).
+  folder; each rating a `.chip` with an icon, never colour alone), then Credits on a card of its own.
+  Between the About card and Compare formats sits **Output names** (issue #33; the naming template, below). The page's QR code lives on the Connect tab (web build).
 - UI languages: English (the fallback), Russian, Simplified Chinese (`zh`), German, Spanish, French,
   Japanese, Brazilian Portuguese (`pt`), Italian, Korean and Arabic; UI text only (`app/src/i18n.ts`). Backend text
   (errors, findings, job logs, checks, `describe`), the CLI, `entry.c`'s notices, format ids, file names, product
@@ -1242,7 +1243,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (exact tag, then its primary subtag) until the About tab's selector (System + each language, every
   platform) does. Game titles come from param.json's `localizedParameters` (`title_names` in
   `Inspection`/`LibraryEntry`; `gameTitle`): the chosen language, else the system languages, else
-  English, else `title_name` (the default language, still used for generated names and sorting).
+  English, else `title_name` (the default language, still used for sorting). Generated names' `{title}` is the English title (`localizedParameters` `en-US`, `en-GB`, then any `en*`, by user decision), else `title_name`.
   Every UI copy change updates every language; the UI says "game", never "dump" (except the product
   names). Russian writes trace terms as трейс/трейсы/трейсинг. Arabic is right-to-left (`rtl` in
   `LANGUAGES`: `<html dir="rtl">`; styles.css uses logical properties plus a few `[dir="rtl"]` overrides,
@@ -1258,9 +1259,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - No settings and no config file: the UI keeps choices in memory until it closes (Connect's pairings,
   above, are the service's own state), except the UI language (`forge.lang` in `localStorage`; unreadable
   storage falls back to the system languages), the pickers' shortcut folders (`forge.shortcuts` in
-  `localStorage`, issue #18; unreadable storage is none), the generated-name template
-  (`forge.nameTemplate` in `localStorage`, issue #33; unreadable or invalid storage is the built-in one)
-  and the PS5 About notification switch (kept by the server
+  `localStorage`, issue #18; unreadable storage is none), the output naming (`forge.naming`, issue #33; unreadable or invalid is the default) and the PS5 About notification switch (kept by the server
   on the console as `notifications.off`; by user decision). Defaults: Convert's target
   fpkg (`.pkg`), exfat for a `.pkg` source (by user decision; picker order Folder, fpkg, exfat, ffpkg, ffpfsc,
   ffpfs), exfat inside a `.ffpfsc` in the UI (by user decision; core and CLI keep ffpkg; under the inner picker
@@ -1283,7 +1282,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   slices), full is opt-in (`full_verify`, `--full-verify`, the "Full verification" switch). A fast `.pkg`
   also samples the builder's own block sweep and `playgo-chunk.crc` check (vendor patch 0012, the job's seed).
 - Updates (by user decision): every start checks GitHub, always on, no setting, nothing stored (`localStorage`
-  keeps only `forge.lang`, `forge.shortcuts` and `forge.nameTemplate`); **Later** hides the toast for the session. `app/src/update.ts` (no runtime imports;
+  keeps only `forge.lang`, `forge.shortcuts` and `forge.naming`); **Later** hides the toast for the session. `app/src/update.ts` (no runtime imports;
   `scripts/check-update.mjs`): `GET api.github.com/repos/quer3q/ps5-dump-forge/releases/latest` (10 s, no
   cookies, any error = no toast), `tag_name` `vX.Y.Z` newer than the running version (a prerelease is older than
   its release) and the release lists this build's exact asset (`ps5-dump-forge-<v>-<asset>`, `state`
@@ -1373,12 +1372,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (longer fails with ENAMETOOLONG), so the stem (the name without its extension) is ≤ 63 bytes for
   `.exfat`/`.ffpkg`/`.ffpfs` and ≤ 58 for `.ffpfsc` (`preflight::stem_limit`); preflight refuses a longer
   typed name. Folders and `.pkg` keep to the same 63 bytes, so every output follows one rule. Generated names
-  follow the built-in template `{id}-{title}-{version}-{kind}` (issue #33): the title id, an English
-  title compacted to letters and digits with each word capitalized, `-v<version>`, and `-lz4`/`-zstd`
-  only for a packed folder (an image never gets one). A user can override the assembly with
-  `forge.nameTemplate`; the field values and the shortening stay fixed. Only the title is shortened
-  (its upper-case letters, then cut at a character boundary); a fixed part that does not fit is an
-  error, never a cut version. `-2`, `-3`, ... when taken.
+  are `[GAME_TITLE]-[TITLE_ID]` by default (`-2`, `-3`, ... when taken); the game title is cut first. Output names (issue #33, by user decision): the About tab's **Output names** card (`Formats.tsx`, store `app/src/naming.ts`, `localStorage` `forge.naming`, saved 500 ms after the last keystroke; Convert and Pack name their output again only while shown, a hidden tab once when shown again, since each name reads the source: `useOutput`'s `active`, an idea from PR #39) is one free-text template, default `[{title}]-[{title_id}]` (core `DEFAULT_NAMING`), tokens `{title}`, `{title_id}`, `{version}` (param.json `contentVersion`: ASCII letters, digits and dots, no dot at an end, at most 16 bytes) `{pack}` (`zstd`/`LZ4`, a Pack job only: `PackKind`, `Format::Lz4` counts as LZ4), `{region}` (`USA`/`EUR`/`JPN`/`ASIA`/`KOR` from the content id's `UP`/`EP`/`JP`/`HP`/`KP`, else empty) and `{fw}` (param.json `requiredSystemSoftwareVersion` as `7.00`, by user request); chips insert a token at the cursor; each part at most once (core and the TS port refuse a repeat; a chip whose part is in the template is off, with a check); one example line (the sample as a zstd Pack names it: one rule for every job, a Convert leaves `{pack}` empty) with a live Length row: the example's bytes of 63 and the bytes left for the title (`naming.ts` `STEM_MAX`, `bytes`); a template cut to nothing falls back to the title id or the source's name; core `naming_problem` (and its TS port) refuses a template over 128 bytes, without `{title}` or `{title_id}`, with another `{`/`}`, a control character or `/ \ : * ? " < > |` (an invalid one is not saved; the server answers 400). A missing value is empty, then the template's own text is cleaned: empty `[]`/`()` removed, a run of one separator (`-`, `_`, space) collapsed, separators trimmed at the ends (ponytail: a spaced ` - ` can double). `generated_output`'s `naming: Option<&str>`, server/Tauri `naming` (absent = the default); within the limit the version is dropped when the rest doesn't fit even without the title, then the title cut, then the rest.
 - In-place edits (each format crate's `edit.rs`; every overwritten byte journaled; within 128 MiB of
   metadata, else "rebuild it instead"; timestamps of renamed entries unchanged; exFAT and UFS2 write new
   data only into free space and reuse no cluster, block or inode freed within the same plan):
@@ -1412,7 +1406,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - zstd packs (`docs/zstd.md`): `ampr_zstd.index` (`AMPRZPK1`, version 1, 128-byte header, file, chunk and volume
   records, FNV-1a 64 path hashes, CRC-32 over header and tables) and `ampr_zstd-NNN.pak` volumes (`AMPRZDT1`, from 000; 64-byte header with
   the index's archive id, at most 4 GiB - 64 KiB, at most 4,096); 256 KiB chunks, each one zstd frame or raw
-  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.3.2, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
+  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.3.4, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
 
 ## Commands
 ```sh

@@ -7,7 +7,8 @@
 #
 # The last matching [[rule]] wins. Globs are case-sensitive and `*` crosses `/`, so
 # "*.ini" matches an .ini file in any folder. eboot.bin, executables, sce_sys/, sce_module/,
-# fakelib*/ and the AMPR files always stay loose, whatever the rules say.
+# fakelib*/, every .ini (dlc_emu.ini stays editable) and the AMPR files always stay loose,
+# whatever the rules say.
 
 [pack]
 # Files no rule matches stay loose: root files, anything outside data/.

@@ -598,7 +598,7 @@ const zh: Messages = {
 
         <h3>打包策略</h3>
         <ol>
-          <li><b>打包除系统文件外的全部文件</b>（zstd，以及使用 ampr-emu-ng 的 LZ4）：打包除 eboot.bin、可执行文件与模块、sce_sys、sce_module 和 fakelib 以外的所有文件，其余文件（包括音频和视频）由 ampr-emu-ng 提供。</li>
+          <li><b>打包除系统文件外的全部文件</b>（zstd，以及使用 ampr-emu-ng 的 LZ4）：打包除 eboot.bin、可执行文件与模块、sce_sys、sce_module、fakelib 和 .ini 文件（dlc_emu.ini 仍可编辑）以外的所有文件，其余文件（包括音频和视频）由 ampr-emu-ng 提供。</li>
           <li><b>兼容 LZ4 策略</b>（使用 ampr_emu 的 LZ4）：配置、媒体等游戏直接读取的文件保持独立。</li>
           <li>仅限打包：在<b>自定义规则（TOML）</b>中，从本设备或其他设备选择 ampr_pack.py 与 Lazy_AMPR 格式的配置文件。</li>
           <li>以最后一条匹配的规则为准；系统文件始终保持独立。规则有误可能导致游戏无法启动。</li>
@@ -840,15 +840,36 @@ const zh: Messages = {
     savedAs: (name, dir) => `将以 ${name} 保存在 ${dir}`,
     inDir: (dir) => `位于 ${dir}`,
     generate: "根据内容生成名称",
-    nameTemplate: "命名模板",
-    nameTemplateHint:
-      "可用 {id}、{title}、{version}、{kind}；{kind} 仅压缩文件夹为 lz4 或 zstd，超长时只缩短标题。",
-    nameTemplateReset: "默认",
-    templateUnknown: (token: string) => `未知占位符 {${token}}`,
-    templateUnclosed: "模板里有未闭合的 {",
-    templateNested: "占位符里不能再有 {",
-    templateChar: (c: string) => `${c} 不能出现在文件名里`,
-    templateLong: (n: number) => `模板最多 ${n} 字节`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "输出名称",
+    parts: { title: "标题", title_id: "游戏 ID", version: "版本", pack: "打包类型", region: "地区", fw: "固件" },
+    template: "名称模板",
+    partsLabel: "插入部分",
+    insert: (part: string) => `插入${part}`,
+    inUse: (part) => `模板中已有${part}`,
+    example: "示例",
+    length: "长度",
+    bytes: (n, max) => `${n} / ${max} 字节。`,
+    room: (n) => `标题还剩 ${n} 字节。`,
+    noRoom: "没有留给标题的空间：标题会被省略。",
+    versionOut: "为腾出空间，版本会被省略。",
+    cut: "名称会截断为 63 字节。",
+    idOnly: "模板文字占满了 63 字节，因此改用游戏 ID 作为输出名称。",
+    limit: "ShadowMount+ 无法挂载名称超过 63 字节（ffpfsc 为 58 字节）的映像，因此更长的名称会先截短标题。",
+    errors: {
+      long: (max: number) => `模板最多 ${max} 字节。`,
+      open: "{ 缺少对应的 }。",
+      close: "} 缺少对应的 {。",
+      unknown: (token: string) => `{${token}} 不是名称的部分：请使用标题、游戏 ID、版本、打包类型、地区或固件。`,
+      twice: (token) => `模板中 {${token}} 出现了两次：每个部分只能使用一次。`,
+      char: (c: string) => `名称不能包含 ${c}。`,
+      control: "名称不能包含控制字符。",
+      needsName: "名称需要标题或游戏 ID。",
+    },
+    notSaved: "未保存：名称仍使用上一个有效的模板。",
+    reset: "重置",
   },
   // UpdateToast.tsx
   update: {

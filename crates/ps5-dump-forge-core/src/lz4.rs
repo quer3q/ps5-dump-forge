@@ -1085,7 +1085,8 @@ pub(crate) fn loose_line(
 }
 
 /// The "kept loose" line of pack everything except system files: without a profile only system
-/// and runtime files (`always_loose`) and empty files stay loose (`rules::select_everything`).
+/// and runtime files (`always_loose`, `.ini` files counted among them) and empty files stay loose
+/// (`rules::select_everything`).
 pub(crate) fn everything_loose_line(
     loose: &[(&str, u64, bool)],
     profile: Option<&ps5_dump_forge_lz4::Profile>,

@@ -633,7 +633,7 @@ const fr: Messages = {
 
         <h3>Stratégie d’empaquetage</h3>
         <ol>
-          <li><b>Tout empaqueter sauf les fichiers système</b> (zstd, et LZ4 avec ampr-emu-ng) : tous les fichiers sauf eboot.bin, les exécutables et modules, sce_sys, sce_module et fakelib ; ampr-emu-ng sert le reste, audio et vidéo compris.</li>
+          <li><b>Tout empaqueter sauf les fichiers système</b> (zstd, et LZ4 avec ampr-emu-ng) : tous les fichiers sauf eboot.bin, les exécutables et modules, sce_sys, sce_module, fakelib et les fichiers .ini (dlc_emu.ini reste modifiable) ; ampr-emu-ng sert le reste, audio et vidéo compris.</li>
           <li><b>Stratégie LZ4 de compatibilité</b> (LZ4 avec ampr_emu) : les configurations, les médias et les autres fichiers que le jeu lit directement restent à part.</li>
           <li>Pour Empaqueter seulement : sous <b>Règles personnalisées (TOML)</b>, choisissez un profil au format de ampr_pack.py et Lazy_AMPR, sur cet appareil ou un autre.</li>
           <li>La dernière règle correspondante l’emporte ; les fichiers système restent toujours à part. De mauvaises règles peuvent donner un jeu qui ne démarre pas.</li>
@@ -890,15 +890,36 @@ const fr: Messages = {
     savedAs: (name, dir) => `enregistré sous ${name} dans ${dir}`,
     inDir: (dir) => `dans ${dir}`,
     generate: "Générer un nom d’après le contenu",
-    nameTemplate: "Modèle de nom",
-    nameTemplateHint:
-      "Variables : {id}, {title}, {version}, {kind}. {kind} vaut lz4 ou zstd pour un dossier compressé uniquement ; un nom long raccourcit seulement le titre.",
-    nameTemplateReset: "Par défaut",
-    templateUnknown: (token: string) => `Variable inconnue {${token}}`,
-    templateUnclosed: "Le modèle a une { non fermée",
-    templateNested: "Une variable ne peut pas contenir {",
-    templateChar: (c: string) => `${c} ne peut pas figurer dans un nom de fichier`,
-    templateLong: (n: number) => `Le modèle fait au plus ${n} octets`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "Noms de sortie",
+    parts: { title: "Titre", title_id: "ID du titre", version: "Version", pack: "Type de paquet", region: "Région", fw: "Firmware" },
+    template: "Modèle de nom",
+    partsLabel: "Insérer une partie",
+    insert: (part: string) => `Insérer ${part}`,
+    inUse: (part) => `${part} est déjà dans le modèle`,
+    example: "Exemple",
+    length: "Longueur",
+    bytes: (n, max) => `${n} octets sur ${max}.`,
+    room: (n) => plural(n, { one: `Il reste ${num(n)} octet pour le titre.`, other: `Il reste ${num(n)} octets pour le titre.` }),
+    noRoom: "Il ne reste aucune place pour le titre : il est omis.",
+    versionOut: "La version est omise pour faire de la place.",
+    cut: "Le nom est coupé à 63 octets.",
+    idOnly: "Le texte du modèle remplit les 63 octets : l'ID du titre nomme donc la sortie.",
+    limit: "ShadowMount+ ne peut pas monter une image dont le nom dépasse 63 octets (58 pour ffpfsc) : un nom plus long voit donc d'abord son titre raccourci.",
+    errors: {
+      long: (max: number) => `Un modèle fait au plus ${max} octets.`,
+      open: "Une { n'a pas de } fermante.",
+      close: "Une } n'a pas de { ouvrante.",
+      unknown: (token: string) => `{${token}} n'est pas une partie : utilisez Titre, ID du titre, Version, Type de paquet, Région ou Firmware.`,
+      twice: (token) => `{${token}} figure deux fois dans le modèle : utilisez chaque partie une seule fois.`,
+      char: (c: string) => `Un nom ne peut pas contenir ${c}.`,
+      control: "Un nom ne peut pas contenir de caractère de contrôle.",
+      needsName: "Un nom a besoin du Titre ou de l'ID du titre.",
+    },
+    notSaved: "Non enregistré : les noms suivent toujours le dernier modèle valide.",
+    reset: "Réinitialiser",
   },
   // UpdateToast.tsx
   update: {

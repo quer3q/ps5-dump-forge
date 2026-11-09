@@ -250,7 +250,8 @@ fn artifact(path: &str) -> bool {
 }
 
 /// Paths that are never packed: they are loaded by the console or the
-/// runtime before (or outside) the pack layer. `path` is relative with `/` separators.
+/// runtime before (or outside) the pack layer, and `*.ini` (`dlc_emu.ini` and other settings
+/// a user edits by hand).  `path` is relative with `/` separators.
 /// Names compare ASCII case-insensitively: exFAT and PFS images fold case, so `SCE_SYS/x` is
 /// the folder the console reads.
 pub fn always_loose(path: &str) -> bool {
@@ -258,7 +259,7 @@ pub fn always_loose(path: &str) -> bool {
     let first = path.split('/').next().unwrap_or("").to_ascii_lowercase();
     let in_dir = path.contains('/');
     file.eq_ignore_ascii_case("eboot.bin")
-        || has_suffix(path, &[".elf", ".self", ".prx", ".sprx"])
+        || has_suffix(path, &[".elf", ".self", ".prx", ".sprx", ".ini"])
         || (in_dir && (first == "sce_sys" || first == "sce_module" || first.starts_with("fakelib")))
         || artifact(path)
 }
@@ -610,7 +611,7 @@ pub fn select(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSp
 
 /// Pack everything except system files (by user decision: zstd Pack, and LZ4 Pack with
 /// ampr-emu-ng): without a profile every non-empty file is packed except `always_loose`
-/// (executables, `sce_sys`, `sce_module`, `fakelib*`, the runtime's own files): ampr-emu-ng serves
+/// (executables, `sce_sys`, `sce_module`, `fakelib*`, `.ini` files, the runtime's own files): ampr-emu-ng serves
 /// a fully packed game (plain and libc I/O, directory listings, mmap), so media, configs and root
 /// files go into the packs too. A profile decides as in [`select`].
 pub fn select_everything(path: &str, size: u64, profile: Option<&Profile>) -> Option<PackSpec> {
@@ -1314,6 +1315,7 @@ include = [
             "a profile overrides the keep-loose list"
         );
         assert_eq!(f("sce_sys/icon0.png"), None, "always_loose still wins");
+        assert_eq!(f("data/prein/DLC_EMU.INI"), None, "an .ini stays editable");
         assert_eq!(f("data/other.bin"), None, "default_action = loose");
         for bad in [
             "[pack\n",

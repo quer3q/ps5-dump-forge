@@ -24,12 +24,12 @@ export const ARCHIVE_PASSWORD_REQUIRED = "This archive needs a password.";
 export const ARCHIVE_PASSWORD_WRONG = "The password is not correct.";
 /** A target: every source kind, plus the LZ4 packed folder (a folder, read as one). */
 export type Format = Kind | "lz4";
+/** The packs a Pack job makes, the `pack` part of a generated output's name (`zstd`, `LZ4`). */
+export type PackKind = "zstd" | "lz4";
 /** What a job does with LZ4 asset packs, besides the target: write packs back as plain files
  * (`unpack`), or pack into `format` (`pack`: folder, exfat, ffpkg, ffpfs, ffpfsc; the `lz4`
  * format is the same as `folder` with `pack`). */
 export type Lz4Mode = "unpack" | "pack";
-/** The pack kind a generated name marks: only a packed folder's name gets one. */
-export type PackKind = "lz4" | "zstd";
 /** The image inside a `.ffpfsc` container. */
 export type InnerFormat = "exfat" | "ffpkg" | "ffpfs";
 /** How hard a `.pkg` build compresses (Kraken); `stored`: every inner block raw, same layout. */
@@ -630,9 +630,11 @@ export const api = {
   defaultOutput: (source: string, format: Format, dir: string, password: string | null = null) =>
     invoke<string>("default_output", { source, format, dir, password }),
   /**
-   * The built-in template `{id}-{title}-{version}-{kind}` (or `template`) in `dir`, from the
-   * source's param.json; never an existing path nor one in `taken` (outputs of running jobs):
-   * `-2`, `-3`, ... instead. `pack` adds `-lz4`/`-zstd` for a packed folder only.
+   * `[GAME_NAME]-[TITLE_ID].<ext>` (brackets included) in `dir`, from the source's
+   * param.json, or by the `naming` template (`null`: `[{title}]-[{title_id}]`; tokens
+   * `{title}`, `{title_id}`, `{version}`, `{pack}` (from `pack`), `{region}`, `{fw}`; core refuses an
+   * invalid one);
+   * never an existing path nor one in `taken` (outputs of running jobs): `-2`, `-3`, ... instead.
    */
   generatedOutput: (
     source: string,
@@ -641,8 +643,8 @@ export const api = {
     taken: string[],
     password: string | null = null,
     pack: PackKind | null = null,
-    template: string | null = null,
-  ) => invoke<string>("generated_output", { source, format, dir, taken, password, pack, template }),
+    naming: string | null = null,
+  ) => invoke<string>("generated_output", { source, format, dir, taken, password, pack, naming }),
   startJob: (request: ConvertRequest) => invoke<JobId>("start_job", { request }),
   /** A file or folder on the machine that runs the job, as an edit would add it (sizes; a
    * folder's files and empty folders, junk left out; bounded: `truncated`). */

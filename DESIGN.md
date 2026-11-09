@@ -37,6 +37,7 @@ gradient notice bar) and the app icon (a blue portal-and-anvil emblem with an or
 | `--accent` / `--accent-ink` | `#3d6bff` / `#9db6ff` | Switch on, progress fill, range inputs / link text, empty-state and folder icons, the info finding icon, a job's current step |
 | `--orange` | `#ff7a2f` | The glow's orange (logo shadow, hero edge, written there as `rgba(255, 122, 47, …)`), never text |
 | `--good` / `--bad` / `--warn` | `#2fd27a` / `#ff6b6b` / `#ffb547` | Status icons and text |
+| `--warn-ink` | `#ffcf8a` | Warning prose: `.note-line.warn`, the naming card's Length row when a name is cut |
 | `--focus` | `#9db6ff` | 2px focus ring on every control (`:focus-visible`) |
 | `--sans` | `-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif` | Body text; placeholders and the Naming text inside mono boxes |
 | `--mono` | `ui-monospace, SFMono-Regular, Menlo, monospace` | Paths, file names, IDs, param.json, logs |
@@ -342,7 +343,7 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   note when there are several.
   `.tile.wide` spans the row (Edit's Game facts also add Content ID and the Forge version that made
   the image, both mono; the AMPR tile (LZ4 and zstd alike): the game's runtime with its version as the title
-  (`ampr-emu-ng 0.3.2`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
+  (`ampr-emu-ng 0.3.4`, `ampr_emu 0.4.2.1`, `ampr_emu`, the old trace runtime or No runtime), Packed (LZ4),
   Packed (zstd), Damaged packs or Unpacked as the value; its note
   says when the game doesn't use AMPR and adds what a conversion does to the runtime (installs or replaces with the bundled ampr_emu, or
   "a conversion keeps it" for another build with a version, the title already naming it) and a stale, damaged or missing
@@ -393,13 +394,28 @@ tiles and tags. Two columns from 880px; Edit splits 1:2 from 1100px (its game ca
   sent to that peer), no buttons once finished; never in the quit prompt.
 - **Rating chip** (`.chip.good` / `.ok` / `.bad`): the About tab's Compare formats rows (Console speed
   and Size on disk). Tint, icon and text together, every text ≥ 8.9:1.
-- **About tab** (`Formats.tsx`), three cards. **About** (full width; the head: info icon, title, the
+- **About tab** (`Formats.tsx`), four cards. **About** (full width; the head: info icon, title, the
   language select at its end; no introduction line): the nine features as one grid of small inset tiles
   (`.feat-tiles` / `.feat-tile`: `--inset`, `--line` border; a round icon, the bold name, its text), no
   group headings, in three sets of three (Convert, Transfer, Edit / Streamed, Archives, USB and SD cards /
   Pack, Storage, Safe). From 1000px each set is a column, the three sharing the card's width at equal
   heights; 600–999px each set a row of three; a phone one tile a row; a slightly wider gap between sets
-  is the only grouping cue. **Compare formats** (`.fmt-table`): one row per format (`.fmt-row`), an
+  is the only grouping cue. **Output names** (file icon; **Reset** `.small` in its head, off at the
+  default): one text input holding the template (mono, LTR, no spellcheck; no visible caption, its label visually hidden), typed freely:
+  brackets, separators or none. Under it the parts as `.kind-chip`s (`.naming-chip`, a plus icon, the
+  explorer blue): Title, Title ID, Version, Pack kind, Region, Firmware; a click inserts its token at the cursor (replacing a
+  selection) and focus stays in the input. No toggles, no reorder buttons. An invalid template shows its
+  error as a `.bad.field-error` under the input and is not saved (names keep the last saved one). An inset
+  example (`.naming-example`, a two-row grid: the label muted, the value) names the sample game once, one
+  rule for every job (`{pack}` as a zstd Pack fills it; a Convert leaves it empty), LTR in mono; its
+  Length row (`aria-live="polite"`) shows the count (`.naming-count`, tabular: "41 of 63 bytes") and under
+  it one muted line (`.naming-why`): the bytes left for the title, or what the limit cuts (the name, the
+  title, the version); both in `--warn-ink` (`dd.over`) while anything is cut. Then the note on ShadowMount+'s
+  63-byte name limit, a muted `.note-line` with the info icon while the name fits and a `.note-line.warn`
+  only while it is cut (an always-amber line would stop meaning anything). A chip whose part is already in
+  the template (each part once) is `aria-disabled`, faded, with a check in place of its plus. The limit is 58 bytes
+  for ffpfsc. Saved in `localStorage` `forge.naming` (`naming.ts`, a port of core's template rules and
+  cleanup); Convert's and Pack's name pattern hint renders it with the part names. **Compare formats** (`.fmt-table`): one row per format (`.fmt-row`), an
   inset tile edged at its start in the format's hue (`.fmt-*` `--h-line`): the format and its tagline,
   then the two rating chips; from 760px a muted heading row (`.fmt-head`: Format / Console speed / Size
   on disk), below it the row stacks, the heading row is only read (visually hidden) and each chip carries

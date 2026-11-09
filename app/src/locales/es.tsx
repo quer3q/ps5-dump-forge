@@ -647,7 +647,7 @@ const es: Messages = {
 
         <h3>Estrategia de empaquetado</h3>
         <ol>
-          <li><b>Empaquetar todo salvo los archivos del sistema</b> (zstd, y LZ4 con ampr-emu-ng): todos los archivos salvo eboot.bin, ejecutables y módulos, sce_sys, sce_module y fakelib; ampr-emu-ng sirve el resto, audio y vídeo incluidos.</li>
+          <li><b>Empaquetar todo salvo los archivos del sistema</b> (zstd, y LZ4 con ampr-emu-ng): todos los archivos salvo eboot.bin, ejecutables y módulos, sce_sys, sce_module, fakelib y los archivos .ini (dlc_emu.ini sigue siendo editable); ampr-emu-ng sirve el resto, audio y vídeo incluidos.</li>
           <li><b>Estrategia LZ4 de compatibilidad</b> (LZ4 con ampr_emu): las configuraciones, los medios y los demás archivos que el juego lee directamente quedan sueltos.</li>
           <li>Solo al empaquetar: en <b>Reglas propias (TOML)</b>, elige un perfil en el formato de ampr_pack.py y Lazy_AMPR, en este dispositivo o en otro.</li>
           <li>Gana la última regla que coincide; los archivos del sistema siempre quedan sueltos. Unas reglas erróneas pueden dejar un juego que no arranca.</li>
@@ -908,15 +908,36 @@ const es: Messages = {
     savedAs: (name, dir) => `se guarda como ${name} en ${dir}`,
     inDir: (dir) => `en ${dir}`,
     generate: "Generar nombre según el contenido",
-    nameTemplate: "Plantilla de nombre",
-    nameTemplateHint:
-      "Marcadores: {id}, {title}, {version}, {kind}. {kind} es lz4 o zstd solo para una carpeta empaquetada; un nombre largo acorta solo el título.",
-    nameTemplateReset: "Predeterminada",
-    templateUnknown: (token: string) => `Marcador desconocido {${token}}`,
-    templateUnclosed: "La plantilla tiene una { sin cerrar",
-    templateNested: "Un marcador no puede contener {",
-    templateChar: (c: string) => `${c} no puede estar en un nombre de archivo`,
-    templateLong: (n: number) => `La plantilla admite como máximo ${n} bytes`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "Nombres de salida",
+    parts: { title: "Título", title_id: "ID del título", version: "Versión", pack: "Tipo de paquete", region: "Región", fw: "Firmware" },
+    template: "Plantilla del nombre",
+    partsLabel: "Insertar una parte",
+    insert: (part: string) => `Insertar ${part}`,
+    inUse: (part) => `${part} ya está en la plantilla`,
+    example: "Ejemplo",
+    length: "Longitud",
+    bytes: (n, max) => `${n} de ${max} bytes.`,
+    room: (n) => plural(n, { one: `Queda ${num(n)} byte para el título.`, other: `Quedan ${num(n)} bytes para el título.` }),
+    noRoom: "No queda espacio para el título: se omite.",
+    versionOut: "La versión se omite para hacer sitio.",
+    cut: "El nombre se corta a 63 bytes.",
+    idOnly: "El texto de la plantilla ocupa los 63 bytes, así que el ID del título nombra la salida.",
+    limit: "ShadowMount+ no puede montar una imagen cuyo nombre supere los 63 bytes (58 para ffpfsc), así que en un nombre más largo se acorta primero el título.",
+    errors: {
+      long: (max: number) => `Una plantilla tiene como máximo ${max} bytes.`,
+      open: "Una { no tiene su } de cierre.",
+      close: "Una } no tiene su { de apertura.",
+      unknown: (token: string) => `{${token}} no es una parte: usa Título, ID del título, Versión, Tipo de paquete, Región o Firmware.`,
+      twice: (token) => `{${token}} aparece dos veces en la plantilla: usa cada parte una sola vez.`,
+      char: (c: string) => `Un nombre no puede contener ${c}.`,
+      control: "Un nombre no puede contener un carácter de control.",
+      needsName: "Un nombre necesita Título o ID del título.",
+    },
+    notSaved: "No se guardó: los nombres siguen usando la última plantilla válida.",
+    reset: "Restablecer",
   },
   // UpdateToast.tsx
   update: {

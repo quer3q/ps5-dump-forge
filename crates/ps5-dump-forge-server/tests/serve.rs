@@ -42,9 +42,7 @@ fn game(root: &Path) {
     write(
         root,
         "sce_sys/param.json",
-        br#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST",
-             "contentVersion":"01.018.000",
-             "localizedParameters":{"en-US":{"titleName":"Astro Bot"}}}"#,
+        br#"{"titleId":"PPSA01234","contentId":"UP0000-PPSA01234_00-TESTTESTTESTTEST"}"#,
     );
     write(root, "data/a.bin", &[7u8; 100_000]);
 }
@@ -188,30 +186,6 @@ fn job_end_to_end() {
     assert_eq!(status, 200, "{output}");
     let output = PathBuf::from(output.as_str().unwrap());
     assert_eq!(output.parent(), Some(srv.root.as_path()));
-    // The pack kind marks a packed folder only; the template only assembles the fields.
-    let body = json!({
-        "source": s(&game), "format": "folder", "dir": s(&srv.root), "taken": [],
-        "pack": "zstd",
-    });
-    let (status, v) = srv.post("/api/generated_output", body);
-    assert_eq!(status, 200, "{v}");
-    assert_eq!(
-        v.as_str().unwrap(),
-        format!("{}/PPSA01234-AstroBot-v01.018.000-zstd", srv.root.display())
-    );
-    let body = json!({
-        "source": s(&game), "format": "lz4", "dir": s(&srv.root), "taken": [],
-        "pack": "lz4", "template": "[{title}]-[{id}]-[{version}]-[{kind}]",
-    });
-    let (status, v) = srv.post("/api/generated_output", body);
-    assert_eq!(status, 200, "{v}");
-    assert_eq!(
-        v.as_str().unwrap(),
-        format!(
-            "{}/[AstroBot]-[PPSA01234]-[v01.018.000]-[lz4]",
-            srv.root.display()
-        )
-    );
     let (status, id) = srv.post("/api/start_job", request(&game, &output));
     assert_eq!(status, 200, "{id}");
     let id = id.as_u64().unwrap();

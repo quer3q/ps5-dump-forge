@@ -3,12 +3,28 @@
 // upstream authors, labelled as theirs), then the credits; the language selector sits in the
 // About card's head. On the PS5, one switch saves job notices through the server.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { APP_NAME, jobNotifications, type Format } from "./api";
 import { CardHead, FormatPill, Prose } from "./common";
 import { getChoice, type Lang, LANGS, setLang, useMessages } from "./i18n";
+import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
+import {
+  DEFAULT_NAMING,
+  MAX_NAMING,
+  namingProblem,
+  PARTS,
+  render,
+  SAMPLE,
+  setNaming,
+  STEM_MAX,
+  bytes,
+  cutBytes,
+  type NamePart,
+  type NamingProblem,
+} from "./naming";
+import { useNaming } from "./target";
 
 export type Rating = "good" | "ok" | "bad";
 
@@ -66,6 +82,8 @@ export function Formats(props: { shown: boolean }) {
         </ul>
         <NotificationSwitch shown={props.shown} />
       </section>
+
+      <NamingCard shown={props.shown} />
 
       <section className="card" aria-labelledby="f-title">
         <CardHead icon="table" title={t.compare} id="f-title" />
@@ -128,6 +146,203 @@ export function Formats(props: { shown: boolean }) {
       </section>
     </div>
   );
+}
+
+/** Output names (by user decision): one template, typed freely, with chips that insert a
+ * token at the cursor; kept by naming.ts. An invalid template says why and isn't saved. */
+function NamingCard(props: { shown: boolean }) {
+  const t = useMessages().naming;
+  const naming = useNaming();
+  const [draft, setDraft] = useState(naming);
+  // Reset, or a save from elsewhere in this page: the box follows the saved template.
+  const seen = useRef(naming);
+  if (seen.current !== naming) {
+    seen.current = naming;
+    if (draft !== naming) setDraft(naming);
+  }
+  const input = useRef<HTMLInputElement>(null);
+  // Where the caret goes once an inserted token renders.
+  const [caret, setCaret] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (caret === null || !input.current) return;
+    input.current.focus();
+    input.current.setSelectionRange(caret, caret);
+    setCaret(null);
+  }, [caret]);
+  // Saved 500 ms after the last keystroke (each save makes open tabs name their output again,
+  // which reads the source), and at once when the box loses focus, the tab hides, the page goes
+  // or the card unmounts, so a job started right after an edit uses it.
+  const pending = useRef<{ timer: number; value: string } | null>(null);
+  const flush = () => {
+    if (!pending.current) return;
+    clearTimeout(pending.current.timer);
+    setNaming(pending.current.value); // ignored while invalid
+    pending.current = null;
+  };
+  useEffect(() => {
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, []);
+  useEffect(() => {
+    if (!props.shown) flush();
+  }, [props.shown]);
+  const change = (v: string) => {
+    setDraft(v);
+    if (pending.current) clearTimeout(pending.current.timer);
+    pending.current = { timer: window.setTimeout(flush, 500), value: v };
+  };
+  const insert = (p: NamePart) => {
+    const el = input.current;
+    const at = el?.selectionStart ?? draft.length;
+    const to = el?.selectionEnd ?? at;
+    const token = `{${p}}`;
+    change(draft.slice(0, at) + token + draft.slice(to));
+    setCaret(at + token.length);
+  };
+  const problem = namingProblem(draft);
+  const error = problem && problemText(t.errors, problem);
+  const atDefault = draft === DEFAULT_NAMING && naming === DEFAULT_NAMING;
+  // The example follows the box while it is valid, else the saved template; one rule for
+  // every job, so a Pack's kind is in (a Convert leaves `{pack}` empty).
+  const shown = problem ? naming : draft;
+  // What the template takes without the title: the rest of the 63 bytes is the title's.
+  // As core cuts: the version goes when the rest doesn't fit even without the title, then each
+  // `{title}` gets an equal share of what is left.
+  const titles = (shown.match(/\{title\}/g) ?? []).length;
+  const dropVersion = bytes(render(shown, (p) => (p === "title" ? "" : SAMPLE[p]))) > STEM_MAX;
+  const kept = render(shown, (p) => (p === "version" && dropVersion ? "" : SAMPLE[p]));
+  const others = bytes(kept) - titles * bytes(SAMPLE.title);
+  const room = titles ? Math.floor((STEM_MAX - others) / titles) : null;
+  // No title to cut: the whole name is cut at 63 bytes.
+  const cutAway = titles === 0 && bytes(kept) > STEM_MAX;
+  // The example as core names it: the title cut to its share, then the whole within 63 bytes.
+  const cutName =
+    bytes(kept) <= STEM_MAX
+      ? kept
+      : cutBytes(
+          render(shown, (p) =>
+            p === "title" ? cutBytes(SAMPLE.title, Math.max(0, room ?? 0)) : p === "version" && dropVersion ? "" : SAMPLE[p],
+          ),
+          STEM_MAX,
+        );
+  // As core: a cut that took the game away (template text filling the room before the title
+  // id) names it by its title id instead.
+  const keptGame =
+    (shown.includes("{title_id}") && cutName.includes(SAMPLE.title_id)) ||
+    (shown.includes("{title}") && cutName.includes(SAMPLE.title[0]));
+  const fitted = keptGame ? cutName : SAMPLE.title_id;
+  // Anything cut or left out for the limit, and the one line that says what.
+  const cutting = !keptGame || bytes(kept) > STEM_MAX || dropVersion || (room !== null && room <= 0);
+  const why = !keptGame
+    ? t.idOnly
+    : cutAway
+      ? t.cut
+    : room !== null && room <= 0
+      ? t.noRoom
+      : dropVersion
+        ? t.versionOut
+        : room !== null
+          ? t.room(room)
+          : null;
+  return (
+    <section className="card" aria-labelledby="f-naming">
+      <CardHead icon="file" title={t.title} id="f-naming">
+        <button
+          type="button"
+          className="small"
+          aria-disabled={atDefault || undefined}
+          onClick={() => {
+            if (atDefault) return;
+            if (pending.current) clearTimeout(pending.current.timer);
+            pending.current = null;
+            setDraft(DEFAULT_NAMING);
+            setNaming(DEFAULT_NAMING);
+          }}
+        >
+          <Icon name="undo" />
+          {t.reset}
+        </button>
+      </CardHead>
+      <label className="field-label naming-field">
+        {/* No visible caption (the card's title says it); screen readers still hear it. */}
+        <span className="visually-hidden">{t.template}</span>
+        <input
+          ref={input}
+          className="mono"
+          dir="ltr"
+          value={draft}
+          onChange={(e) => change(e.target.value)}
+          onBlur={flush}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? "naming-error" : undefined}
+          spellCheck={false}
+          autoCapitalize="none"
+          autoCorrect="off"
+        />
+      </label>
+      {error && (
+        <p className="bad field-error" id="naming-error">
+          {error} {t.notSaved}
+        </p>
+      )}
+      <div className="naming-parts" role="group" aria-label={t.partsLabel}>
+        {PARTS.map((p) => (
+          <button
+            type="button"
+            key={p}
+            className="kind-chip naming-chip"
+            aria-label={draft.includes(`{${p}}`) ? t.inUse(t.parts[p]) : t.insert(t.parts[p])}
+            // Each part once: its chip is off while the template has it.
+            aria-disabled={draft.includes(`{${p}}`) || undefined}
+            title={draft.includes(`{${p}}`) ? t.inUse(t.parts[p]) : undefined}
+            // The input keeps focus (and its selection) through a click.
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => !draft.includes(`{${p}}`) && insert(p)}
+          >
+            <Icon name={draft.includes(`{${p}}`) ? "check" : "plus"} />
+            {t.parts[p]}
+          </button>
+        ))}
+      </div>
+      <dl className="naming-example">
+        <dt className="muted">{t.example}</dt>
+        <dd className="mono" dir="ltr">
+          {fitted}
+        </dd>
+        <dt className="muted">{t.length}</dt>
+        <dd className={cutting ? "over" : undefined} aria-live="polite">
+          <span className="naming-count">{t.bytes(bytes(fitted), STEM_MAX)}</span>
+          {why && <span className="naming-why">{why}</span>}
+        </dd>
+      </dl>
+      {/* The limit is a warning only while this template is being cut. */}
+      <p className={`note-line naming-note ${cutting ? "warn" : "muted"}`}>
+        <Icon name={cutting ? "warn" : "info"} />
+        <span>
+          <Prose text={t.limit} />
+        </span>
+      </p>
+    </section>
+  );
+}
+
+/** A template problem in this language. */
+function problemText(e: Messages["naming"]["errors"], p: NamingProblem): string {
+  switch (p.kind) {
+    case "long":
+      return e.long(MAX_NAMING);
+    case "unknown":
+      return e.unknown(p.token);
+    case "twice":
+      return e.twice(p.token);
+    case "char":
+      return e.char(p.char);
+    default:
+      return e[p.kind];
+  }
 }
 
 /** The console keeps this one choice for jobs started here; read again each time About shows

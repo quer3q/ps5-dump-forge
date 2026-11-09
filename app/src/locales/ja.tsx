@@ -620,7 +620,7 @@ const ja: Messages = {
 
         <h3>パック戦略</h3>
         <ol>
-          <li><b>システムファイル以外をすべてパック</b> (zstd、および ampr-emu-ng を使う LZ4): eboot.bin、実行ファイルとモジュール、sce_sys、sce_module、fakelib 以外のすべてのファイルをパックし、音声や動画を含む残りは ampr-emu-ng が提供します。</li>
+          <li><b>システムファイル以外をすべてパック</b> (zstd、および ampr-emu-ng を使う LZ4): eboot.bin、実行ファイルとモジュール、sce_sys、sce_module、fakelib、.ini ファイル (dlc_emu.ini は編集可能なまま) 以外のすべてのファイルをパックし、音声や動画を含む残りは ampr-emu-ng が提供します。</li>
           <li><b>互換 LZ4 方式</b> (ampr_emu を使う LZ4): 設定、メディアなどゲームが直接読むファイルは個別に残します。</li>
           <li>パックのみ：<b>カスタムルール（TOML）</b>で、ampr_pack.py と Lazy_AMPR の形式のプロファイルを、このデバイスまたは別のデバイスから選びます。</li>
           <li>一致した最後のルールが優先され、システムファイルは常に個別に残ります。ルールが誤っていると、ゲームが起動しなくなることがあります。</li>
@@ -873,15 +873,36 @@ const ja: Messages = {
     savedAs: (name, dir) => `${dir} に ${name} として保存`,
     inDir: (dir) => `保存先：${dir}`,
     generate: "内容から名前を生成",
-    nameTemplate: "名前テンプレート",
-    nameTemplateHint:
-      "使用できるのは {id}、{title}、{version}、{kind} です。{kind} はパックしたフォルダーだけが lz4 / zstd になり、長い名前はタイトルだけを短縮します。",
-    nameTemplateReset: "デフォルト",
-    templateUnknown: (token: string) => `不明なプレースホルダー {${token}}`,
-    templateUnclosed: "テンプレートの { が閉じられていません",
-    templateNested: "プレースホルダーに { は使えません",
-    templateChar: (c: string) => `${c} はファイル名に使えません`,
-    templateLong: (n: number) => `テンプレートは最大 ${n} バイトです`,
+  },
+  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  naming: {
+    title: "出力名",
+    parts: { title: "タイトル", title_id: "タイトル ID", version: "バージョン", pack: "パックの種類", region: "リージョン", fw: "ファームウェア" },
+    template: "名前のテンプレート",
+    partsLabel: "部分を挿入",
+    insert: (part: string) => `${part}を挿入`,
+    inUse: (part) => `${part} はすでにテンプレートにあります`,
+    example: "例",
+    length: "長さ",
+    bytes: (n, max) => `${max} バイト中 ${n} バイト。`,
+    room: (n) => `タイトルに使えるのは残り ${n} バイトです。`,
+    noRoom: "タイトルの余地がないため、タイトルは省かれます。",
+    versionOut: "余地を作るためにバージョンが省かれます。",
+    cut: "名前は 63 バイトで切り詰められます。",
+    idOnly: "テンプレートの文字で 63 バイトが埋まるため、タイトル ID が出力名になります。",
+    limit: "ShadowMount+ は名前が 63 バイト（ffpfsc は 58 バイト）を超えるイメージをマウントできないため、それより長い名前はまずタイトルが短くなります。",
+    errors: {
+      long: (max: number) => `テンプレートは最大 ${max} バイトです。`,
+      open: "{ に対応する } がありません。",
+      close: "} に対応する { がありません。",
+      unknown: (token: string) => `{${token}} は名前の部分ではありません。タイトル、タイトル ID、バージョン、パックの種類、リージョン、ファームウェアのいずれかを使ってください。`,
+      twice: (token) => `{${token}} がテンプレートに 2 回あります。各部分は 1 回だけ使ってください。`,
+      char: (c: string) => `名前に ${c} は使えません。`,
+      control: "名前に制御文字は使えません。",
+      needsName: "名前にはタイトルかタイトル ID が必要です。",
+    },
+    notSaved: "保存されていません。名前には最後に使えたテンプレートが引き続き使われます。",
+    reset: "リセット",
   },
   // UpdateToast.tsx
   update: {
