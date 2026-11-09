@@ -28,6 +28,8 @@ export type Format = Kind | "lz4";
  * (`unpack`), or pack into `format` (`pack`: folder, exfat, ffpkg, ffpfs, ffpfsc; the `lz4`
  * format is the same as `folder` with `pack`). */
 export type Lz4Mode = "unpack" | "pack";
+/** The pack kind a generated name marks: only a packed folder's name gets one. */
+export type PackKind = "lz4" | "zstd";
 /** The image inside a `.ffpfsc` container. */
 export type InnerFormat = "exfat" | "ffpkg" | "ffpfs";
 /** How hard a `.pkg` build compresses (Kraken); `stored`: every inner block raw, same layout. */
@@ -628,12 +630,19 @@ export const api = {
   defaultOutput: (source: string, format: Format, dir: string, password: string | null = null) =>
     invoke<string>("default_output", { source, format, dir, password }),
   /**
-   * `[GAME_NAME]-[TITLE_ID].<ext>` (brackets included) in `dir`, from the
-   * source's param.json; never
-   * an existing path nor one in `taken` (outputs of running jobs): `-2`, `-3`, ... instead.
+   * The built-in template `{id}-{title}-{version}-{kind}` (or `template`) in `dir`, from the
+   * source's param.json; never an existing path nor one in `taken` (outputs of running jobs):
+   * `-2`, `-3`, ... instead. `pack` adds `-lz4`/`-zstd` for a packed folder only.
    */
-  generatedOutput: (source: string, format: Format, dir: string, taken: string[], password: string | null = null) =>
-    invoke<string>("generated_output", { source, format, dir, taken, password }),
+  generatedOutput: (
+    source: string,
+    format: Format,
+    dir: string,
+    taken: string[],
+    password: string | null = null,
+    pack: PackKind | null = null,
+    template: string | null = null,
+  ) => invoke<string>("generated_output", { source, format, dir, taken, password, pack, template }),
   startJob: (request: ConvertRequest) => invoke<JobId>("start_job", { request }),
   /** A file or folder on the machine that runs the job, as an edit would add it (sizes; a
    * folder's files and empty folders, junk left out; bounded: `truncated`). */

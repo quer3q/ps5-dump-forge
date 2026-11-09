@@ -916,7 +916,15 @@ const ru: Messages = {
     savedAs: (name, dir) => `сохранится как ${name} в ${dir}`,
     inDir: (dir) => `в ${dir}`,
     generate: "Имя по содержимому",
-    generatePattern: "[название игры]-[ID игры]",
+    nameTemplate: "Шаблон имени",
+    nameTemplateHint:
+      "Доступны {id}, {title}, {version} и {kind}. {kind} — lz4 или zstd только для папки с пакетами; длинное имя сокращает только название.",
+    nameTemplateReset: "По умолчанию",
+    templateUnknown: (token: string) => `Неизвестный заполнитель {${token}}`,
+    templateUnclosed: "В шаблоне не закрыта {",
+    templateNested: "В заполнителе нельзя использовать {",
+    templateChar: (c: string) => `${c} нельзя использовать в имени файла`,
+    templateLong: (n: number) => `Шаблон не длиннее ${n} байт`,
   },
   // UpdateToast.tsx
   update: {

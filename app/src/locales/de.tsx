@@ -892,7 +892,15 @@ const de: Messages = {
     savedAs: (name, dir) => `wird als ${name} in ${dir} gespeichert`,
     inDir: (dir) => `in ${dir}`,
     generate: "Namen aus dem Inhalt erzeugen",
-    generatePattern: "[Spielname]-[Titel-ID]",
+    nameTemplate: "Namensvorlage",
+    nameTemplateHint:
+      "Platzhalter: {id}, {title}, {version}, {kind}. {kind} ist lz4 oder zstd nur für einen gepackten Ordner; ein langer Name kürzt nur den Titel.",
+    nameTemplateReset: "Standard",
+    templateUnknown: (token: string) => `Unbekannter Platzhalter {${token}}`,
+    templateUnclosed: "In der Vorlage ist eine { nicht geschlossen",
+    templateNested: "Ein Platzhalter kann kein { enthalten",
+    templateChar: (c: string) => `${c} darf nicht in einem Dateinamen stehen`,
+    templateLong: (n: number) => `Die Vorlage hat höchstens ${n} Bytes`,
   },
   // UpdateToast.tsx
   update: {

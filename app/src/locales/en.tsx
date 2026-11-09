@@ -903,7 +903,15 @@ const en = {
     savedAs: (name: string, dir: string) => `saved as ${name} in ${dir}`,
     inDir: (dir: string) => `in ${dir}`,
     generate: "Generate name based on content",
-    generatePattern: "[game name]-[title ID]",
+    nameTemplate: "Name template",
+    nameTemplateHint:
+      "Placeholders: {id}, {title}, {version}, {kind}. {kind} is lz4 or zstd for a packed folder only; a long name shortens the title only.",
+    nameTemplateReset: "Default",
+    templateUnknown: (token: string) => `Unknown placeholder {${token}}`,
+    templateUnclosed: "The template has an unclosed {",
+    templateNested: "A placeholder can't hold {",
+    templateChar: (c: string) => `${c} can't be in a file name`,
+    templateLong: (n: number) => `The template is at most ${n} bytes`,
   },
   // UpdateToast.tsx: a newer release (checked at every start)
   update: {

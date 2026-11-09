@@ -315,7 +315,14 @@ export function App() {
             hidden={tab !== "convert"}
           >
             {/* onCompare: the link goes away with its screen, so focus moves to the tab now shown. */}
-            <ConvertScreen selection={convertSel} onEdit={editPkg} jobs={settled} dispatch={dispatch} onCompare={openFormats} />
+            <ConvertScreen
+              selection={convertSel}
+              onEdit={editPkg}
+              jobs={settled}
+              dispatch={dispatch}
+              onCompare={openFormats}
+              active={tab === "convert"}
+            />
             {jobsOf("convert")}
           </div>
           <div
@@ -339,7 +346,7 @@ export function App() {
             aria-labelledby={tabId("screen", "pack")}
             hidden={tab !== "pack"}
           >
-            <PackScreen jobs={settled} dispatch={dispatch} />
+            <PackScreen jobs={settled} dispatch={dispatch} active={tab === "pack"} />
             {jobsOf("pack")}
           </div>
           <div

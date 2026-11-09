@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ps5_dump_forge_core::{
-    ArchivePassword, ConvertRequest, DeleteError, Event, Format, JobId, Jobs, ListEntry,
+    ArchivePassword, ConvertRequest, DeleteError, Event, Format, JobId, Jobs, ListEntry, PackKind,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -384,6 +384,12 @@ struct OutputArg {
     taken: Vec<PathBuf>,
     #[serde(default)]
     password: Option<ArchivePassword>,
+    /// `/api/generated_output` only: the pack kind a packed folder's name marks.
+    #[serde(default)]
+    pack: Option<PackKind>,
+    /// `/api/generated_output` only: the name template (blank: the built-in one).
+    #[serde(default)]
+    template: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -589,12 +595,14 @@ impl Server {
                 readable(&arg.source)?;
                 let password = arg.password.as_ref().map(ArchivePassword::as_str);
                 let out = self.capped(|| {
-                    ps5_dump_forge_core::generated_output_with(
+                    ps5_dump_forge_core::generated_output_with_options(
                         &arg.source,
                         arg.format,
                         &arg.dir,
                         &arg.taken,
                         password,
+                        arg.pack,
+                        arg.template.as_deref(),
                     )
                 })?;
                 Ok(Response::json(&out))

@@ -997,7 +997,15 @@ const ar: Messages = {
     savedAs: (name, dir) => `سيُحفظ باسم ${iso(name)} في ${iso(dir)}`,
     inDir: (dir) => `في ${iso(dir)}`,
     generate: "إنشاء اسم من المحتوى",
-    generatePattern: "[اسم اللعبة]-[معرّف اللعبة]",
+    nameTemplate: "قالب الاسم",
+    nameTemplateHint:
+      "المتاح: {id} و{title} و{version} و{kind}. {kind} يكون lz4 أو zstd للمجلد المضغوط فقط؛ الاسم الطويل يختصر العنوان فقط.",
+    nameTemplateReset: "افتراضي",
+    templateUnknown: (token: string) => `عنصر غير معروف {${token}}`,
+    templateUnclosed: "في القالب { غير مغلق",
+    templateNested: "لا يمكن أن يحتوي العنصر على {",
+    templateChar: (c: string) => `لا يمكن أن يظهر ${c} في اسم ملف`,
+    templateLong: (n: number) => `القالب ${n} بايت على الأكثر`,
   },
   // UpdateToast.tsx
   update: {

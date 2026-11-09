@@ -862,7 +862,15 @@ const ko: Messages = {
     savedAs: (name, dir) => `저장 이름: ${name}, 위치: ${dir}`,
     inDir: (dir) => `위치: ${dir}`,
     generate: "내용을 바탕으로 이름 생성",
-    generatePattern: "[게임 이름]-[타이틀 ID]",
+    nameTemplate: "이름 템플릿",
+    nameTemplateHint:
+      "사용 가능: {id}, {title}, {version}, {kind}. {kind}는 압축 폴더에만 lz4 또는 zstd로 들어가며, 이름이 길면 제목만 줄어듭니다.",
+    nameTemplateReset: "기본값",
+    templateUnknown: (token: string) => `알 수 없는 자리표시자 {${token}}`,
+    templateUnclosed: "템플릿에 닫히지 않은 { 가 있습니다",
+    templateNested: "자리표시자에는 { 를 넣을 수 없습니다",
+    templateChar: (c: string) => `${c}는 파일 이름에 쓸 수 없습니다`,
+    templateLong: (n: number) => `템플릿은 최대 ${n}바이트입니다`,
   },
   // UpdateToast.tsx
   update: {
