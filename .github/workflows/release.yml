@@ -3,7 +3,7 @@ name: Release
 # A `v*` tag builds the macOS, Windows, Linux and PS5 releases and creates a *draft* GitHub Release
 # with the macOS universal (arm64 + Intel) zip, the two Windows x86-64 zips (with and without a
 # bundled WebView2 runtime), the Windows arm64 zip, the Linux x86-64 and arm64 tarballs, the PS5
-# payload (one plain .elf) and SHA256SUMS (the source is GitHub's own archive of the tag); publishing the draft is a manual step on GitHub, after checking its assets.
+# payload (one plain .elf), SHA256SUMS and payloads.json (the PS5 payload's catalog for ps5-payload-manager) (the source is GitHub's own archive of the tag); publishing the draft is a manual step on GitHub, after checking its assets.
 # `workflow_dispatch` is a dry run, even on a tag: same build, artifact kept on the run,
 # nothing published.
 on:
@@ -170,6 +170,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The checkout is for scripts/make-payloads-json.sh and Cargo.toml's version.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Every platform job uploads a `release-*` artifact; merge them all into dist/.
       - uses: actions/download-artifact@v8
         with:
@@ -194,6 +198,10 @@ jobs:
           printf '%s\n' * | LC_ALL=C sort | diff ../expected.txt - || { echo "::error::dist/ does not hold exactly the expected archives"; exit 1; }
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
+      # The catalog for ps5-payload-manager: this release's .elf and its SHA-256. It is written
+      # after SHA256SUMS and the check above, so neither lists it (it is not an archive).
+      - name: Write payloads.json
+        run: scripts/make-payloads-json.sh "dist/ps5-dump-forge-${GITHUB_REF_NAME#v}-ps5.elf" dist/payloads.json
       # gh is preinstalled on the runner; no third-party release action needed.
       - name: Create the GitHub Release
         env:
@@ -216,6 +224,7 @@ jobs:
             echo
             echo "PS5 (jailbroken, with an ELF loader): load ps5-dump-forge-$ver-ps5.elf, e.g. send it to elfldr's port 9021 or list it in the webkit autoloader's autoload.txt, then open http://<ps5-ip>:8095 in a browser."
             echo "The web UI has no access control: use it on a trusted network."
+            echo "ps5-payload-manager: add https://github.com/$GITHUB_REPOSITORY/releases/latest/download/payloads.json as a custom repository to install and update the payload there (payloads.json carries the .elf's SHA-256)."
             echo
             echo "Each desktop archive (macOS, Windows, Linux) holds the app (PS5 Dump Forge.app, PS5 Dump Forge.exe or PS5 Dump Forge.AppDir with forge.sh) and the ps5-dump-forge command-line tool. README, LICENSE (GPL-3.0), the UnRAR license and THIRD-PARTY-NOTICES.md are in the source archives below, the complete corresponding source of this release. SHA256SUMS lists every archive's SHA-256."
             case "$GITHUB_REF_NAME" in *-*)

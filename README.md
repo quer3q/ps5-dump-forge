@@ -94,6 +94,10 @@ for a newer release and offer it (on the PS5, **Update** downloads it and hands 
   (`nc -w 3 <ps5-ip> 9021 < ps5-dump-forge-<version>-ps5.elf`), or list it in an autoloader's
   `autoload.txt`, or use **Install on PS5** in the desktop app's Connect tab. A notification says Dump Forge is
   launched; open it from its icon.
+- **Keep it updated with [ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager):** add
+  `https://github.com/quer3q/ps5-dump-forge/releases/latest/download/payloads.json` as a custom
+  repository. Each published release carries that catalog (the `.elf` and its SHA-256, which the manager checks
+  on every download); `latest` is the newest release that isn't a pre-release.
 - **Open the UI** from the Dump Forge icon, or in any browser on the same network:
   `http://<ps5-ip>:8095`. In the console's browser, **L2** / **R2** switch tabs.
 

@@ -201,6 +201,10 @@ jobs:
         with:
           node-version: lts/*
       - run: scripts/release-ps5.sh
+      # The catalog the release publishes, from the ELF just built (the script checks what it wrote).
+      - run: |
+          ver=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          scripts/make-payloads-json.sh "dist/ps5-dump-forge-$ver-ps5.elf" "$RUNNER_TEMP/payloads.json"
       - run: ps5/test-entry.sh
 
   fuzz:
