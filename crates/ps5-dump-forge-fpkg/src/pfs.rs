@@ -182,9 +182,13 @@ pub(crate) fn header(pkg: &mut Pkg) -> Result<Header> {
 pub(crate) struct Entry {
     pub id: u32,
     pub flags1: u32,
+    /// For a protected entry (`flags1` bit 31) the key index is `flags2 >> 12`.
+    pub flags2: u32,
     /// Absolute offset in the package.
     pub at: u64,
     pub size: u64,
+    /// The entry's 32-byte table row as stored: a protected entry's key depends on it.
+    pub row: [u8; 32],
 }
 
 pub(crate) struct Container {
@@ -239,8 +243,10 @@ pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
         entries.push(Entry {
             id,
             flags1: be32(row, 8),
+            flags2: be32(row, 12),
             at,
             size,
+            row: *row,
         });
     }
     let content_id = String::from_utf8_lossy(&head[0x40..0x64])

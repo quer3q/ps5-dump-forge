@@ -2637,6 +2637,7 @@ dependencies = [
 name = "ps5-dump-forge-fpkg"
 version = "0.5.5"
 dependencies = [
+ "aes",
  "ps5upload-fpkg",
 ]
 

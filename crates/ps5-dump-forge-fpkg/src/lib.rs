@@ -18,6 +18,7 @@
 mod lih;
 mod mount;
 mod pfs;
+mod protected;
 mod tree;
 
 use std::collections::HashSet;
@@ -92,9 +93,9 @@ pub(crate) fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync
 
 /// The container entries that carry a game file: the presentation set the builder copies into
 /// the container (icons, `pic*` PNGs and DDSs, `snd0.at9`, `save_data.png`, trophy and UDS data), and
-/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a third-party builder can keep
-/// only in the container (plaintext; ours keeps them in the image too and encrypts the
-/// container's NP copies, which the merge skips). Everything else in a container is the
+/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a package can keep only in the
+/// container, plaintext or protected (encrypted: `flags1` bit 31, see [`protected`]; ours keeps
+/// them in the image too, where the image's copy wins). Everything else in a container is the
 /// package's own metadata (keys, digests, license, PlayGo tables) and is not a file of the game.
 fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     [
@@ -113,6 +114,8 @@ enum Where {
     Inner(u64),
     /// A container entry, at this absolute package offset.
     Container(u64),
+    /// A protected container entry, decrypted at open: `held[n]`.
+    Held(usize),
 }
 
 /// The layers a read goes through, kept apart so each can borrow the others.
@@ -149,6 +152,8 @@ pub struct FpkgSource {
     files: Vec<SourceFile>,
     /// Parallel to `files`.
     places: Vec<Where>,
+    /// The decrypted protected entries `Where::Held` points into.
+    held: Vec<Vec<u8>>,
     empty_dirs: Vec<String>,
     conflicts: Vec<String>,
     details: Vec<String>,
@@ -339,11 +344,11 @@ impl FpkgSource {
         // skipped (and noted when they disagree) where it does.
         let mut conflicts = Vec::new();
         let mut from_container = 0usize;
+        let mut held: Vec<Vec<u8>> = Vec::new();
         for (id, path) in container_paths() {
             let Some(e) = cnt.entry(id) else { continue };
-            // An empty slot is how the builder leaves an icon out; a protected (encrypted) entry
-            // is not a plain copy of anything.
-            if e.size == 0 || e.flags1 & 0x8000_0000 != 0 {
+            // An empty slot is how the builder leaves an icon out.
+            if e.size == 0 {
                 continue;
             }
             if dirs.contains(path) {
@@ -372,13 +377,30 @@ impl FpkgSource {
                 }
                 continue;
             }
+            // A protected entry (nptitle.dat, the npbind files: AES-128-CBC, keyed by the content
+            // id and passcode) is decrypted here, once: without them trophies don't register
+            // from a converted copy. One that can't be left out, and the fact says why.
+            let place = if e.flags1 & protected::FLAG != 0 {
+                match protected::plaintext(&mut reader.outer.pkg, &cnt, &e, passcode) {
+                    Ok(bytes) => {
+                        held.push(bytes);
+                        Where::Held(held.len() - 1)
+                    }
+                    Err(why) => {
+                        facts.push(format!("{path}: protected container entry left out: {why}"));
+                        continue;
+                    }
+                }
+            } else {
+                Where::Container(e.at)
+            };
             empty_dirs.retain(|d| !path.starts_with(&format!("{d}/")));
             files.push((
                 SourceFile {
                     path: path.to_string(),
                     size: e.size,
                 },
-                Where::Container(e.at),
+                place,
             ));
             from_container += 1;
         }
@@ -387,7 +409,7 @@ impl FpkgSource {
             let mut partial = Vec::new();
             files.retain(|(f, at)| {
                 let whole = match at {
-                    Where::Container(_) => true,
+                    Where::Container(_) | Where::Held(_) => true,
                     Where::Inner(at) => reader.carried(*at, f.size, &p.present),
                 };
                 if !whole {
@@ -419,6 +441,7 @@ impl FpkgSource {
         Ok(Self {
             files,
             places,
+            held,
             empty_dirs,
             conflicts,
             details: facts,
@@ -549,6 +572,11 @@ impl SourceTree for FpkgSource {
         match self.places[i] {
             Where::Inner(at) => self.reader.mount(at + offset, &mut buf)?,
             Where::Container(at) => self.reader.outer.pkg.read_at(at + offset, &mut buf)?,
+            // `size` is the plaintext's length, so the range is inside it.
+            Where::Held(h) => {
+                let from = offset as usize;
+                buf.copy_from_slice(&self.held[h][from..from + n]);
+            }
         }
         Ok(buf)
     }
