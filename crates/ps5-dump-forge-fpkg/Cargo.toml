@@ -6,4 +6,5 @@ version.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aes.workspace = true
 ps5upload-fpkg.workspace = true
