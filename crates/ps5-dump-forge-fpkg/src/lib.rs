@@ -108,6 +108,33 @@ fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     .chain(PROTECTED.iter().map(|(id, path, _, _)| (*id, *path)))
 }
 
+/// Where the container entry `e`, the game file `path`, is read from: the package at the
+/// entry's own offset, or, for a protected entry, its decrypted copy pushed onto `held`. `None`
+/// when a protected entry can't be decrypted (the entry is left out and `facts` says why).
+fn place_entry(
+    pkg: &mut Pkg,
+    cnt: &pfs::Container,
+    e: &pfs::Entry,
+    path: &str,
+    passcode: &str,
+    held: &mut Vec<Vec<u8>>,
+    facts: &mut Vec<String>,
+) -> Option<Where> {
+    if e.flags1 & protected::FLAG == 0 {
+        return Some(Where::Container(e.at));
+    }
+    match protected::plaintext(pkg, cnt, e, passcode) {
+        Ok(bytes) => {
+            held.push(bytes);
+            Some(Where::Held(held.len() - 1))
+        }
+        Err(why) => {
+            facts.push(format!("{path}: protected container entry left out: {why}"));
+            None
+        }
+    }
+}
+
 /// Where a file's bytes are.
 enum Where {
     /// In the inner image: a mount offset (Kraken) or an on-disk one (flat).
@@ -380,19 +407,16 @@ impl FpkgSource {
             // A protected entry (nptitle.dat, the npbind files: AES-128-CBC, keyed by the content
             // id and passcode) is decrypted here, once: without them trophies don't register
             // from a converted copy. One that can't be left out, and the fact says why.
-            let place = if e.flags1 & protected::FLAG != 0 {
-                match protected::plaintext(&mut reader.outer.pkg, &cnt, &e, passcode) {
-                    Ok(bytes) => {
-                        held.push(bytes);
-                        Where::Held(held.len() - 1)
-                    }
-                    Err(why) => {
-                        facts.push(format!("{path}: protected container entry left out: {why}"));
-                        continue;
-                    }
-                }
-            } else {
-                Where::Container(e.at)
+            let Some(place) = place_entry(
+                &mut reader.outer.pkg,
+                &cnt,
+                &e,
+                path,
+                passcode,
+                &mut held,
+                &mut facts,
+            ) else {
+                continue;
             };
             empty_dirs.retain(|d| !path.starts_with(&format!("{d}/")));
             files.push((

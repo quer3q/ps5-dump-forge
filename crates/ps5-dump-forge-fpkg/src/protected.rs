@@ -207,6 +207,77 @@ mod tests {
         assert!(why.contains("no key check"), "{why}");
     }
 
+    /// What the merge does with a protected entry: it is decrypted once and held, and the file
+    /// is read from there; a plain entry is read from the package as before.
+    #[test]
+    fn the_merge_holds_a_protected_entry_and_reads_a_plain_one_in_place() {
+        let (bytes, plain) = container(DEFAULT_PASSCODE);
+        let (mut pkg, cnt) = open(bytes);
+        let (mut held, mut facts) = (Vec::new(), Vec::new());
+        let title = cnt.entry(0x0402).unwrap();
+        let at = |pkg: &mut Pkg, held: &mut Vec<Vec<u8>>, facts: &mut Vec<String>| {
+            crate::place_entry(
+                pkg,
+                &cnt,
+                &title,
+                "sce_sys/nptitle.dat",
+                DEFAULT_PASSCODE,
+                held,
+                facts,
+            )
+        };
+        assert!(matches!(
+            at(&mut pkg, &mut held, &mut facts),
+            Some(crate::Where::Held(0))
+        ));
+        assert!(matches!(
+            at(&mut pkg, &mut held, &mut facts),
+            Some(crate::Where::Held(1))
+        ));
+        assert_eq!(held, vec![plain.clone(), plain]);
+        assert!(facts.is_empty(), "{facts:?}");
+
+        let keys = cnt.entry(ids::ENTRY_KEYS).unwrap();
+        let place = crate::place_entry(
+            &mut pkg,
+            &cnt,
+            &keys,
+            "sce_sys/x",
+            DEFAULT_PASSCODE,
+            &mut held,
+            &mut facts,
+        );
+        assert!(matches!(place, Some(crate::Where::Container(a)) if a == keys.at));
+        assert_eq!(held.len(), 2);
+    }
+
+    /// A protected entry that can't be decrypted is left out, held nowhere, and the details
+    /// say which file and why.
+    #[test]
+    fn the_merge_leaves_out_an_entry_it_cannot_decrypt_and_says_so() {
+        let (bytes, _) = container(DEFAULT_PASSCODE);
+        let (mut pkg, cnt) = open(bytes);
+        let (mut held, mut facts) = (Vec::new(), Vec::new());
+        let title = cnt.entry(0x0402).unwrap();
+        let place = crate::place_entry(
+            &mut pkg,
+            &cnt,
+            &title,
+            "sce_sys/nptitle.dat",
+            "11111111111111111111111111111111",
+            &mut held,
+            &mut facts,
+        );
+        assert!(place.is_none());
+        assert!(held.is_empty());
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(
+            facts[0].starts_with("sce_sys/nptitle.dat: protected container entry left out:")
+                && facts[0].contains("key check"),
+            "{facts:?}"
+        );
+    }
+
     /// The row is part of the key: another row decrypts to something else.
     #[test]
     fn the_row_is_part_of_the_key() {
