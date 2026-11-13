@@ -1,0 +1,53 @@
+diff --git a/ps5upload-pkg/src/lib.rs b/ps5upload-pkg/src/lib.rs
+index 86b306d..a7f1931 100644
+--- a/ps5upload-pkg/src/lib.rs
++++ b/ps5upload-pkg/src/lib.rs
+@@ -179,13 +179,10 @@ fn is_safe_child_name(name: &str) -> bool {
+     // RootDir, CurDir, or ParentDir component on every host, not just
+     // the specific cases enumerated above.
+     let mut comps = Path::new(name).components();
+-    if !matches!(
++    matches!(
+         (comps.next(), comps.next()),
+         (Some(std::path::Component::Normal(_)), None)
+-    ) {
+-        return false;
+-    }
+-    true
++    )
+ }
+ 
+ fn extract_dir_recursive(
+@@ -1841,4 +1838,32 @@ mod tests {
+             read_pkg_entry_from(&mut cur, e, 1 << 20).unwrap()
+         );
+     }
++
++    // An extracted entry's name must be one ordinary path component: the names the guard
++    // exists for are refused, the ones real game assets carry are kept.
++    #[test]
++    fn child_names_are_one_ordinary_component() {
++        for ok in [
++            "a.txt",
++            "name with spaces",
++            "dots.in.name",
++            "über.bin",
++            ".hidden",
++        ] {
++            assert!(is_safe_child_name(ok), "{ok}");
++        }
++        for bad in [
++            "",
++            ".",
++            "..",
++            "a/b",
++            "a\\b",
++            "/abs",
++            "C:evil.txt",
++            "a:b",
++            "nul\0",
++        ] {
++            assert!(!is_safe_child_name(bad), "{bad:?}");
++        }
++    }
+ }

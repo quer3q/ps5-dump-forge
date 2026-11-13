@@ -329,8 +329,15 @@ fn bad_names_are_all_listed() {
     let e = plan(&tree, &Options::default(), &AtomicBool::new(false))
         .unwrap_err()
         .to_string();
+    // The names are written with `str::escape_debug`, and whether a combining mark after a
+    // letter is escaped depends on the Rust release (newer ones write `\u{301}`): either
+    // spelling names the file.
+    assert!(
+        e.contains("sce_sys/Cafe\u{301}.png: not in Unicode NFC")
+            || e.contains("sce_sys/Cafe\\u{301}.png: not in Unicode NFC"),
+        "missing the NFC problem in:\n{e}"
+    );
     for needle in [
-        "sce_sys/Cafe\u{301}.png: not in Unicode NFC",
         "sce_sys/a.txt: same name as sce_sys/A.txt",
         "data/bad:name: forbidden character ':'",
         "same name as data/Σ.bin",
