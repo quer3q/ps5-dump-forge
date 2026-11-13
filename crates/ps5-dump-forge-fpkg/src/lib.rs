@@ -711,3 +711,63 @@ fn flat_placements(files: &mut [InnerFile], layout: &naps::Layout, meta_base: u6
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ps5upload_fpkg::build::{self, BuildRequest};
+
+    /// A package built from a tiny game folder and opened, its temporary folders gone again.
+    fn small_package() -> FpkgSource {
+        let dir = std::env::temp_dir().join(format!("forge-fpkg-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, out) = (dir.join("src"), dir.join("out"));
+        std::fs::create_dir_all(src.join("sce_sys")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("eboot.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::write(
+            src.join("sce_sys/param.json"),
+            br#"{"contentId":"UP0000-PPSA01234_00-TESTGAME00000000","titleId":"PPSA01234"}"#,
+        )
+        .unwrap();
+        let mut request = BuildRequest::production(&src, &out);
+        request.time = Some((1_700_000_000, 0));
+        request.threads = Some(1);
+        request.level = ps5upload_fpkg::kraken::Level::Fast;
+        let report = build::build(&request, &mut |_| {}).unwrap();
+        let source = FpkgSource::open(&report.path, None).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        source
+    }
+
+    /// A file served from a decrypted copy (`Where::Held`) reads exactly like any other: whole,
+    /// by ranges from any offset, short at its end, and empty at and past it.
+    #[test]
+    fn a_held_file_reads_whole_and_by_range() {
+        let mut package = small_package();
+        let plain: Vec<u8> = (0..50u8)
+            .map(|i| i.wrapping_mul(5).wrapping_add(3))
+            .collect();
+        let path = "sce_sys/zz-held.dat";
+        package.held.push(plain.clone());
+        let at = package.files.partition_point(|f| f.path.as_str() < path);
+        package.files.insert(
+            at,
+            SourceFile {
+                path: path.into(),
+                size: plain.len() as u64,
+            },
+        );
+        package.places.insert(at, Where::Held(0));
+
+        assert_eq!(package.read(path).unwrap(), plain);
+        assert_eq!(package.read_range(path, 0, 50).unwrap(), plain);
+        assert_eq!(package.read_range(path, 7, 10).unwrap(), plain[7..17]);
+        assert_eq!(package.read_range(path, 45, 100).unwrap(), plain[45..]);
+        assert_eq!(package.read_range(path, 49, 1).unwrap(), plain[49..]);
+        assert!(package.read_range(path, 50, 10).unwrap().is_empty());
+        assert!(package.read_range(path, 500, 10).unwrap().is_empty());
+        // The files around it still read from the package.
+        assert_eq!(package.read("eboot.bin").unwrap(), vec![7u8; 4096]);
+    }
+}
