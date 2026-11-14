@@ -3160,14 +3160,25 @@ mod tests {
 
     /// Waits until the serving side has released `peer`'s speed lanes: a test returns once
     /// its answers are in, and each lane is freed only when the peer sees it close, so a
-    /// test started at once could find the lanes still taken and be refused.
+    /// test started at once could find the lanes still taken and be refused. Usually that is
+    /// at once, but a lane serving `speed_down` whose client was cancelled and closed with the
+    /// answer still on its way can be left blocked in `send`: the client's socket ends in
+    /// FIN_WAIT2 with a zero window, which neither reads nor resets, so the lane ends only when
+    /// its write times out, and `write_all` sends a second time after a partial first one:
+    /// `2 * DEAD_AFTER`, measured at 24.03 s. Hence three, not the 5 s that failed on GitHub's.
     fn speed_lanes_released(peer: &str) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + DEAD_AFTER * 3;
         while lock(&SPEED_OPEN)
             .as_ref()
             .is_some_and(|m| m.contains_key(peer))
         {
-            assert!(Instant::now() < until, "{peer}'s speed lanes stay open");
+            assert!(
+                Instant::now() < until,
+                "{peer}'s speed lanes stay open: {:?}",
+                lock(&SPEED_OPEN)
+                    .as_ref()
+                    .and_then(|m| m.get(peer).copied())
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -3193,8 +3204,12 @@ mod tests {
         let kb = b.state().device.key_id;
         speed_lanes_released(&kb);
 
-        // A lane refuses an empty request and a method other than speed_up / speed_down.
-        let (_rpc, hs) = b.session(&ka).unwrap();
+        // A lane refuses an empty request and a method other than speed_up / speed_down. The
+        // server registers a session on its control thread, after the handshake the client has
+        // already finished, so a Join right after `session` can find none (`bad_join`): an
+        // answered RPC says it is there, as it does before any real lane.
+        let (mut rpc, hs) = b.session(&ka).unwrap();
+        rpc.call("speed", serde_json::json!({})).unwrap();
         for (method, len) in [("speed_down", 0), ("speed_up", 0), ("read", 10)] {
             let mut lane = join_lane(&hs, 0).unwrap();
             let first = Request {
