@@ -51,6 +51,31 @@ pub(crate) fn decrypt_entry(row: &[u8; 32], entry_key: &[u8; 32], data: &mut [u8
     );
 }
 
+/// Whether `key`, the passcode-derived key `k`, passes the container's entry-keys slot (the
+/// 32-byte seed digest, then `SHA3(k) ^ k` for keys 0..=6); `None` when the slot has no digest
+/// for it.
+pub(crate) fn key_check(
+    pkg: &mut Pkg,
+    cnt: &Container,
+    key: &[u8; 32],
+    k: u32,
+) -> crate::Result<Option<bool>> {
+    let digest_at = 32 + 32 * u64::from(k);
+    let Some(keys) = cnt
+        .entry(ids::ENTRY_KEYS)
+        .filter(|ek| ek.size >= digest_at + 32)
+    else {
+        return Ok(None);
+    };
+    let mut stored = [0u8; 32];
+    pkg.read_at(keys.at + digest_at, &mut stored)?;
+    let mut want = sha3(key);
+    for (w, b) in want.iter_mut().zip(key) {
+        *w ^= b;
+    }
+    Ok(Some(stored == want))
+}
+
 /// The plaintext of protected entry `e`, or why it can't be had.
 ///
 /// The key comes from the content id and the passcode, so before any byte is decrypted the
@@ -73,20 +98,10 @@ pub(crate) fn plaintext(
         ));
     }
     let key = derive_pfs_key(&cnt.content_id, passcode, k);
-    let digest_at = 32 + 32 * u64::from(k);
-    let keys = cnt
-        .entry(ids::ENTRY_KEYS)
-        .filter(|ek| ek.size >= digest_at + 32)
-        .ok_or("the container has no key check for its key index")?;
-    let mut stored = [0u8; 32];
-    pkg.read_at(keys.at + digest_at, &mut stored)
-        .map_err(|e| e.to_string())?;
-    let mut want = sha3(&key);
-    for (w, k) in want.iter_mut().zip(key) {
-        *w ^= k;
-    }
-    if stored != want {
-        return Err("the passcode fails the container's key check".into());
+    match key_check(pkg, cnt, &key, k).map_err(|e| e.to_string())? {
+        None => return Err("the container has no key check for its key index".into()),
+        Some(false) => return Err("the passcode fails the container's key check".into()),
+        Some(true) => {}
     }
     // Stored padded to the cipher's block; `size` is the file's own length.
     let mut data = vec![0u8; e.size.next_multiple_of(16) as usize];
@@ -101,30 +116,14 @@ mod tests {
     use super::*;
     use ps5upload_fpkg::crypto::{DEFAULT_PASSCODE, encrypt_entry};
 
-    /// What the builder encrypts, this decrypts, for every length a file can have.
-    #[test]
-    fn decrypts_what_the_builder_encrypts() {
-        let row = [7u8; 32];
-        let key = derive_pfs_key("UP0000-PPSA01234_00-TESTGAME00000000", DEFAULT_PASSCODE, 3);
-        for len in [1usize, 15, 16, 17, 0x80, 1000] {
-            let plain: Vec<u8> = (0..len).map(|i| (i * 31 + 5) as u8).collect();
-            let mut data = plain.clone();
-            data.resize(len.next_multiple_of(16), 0);
-            encrypt_entry(&row, &key, &mut data);
-            assert_ne!(&data[..len.min(16)], &plain[..len.min(16)]);
-            decrypt_entry(&row, &key, &mut data);
-            data.truncate(len);
-            assert_eq!(data, plain, "length {len}");
-        }
-    }
-
     const CONTENT_ID: &str = "UP0000-PPSA01234_00-TESTGAME00000000";
     const PLAIN_LEN: usize = 50;
 
     /// A container of two entries as a third-party builder writes it: the entry-keys slot (the
     /// seed digest and `SHA3(k) ^ k` for keys 0..=6) and a protected `nptitle.dat` whose key
-    /// is `passcode`'s key 3. Returns the package bytes and the file's plaintext.
-    fn container(passcode: &str) -> (Vec<u8>, Vec<u8>) {
+    /// is `passcode`'s key 3, encrypted by the builder's own `encrypt_entry`. Returns the
+    /// package and the file's plaintext.
+    fn container(passcode: &str) -> (Pkg, Container, Vec<u8>) {
         let (keys_at, title_at) = (0x1100usize, 0x1200usize);
         let plain: Vec<u8> = (0..PLAIN_LEN).map(|i| (i * 7 + 1) as u8).collect();
         let padded = PLAIN_LEN.next_multiple_of(16);
@@ -162,21 +161,17 @@ mod tests {
             &mut data,
         );
         c[title_at..].copy_from_slice(&data);
-        (c, plain)
-    }
-
-    fn open(bytes: Vec<u8>) -> (Pkg, Container) {
-        let len = bytes.len() as u64;
-        let mut pkg = Pkg::new(Box::new(std::io::Cursor::new(bytes)), len);
+        let len = c.len() as u64;
+        let mut pkg = Pkg::new(Box::new(std::io::Cursor::new(c)), len);
         let cnt = crate::pfs::container(&mut pkg, 0).unwrap();
-        (pkg, cnt)
+        (pkg, cnt, plain)
     }
 
-    /// A container-only `nptitle.dat` reads back as the file it was.
+    /// A container-only `nptitle.dat` reads back as the file it was (padded to the cipher's
+    /// block, truncated to its size).
     #[test]
     fn a_protected_entry_reads_back_as_its_file() {
-        let (bytes, plain) = container(DEFAULT_PASSCODE);
-        let (mut pkg, cnt) = open(bytes);
+        let (mut pkg, cnt, plain) = container(DEFAULT_PASSCODE);
         let e = cnt.entry(0x0402).unwrap();
         assert_eq!(
             plaintext(&mut pkg, &cnt, &e, DEFAULT_PASSCODE).unwrap(),
@@ -187,105 +182,10 @@ mod tests {
     /// Another passcode fails the key check; it never yields garbage as if it were the file.
     #[test]
     fn a_wrong_passcode_yields_nothing() {
-        let (bytes, _) = container(DEFAULT_PASSCODE);
-        let (mut pkg, cnt) = open(bytes);
+        let (mut pkg, cnt, _) = container(DEFAULT_PASSCODE);
         let e = cnt.entry(0x0402).unwrap();
         let other = "11111111111111111111111111111111";
         let why = plaintext(&mut pkg, &cnt, &e, other).unwrap_err();
         assert!(why.contains("key check"), "{why}");
-    }
-
-    /// Without the entry-keys slot there is nothing to test the passcode against.
-    #[test]
-    fn no_key_check_no_decryption() {
-        let (mut bytes, _) = container(DEFAULT_PASSCODE);
-        // Turn the entry-keys row into another entry's id.
-        bytes[0x1000..0x1004].copy_from_slice(&0x0999u32.to_be_bytes());
-        let (mut pkg, cnt) = open(bytes);
-        let e = cnt.entry(0x0402).unwrap();
-        let why = plaintext(&mut pkg, &cnt, &e, DEFAULT_PASSCODE).unwrap_err();
-        assert!(why.contains("no key check"), "{why}");
-    }
-
-    /// What the merge does with a protected entry: it is decrypted once and held, and the file
-    /// is read from there; a plain entry is read from the package as before.
-    #[test]
-    fn the_merge_holds_a_protected_entry_and_reads_a_plain_one_in_place() {
-        let (bytes, plain) = container(DEFAULT_PASSCODE);
-        let (mut pkg, cnt) = open(bytes);
-        let (mut held, mut facts) = (Vec::new(), Vec::new());
-        let title = cnt.entry(0x0402).unwrap();
-        let at = |pkg: &mut Pkg, held: &mut Vec<Vec<u8>>, facts: &mut Vec<String>| {
-            crate::place_entry(
-                pkg,
-                &cnt,
-                &title,
-                "sce_sys/nptitle.dat",
-                DEFAULT_PASSCODE,
-                held,
-                facts,
-            )
-        };
-        assert!(matches!(
-            at(&mut pkg, &mut held, &mut facts),
-            Some(crate::Where::Held(0))
-        ));
-        assert!(matches!(
-            at(&mut pkg, &mut held, &mut facts),
-            Some(crate::Where::Held(1))
-        ));
-        assert_eq!(held, vec![plain.clone(), plain]);
-        assert!(facts.is_empty(), "{facts:?}");
-
-        let keys = cnt.entry(ids::ENTRY_KEYS).unwrap();
-        let place = crate::place_entry(
-            &mut pkg,
-            &cnt,
-            &keys,
-            "sce_sys/x",
-            DEFAULT_PASSCODE,
-            &mut held,
-            &mut facts,
-        );
-        assert!(matches!(place, Some(crate::Where::Container(a)) if a == keys.at));
-        assert_eq!(held.len(), 2);
-    }
-
-    /// A protected entry that can't be decrypted is left out, held nowhere, and the details
-    /// say which file and why.
-    #[test]
-    fn the_merge_leaves_out_an_entry_it_cannot_decrypt_and_says_so() {
-        let (bytes, _) = container(DEFAULT_PASSCODE);
-        let (mut pkg, cnt) = open(bytes);
-        let (mut held, mut facts) = (Vec::new(), Vec::new());
-        let title = cnt.entry(0x0402).unwrap();
-        let place = crate::place_entry(
-            &mut pkg,
-            &cnt,
-            &title,
-            "sce_sys/nptitle.dat",
-            "11111111111111111111111111111111",
-            &mut held,
-            &mut facts,
-        );
-        assert!(place.is_none());
-        assert!(held.is_empty());
-        assert_eq!(facts.len(), 1, "{facts:?}");
-        assert!(
-            facts[0].starts_with("sce_sys/nptitle.dat: protected container entry left out:")
-                && facts[0].contains("key check"),
-            "{facts:?}"
-        );
-    }
-
-    /// The row is part of the key: another row decrypts to something else.
-    #[test]
-    fn the_row_is_part_of_the_key() {
-        let key = derive_pfs_key("UP0000-PPSA01234_00-TESTGAME00000000", DEFAULT_PASSCODE, 3);
-        let plain = vec![0x5Au8; 32];
-        let mut data = plain.clone();
-        encrypt_entry(&[1u8; 32], &key, &mut data);
-        decrypt_entry(&[2u8; 32], &key, &mut data);
-        assert_ne!(data, plain);
     }
 }

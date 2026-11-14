@@ -91,9 +91,8 @@ impl Layout {
             Shape::Kraken => open_cost(true, len, w0, w1),
             Shape::Flat => open_cost(false, len, w0, w1),
             // The walk holds a copy of the blob too.
-            Shape::Either => {
-                (open_cost(true, len, w0, w1) + len).max(open_cost(false, len, w0, w1))
-            }
+            Shape::Either => (open_cost(true, len, w0, w1).saturating_add(len))
+                .max(open_cost(false, len, w0, w1)),
         };
         if cost > MAX_OPEN {
             return Err(err(
@@ -188,7 +187,7 @@ fn shape(blob: &[u8], w0: u64, w1: u64) -> Shape {
 /// for.
 fn open_cost(kraken: bool, len: u64, w0: u64, w1: u64) -> u64 {
     use std::mem::size_of;
-    // Every count is a 24-bit field, so only `len` can overflow.
+    // Every count is a 24-bit field, so only `len` and its terms can overflow; they saturate.
     let files = (w0 & 0xFF_FFFF) + 1;
     let ublocks = (w0 >> 32) & 0xFF_FFFF;
     if kraken {
@@ -202,10 +201,10 @@ fn open_cost(kraken: bool, len: u64, w0: u64, w1: u64) -> u64 {
     let outer = (w1 & 0xFF_FFFF) + ((w0 >> 28) & 0xF);
     let cblocks = ((w1 >> 24) & 0xFF_FFFF) + 2;
     let tables = outer * 8
-        + len / 6 * size_of::<(u64, u8)>() as u64
         + (ublocks / 8 + 2) * size_of::<(u32, [u8; 7])>() as u64
         + cblocks * size_of::<naps::Cblock>() as u64;
-    len.saturating_add(tables)
+    len.saturating_add((len / 6).saturating_mul(size_of::<(u64, u8)>() as u64))
+        .saturating_add(tables)
 }
 
 impl Kraken {

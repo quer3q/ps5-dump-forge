@@ -77,7 +77,11 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - `crates/ps5-dump-forge-fpkg`: streaming `.pkg` reader (`FpkgSource`), CNT entries merged with the
   inner filesystem; Kraken blocks decoded by the vendored `kraken_image` (PFSv3 byte shuffles undone,
   `SHUFFLES`; vendor patch 0029); `peek` (header and container only, a few KiB: patch, content ID and type,
-  plaintext `param.json`, `icon0.png` size; the package scan's); `lih.rs` reads a patch package (`\x7FLIH`) as the package it patches (Patch packages
+  plaintext `param.json`, `icon0.png` size; the package scan's); `protected.rs` decrypts a protected container
+  entry (`flags1` bit 31: `nptitle.dat`, the `npbind.dat` files a package keeps only in its container; issue #45),
+  the inverse of the builder's `crypto::encrypt_entry`, once at open and served from memory (`Where::Held`), after
+  `key_check` passes the passcode against the entry-keys slot (else it is left out, a details line says why; the
+  image's own copy still wins); `lih.rs` reads a patch package (`\x7FLIH`) as the package it patches (Patch packages
   below).
 - `crates/ps5-dump-forge-lz4`: ampr_emu asset packs: AMPRPAK4 manifest + AMPRDAT3 volume writer and
   reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, the packing strategy (`rules.rs`, shared by zstd and LZ4 Pack), LZ4 blocks through
