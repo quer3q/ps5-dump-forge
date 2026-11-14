@@ -1438,7 +1438,11 @@ FORGE_DEBUG_API=1 ps5/build.sh                 # bring-up build with POST /api/d
 
 ## Preferences
 - Do not commit, push or stage unless asked.
-- Rust 2024 edition, latest stable (`rust-version` tracks it). CI is unpinned and latest on purpose.
+- Rust 2024 edition, one pinned release everywhere (by user decision, after 1.100 broke CI): `rust-toolchain.toml`'s
+  channel (1.100.0), `rust-version`, `ps5/Dockerfile`'s image and `RUSTUP_TOOLCHAIN`, `scripts/test-freebsd.sh`; bumped
+  together. Every CI and release job that builds Rust on a runner installs exactly it (no `rustup update`), fuzz too
+  (`RUSTC_BOOTSTRAP=1`, no nightly), and the PS5 jobs build in that image; action tags and `*-latest` runners stay
+  unpinned.
 - Keep code small and boring (stdlib first, no speculative abstractions; `// ponytail:` notes name
   the ceiling of a deliberate shortcut).
 - Changes to `vendor/` go into a new numbered patch in `vendor/patches/` and `vendor/README.md`.

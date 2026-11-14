@@ -45,7 +45,7 @@ DIST=https://download.freebsd.org/releases/arm64/aarch64/$REL
 SYSROOT=freebsd-$REL-arm64-sysroot
 VM_TAG=ps5-dump-forge-ufs-vm
 BUILD_TAG=ps5-dump-forge-freebsd-build
-TOOLCHAIN=1.99.0
+TOOLCHAIN=1.100.0
 VOLUMES=${FREEBSD_VOLUMES:-ufs fat nullfs}
 TIMEOUT=${FREEBSD_TIMEOUT:-3600}
 
@@ -68,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 DOCKER
 
 docker build -q -t "$BUILD_TAG" - >/dev/null <<DOCKER
-FROM rust:1.99.0-slim-trixie@sha256:24e632c09342c20abf8312cf4f61430a911c01ed3a5e4c02b87292b1c39c5273
+FROM rust:1.100.0-slim-trixie@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a
 RUN apt-get update && apt-get install -y --no-install-recommends \
       clang-19 lld-19 llvm-19 jq xz-utils && rm -rf /var/lib/apt/lists/*
 RUN rustup target add --toolchain $TOOLCHAIN aarch64-unknown-freebsd && chmod -R a+rX "\$RUSTUP_HOME"
@@ -154,7 +154,7 @@ if [ ! -f "$SYSROOT/.done" ]; then
   tar -xJf "/cache/$REL-arm64-base.txz" -C "$SYSROOT" ./lib ./usr/lib ./usr/include
   chmod -R u+w "$SYSROOT" && touch "$SYSROOT/.done"
 fi
-export RUSTUP_TOOLCHAIN=1.99.0 RUSTUP_AUTO_INSTALL=0
+export RUSTUP_TOOLCHAIN=1.100.0 RUSTUP_AUTO_INSTALL=0
 export CARGO_HOME=/src/target/freebsd/cargo-home CARGO_TARGET_DIR=/forge
 t="--target=aarch64-unknown-freebsd14.4 --sysroot=$SYSROOT"
 export CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER=clang-19
