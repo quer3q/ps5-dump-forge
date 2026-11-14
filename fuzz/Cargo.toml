@@ -1,8 +1,9 @@
 # cargo-fuzz targets for every reader of untrusted images. Its own workspace,
-# not a member of the root one: it builds on nightly with sanitizer flags.
+# not a member of the root one: it builds with sanitizer flags, on the pinned stable release with
+# RUSTC_BOOTSTRAP=1 (no nightly).
 #
 #   ./seed.sh                                     # seed corpora (stable)
-#   cargo +nightly fuzz run exfat -- -max_total_time=60
+#   RUSTC_BOOTSTRAP=1 cargo fuzz run exfat -- -max_total_time=60
 [package]
 name = "ps5-dump-forge-fuzz"
 version = "0.0.0"

@@ -14,10 +14,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Unpinned and latest on purpose: major action tags, *-latest runners, the latest stable Rust.
-# rust-toolchain.toml selects `stable`, but that does not update the runner's preinstalled
-# stable, so every job runs `rustup update stable` first, then `rustup toolchain install` adds
-# that file's components and targets. No cargo cache.
+# Major action tags and *-latest runners float; Rust is pinned: rust-toolchain.toml names one
+# release, which `rustup toolchain install` installs with that file's components and targets in
+# every job that builds Rust here (fuzz too, through RUSTC_BOOTSTRAP); the ps5 job builds in
+# ps5/Dockerfile's image of the same release.
+# Bump it there, in Cargo.toml's rust-version, ps5/Dockerfile and scripts/test-freebsd.sh together.
+# No cargo cache.
 defaults:
   run:
     shell: bash
@@ -55,7 +57,6 @@ jobs:
         with:
           persist-credentials: false
       - run: |
-          rustup update --no-self-update stable
           rustup toolchain install --no-self-update
           rustc --version
       - if: matrix.fmt
@@ -90,7 +91,6 @@ jobs:
         with:
           persist-credentials: false
       - run: |
-          rustup update --no-self-update stable
           rustup toolchain install --no-self-update
           rustc --version
       - run: cargo build --release --locked -p ps5-dump-forge-cli
@@ -211,25 +211,26 @@ jobs:
     # Every reader of untrusted images, 60 s each from the seed corpora.
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The pinned stable release runs cargo-fuzz's -Z flags (sanitizer, sancov) once bootstrapped.
+    env:
+      RUSTC_BOOTSTRAP: 1
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: |
-          rustup update --no-self-update stable
           rustup toolchain install --no-self-update
-          rustup toolchain install --no-self-update --profile minimal nightly
-          rustc +nightly --version
+          rustc --version
           # The prebuilt cargo-fuzz is a musl binary and defaults to its own target
           # (x86_64-unknown-linux-musl), where the sanitizer cannot run; build for the host.
-          echo "FUZZ_TARGET=$(rustc +nightly -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+          echo "FUZZ_TARGET=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - run: cargo fmt --all --check
         working-directory: fuzz
       - run: fuzz/seed.sh
-      - run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
+      - run: cargo fuzz build --target "$FUZZ_TARGET"
         working-directory: fuzz
       # One libFuzzer process per core (each is single-threaded), each target its full 60 s;
       # the logs follow, one group per target.
@@ -238,9 +239,9 @@ jobs:
         run: |
           mkdir -p logs
           : > failed.txt
-          cargo +nightly fuzz list | xargs -P "$(nproc)" -I{} sh -c \
-            'cargo +nightly fuzz run --target "$FUZZ_TARGET" {} -- -max_total_time=60 > logs/{}.log 2>&1 || echo {} >> failed.txt'
-          for t in $(cargo +nightly fuzz list); do
+          cargo fuzz list | xargs -P "$(nproc)" -I{} sh -c \
+            'cargo fuzz run --target "$FUZZ_TARGET" {} -- -max_total_time=60 > logs/{}.log 2>&1 || echo {} >> failed.txt'
+          for t in $(cargo fuzz list); do
             echo "::group::$t"
             cat "logs/$t.log"
             echo "::endgroup::"

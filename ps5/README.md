@@ -15,9 +15,9 @@ FORGE_DEBUG_API=1 ps5/build.sh   # bring-up only: adds POST /api/debug, GET /pro
 
 ## Harness (`ps5/`)
 
-- `Dockerfile`: `rust:1.99.0-slim-trixie` (pinned by digest), Debian clang/lld/llvm 19, ps5-payload-dev SDK
+- `Dockerfile`: `rust:1.100.0-slim-trixie` (pinned by digest), Debian clang/lld/llvm 19, ps5-payload-dev SDK
   v0.43 (zip pinned by SHA-256), `rust-src` with a one-line FreeBSD 11 std patch (`prepare-rust-std.py`
-  refuses a changed context). `RUSTUP_TOOLCHAIN=1.99.0` overrides `rust-toolchain.toml`, since build-std
+  refuses a changed context). `RUSTUP_TOOLCHAIN=1.100.0`, the version `rust-toolchain.toml` pins, since build-std
   needs that toolchain's patched `rust-src`. Rust, the std patch, the SDK, the target JSON and the shims are
   pinned together; bump them together.
 - `build.sh`: `npm run build:http` on the host (`FORGE_SKIP_WEB=1` skips it), the C files with
