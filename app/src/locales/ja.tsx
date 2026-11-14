@@ -24,7 +24,7 @@ const ja: Messages = {
     prevTab: "前のタブ (L2)",
     nextTab: "次のタブ (R2)",
     offline: "オフライン、再試行中…",
-    stop: "Dump Forge を停止",
+    stop: "停止",
     stillRunning: (n) => (n === 1 ? "ジョブが実行中です" : `ジョブが ${num(n)} 件実行中です`),
     job: (id) => `ジョブ ${id}`,
     quitNote: (web, n) =>

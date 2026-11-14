@@ -561,13 +561,13 @@ The web build names the product "Dump Forge" (the PS5 tile's name); the desktop 
   card with the spinner and "Starting Dump Forge…" (`role="status"`); on failure (`role="alert"`) the
   warn icon, "Can't start Dump Forge" (or "Dump Forge didn't answer"), the reason muted, a primary
   Retry.
-- **Header controls** (`.top-actions`): "Stop Dump Forge" (`.small`, 14px, power icon) before the
+- **Header controls** (`.top-actions`): "Stop" (`.small`, 14px, power icon) before the
   GitHub mark; under 600px and at 900–1049px (where its label beside the longer languages' tabs
   would squeeze the logo and Connect's state away) it shrinks to its icon (the label stays as visually
   hidden text, and a `title` tip); the orange `.tag` "Offline, retrying…" sits before it (announced by an always-mounted, visually hidden
   `role="status"`). A debug build (never released) adds an English "Input probe" (`.small`) before Stop.
   With no job running it stops at once; with jobs it opens the quit modal listing them (Keep
-  running / Stop Dump Forge); if they all finish while it is open, it asks "Stop Dump Forge?" and
+  running / Stop); if they all finish while it is open, it asks "Stop Dump Forge?" and
   says how it starts again (the PS5: its tile; a computer's `serve`: run it again). Then "has
   stopped" with the same. Once Stop is confirmed the dialog takes no keys or clicks:
   Escape stays the browser's, so the PS5's Circle leaves the page. A failed stop turns it into

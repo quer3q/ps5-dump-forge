@@ -25,7 +25,7 @@ const de: Messages = {
     prevTab: "Vorheriger Tab (L2)",
     nextTab: "Nächster Tab (R2)",
     offline: "Offline, neuer Versuch…",
-    stop: "Dump Forge beenden",
+    stop: "Beenden",
     stillRunning: (n) => (n === 1 ? "Ein Auftrag läuft noch" : `${num(n)} Aufträge laufen noch`),
     job: (id) => `Auftrag ${id}`,
     quitNote: (web, n) =>

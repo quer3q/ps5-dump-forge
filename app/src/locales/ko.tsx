@@ -24,7 +24,7 @@ const ko: Messages = {
     prevTab: "이전 탭 (L2)",
     nextTab: "다음 탭 (R2)",
     offline: "오프라인, 다시 시도 중…",
-    stop: "Dump Forge 중지",
+    stop: "중지",
     stillRunning: (n) => (n === 1 ? "작업이 아직 실행 중입니다" : `작업 ${num(n)}개가 아직 실행 중입니다`),
     job: (id) => `작업 ${id}`,
     quitNote: (web) =>

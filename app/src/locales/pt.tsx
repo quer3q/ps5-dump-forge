@@ -31,7 +31,7 @@ const pt: Messages = {
     prevTab: "Aba anterior (L2)",
     nextTab: "Próxima aba (R2)",
     offline: "Sem conexão, tentando de novo…",
-    stop: "Parar o Dump Forge",
+    stop: "Parar",
     stillRunning: (n) =>
       n === 1 ? "Uma tarefa ainda está em execução" : `${num(n)} tarefas ainda estão em execução`,
     job: (id) => `Tarefa ${id}`,

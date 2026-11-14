@@ -56,7 +56,7 @@ const ar: Messages = {
     prevTab: "التبويب السابق (⁦L2⁩)",
     nextTab: "التبويب التالي (⁦R2⁩)",
     offline: "غير متصل، جارٍ إعادة المحاولة…",
-    stop: "إيقاف Dump Forge",
+    stop: "إيقاف",
     stillRunning: (n) =>
       plural(n, {
         zero: `لا تزال ${num(n)} مهام قيد التشغيل`,

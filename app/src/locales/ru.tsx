@@ -25,7 +25,7 @@ const ru: Messages = {
     prevTab: "Предыдущая вкладка (L2)",
     nextTab: "Следующая вкладка (R2)",
     offline: "Нет связи, повтор…",
-    stop: "Остановить Dump Forge",
+    stop: "Остановить",
     stillRunning: (n) =>
       n === 1
         ? "Задача ещё выполняется"

@@ -31,7 +31,7 @@ const en = {
     prevTab: "Previous tab (L2)",
     nextTab: "Next tab (R2)",
     offline: "Offline, retrying…",
-    stop: "Stop Dump Forge",
+    stop: "Stop",
     stillRunning: (n: number): string => (n === 1 ? "A job is still running" : `${num(n)} jobs are still running`),
     job: (id: number) => `Job ${id}`,
     quitNote: (web: boolean, n: number) =>

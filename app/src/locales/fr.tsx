@@ -26,7 +26,7 @@ const fr: Messages = {
     prevTab: "Onglet précédent (L2)",
     nextTab: "Onglet suivant (R2)",
     offline: "Hors ligne, nouvelle tentative…",
-    stop: "Arrêter Dump Forge",
+    stop: "Arrêter",
     stillRunning: (n) =>
       n === 1
         ? "Une tâche est encore en cours"

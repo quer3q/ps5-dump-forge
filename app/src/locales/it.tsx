@@ -26,7 +26,7 @@ const it: Messages = {
     prevTab: "Scheda precedente (L2)",
     nextTab: "Scheda successiva (R2)",
     offline: "Non in linea, nuovo tentativo…",
-    stop: "Arresta Dump Forge",
+    stop: "Arresta",
     stillRunning: (n) =>
       n === 1
         ? "Un'operazione è ancora in corso"

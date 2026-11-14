@@ -1040,7 +1040,7 @@ button.naming-chip .icon { width: 14px; height: 14px; }
 .credit-list .path { color: var(--fg-2); user-select: text; }
 
 /* ---------- http build (PS5 web UI) ---------- */
-/* The header's right column: an offline notice and "Stop Dump Forge". */
+/* The header's right column: an offline notice and "Stop". */
 .top-actions { justify-self: end; display: flex; align-items: center; gap: 8px; }
 .top-actions button.small { font-size: 14px; }
 /* The GitHub mark: a round icon-only link (the app: a button), --muted until hovered. */

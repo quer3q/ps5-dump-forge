@@ -1,6 +1,6 @@
 // Shell: header with tabs, the job list (fed by events), and the close-while-running prompt.
 // Nothing is saved: what the screens remember lasts until the app closes. The http build adds
-// "Stop Dump Forge" to the header (there's no window to close) and rebuilds the job list
+// "Stop" to the header (there's no window to close) and rebuilds the job list
 // from the server's.
 
 import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";

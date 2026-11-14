@@ -26,7 +26,7 @@ const es: Messages = {
     prevTab: "Pestaña anterior (L2)",
     nextTab: "Pestaña siguiente (R2)",
     offline: "Sin conexión, reintentando…",
-    stop: "Detener Dump Forge",
+    stop: "Detener",
     stillRunning: (n) =>
       n === 1
         ? "Una tarea sigue en curso"

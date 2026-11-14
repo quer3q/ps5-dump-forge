@@ -25,7 +25,7 @@ const zh: Messages = {
     prevTab: "上一个标签页 (L2)",
     nextTab: "下一个标签页 (R2)",
     offline: "已离线，正在重试…",
-    stop: "停止 Dump Forge",
+    stop: "停止",
     stillRunning: (n) => (n === 1 ? "仍有一个任务在运行" : `仍有 ${num(n)} 个任务在运行`),
     job: (id) => `任务 ${id}`,
     quitNote: (web, n) =>
