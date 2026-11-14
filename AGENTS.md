@@ -5,7 +5,7 @@ mounts (`.exfat`, `.ffpkg` UFS2, `.ffpfs` PFS, `.ffpfsc` compressed PFS containe
 debug FPKG `.pkg` (create and extract; on the PS5 also install), and edits a game's files in a folder or image (the Edit tab:
 in place or rebuilt) or copies some out (Extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`), a
 CLI (`ps5-dump-forge`), and a PS5 ELF payload (the CLI's `serve`: the same UI as a web page on port 8095).
-Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, the PS5 `.elf`.
+Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, the PS5 `.elf` (and `payloads.json`, its ps5-payload-manager catalog).
 `ps5/README.md` holds the payload's details (harness, HTTP routes, tile/self copy/launch on open, U1–U10
 write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zstd.md` the zstd pack format; `docs/packing.md` the TOML profiles of the packing strategy (`docs/packing-sample.toml` a sample).
 
@@ -213,7 +213,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   `vendor/lzma-rust2`: crates.io 0.22.0 + patch 0021 (bounded multithreaded LZMA2 decode, which
   `sevenz.rs` sizes per block by dictionary and largest run), via `[patch.crates-io]`, excluded
   from the workspace.
-- `scripts/`: checks and releases (see Commands); `check-versions.sh` also matches the tag on a tag build.
+- `scripts/`: checks and releases (see Commands); `check-versions.sh` also matches the tag on a tag build;
+  `make-payloads-json.sh` writes `payloads.json`, a ps5-payload-manager custom repository (the release's `.elf`
+  URL, `v<version>`, its SHA-256, the stable `filename` `ps5-dump-forge.elf`) and parses it back; CI's `ps5` job
+  runs it on the ELF it builds, the publish job after `SHA256SUMS` (which doesn't list it).
   `fuzz/`: cargo-fuzz targets, its own workspace.
 - `tests/`: the Connect smoke suite against a real console: `README.md` there, every script in
   `tests/scripts/` (`smoke.mjs`, 26 cases over both Forges' HTTP APIs; by user decision at most 30, only
@@ -1431,6 +1434,7 @@ cargo run -p ps5-dump-forge-cli -- serve --root <dir>   # the web UI on this com
 ps5/build.sh                                   # PS5 payload in Docker: target/ps5/ps5-dump-forge.elf
 ps5/test-entry.sh                              # host check of entry.c
 scripts/release-ps5.sh                         # dist/ps5-dump-forge-<ver>-ps5.elf, checked (SKIP_BUILD=1: check only; needs the zstd CLI)
+scripts/make-payloads-json.sh <elf> [out.json] # ps5-payload-manager catalog for that .elf (GITHUB_REPOSITORY, PAYLOADS_DATE)
 scripts/test-freebsd.sh                        # core + server tests on FreeBSD UFS/FAT32/nullfs (VM; long)
 FORGE_DEBUG_API=1 ps5/build.sh                 # bring-up build with POST /api/debug, GET /probe, /api/debug_input; never released
 ```

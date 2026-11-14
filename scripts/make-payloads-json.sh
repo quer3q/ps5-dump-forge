@@ -21,14 +21,14 @@
 # JSON is written with printf and needs no jq; the check below parses it back.
 set -euo pipefail
 
+# Paths are the caller's: only Cargo.toml is read from the repository root.
 root=$(cd "$(dirname "$0")/.." && pwd)
-cd "$root"
 
 [[ $# -ge 1 && $# -le 2 ]] || { echo "usage: $0 <ps5 .elf> [output.json]" >&2; exit 2; }
 elf=$1
 out=${2:-payloads.json}
 
-version=$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n1)
+version=$(tr -d '\r' < "$root/Cargo.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n1)
 [[ -n $version ]] || { echo "make-payloads-json.sh: no version in Cargo.toml" >&2; exit 1; }
 [[ $version =~ ^[0-9A-Za-z.+-]+$ ]] ||
   { echo "make-payloads-json.sh: odd version '$version'" >&2; exit 1; }

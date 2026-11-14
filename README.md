@@ -98,6 +98,8 @@ for a newer release and offer it (on the PS5, **Update** downloads it and hands 
   `https://github.com/quer3q/ps5-dump-forge/releases/latest/download/payloads.json` as a custom
   repository. Each published release carries that catalog (the `.elf` and its SHA-256, which the manager checks
   on every download); `latest` is the newest release that isn't a pre-release.
+  Dump Forge's own **Update** doesn't change the manager's copy: if the manager loads Dump Forge at boot, it
+  starts the version the manager last installed, so update it in the manager too.
 - **Open the UI** from the Dump Forge icon, or in any browser on the same network:
   `http://<ps5-ip>:8095`. In the console's browser, **L2** / **R2** switch tabs.
 
