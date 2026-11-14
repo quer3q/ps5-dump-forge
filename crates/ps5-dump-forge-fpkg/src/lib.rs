@@ -18,6 +18,7 @@
 mod lih;
 mod mount;
 mod pfs;
+mod protected;
 mod tree;
 
 use std::collections::HashSet;
@@ -92,9 +93,9 @@ pub(crate) fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync
 
 /// The container entries that carry a game file: the presentation set the builder copies into
 /// the container (icons, `pic*` PNGs and DDSs, `snd0.at9`, `save_data.png`, trophy and UDS data), and
-/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a third-party builder can keep
-/// only in the container (plaintext; ours keeps them in the image too and encrypts the
-/// container's NP copies, which the merge skips). Everything else in a container is the
+/// `param.json`, `nptitle.dat` and the `npbind.dat` files, which a package can keep only in the
+/// container, plaintext or protected (encrypted: `flags1` bit 31, see [`protected`]; ours keeps
+/// them in the image too, where the image's copy wins). Everything else in a container is the
 /// package's own metadata (keys, digests, license, PlayGo tables) and is not a file of the game.
 fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     [
@@ -107,12 +108,41 @@ fn container_paths() -> impl Iterator<Item = (u32, &'static str)> {
     .chain(PROTECTED.iter().map(|(id, path, _, _)| (*id, *path)))
 }
 
+/// Where the container entry `e`, the game file `path`, is read from: the package at the
+/// entry's own offset, or, for a protected entry, its decrypted copy pushed onto `held`. `None`
+/// when a protected entry can't be decrypted (the entry is left out and `facts` says why).
+fn place_entry(
+    pkg: &mut Pkg,
+    cnt: &pfs::Container,
+    e: &pfs::Entry,
+    path: &str,
+    passcode: &str,
+    held: &mut Vec<Vec<u8>>,
+    facts: &mut Vec<String>,
+) -> Option<Where> {
+    if e.flags1 & protected::FLAG == 0 {
+        return Some(Where::Container(e.at));
+    }
+    match protected::plaintext(pkg, cnt, e, passcode) {
+        Ok(bytes) => {
+            held.push(bytes);
+            Some(Where::Held(held.len() - 1))
+        }
+        Err(why) => {
+            facts.push(format!("{path}: protected container entry left out: {why}"));
+            None
+        }
+    }
+}
+
 /// Where a file's bytes are.
 enum Where {
     /// In the inner image: a mount offset (Kraken) or an on-disk one (flat).
     Inner(u64),
     /// A container entry, at this absolute package offset.
     Container(u64),
+    /// A protected container entry, decrypted at open: `held[n]`.
+    Held(usize),
 }
 
 /// The layers a read goes through, kept apart so each can borrow the others.
@@ -149,6 +179,8 @@ pub struct FpkgSource {
     files: Vec<SourceFile>,
     /// Parallel to `files`.
     places: Vec<Where>,
+    /// The decrypted protected entries `Where::Held` points into.
+    held: Vec<Vec<u8>>,
     empty_dirs: Vec<String>,
     conflicts: Vec<String>,
     details: Vec<String>,
@@ -339,11 +371,11 @@ impl FpkgSource {
         // skipped (and noted when they disagree) where it does.
         let mut conflicts = Vec::new();
         let mut from_container = 0usize;
+        let mut held: Vec<Vec<u8>> = Vec::new();
         for (id, path) in container_paths() {
             let Some(e) = cnt.entry(id) else { continue };
-            // An empty slot is how the builder leaves an icon out; a protected (encrypted) entry
-            // is not a plain copy of anything.
-            if e.size == 0 || e.flags1 & 0x8000_0000 != 0 {
+            // An empty slot is how the builder leaves an icon out.
+            if e.size == 0 {
                 continue;
             }
             if dirs.contains(path) {
@@ -372,13 +404,27 @@ impl FpkgSource {
                 }
                 continue;
             }
+            // A protected entry (nptitle.dat, the npbind files: AES-128-CBC, keyed by the content
+            // id and passcode) is decrypted here, once: without them trophies don't register
+            // from a converted copy. One that can't be left out, and the fact says why.
+            let Some(place) = place_entry(
+                &mut reader.outer.pkg,
+                &cnt,
+                &e,
+                path,
+                passcode,
+                &mut held,
+                &mut facts,
+            ) else {
+                continue;
+            };
             empty_dirs.retain(|d| !path.starts_with(&format!("{d}/")));
             files.push((
                 SourceFile {
                     path: path.to_string(),
                     size: e.size,
                 },
-                Where::Container(e.at),
+                place,
             ));
             from_container += 1;
         }
@@ -387,7 +433,7 @@ impl FpkgSource {
             let mut partial = Vec::new();
             files.retain(|(f, at)| {
                 let whole = match at {
-                    Where::Container(_) => true,
+                    Where::Container(_) | Where::Held(_) => true,
                     Where::Inner(at) => reader.carried(*at, f.size, &p.present),
                 };
                 if !whole {
@@ -419,6 +465,7 @@ impl FpkgSource {
         Ok(Self {
             files,
             places,
+            held,
             empty_dirs,
             conflicts,
             details: facts,
@@ -549,6 +596,11 @@ impl SourceTree for FpkgSource {
         match self.places[i] {
             Where::Inner(at) => self.reader.mount(at + offset, &mut buf)?,
             Where::Container(at) => self.reader.outer.pkg.read_at(at + offset, &mut buf)?,
+            // `size` is the plaintext's length, so the range is inside it.
+            Where::Held(h) => {
+                let from = offset as usize;
+                buf.copy_from_slice(&self.held[h][from..from + n]);
+            }
         }
         Ok(buf)
     }
@@ -658,4 +710,64 @@ fn flat_placements(files: &mut [InnerFile], layout: &naps::Layout, meta_base: u6
         return refuse("the data end or metadata base differs from the descriptor's");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ps5upload_fpkg::build::{self, BuildRequest};
+
+    /// A package built from a tiny game folder and opened, its temporary folders gone again.
+    fn small_package() -> FpkgSource {
+        let dir = std::env::temp_dir().join(format!("forge-fpkg-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (src, out) = (dir.join("src"), dir.join("out"));
+        std::fs::create_dir_all(src.join("sce_sys")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(src.join("eboot.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::write(
+            src.join("sce_sys/param.json"),
+            br#"{"contentId":"UP0000-PPSA01234_00-TESTGAME00000000","titleId":"PPSA01234"}"#,
+        )
+        .unwrap();
+        let mut request = BuildRequest::production(&src, &out);
+        request.time = Some((1_700_000_000, 0));
+        request.threads = Some(1);
+        request.level = ps5upload_fpkg::kraken::Level::Fast;
+        let report = build::build(&request, &mut |_| {}).unwrap();
+        let source = FpkgSource::open(&report.path, None).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        source
+    }
+
+    /// A file served from a decrypted copy (`Where::Held`) reads exactly like any other: whole,
+    /// by ranges from any offset, short at its end, and empty at and past it.
+    #[test]
+    fn a_held_file_reads_whole_and_by_range() {
+        let mut package = small_package();
+        let plain: Vec<u8> = (0..50u8)
+            .map(|i| i.wrapping_mul(5).wrapping_add(3))
+            .collect();
+        let path = "sce_sys/zz-held.dat";
+        package.held.push(plain.clone());
+        let at = package.files.partition_point(|f| f.path.as_str() < path);
+        package.files.insert(
+            at,
+            SourceFile {
+                path: path.into(),
+                size: plain.len() as u64,
+            },
+        );
+        package.places.insert(at, Where::Held(0));
+
+        assert_eq!(package.read(path).unwrap(), plain);
+        assert_eq!(package.read_range(path, 0, 50).unwrap(), plain);
+        assert_eq!(package.read_range(path, 7, 10).unwrap(), plain[7..17]);
+        assert_eq!(package.read_range(path, 45, 100).unwrap(), plain[45..]);
+        assert_eq!(package.read_range(path, 49, 1).unwrap(), plain[49..]);
+        assert!(package.read_range(path, 50, 10).unwrap().is_empty());
+        assert!(package.read_range(path, 500, 10).unwrap().is_empty());
+        // The files around it still read from the package.
+        assert_eq!(package.read("eboot.bin").unwrap(), vec![7u8; 4096]);
+    }
 }
