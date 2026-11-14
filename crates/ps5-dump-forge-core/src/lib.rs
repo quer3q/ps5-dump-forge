@@ -735,6 +735,16 @@ pub fn folder_refusal(path: &Path) -> Option<String> {
     library::folder_refusal(path)
 }
 
+/// The disk volumes mounted on this computer, for the picker's first screen: on Linux the
+/// block-device, ZFS and network mounts of `/proc/self/mountinfo`, sorted; empty elsewhere (macOS
+/// has `/Volumes`, Windows its drive letters). Not filtered by [`folder_refusal`].
+pub fn volume_mounts() -> Vec<PathBuf> {
+    #[cfg(target_os = "linux")]
+    return library_roots::volume_mounts();
+    #[cfg(not(target_os = "linux"))]
+    Vec::new()
+}
+
 /// The cover of a Library entry (a supported image or a plain game folder, on any filesystem:
 /// no locality check) as a PNG data URL. `None` when the icon is absent, empty, over 512 KiB (checked before and
 /// after reading) or not a PNG; an error when the source is a link, not eligible, or cannot

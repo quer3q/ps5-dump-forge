@@ -350,15 +350,16 @@ fn home_folder() -> Option<PathBuf> {
     std::env::home_dir().map(|h| dunce::simplified(&h).to_path_buf())
 }
 
-/// The picker's volume roots (Windows: drives A: to Z:) that open and that `list_dir` doesn't
-/// refuse. Existence only: each root is opened, not read, on a thread of its own, 1.5 s for all,
-/// so a drive that stalls (a stale mapped drive, an empty floppy or optical drive) is left out by
-/// the deadline instead of holding the picker.
+/// The picker's volume roots (Windows: drives A: to Z:; Linux: also every mounted disk volume,
+/// wherever it is) that open and that `list_dir` doesn't refuse, one per folder (a link or a bind
+/// mount of one already listed is left out). Existence only: each root is opened, not read, on a
+/// thread of its own, 1.5 s for all, so a drive that stalls (a stale mapped drive, an empty floppy
+/// or optical drive) is left out by the deadline instead of holding the picker.
 // ponytail: a root still stalled at the deadline leaves its thread running.
 #[tauri::command]
 async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
     blocking(app, |_, _| {
-        let candidates: Vec<PathBuf> = if cfg!(windows) {
+        let mut candidates: Vec<PathBuf> = if cfg!(windows) {
             ('A'..='Z')
                 .map(|d| PathBuf::from(format!("{d}:\\")))
                 .collect()
@@ -367,6 +368,7 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
                 .map(PathBuf::from)
                 .into()
         };
+        candidates.extend(ps5_dump_forge_core::volume_mounts());
         let (tx, rx) = std::sync::mpsc::channel();
         for (i, path) in candidates.iter().cloned().enumerate() {
             let tx = tx.clone();
@@ -374,25 +376,44 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
                 #[cfg(windows)]
                 quiet_drive_errors();
                 let refused = path.parent().is_some() && folder_refusal(&path).is_some();
-                let _ = tx.send((i, !refused && std::fs::read_dir(&path).is_ok()));
+                let open = !refused && std::fs::read_dir(&path).is_ok();
+                let _ = tx.send((i, open.then(|| dir_id(&path))));
             });
         }
         drop(tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        let mut opens = vec![false; candidates.len()];
+        // `None`: not opened (or not in time); `Some(id)`: opened, with the folder's identity.
+        let mut opens = vec![None; candidates.len()];
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok((i, ok)) => opens[i] = ok,
+                Ok((i, open)) => opens[i] = open,
                 Err(_) => break,
             }
         }
+        let mut seen = std::collections::HashSet::new();
         Ok(candidates
             .into_iter()
             .zip(opens)
-            .filter_map(|(p, ok)| ok.then_some(p))
+            .filter_map(|(p, open)| {
+                let id = open?;
+                id.is_none_or(|id| seen.insert(id)).then_some(p)
+            })
             .collect())
     })
     .await
+}
+
+/// A folder's identity (device and inode), so two names for one folder agree. `None` where
+/// there is none (Windows lists no link or bind mount twice).
+#[cfg(unix)]
+fn dir_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn dir_id(_: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// This thread's opens of an empty drive (floppy, card reader, optical) fail at once instead of

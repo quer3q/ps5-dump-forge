@@ -57,6 +57,71 @@ pub(crate) fn home() -> Option<PathBuf> {
     std::env::home_dir().filter(|h| h.is_absolute())
 }
 
+/// The mount points of the disk volumes in `mountinfo` (`/proc/self/mountinfo`), sorted: a
+/// filesystem on a block device (not a loop, ram or zram one), or a ZFS or network one. Pseudo
+/// filesystems, overlays and FUSE mounts are not volumes. Names are kept as the kernel prints
+/// them, spaces as `\040`, unescaped here.
+#[cfg(target_os = "linux")]
+pub(crate) fn volume_mounts_of(mountinfo: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for line in mountinfo.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        let Some(dash) = f.iter().position(|&s| s == "-") else {
+            continue;
+        };
+        let (Some(&at), Some(&fstype), Some(&source)) =
+            (f.get(4), f.get(dash + 1), f.get(dash + 2))
+        else {
+            continue;
+        };
+        let block = source.starts_with("/dev/")
+            && !["/dev/loop", "/dev/ram", "/dev/zram"]
+                .iter()
+                .any(|virt| source.starts_with(virt));
+        if block || ["zfs", "nfs", "nfs4", "cifs", "smb3"].contains(&fstype) {
+            found.push(unescape_mount(at));
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// A mountinfo path: `\040` and the other `\NNN` octal escapes turned into their bytes.
+#[cfg(target_os = "linux")]
+fn unescape_mount(s: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b
+            .get(i + 1..i + 4)
+            .filter(|_| b[i] == b'\\')
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .and_then(|d| u8::from_str_radix(d, 8).ok());
+        match octal {
+            Some(c) => {
+                out.push(c);
+                i += 4;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// The disk volumes mounted now (Linux), from `/proc/self/mountinfo`; none if it can't be read.
+#[cfg(target_os = "linux")]
+pub(crate) fn volume_mounts() -> Vec<PathBuf> {
+    std::fs::read("/proc/self/mountinfo")
+        .map(|b| volume_mounts_of(&String::from_utf8_lossy(&b)))
+        .unwrap_or_default()
+}
+
 /// Filesystems the PS5 Library may enter; anything else (network, FUSE, pseudo, unknown) is
 /// refused.
 #[cfg(target_os = "freebsd")]
@@ -147,9 +212,9 @@ const MAC_SYSTEM: [&str; 12] = [
     "cores",
     "opt",
 ];
-const LINUX_SYSTEM: [&str; 15] = [
+const LINUX_SYSTEM: [&str; 16] = [
     "proc", "sys", "dev", "run", "bin", "sbin", "lib", "lib64", "usr", "etc", "var", "boot",
-    "root", "snap", "opt",
+    "root", "snap", "opt", "sysroot",
 ];
 const WINDOWS_SYSTEM: [&str; 7] = [
     "windows",
@@ -246,8 +311,12 @@ pub(crate) fn refusal(path: &Path, home: Option<&Path>, os: Os, sys_drive: char)
     let in_system = match os {
         // `/tmp` resolves to `/private/tmp`: the one part of `/private` that is allowed.
         Os::Mac => MAC_SYSTEM.contains(&first) && !(first == "private" && p.get(1) == Some(&"tmp")),
+        // `/run/media` and `/var/mnt` are where the disks are: on Fedora Atomic `/media` and
+        // `/mnt` are links to them.
         Os::Linux => {
-            LINUX_SYSTEM.contains(&first) && !(first == "run" && p.get(1) == Some(&"media"))
+            LINUX_SYSTEM.contains(&first)
+                && !(first == "run" && p.get(1) == Some(&"media"))
+                && !(first == "var" && p.get(1) == Some(&"mnt"))
         }
         Os::Windows => on_system_drive && WINDOWS_SYSTEM.contains(&first),
     };
@@ -282,6 +351,9 @@ mod tests {
             "/media/me/Games",
             "/run/media/me/Games",
             "/mnt/games",
+            // Fedora Atomic's `/mnt`.
+            "/var/mnt",
+            "/var/mnt/datos",
         ] {
             assert!(linux(c).is_none(), "{c}");
         }
@@ -306,9 +378,33 @@ mod tests {
             "/run/user/1",
             "/root",
             "/snap",
+            "/sysroot",
         ] {
             assert!(linux(c).is_some(), "{c}");
         }
         assert!(linux("/srv/games").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_lists_the_disk_volumes_only() {
+        let info = "\
+22 28 0:21 / /proc rw,nosuid - proc proc rw
+29 1 259:2 / / rw,relatime - btrfs /dev/nvme1n1p3 rw,subvol=/root
+35 29 259:1 / /var/mnt/datos rw,relatime shared:3 - ext4 /dev/nvme0n1p1 rw
+40 29 7:0 / /snap/core rw - squashfs /dev/loop0 ro
+41 29 0:50 / /run/user/1000 rw - tmpfs tmpfs rw
+42 29 8:17 / /run/media/me/My\\040Stick rw - vfat /dev/sdb1 rw
+43 29 0:55 / /srv/nas rw - nfs4 nas:/export rw
+44 29 0:60 / /overlay rw - overlay overlay rw
+";
+        let found: Vec<_> = volume_mounts_of(info)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            found,
+            ["/", "/run/media/me/My Stick", "/srv/nas", "/var/mnt/datos"]
+        );
     }
 }
