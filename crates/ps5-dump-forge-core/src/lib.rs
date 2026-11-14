@@ -832,6 +832,12 @@ pub mod out {
         crate::finalize::create_new(path)
     }
 
+    /// A regular file made by [`create_new`] and closed, open again for writing (a link at
+    /// `path` not followed).
+    pub fn reopen(path: &Path) -> io::Result<File> {
+        crate::finalize::reopen(path)
+    }
+
     /// One folder; its parent must exist.
     pub fn make_dir(path: &Path) -> io::Result<()> {
         std::fs::create_dir(path)?;
