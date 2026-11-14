@@ -762,7 +762,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
     `library_roots::refusal`, checked on the canonical path, ASCII case-insensitive on macOS and Windows):
     the filesystem root (Windows: the system drive root), `~/Library` / `~/AppData` and everything inside,
     and each OS's system folders with everything inside (macOS `/System`, `/usr`, `/private` except
-    `/private/tmp`, ...; Linux `/proc`, `/usr`, `/run` except `/run/media/…`, ...; Windows, Program Files,
+    `/private/tmp`, ...; Linux `/proc`, `/usr`, `/run` except `/run/media/…`, `/var` except `/var/mnt/…` (Fedora Atomic's `/mnt`), `/sysroot`, `/efi`, `/nix`, ...; Windows, Program Files,
     ... on the system drive). A path at or inside the canonical home is allowed first (a `/var/home/me` or
     `/root` home works). Everything else is allowed (home and its children, `/Volumes`, `/media`, `/mnt`,
     volume and drive roots). `library_cover` refuses links, devices, `/mnt/shadowmnt`, a file
@@ -991,8 +991,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   device, this device first, then each online peer (`flink://<key_id>`) and each online saved NAS
   (`smb://`, `ftp://`, `nfs://<host>[:port]`, `nasRoot`), for sources and outputs alike (on another device's tab archives and `.pkg` files are listed greyed out,
   not pickable, issue #20; one short note above the list, `picker.netOnlyHere`); Edit's Add lists peers only (`peersOnly`). No system dialog on any platform (by user decision; `tauri-plugin-dialog`
-  removed): the desktop's local tab lists Tauri `local_roots` (home and the volume folders, Windows A: to Z:,
-  that open and that `list_dir` doesn't refuse; existence only, one thread each, 1.5 s for all; ponytail: a
+  removed): the desktop's local tab lists Tauri `local_roots` (home and the volume folders, Windows A: to Z:, Linux
+  also every disk filesystem in `/proc/self/mountinfo` (issue #52; ponytail: named by its folder, not its label), each
+  folder once at its real path, that open and that `list_dir` doesn't refuse; existence only, one thread each, 1.5 s for all; ponytail: a
   stalled root's thread is left running), a root listed only when opened. A source is one **[disc] Pick** button (by user request; Convert, Edit, Pack) in the
   `folderToo` mode: a file click picks an image or archive, "Choose this folder" a game folder, told apart
   by extension. Rows: at most 2,000 shown, one Tab stop, arrows move; multi-select's button reads

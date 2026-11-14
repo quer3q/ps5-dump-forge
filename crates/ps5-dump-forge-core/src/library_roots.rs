@@ -147,9 +147,9 @@ const MAC_SYSTEM: [&str; 12] = [
     "cores",
     "opt",
 ];
-const LINUX_SYSTEM: [&str; 15] = [
+const LINUX_SYSTEM: [&str; 18] = [
     "proc", "sys", "dev", "run", "bin", "sbin", "lib", "lib64", "usr", "etc", "var", "boot",
-    "root", "snap", "opt",
+    "root", "snap", "opt", "sysroot", "efi", "nix",
 ];
 const WINDOWS_SYSTEM: [&str; 7] = [
     "windows",
@@ -246,8 +246,13 @@ pub(crate) fn refusal(path: &Path, home: Option<&Path>, os: Os, sys_drive: char)
     let in_system = match os {
         // `/tmp` resolves to `/private/tmp`: the one part of `/private` that is allowed.
         Os::Mac => MAC_SYSTEM.contains(&first) && !(first == "private" && p.get(1) == Some(&"tmp")),
+        // `/run/media` holds removable drives; `/var/mnt` is Fedora Atomic's `/mnt` (issue #52).
         Os::Linux => {
-            LINUX_SYSTEM.contains(&first) && !(first == "run" && p.get(1) == Some(&"media"))
+            LINUX_SYSTEM.contains(&first)
+                && !matches!(
+                    (first, p.get(1)),
+                    ("run", Some(&"media")) | ("var", Some(&"mnt"))
+                )
         }
         Os::Windows => on_system_drive && WINDOWS_SYSTEM.contains(&first),
     };
@@ -306,9 +311,13 @@ mod tests {
             "/run/user/1",
             "/root",
             "/snap",
+            "/sysroot",
+            "/efi",
+            "/nix/store",
         ] {
             assert!(linux(c).is_some(), "{c}");
         }
         assert!(linux("/srv/games").is_none());
+        assert!(linux("/var/mnt/datos").is_none());
     }
 }

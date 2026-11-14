@@ -350,23 +350,35 @@ fn home_folder() -> Option<PathBuf> {
     std::env::home_dir().map(|h| dunce::simplified(&h).to_path_buf())
 }
 
-/// The picker's volume roots (Windows: drives A: to Z:) that open and that `list_dir` doesn't
-/// refuse. Existence only: each root is opened, not read, on a thread of its own, 1.5 s for all,
+/// The picker's volume roots (Windows: drives A: to Z:; Linux: also every mounted disk) that open
+/// and that `list_dir` doesn't refuse, each once at its real path. Existence only: each root is
+/// opened, not read, on a thread of its own, 1.5 s for all,
 /// so a drive that stalls (a stale mapped drive, an empty floppy or optical drive) is left out by
 /// the deadline instead of holding the picker.
 // ponytail: a root still stalled at the deadline leaves its thread running.
 #[tauri::command]
 async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
     blocking(app, |_, _| {
-        let candidates: Vec<PathBuf> = if cfg!(windows) {
+        let mut candidates: Vec<PathBuf> = if cfg!(windows) {
             ('A'..='Z')
                 .map(|d| PathBuf::from(format!("{d}:\\")))
                 .collect()
         } else {
-            ["/Volumes", "/media", "/run/media", "/mnt", "/"]
+            ["/Volumes", "/media", "/run/media", "/mnt"]
                 .map(PathBuf::from)
                 .into()
         };
+        // Linux: every disk mounted anywhere is a root too (issue #52: `/var/mnt/datos`, `/srv`,
+        // a second disk from fstab), and a folder reached twice through a link (Fedora Atomic's
+        // `/media` -> `/run/media`, `/mnt` -> `/var/mnt`) is listed once, at its real path.
+        // Read lossily: a mount path that isn't UTF-8 then fails to open, the others still list.
+        #[cfg(target_os = "linux")]
+        if let Ok(info) = std::fs::read("/proc/self/mountinfo") {
+            candidates.extend(disk_mounts(&String::from_utf8_lossy(&info)));
+        }
+        if !cfg!(windows) {
+            candidates.push(PathBuf::from("/"));
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         for (i, path) in candidates.iter().cloned().enumerate() {
             let tx = tx.clone();
@@ -374,25 +386,86 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
                 #[cfg(windows)]
                 quiet_drive_errors();
                 let refused = path.parent().is_some() && folder_refusal(&path).is_some();
-                let _ = tx.send((i, !refused && std::fs::read_dir(&path).is_ok()));
+                let opens = !refused && std::fs::read_dir(&path).is_ok();
+                // The real path, resolved here so a stalled mount waits out the deadline too.
+                let real = if cfg!(windows) {
+                    path
+                } else {
+                    dunce::canonicalize(&path).unwrap_or(path)
+                };
+                let _ = tx.send((i, opens.then_some(real)));
+            });
+        }
+        // The home folder is the picker's first root already: a home that is a disk of its own
+        // isn't listed again. Resolved on a thread too, within the same deadline.
+        const HOME: usize = usize::MAX;
+        if let Some(home) = home_folder() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((HOME, dunce::canonicalize(&home).ok()));
             });
         }
         drop(tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        let mut opens = vec![false; candidates.len()];
+        let mut roots = vec![None; candidates.len()];
+        let mut seen = std::collections::HashSet::new();
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok((i, ok)) => opens[i] = ok,
+                Ok((HOME, home)) => seen.extend(home),
+                Ok((i, root)) => roots[i] = root,
                 Err(_) => break,
             }
         }
-        Ok(candidates
+        Ok(roots
             .into_iter()
-            .zip(opens)
-            .filter_map(|(p, ok)| ok.then_some(p))
+            .flatten()
+            .filter(|p| seen.insert(p.clone()))
             .collect())
     })
     .await
+}
+
+/// The mount points in `/proc/self/mountinfo` text that are a disk's filesystem: not `/` (a root
+/// of its own) and none of the kernel's, container or package-image filesystems (`proc`, `tmpfs`,
+/// `overlay`, `squashfs`, ...). Mount points are octal-escaped there (`\040` a space).
+#[cfg(target_os = "linux")]
+fn disk_mounts(info: &str) -> Vec<PathBuf> {
+    const DISK: [&str; 18] = [
+        "ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "bcachefs", "zfs", "jfs", "reiserfs",
+        "vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "hfsplus", "udf", "iso9660",
+    ];
+    info.lines()
+        .filter_map(|line| {
+            let (mount, fs) = line.split_once(" - ")?;
+            let point = mount.split(' ').nth(4)?;
+            let fs = fs.split(' ').next()?;
+            (DISK.contains(&fs) && point != "/").then(|| PathBuf::from(unescape_mount(point)))
+        })
+        .collect()
+}
+
+/// `mountinfo`'s `\NNN` octal escapes undone (space, tab, newline, backslash).
+#[cfg(target_os = "linux")]
+fn unescape_mount(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let oct = b
+            .get(i + 1..i + 4)
+            .filter(|o| o.iter().all(|c| (b'0'..=b'7').contains(c)));
+        match oct {
+            Some(o) if b[i] == b'\\' => {
+                out.push(o.iter().fold(0u8, |n, c| n.wrapping_mul(8) + (c - b'0')));
+                i += 4;
+            }
+            _ => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// This thread's opens of an empty drive (floppy, card reader, optical) fail at once instead of
