@@ -379,6 +379,21 @@ impl Conn {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.stream.peer_addr()
     }
+
+    /// Whether the peer closed its side (a read would end at once, with no bytes or a reset),
+    /// asked without blocking: for a wait in which the peer sends nothing, so its leaving is seen
+    /// at once rather than when a later write fails.
+    fn peer_left(&self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let left = match self.stream.peek(&mut [0u8; 1]) {
+            Ok(n) => n == 0,
+            Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+        };
+        let _ = self.stream.set_nonblocking(false);
+        left
+    }
 }
 
 // ---- Handshake --------------------------------------------------------------------------------
@@ -941,7 +956,9 @@ fn server_steps(
 }
 
 /// The server's user's answer to `req`, asked in `PAIR_PING` slices with a ping to the client
-/// between them (a client that left fails the ping); `refused(TIMED_OUT)` after `PAIR_WAIT`.
+/// between them; `refused(TIMED_OUT)` after `PAIR_WAIT`. The client sends nothing meanwhile, so
+/// one that closed its side (a cancelled request) is seen before the next ping: a ping alone is
+/// seen to fail only once the client's reset is back, slices later on a slow machine.
 fn ask(conn: &mut Conn, approver: &dyn Approver, req: &PairRequest) -> io::Result<bool> {
     let start = std::time::Instant::now();
     loop {
@@ -951,6 +968,12 @@ fn ask(conn: &mut Conn, approver: &dyn Approver, req: &PairRequest) -> io::Resul
         }
         if let Some(answer) = approver.decide(req, left.min(PAIR_PING)) {
             return Ok(answer);
+        }
+        if conn.peer_left() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the requester left",
+            ));
         }
         conn.send_frame(&Frame::new(kind2::PING, 0, Vec::new()))?;
     }
