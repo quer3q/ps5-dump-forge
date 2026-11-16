@@ -1466,6 +1466,13 @@ pub struct SpeedTest {
 /// Speed lanes one paired device may hold open at once (a test uses `SPEED_LANES`).
 pub const SPEED_PEER_LANES: usize = 8;
 
+/// How long a speed lane's send may get no byte out before it fails (a transfer's lanes keep
+/// `DEAD_AFTER`). A client that was cancelled and closed with a chunk still on its way can
+/// leave its socket reading nothing and sending no reset; the lane, and the slot and bytes it
+/// holds in `SPEED_OPEN`, are then freed after up to twice this, so a Stop followed by another
+/// test is not refused for `2 * DEAD_AFTER` (24 s).
+pub const SPEED_WRITE_WAIT: Duration = Duration::from_secs(4);
+
 /// Per paired device's key id: its open speed lanes and the bytes they have carried.
 static SPEED_OPEN: Mutex<Option<HashMap<String, (usize, u64)>>> = Mutex::new(None);
 
@@ -1556,6 +1563,7 @@ pub fn serve_speed(
         let why = format!("{TRANSFER_FAILED}: at most {SPEED_PEER_LANES} speed lanes at once");
         return Err(send_refusal(conn, &why));
     };
+    conn.set_write_timeout(SPEED_WRITE_WAIT)?;
     let (zeros, full) = speed_zeros();
     let mut f = first;
     loop {
@@ -3164,10 +3172,11 @@ mod tests {
     /// at once, but a lane serving `speed_down` whose client was cancelled and closed with the
     /// answer still on its way can be left blocked in `send`: the client's socket ends in
     /// FIN_WAIT2 with a zero window, which neither reads nor resets, so the lane ends only when
-    /// its write times out, and `write_all` sends a second time after a partial first one:
-    /// `2 * DEAD_AFTER`, measured at 24.03 s. Hence three, not the 5 s that failed on GitHub's.
+    /// its write times out (`SPEED_WRITE_WAIT`), and `write_all` sends a second time after a
+    /// partial first one: up to twice that (with `DEAD_AFTER` it was 24.03 s). Hence four
+    /// times, not the 5 s that failed on GitHub's.
     fn speed_lanes_released(peer: &str) {
-        let until = Instant::now() + DEAD_AFTER * 3;
+        let until = Instant::now() + SPEED_WRITE_WAIT * 4;
         while lock(&SPEED_OPEN)
             .as_ref()
             .is_some_and(|m| m.contains_key(peer))

@@ -1105,7 +1105,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   lanes together at most `SPEED_PEER_LANES` (8) and `SPEED_BUDGET` (2 x `SPEED_BYTES`, 256 MiB, both
   directions) at once, reserved per request in `SpeedLane` (`SPEED_OPEN`, by key id) and released as each
   lane ends; past either a refusal ("at most 8 speed lanes at once", "a device's speed tests carry at most N
-  bytes at once"). `SPEED_MAX` (the `speed` RPC's `max`, the client's clamp) is `SPEED_BYTES` per direction.
+  bytes at once"). A speed lane's write timeout is `SPEED_WRITE_WAIT` (4 s; `Conn::set_write_timeout`), not
+  `DEAD_AFTER`: a client cancelled with a chunk on its way can end in FIN_WAIT2 with a zero window (no read, no
+  reset), and the send, tried twice by `write_all`, then frees the lane's slot and bytes after up to 8 s, not 24.
+  `SPEED_MAX` (the `speed` RPC's `max`, the client's clamp) is `SPEED_BYTES` per direction.
   Both sides share one static `CHUNK` of zeros and its hash (`speed_zeros`).
   Holds `awake()` on the testing side (ponytail: the peer's lanes don't count as `peers_active`). Routes:
   Tauri `connect_speed_test {keyId, run}`, server `POST /api/connect/speed_test {key_id, run}` (409 while
