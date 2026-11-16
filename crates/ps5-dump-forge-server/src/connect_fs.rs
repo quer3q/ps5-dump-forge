@@ -1587,11 +1587,12 @@ pub fn serve_speed(
     peer: &str,
     allowed: &dyn Fn() -> bool,
 ) -> io::Result<()> {
+    // Before the refusal too: a lane refused for the count still sends to a client maybe gone.
+    conn.set_write_timeout(SPEED_WRITE_WAIT)?;
     let Some(mut lane) = SpeedLane::take(peer) else {
         let why = format!("{TRANSFER_FAILED}: at most {SPEED_PEER_LANES} speed lanes at once");
         return Err(send_refusal(conn, &why));
     };
-    conn.set_write_timeout(SPEED_WRITE_WAIT)?;
     let (zeros, full) = speed_zeros();
     let mut f = first;
     loop {
