@@ -748,6 +748,10 @@ impl<'a> Ctx<'a> {
             stage: stage.to_string(),
             done: job_done,
             total: job_total,
+            // Verification may include several separately sized reads under one stage id.
+            // A pass fraction there would falsely claim the whole stage was complete.
+            stage_done: (total > 1 && stage != "verify").then_some(done),
+            stage_total: (total > 1 && stage != "verify").then_some(total),
         });
     }
 }

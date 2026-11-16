@@ -1276,7 +1276,11 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   `smallest`, and `stored`: every block raw, the fallback for a console that won't start a compressed
   package; tests use `fast` only), no extra free space beyond each format's built-in spare, output next
   to the source (an empty output `dir` is the source's folder, never the process's working directory).
-- Progress is one bar per job: `Event::Progress` `done`/`total` span every pass (write, verify,
+- Progress: conversion rows show one segment per announced stage; completed stages are full, the current
+  segment uses `Event::Progress`'s optional `stage_done`/`stage_total` pass counters, and upcoming
+  stages are empty. Marker-only stages, verification (which can have multiple passes), and older
+  peers without counters are indeterminate. Other job types retain the job-wide bar. The existing
+  `done`/`total` span every pass (write, verify,
   ...); `Ctx::expect_rest` renews the estimate as each pass learns its size. No pass fills the bar while
   another is left: LZ4 measuring and auto-loose sampling count the write and check passes after them,
   and `Ctx::reserve` holds back a packed image's check through its packs while it is checked as written.

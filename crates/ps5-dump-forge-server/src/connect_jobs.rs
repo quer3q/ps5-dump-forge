@@ -404,6 +404,8 @@ mod tests {
             stage: "write".into(),
             done: 1,
             total: 2,
+            stage_done: Some(1),
+            stage_total: Some(2),
         });
         let out = dirs[2].join("out").to_string_lossy().into_owned();
         a.job_started(2, &request(&dirs[2].join("other"), &out));

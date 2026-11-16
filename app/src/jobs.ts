@@ -34,6 +34,8 @@ export interface Job {
   /** When the current stage began, and how far it was then (for the rate). */
   stageAt: number;
   stageDone: number;
+  /** Current pass fraction, absent when not reported or not measurable. */
+  stageFraction?: number;
   /** Milliseconds left in the job at the current stage's rate, when a rate is known. */
   etaMs?: number;
   /** Bytes per second in the current stage, when known. */
@@ -99,6 +101,11 @@ function stepOf(stages: string[] | undefined, stage: string | undefined, from: n
   return j >= 0 ? j : from;
 }
 
+function stageFraction(p: ProgressEvent): number | undefined {
+  if (p.stage_done == null || p.stage_total == null || p.stage_total <= 1) return undefined;
+  return Math.max(0, Math.min(1, p.stage_done / p.stage_total));
+}
+
 function blank(id: JobId): Job {
   return { id, done: 0, total: 0, shown: 0, stageAt: 0, stageDone: 0, log: [] };
 }
@@ -110,7 +117,7 @@ function fromSnapshot(j: Job, s: Omit<SnapshotJob, "log_total">, at: number): Jo
   const p = s.progress;
   if (p) {
     const shown = bar(j.shown, p.done, p.total);
-    k = { ...k, stage: p.stage, done: p.done, total: p.total, shown, stageAt: at, stageDone: p.done };
+    k = { ...k, stage: p.stage, done: p.done, total: p.total, shown, stageAt: at, stageDone: p.done, stageFraction: stageFraction(p) };
     k = { ...k, etaMs: undefined, speed: undefined };
   }
   k = { ...k, step: stepOf(k.stages, k.stage, k.step) };
@@ -165,6 +172,7 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
             shown,
             stageAt: a.at,
             stageDone: done,
+            stageFraction: stageFraction(a.e),
             etaMs: undefined,
             speed: undefined,
           };
@@ -175,7 +183,7 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
         const rate = BYTE_STAGES.has(stage) && elapsed >= 1000 ? (done - j.stageDone) / elapsed : 0;
         const etaMs = rate > 0 && total > done ? (total - done) / rate : undefined;
         const speed = rate > 0 ? rate * 1000 : j.speed;
-        return { ...j, done, total, shown, etaMs, speed };
+        return { ...j, done, total, shown, stageFraction: stageFraction(a.e), etaMs, speed };
       });
     case "stages":
       if (a.e.stages.length === 0) return jobs;

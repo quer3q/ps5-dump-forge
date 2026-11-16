@@ -153,6 +153,9 @@ export interface ProgressEvent {
   stage: string;
   done: number;
   total: number;
+  /** Current pass counters; older peers may not provide them. */
+  stage_done?: number | null;
+  stage_total?: number | null;
 }
 export interface LogEvent {
   kind: "log";

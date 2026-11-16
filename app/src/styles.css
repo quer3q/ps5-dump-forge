@@ -673,6 +673,14 @@ ul.findings li.info .icon { color: var(--accent-ink); }
 }
 [dir="rtl"] .bar .sheen::after { animation-direction: reverse; }
 @keyframes sheen { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+.stage-bars { display: flex; gap: 4px; margin-top: 10px; }
+.stage-bar { position: relative; flex: 1 1 0; min-width: 0; overflow: hidden; border-radius: 999px; background: var(--bar-track); }
+.stage-bar progress:not([value]) { visibility: hidden; }
+.stage-bar progress::-webkit-progress-value { background: #253095; }
+.stage-bar progress::-moz-progress-bar { background: #253095; }
+.stage-indeterminate { position: absolute; inset: 0; background: #253095; animation: stage-pulse 1.6s ease-in-out infinite; }
+@keyframes stage-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .stage-indeterminate { animation: none; opacity: 0.5; } }
 .job-status { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; font-size: 12.5px; overflow-wrap: break-word; overflow-wrap: anywhere; }
 .job-status .path { color: var(--fg-2); }
 /* The job's steps (`ol.steps`): done ones with a green check, the current one in accent ink, the
@@ -1260,6 +1268,8 @@ button.kind-chip.addon { --h: var(--fg); --h-bg: var(--raise-hi); --h-line: var(
 [dir="rtl"] ol.steps .sep { display: inline-block; direction: ltr; unicode-bidi: isolate; transform: scaleX(-1); }
 [dir="rtl"] progress::-webkit-progress-value { background: linear-gradient(270deg, var(--bar-lo), var(--accent) 70%, var(--bar-hi)); }
 [dir="rtl"] progress::-moz-progress-bar { background: linear-gradient(270deg, var(--bar-lo), var(--accent) 70%, var(--bar-hi)); }
+[dir="rtl"] .stage-bar progress::-webkit-progress-value { background: #253095; }
+[dir="rtl"] .stage-bar progress::-moz-progress-bar { background: #253095; }
 
 /* ---------- Storage ---------- */
 /* One card per view; its head holds the view switch first (the start), then the view's actions

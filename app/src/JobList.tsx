@@ -258,6 +258,7 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
   const sourceNote = result && "Ok" in result ? sourceLine(result.Ok.checks) : null;
   // Every step the job will run, once core said; gone when the job ends (its result says it).
   const steps = !result && job.stages?.length ? <Steps job={job} /> : null;
+  const conversion = !!job.request && jobType(job.request) === "convert";
   // Packing straight into an image: its write pass packs too.
   if (running && job.stage === "write" && pack?.kind === "lz4" && pack.id === "pack" && targetKind(job.request!) !== "lz4")
     status = t.packingWriting;
@@ -339,7 +340,8 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
           {confirming ? t.stopHint : ""}
         </span>
       </header>
-      {running && (
+      {running && conversion && <StageBars job={job} name={name} alive={alive} />}
+      {running && !conversion && (
         <div className="bar" style={{ "--p": job.shown } as CSSProperties}>
           <progress value={job.shown} max={1} aria-label={`${name}: ${status}`} />
           {alive && <span className={job.shown < 0.02 ? "sheen track" : "sheen"} aria-hidden="true" />}
@@ -350,11 +352,11 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
         <span className={`tag status ${tone}`}>
           {status}
         </span>
-        {running && (job.total > 0 || step) && (
+        {running && (job.total > 0 || step || (conversion && job.stageFraction !== undefined)) && (
           <span className="meta">
-            {job.total > 0 && (
+            {(conversion ? job.stageFraction !== undefined : job.total > 0) && (
               <>
-                <strong>{Math.floor(100 * job.shown)}%</strong>
+                <strong>{Math.floor(100 * (conversion ? job.stageFraction! : job.shown))}%</strong>
                 {job.speed !== undefined && (
                   <>
                     {` · ${rateLabel(t, job.stage ?? "")} `}
@@ -364,7 +366,7 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
                 {job.etaMs !== undefined && ` · ${t.left(prettyDuration(job.etaMs))}`}
               </>
             )}
-            {step && `${job.total > 0 ? " · " : ""}${t.inStep(step)}`}
+            {step && `${(conversion ? job.stageFraction !== undefined : job.total > 0) ? " · " : ""}${t.inStep(step)}`}
           </span>
         )}
         {result && "Ok" in result && (
@@ -441,6 +443,29 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
     </article>
   );
 });
+
+/** Each announced conversion stage has its own track; only a reported pass has a fraction.
+ * Older peers and marker-only stages remain indeterminate rather than using job-wide bytes. */
+function StageBars({ job, name, alive }: { job: Job; name: string; alive: boolean }) {
+  const t = useMessages().jobs;
+  const stages = job.stages?.length ? job.stages : [job.stage!];
+  const at = job.stages?.length ? job.step : 0;
+  return (
+    <div className="stage-bars">
+      {stages.map((stage, i) => {
+        const state = at === undefined || i > at ? "later" : i < at ? "done" : "now";
+        const value = state === "done" ? 1 : state === "now" ? job.stageFraction : 0;
+        const label = (t.steps as Record<string, string | undefined>)[stage] ?? stage;
+        return (
+          <div className={`stage-bar ${state}`} key={i}>
+            <progress value={value} max={1} aria-label={`${name}: ${label}`} />
+            {state === "now" && value === undefined && alive && <span className="stage-indeterminate" aria-hidden="true" />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 /** The job's steps in order, neighbours with one label merged (preflight and check are one
  * "Checking"): done before the current one, the rest not started. A stage the messages don't

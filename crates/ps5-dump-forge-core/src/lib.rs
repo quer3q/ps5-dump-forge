@@ -365,6 +365,9 @@ pub enum Event {
         /// fills once. `total` is an estimate that can grow; 0 before it is known.
         done: u64,
         total: u64,
+        /// Current pass counters; absent when the stage has no measurable progress.
+        stage_done: Option<u64>,
+        stage_total: Option<u64>,
     },
     Log {
         job: JobId,

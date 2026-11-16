@@ -460,8 +460,7 @@ function diff(snap: JobsSnapshot): void {
     if (j.stages?.length > 0 && !was.stages)
       emit("job://stages", { kind: "stages", job: j.id, stages: j.stages } satisfies StagesEvent);
     if (j.progress && JSON.stringify(j.progress) !== was.progress) {
-      const { stage, done, total } = j.progress;
-      emit("job://progress", { kind: "progress", job: j.id, stage, done, total } satisfies ProgressEvent);
+      emit("job://progress", { ...j.progress, kind: "progress", job: j.id } satisfies ProgressEvent);
     }
     const n = Math.min(j.log_total - was.logTotal, j.log.length);
     for (const line of n > 0 ? j.log.slice(j.log.length - n) : [])
