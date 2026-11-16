@@ -86,8 +86,15 @@ pub trait Remote: Send + Sync {
     fn write_at(&self, handle: u64, offset: u64, bytes: &[u8]) -> io::Result<()>;
     /// Makes what was written durable on the peer.
     fn sync(&self, handle: u64) -> io::Result<()>;
-    /// Closes a created file; the handle is gone after this, whatever it returns.
+    /// Closes a created file; the handle is gone after this, whatever it returns, unless
+    /// [`Remote::reopen`] gives the file back.
     fn close(&self, handle: u64) -> io::Result<()>;
+    /// Opens a created file again for writing after its [`Remote::close`], while it is not
+    /// renamed; it stays as it is when it is open. `Unsupported` where the device can't (a
+    /// device from before this call, a NAS): the caller then keeps the file open.
+    fn reopen(&self, _handle: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// Renames on the same peer, never replacing `to` (`AlreadyExists`).
     fn rename_no_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()>;
     /// Renames the file `from` on the same device over the file `to` (or to a free name),
@@ -973,6 +980,9 @@ pub(crate) struct RemotePart {
     at: FlinkPath,
     url: PathBuf,
     published: bool,
+    /// Whether the file is open on the peer (a pack's volume is closed once written, then opened
+    /// again for its header).
+    open: bool,
 }
 
 impl RemotePart {
@@ -993,14 +1003,35 @@ impl RemotePart {
             url: at.url(),
             at,
             published: false,
+            open: true,
         };
         Ok((part, file))
     }
 
-    /// The part, still open, written again from its start (an LZ4 volume's header); its
-    /// length is not known to the writer, so it is never sought from the end.
-    fn rewrite(&self) -> RemoteFile {
-        RemoteFile::new(self.remote.clone(), self.handle)
+    /// The part, opened again if it was closed, written again from its start (a pack volume's
+    /// header); its length is not known to the writer, so it is never sought from the end.
+    fn rewrite(&mut self) -> io::Result<RemoteFile> {
+        if !self.open {
+            self.remote.reopen(self.handle)?;
+            self.open = true;
+        }
+        Ok(RemoteFile::new(self.remote.clone(), self.handle))
+    }
+
+    /// Closes the part once written and synced, when the peer can open it again; otherwise it
+    /// stays open. A peer takes only so many files open at once, and a pack has dozens of volumes.
+    fn close_if_reopenable(&mut self) -> io::Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        match self.remote.reopen(self.handle) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        self.remote.close(self.handle)?;
+        self.open = false;
+        Ok(())
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -1430,11 +1461,12 @@ impl RemoteDir {
     }
 }
 
-/// LZ4 pack files written into a [`RemoteDir`]'s root, each under a temporary name and kept
-/// open until [`RemotePacks::publish`] (the packer rewrites every volume's header last; a peer
-/// has no reopen), then closed and renamed without replacing. Dropped, they are removed.
-// ponytail: a peer takes 32 unrenamed files per session, so a pack of more than about 30
-// volumes (~120 GiB of packs) fails there.
+/// Pack files (LZ4 or zstd) written into a [`RemoteDir`]'s root, each under a temporary name until
+/// [`RemotePacks::publish`] renames it without replacing. A file is closed as soon as it is
+/// written and opened again for its header (the packer rewrites every volume's header last), so
+/// only the files being written count against the peer's open files. Dropped, they are removed.
+// ponytail: a peer from before `reopen` keeps every file open until `publish`, and takes 32 open
+// files per session: a pack of more than about 30 volumes (~120 GiB of packs) fails there.
 pub(crate) struct RemotePacks<'a> {
     dir: &'a RemoteDir,
     parts: Vec<(String, RemotePart)>,
@@ -1443,12 +1475,20 @@ pub(crate) struct RemotePacks<'a> {
 impl RemotePacks<'_> {
     pub(crate) fn publish(self) -> anyhow::Result<()> {
         for (name, part) in self.parts {
-            part.remote
-                .close(part.handle)
-                .with_context(|| format!("closing {}", part.at.shown()))?;
+            if part.open {
+                part.remote
+                    .close(part.handle)
+                    .with_context(|| format!("closing {}", part.at.shown()))?;
+            }
             part.publish(&self.dir.root.join(&name).url())?;
         }
         Ok(())
+    }
+
+    fn part(&mut self, name: &str) -> ps5upload_fpkg::Result<&mut RemotePart> {
+        let part = self.parts.iter_mut().find(|(n, _)| n == name);
+        let part = part.ok_or_else(|| io::Error::other(format!("{name} was not packed here")))?;
+        Ok(&mut part.1)
     }
 }
 
@@ -1464,13 +1504,12 @@ impl ps5_dump_forge_lz4::writer::PackOutput for RemotePacks<'_> {
     }
 
     fn reopen(&mut self, name: &str) -> ps5upload_fpkg::Result<RemoteFile> {
-        let part = self.parts.iter().find(|(n, _)| n == name);
-        let part = part.ok_or_else(|| io::Error::other(format!("{name} was not packed here")))?;
-        Ok(part.1.rewrite())
+        Ok(self.part(name)?.rewrite()?)
     }
 
-    fn finish(&mut self, _: &str, mut w: RemoteFile) -> ps5upload_fpkg::Result<()> {
-        Ok(w.sync_open()?)
+    fn finish(&mut self, name: &str, mut w: RemoteFile) -> ps5upload_fpkg::Result<()> {
+        w.sync_open()?;
+        Ok(self.part(name)?.close_if_reopenable()?)
     }
 }
 
@@ -1826,6 +1865,128 @@ pub(crate) mod tests {
 
     fn bytes(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// A peer that takes `cap` open files at most (as a Connect peer's session does), refuses a
+    /// write or close on a closed one and, with `reopens`, opens a closed one again.
+    struct Capped {
+        inner: Arc<Fake>,
+        open: Mutex<HashSet<u64>>,
+        cap: usize,
+        reopens: bool,
+        peak: AtomicUsize,
+    }
+
+    impl Capped {
+        fn open_one(&self, handle: u64) -> io::Result<()> {
+            let mut open = self.open.lock().unwrap();
+            if open.len() >= self.cap {
+                return Err(io::Error::other("files are being written already"));
+            }
+            open.insert(handle);
+            self.peak.fetch_max(open.len(), Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_open(&self, handle: u64) -> io::Result<()> {
+            let open = self.open.lock().unwrap().contains(&handle);
+            open.then_some(())
+                .ok_or_else(|| io::Error::other("no file open"))
+        }
+    }
+
+    impl Remote for Capped {
+        fn stat(&self, path: &FlinkPath) -> io::Result<RemoteStat> {
+            self.inner.stat(path)
+        }
+        fn list(&self, path: &FlinkPath) -> io::Result<Vec<RemoteEntry>> {
+            self.inner.list(path)
+        }
+        fn read_at(&self, path: &FlinkPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+            self.inner.read_at(path, offset, len)
+        }
+        fn mkdir(&self, path: &FlinkPath) -> io::Result<()> {
+            self.inner.mkdir(path)
+        }
+        fn create(&self, path: &FlinkPath) -> io::Result<u64> {
+            let handle = self.inner.create(path)?;
+            self.open_one(handle)?;
+            Ok(handle)
+        }
+        fn write_at(&self, handle: u64, offset: u64, bytes: &[u8]) -> io::Result<()> {
+            self.is_open(handle)?;
+            self.inner.write_at(handle, offset, bytes)
+        }
+        fn sync(&self, handle: u64) -> io::Result<()> {
+            self.is_open(handle)
+        }
+        fn close(&self, handle: u64) -> io::Result<()> {
+            self.is_open(handle)?;
+            self.open.lock().unwrap().remove(&handle);
+            Ok(())
+        }
+        fn reopen(&self, handle: u64) -> io::Result<()> {
+            if !self.reopens {
+                return Err(io::ErrorKind::Unsupported.into());
+            }
+            if self.is_open(handle).is_ok() {
+                return Ok(());
+            }
+            self.open_one(handle)
+        }
+        fn rename_no_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()> {
+            self.inner.rename_no_replace(from, to)
+        }
+        fn rename_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()> {
+            self.inner.rename_replace(from, to)
+        }
+        fn remove(&self, path: &FlinkPath) -> io::Result<()> {
+            self.inner.remove(path)
+        }
+        fn free_space(&self, dir: &FlinkPath) -> io::Result<u64> {
+            self.inner.free_space(dir)
+        }
+    }
+
+    /// A pack's volumes go out one open file at a time and get their headers when reopened (issue
+    /// #42: a pack of more than 32 volumes); a peer that can't reopen keeps them open to the end.
+    #[test]
+    fn pack_volumes_are_closed_once_written_and_opened_again_for_their_headers() {
+        use ps5_dump_forge_lz4::writer::PackOutput;
+        for (reopens, volumes, peak) in [(true, 10, 1), (false, 3, 3)] {
+            let fake = Fake::with(&[], &[]);
+            let peer = Arc::new(Capped {
+                inner: fake.clone(),
+                open: Mutex::default(),
+                cap: 4,
+                reopens,
+                peak: AtomicUsize::new(0),
+            });
+            let dir = RemoteDir::at(peer.clone(), at(""));
+            let mut out = dir.packs();
+            let name = |i: usize| format!("v{i}.pak");
+            for i in 0..volumes {
+                let mut w = out.create(&name(i)).unwrap();
+                w.write_all(b"body-tail").unwrap();
+                out.finish(&name(i), w).unwrap();
+            }
+            for i in 0..volumes {
+                let mut w = out.reopen(&name(i)).unwrap();
+                w.seek(SeekFrom::Start(0)).unwrap();
+                w.write_all(b"HEAD").unwrap();
+                out.finish(&name(i), w).unwrap();
+            }
+            out.publish().unwrap();
+            assert_eq!(
+                peer.peak.load(Ordering::Relaxed),
+                peak,
+                "reopens: {reopens}"
+            );
+            assert!(peer.open.lock().unwrap().is_empty());
+            for i in 0..volumes {
+                assert_eq!(fake.file(&name(i)).unwrap(), b"HEAD-tail");
+            }
+        }
     }
 
     #[test]

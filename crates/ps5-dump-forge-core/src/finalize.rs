@@ -460,6 +460,29 @@ pub(crate) fn create_new(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Opens a regular file this process created and closed, for writing again, without following
+/// a link at `path`.
+// ponytail: no identity check against the file that was closed.
+pub(crate) fn reopen(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 /// CE-107750-0: the game cannot read files made with the process default mode on the PS5, so
 /// everything Forge creates in a game folder is 0777 (like the UFS2 writer's inodes), set
 /// explicitly because the create mode is masked by the umask. A no-op off FreeBSD.

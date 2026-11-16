@@ -15,7 +15,9 @@
 //!
 //! Writes (`Writes`): `mkdir {path}` → `{created}` (one level; an existing folder is fine),
 //! `create {path}` → `{handle}` (exclusive, no link followed, 0777 on the PS5), `sync {handle}`,
-//! `close {handle}`, `rename {from, to, replace?}` (never over another, unless `replace`: then
+//! `close {handle}`, `reopen {path}` → `{handle, size}` (a file the session created and closed,
+//! not yet renamed, open for writing again; an open one stays as it is; an older peer answers
+//! `unknown method`), `rename {from, to, replace?}` (never over another, unless `replace`: then
 //! over a regular file only, never a folder or link; then both folders synced),
 //! `remove {path}`, `free {path}` → `{free}` bytes. Only a file the session created is renamed
 //! or removed; one it never renamed is kept `KEPT_FOR` once the session ends (removed at once
@@ -638,6 +640,9 @@ pub fn answer(
         "create" => path().and_then(|p| writes.create(hs, root, p, me)),
         "sync" => handle().and_then(|h| writes.sync(&sid, h).map(|()| Value::Null)),
         "close" => handle().and_then(|h| writes.close(&sid, h).map(|()| Value::Null)),
+        #[cfg(test)]
+        "reopen" if writes.old.load(Ordering::SeqCst) => return None,
+        "reopen" => path().and_then(|p| writes.reopen(&sid, root, p, me)),
         "rename" => text("from").and_then(|from| {
             let to = text("to")?;
             let replace = r.body["replace"].as_bool().unwrap_or(false);
@@ -667,9 +672,13 @@ pub fn answer(
 
 // ---- Writes: a paired device writing files here -----------------------------------------------
 
-/// Files peers may have created and not yet renamed, on the device and per session.
+/// Files peers may have open for writing at once, on the device and per session. A file closed
+/// and not yet renamed (a pack's volume, until the pack is done) doesn't count against these.
 const MAX_WRITES: usize = 64;
 const MAX_WRITES_PER_SESSION: usize = MAX_WRITES / 2;
+/// Files a session may have created and not yet renamed or removed, open or closed: the most
+/// volumes a zstd pack has (4,096) and its index, with room.
+const MAX_UNRENAMED: usize = 8192;
 
 /// Whether a path is at, in or above one of this device's unfinished jobs' paths.
 pub type Busy = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
@@ -954,6 +963,28 @@ impl Writes {
         Ok(serde_json::json!({ "handle": handle }))
     }
 
+    /// Whether session `sid` may have one more file open: the open ones count against the caps
+    /// (a closed one waits for its rename), and every unrenamed one against `MAX_UNRENAMED`.
+    fn room(files: &HashMap<u64, Created>, sid: &str) -> Result<(), String> {
+        let all = files.values().filter(|c| c.file.is_some()).count();
+        let mine = (files.values())
+            .filter(|c| c.file.is_some() && c.session.id() == sid)
+            .count();
+        if all >= MAX_WRITES || mine >= MAX_WRITES_PER_SESSION {
+            return Err(format!(
+                "{} files are being written already; try again later",
+                mine.max(all)
+            ));
+        }
+        let unrenamed = files.values().filter(|c| c.session.id() == sid).count();
+        if unrenamed >= MAX_UNRENAMED {
+            return Err(format!(
+                "{unrenamed} files are created and not renamed yet; rename or remove some"
+            ));
+        }
+        Ok(())
+    }
+
     /// A new file at `p` (checked) for `session`, within the write caps.
     fn create_at(&self, session: &Session, p: PathBuf) -> Result<u64, String> {
         let mut files = lock(&self.files);
@@ -961,13 +992,7 @@ impl Writes {
         if !lock(&self.live).contains(&sid) {
             return Err(format!("{NO_OPEN_FILE} (the session ended)"));
         }
-        let mine = files.values().filter(|c| c.session.id() == sid).count();
-        if files.len() >= MAX_WRITES || mine >= MAX_WRITES_PER_SESSION {
-            return Err(format!(
-                "{} files are being written already; try again later",
-                mine.max(files.len())
-            ));
-        }
+        Self::room(&files, &sid)?;
         let file = ps5_dump_forge_core::out::create_new(&p).map_err(|e| io_text(&p, &e))?;
         let handle = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let c = Created {
@@ -1075,8 +1100,12 @@ impl Writes {
         if find(&files).map(|f| f.0) != Some(handle) {
             return Err(not_kept());
         }
-        let mine = files.values().filter(|c| c.session.id() == sid).count();
-        if files[&handle].session.id() != sid && mine >= MAX_WRITES_PER_SESSION {
+        // An open file taken over adds to this session's open ones; a closed one adds none.
+        let mine = (files.values())
+            .filter(|c| c.file.is_some() && c.session.id() == sid)
+            .count();
+        let taken = &files[&handle];
+        if taken.file.is_some() && taken.session.id() != sid && mine >= MAX_WRITES_PER_SESSION {
             return Err(format!(
                 "{mine} files are being written already; try again later"
             ));
@@ -1109,6 +1138,37 @@ impl Writes {
             }
             _ => Err(format!("{NO_OPEN_FILE} {handle}")),
         }
+    }
+
+    /// `{handle, size}` of the unrenamed file at `rel` this session created, open for writing
+    /// again: a pack's volume is closed once written and opened for its header at the end. An
+    /// open one stays as it is (the writer asks it to learn the peer can). Counted as a new
+    /// open file while it is.
+    fn reopen(
+        &self,
+        sid: &str,
+        root: Option<&Share>,
+        rel: &str,
+        me: &str,
+    ) -> Result<Value, String> {
+        let p = locate(root, rel)?;
+        self.check(&p, me)?;
+        let mut files = lock(&self.files);
+        let handle = Self::created(&files, sid, &p)?;
+        if files[&handle].file.is_none() {
+            Self::room(&files, sid)?;
+            let file = ps5_dump_forge_core::out::reopen(&p).map_err(|e| io_text(&p, &e))?;
+            if let Some(c) = files.get_mut(&handle) {
+                c.file = Some(Arc::new(file));
+            }
+        }
+        let size = match &files[&handle].file {
+            Some(f) => f.metadata(),
+            None => fs::symlink_metadata(&p),
+        }
+        .map_err(|e| io_text(&p, &e))?
+        .len();
+        Ok(serde_json::json!({ "handle": handle, "size": size }))
     }
 
     /// The handle of the file at `p` this session created.
@@ -2645,6 +2705,9 @@ impl remote::Remote for Services {
     fn close(&self, handle: u64) -> io::Result<()> {
         self.owner(handle)?.close(handle)
     }
+    fn reopen(&self, handle: u64) -> io::Result<()> {
+        self.owner(handle)?.reopen(handle)
+    }
     fn rename_no_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()> {
         self.of(&from.key_id)?.rename_no_replace(from, to)
     }
@@ -2949,6 +3012,37 @@ impl remote::Remote for ConnectRemote {
         })
     }
 
+    /// `reopen` on the peer, which opens the closed file again (an open one is left as it is,
+    /// so a pack asks it of a file it hasn't closed to learn the peer can). A peer from before it
+    /// is `Unsupported`.
+    fn reopen(&self, handle: u64) -> io::Result<()> {
+        let c = lock(&self.files)
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| no_file(handle))?;
+        let v = self
+            .resuming(handle, c, None, |c| {
+                self.on_session(c, |s| {
+                    s.rpc
+                        .call("reopen", serde_json::json!({ "path": c.at.path }))
+                })
+            })
+            .map_err(|e| {
+                if e.to_string().starts_with("unknown method") {
+                    io::Error::new(io::ErrorKind::Unsupported, e.to_string())
+                } else {
+                    e
+                }
+            })?;
+        if let Some(made) = lock(&self.files).get_mut(&handle) {
+            made.open = true;
+            if let Some(h) = v["handle"].as_u64() {
+                made.handle = h;
+            }
+        }
+        Ok(())
+    }
+
     fn rename_no_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()> {
         self.rename_as(from, to, false)
     }
@@ -3066,14 +3160,25 @@ mod tests {
 
     /// Waits until the serving side has released `peer`'s speed lanes: a test returns once
     /// its answers are in, and each lane is freed only when the peer sees it close, so a
-    /// test started at once could find the lanes still taken and be refused.
+    /// test started at once could find the lanes still taken and be refused. Usually that is
+    /// at once, but a lane serving `speed_down` whose client was cancelled and closed with the
+    /// answer still on its way can be left blocked in `send`: the client's socket ends in
+    /// FIN_WAIT2 with a zero window, which neither reads nor resets, so the lane ends only when
+    /// its write times out, and `write_all` sends a second time after a partial first one:
+    /// `2 * DEAD_AFTER`, measured at 24.03 s. Hence three, not the 5 s that failed on GitHub's.
     fn speed_lanes_released(peer: &str) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + DEAD_AFTER * 3;
         while lock(&SPEED_OPEN)
             .as_ref()
             .is_some_and(|m| m.contains_key(peer))
         {
-            assert!(Instant::now() < until, "{peer}'s speed lanes stay open");
+            assert!(
+                Instant::now() < until,
+                "{peer}'s speed lanes stay open: {:?}",
+                lock(&SPEED_OPEN)
+                    .as_ref()
+                    .and_then(|m| m.get(peer).copied())
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -3099,8 +3204,12 @@ mod tests {
         let kb = b.state().device.key_id;
         speed_lanes_released(&kb);
 
-        // A lane refuses an empty request and a method other than speed_up / speed_down.
-        let (_rpc, hs) = b.session(&ka).unwrap();
+        // A lane refuses an empty request and a method other than speed_up / speed_down. The
+        // server registers a session on its control thread, after the handshake the client has
+        // already finished, so a Join right after `session` can find none (`bad_join`): an
+        // answered RPC says it is there, as it does before any real lane.
+        let (mut rpc, hs) = b.session(&ka).unwrap();
+        rpc.call("speed", serde_json::json!({})).unwrap();
         for (method, len) in [("speed_down", 0), ("speed_up", 0), ("read", 10)] {
             let mut lane = join_lane(&hs, 0).unwrap();
             let first = Request {
@@ -4205,6 +4314,68 @@ mod tests {
         assert!(share.join("stop.part").exists(), "kept for a resume");
         a.shutdown();
         assert!(!share.join("stop.part").exists());
+        b.shutdown();
+        for d in dirs.iter().chain([&share]) {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
+    /// A pack's volumes are closed once written and opened again for their headers: files closed
+    /// and not renamed yet don't count against the open-file cap (issue #42: a pack of more than
+    /// 32 volumes), open ones still do, and a peer from before `reopen` is `Unsupported`.
+    #[test]
+    fn closed_volumes_leave_room_and_reopen_for_their_headers() {
+        use ps5_dump_forge_core::remote::Remote;
+        let share = temp_dir("vols-share");
+        fs::create_dir_all(&share).unwrap();
+        let (a, b, rpc, _, dirs) = paired("vols", &share);
+        drop(rpc);
+        let key = a.state().device.key_id;
+        let at = |rel: &str| FlinkPath::parse(Path::new(&format!("flink://{key}/{rel}"))).unwrap();
+        let r = b.remote();
+
+        // Past the open files a session may have, each written, synced and closed.
+        let volumes: Vec<u64> = (0..MAX_WRITES_PER_SESSION + 8)
+            .map(|i| {
+                let h = r.create(&at(&format!("v{i}.part"))).unwrap();
+                r.write_at(h, 0, b"body-tail").unwrap();
+                r.sync(h).unwrap();
+                r.reopen(h).unwrap(); // an open file stays open: how a writer learns the peer can
+                r.close(h).unwrap();
+                h
+            })
+            .collect();
+        // Open ones still count, a reopened one too.
+        let open: Vec<u64> = (0..MAX_WRITES_PER_SESSION)
+            .map(|i| r.create(&at(&format!("o{i}.part"))).unwrap())
+            .collect();
+        let e = r.create(&at("over.part")).unwrap_err();
+        assert!(e.to_string().contains("being written already"), "{e}");
+        let e = r.reopen(volumes[0]).unwrap_err();
+        assert!(e.to_string().contains("being written already"), "{e}");
+        for h in open {
+            r.close(h).unwrap();
+        }
+        // Each volume gets its header, then is put in place.
+        for (i, h) in volumes.into_iter().enumerate() {
+            r.reopen(h).unwrap();
+            r.write_at(h, 0, b"HEAD").unwrap();
+            r.sync(h).unwrap();
+            r.close(h).unwrap();
+            r.rename_no_replace(&at(&format!("v{i}.part")), &at(&format!("v{i}")))
+                .unwrap();
+            assert_eq!(fs::read(share.join(format!("v{i}"))).unwrap(), b"HEAD-tail");
+        }
+
+        // A peer from before `reopen`: nothing to reopen, so the writer keeps its files open.
+        a.writes().old.store(true, Ordering::SeqCst);
+        let h = r.create(&at("old.part")).unwrap();
+        let e = r.reopen(h).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+        r.write_at(h, 0, b"still open").unwrap();
+        r.close(h).unwrap();
+
+        a.shutdown();
         b.shutdown();
         for d in dirs.iter().chain([&share]) {
             let _ = fs::remove_dir_all(d);

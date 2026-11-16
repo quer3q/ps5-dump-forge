@@ -37,7 +37,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (replace) fully), `host_tree.rs` (`host_tree`: a host file or
   folder as `Edited` will scan it, for the UI's preview), `extract_paths.rs` (an Extract job: chosen
   files and folders of any source copied out; `existing_targets`, `replace_findings`), `remote.rs` (every path on another device: the `Remote`
-  trait (stat, list, read_at, read_checked, put_new, mkdir, create, write_at, sync, close,
+  trait (stat, list, read_at, read_checked, put_new, mkdir, create, write_at, sync, close, reopen (a closed,
+  unrenamed file open again; `Unsupported` on an older peer and every NAS),
   rename_no_replace, rename_replace (a file over a file; Replace), remove, free_space; `delete_path`/`move_path`, refused
   by default (`delete::not_here`), a paired peer's its own Delete and Move to), `Scheme` `Flink`/`Ftp`/`Smb`/`Nfs` (`flink://<key_id>`,
   `ftp://`, `smb://`, `nfs://<host[:port]>`; `prefix`, `default_port` 21/445/2049, `authority`,
@@ -1045,7 +1046,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (`refused: `, `busy: `, not found); an older peer answers `unknown method` ("that device's Dump Forge is
   older: update it ..."). Tauri's `delete_path`/`move_path` skip `folder_refusal` for a network path (the peer
   judges it; a NAS is refused by core). Peer side (`connect_fs.rs`): RPCs `stat`, `fs_list`, `read_open`/`read_close`, `mkdir`, `create`,
-  `sync`, `close`, `rename` (`replace: true`: over a regular file only, never a folder, link or special
+  `sync`, `close`, `reopen {path}` → `{handle, size}` (a closed, unrenamed file of the session open for writing
+  again, counted as an open file; one that is open stays as it is, which is how the writer learns the peer can;
+  an older peer answers `unknown method`: the writer keeps the file open), `rename` (`replace: true`: over a regular file only, never a folder, link or special
   file, nor another peer's unrenamed file, and refused as this device's own replace is
   (`Connect::set_replace_check(jobs.replace_check)`: jobs, protected paths, ShadowMount+, an undo journal);
   an older peer ignores it and refuses the taken name), `remove`, `free` (on the PS5 where its folder
@@ -1053,7 +1056,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   parent canonicalized inside it, then on the PS5 `Roots::reach`: `/data` or a mounted drive, `/` and `/mnt`
   for stat and list only; all in `locate`), links never followed, special files and non-UTF-8 names marked so the
   reader refuses them); writes only to files this session created (exclusive, then a no-replace rename, or with
-  `replace` one over a file),
+  `replace` one over a file), at most 32 of them open per session and 64 on the device (a file closed and not
+  yet renamed doesn't count, up to 8,192 unrenamed per session: issue #42, a pack's volumes are closed once
+  written, `RemotePacks::finish`, reopened for their headers and renamed by `publish`; against an older peer
+  the volumes stay open, so a pack of more than about 30 still fails there),
   unrenamed ones kept 60 s (`KEPT_FOR`) once the session ends, then removed (at once when the service stops
   or the pairing is forgotten here); `reattach {path}` → `{handle, size, open}` moves such a file (kept, or
   still held by another session) to the calling session, for the pairing that created it only, once its
