@@ -951,6 +951,22 @@ fn zstd_pack_refusals_and_packed_sources() {
         "{events:?}"
     );
     assert_eq!(tree_bytes(&copy), tree_bytes(&packed));
+    // An older ampr-emu-ng there (v0.3.4's 48 MiB index cap, #59) is replaced by the bundled one.
+    let old = root.join("old");
+    copy_tree(&packed, &old);
+    std::fs::write(
+        old.join("fakelib/libSceAmpr.sprx"),
+        b"AMPRPAK4 AMPRDAT3 AMPRZPK1 ampr-emu-ng 0.3.4 (zstd)",
+    )
+    .unwrap();
+    let renewed = root.join("renewed");
+    let (events, result) = run(request(&old, Format::Folder, &renewed));
+    result.unwrap();
+    assert!(logged(&events, "with the zstd runtime"), "{events:?}");
+    assert!(
+        std::fs::read(renewed.join("fakelib/libSceAmpr.sprx")).unwrap()
+            == ps5_dump_forge_lz4::runtime::zstd()
+    );
     // Packed again, the packs are decoded first: the same logical files in new packs.
     let again = root.join("again");
     let (events, result) = run(zstd_request(&packed, &again));

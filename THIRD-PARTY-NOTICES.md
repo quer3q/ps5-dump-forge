@@ -161,8 +161,8 @@ SUCH DAMAGE.
 embeds and installs into AMPR games (and on LZ4 Pack with runtime `ampr_emu`), and the tagged source archive
 `ampr_emu-0.4.2.1-src.tar.gz`, kept there as its corresponding source (the exact compile-time options of
 the release binary are not recorded; this is no claim of reproducibility). `vendor/ampr-emu-ng/` holds
-the ampr-emu-ng v0.3.4 release binaries (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`) and the tagged source
-archive `ampr-emu-ng-0.3.4-src.tar.gz` (https://github.com/quer3q/ampr-emu-ng, a Rust hard fork of
+the ampr-emu-ng v0.4.1 release binaries (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`) and the tagged source
+archive `ampr-emu-ng-0.4.1-src.tar.gz` (https://github.com/quer3q/ampr-emu-ng, a Rust hard fork of
 ampr_emu, GPL-3.0-or-later) that reads zstd and LZ4 packs; Forge embeds the release `libSceAmpr.sprx` and installs it
 on zstd Pack and LZ4 Pack (runtime `ng`, the default); it compiles in libzstd (`zstd-sys` 2.1.2,
 BSD-3-Clause or GPL-2.0), `lz4_flex` 0.14.0 (MIT), `crc32fast` 1.5.3 and `cfg-if` 1.0.5 (MIT or
@@ -341,6 +341,32 @@ is not available, and in source code comments of resulting package.
 Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0). Its codec crates (`lzma-rust2`,
 `ppmd-rust`, `bzip2` with `libbz2-rs-sys`, `aes`) are under their own permissive licenses, as
 stated in each package's metadata.
+
+## musl libc (MIT) and the GCC runtime libraries
+
+The static Linux CLI (`ps5-dump-forge-<version>-linux-x86-64-musl.tar.gz`, built by
+`scripts/release-linux-musl.sh` in the `rust:1.100.0-alpine` image) links
+[musl libc](https://musl.libc.org) statically:
+
+> Copyright © 2005-2020 Rich Felker, et al.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+> and associated documentation files (the "Software"), to deal in the Software without
+> restriction, including without limitation the rights to use, copy, modify, merge, publish,
+> distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+> Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or
+> substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+> BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+> DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+It also links GCC's `libstdc++` and `libgcc` (for UnRAR's C++), under the GPL-3.0 with the GCC
+Runtime Library Exception. That tarball carries this file and `LICENSE` beside the binary.
 
 ## Tauri and other dependencies
 

@@ -1,5 +1,5 @@
 //! The PS5 payload's global allocator: the CLI installs [`Pool`] when built for the PS5
-//! (`ps5/build.sh`); nothing here is used on other targets.
+//! (`ps5/build.sh`) or for musl (the static Linux CLI); nothing here is used on other targets.
 //!
 //! [`Pool`] keeps freed blocks of 64 B to 4 MiB in power-of-two classes and hands them out again
 //! instead of returning them to the libc (smaller ones stay with it). The PS5 libc serializes

@@ -810,7 +810,8 @@ function AmprTile({ ins }: { ins: Inspection }) {
   const zstd = ins.zstd_packed;
   const damaged = !zstd && !!facts && facts.manifest_error !== null;
   // No runtime (none in fakelib/, or no facts at all): the title says it all, no notes (by user
-  // decision). A zstd-packed game's note otherwise: its packs and runtime are kept as they are.
+  // decision). A zstd-packed game's note otherwise: its packs are kept (an older ampr-emu-ng is
+  // replaced; Convert says so).
   const noRuntime = !facts || facts.runtime === "none";
   const notes: string[] = zstd && !noRuntime ? [t.zstdKept] : [];
   let detail: ReactNode = null;
@@ -850,7 +851,7 @@ function AmprTile({ ins }: { ins: Inspection }) {
   );
 }
 
-/** The game's runtime with the version it names itself with: "ampr-emu-ng 0.3.4",
+/** The game's runtime with the version it names itself with: "ampr-emu-ng 0.4.1",
  * "ampr_emu 0.4.2.1", "ampr_emu" (no version readable), the old trace runtime, "No runtime". */
 function runtimeName(f: Lz4Facts): string {
   const t = msg().common;

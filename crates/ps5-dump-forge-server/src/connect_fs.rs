@@ -676,8 +676,9 @@ pub fn answer(
 /// and not yet renamed (a pack's volume, until the pack is done) doesn't count against these.
 const MAX_WRITES: usize = 64;
 const MAX_WRITES_PER_SESSION: usize = MAX_WRITES / 2;
-/// Files a session may have created and not yet renamed or removed, open or closed: the most
-/// volumes a zstd pack has (4,096) and its index, with room.
+/// Files one paired device may have created here and not yet renamed or removed, open or
+/// closed, all its sessions together (kept ones too): the most volumes a zstd pack has (4,096)
+/// and its index, with room. Per pairing, so one device can't lock another out.
 const MAX_UNRENAMED: usize = 8192;
 
 /// Whether a path is at, in or above one of this device's unfinished jobs' paths.
@@ -710,6 +711,9 @@ struct Created {
     session: Session,
     path: PathBuf,
     file: Option<Arc<fs::File>>,
+    /// Its device and length at its last close (`out::closed_stamp`): a `reopen` finding another
+    /// file there is refused. `None` until first closed.
+    closed: Option<(u64, u64)>,
     /// Held through each lane write (`write_owned`) and by `reattach`: a write of the old
     /// session under way ends before the file changes hands, and a later one is refused.
     gate: Arc<Mutex<()>>,
@@ -964,7 +968,7 @@ impl Writes {
     }
 
     /// Whether session `sid` may have one more file open: the open ones count against the caps
-    /// (a closed one waits for its rename), and every unrenamed one against `MAX_UNRENAMED`.
+    /// (a closed one waits for its rename).
     fn room(files: &HashMap<u64, Created>, sid: &str) -> Result<(), String> {
         let all = files.values().filter(|c| c.file.is_some()).count();
         let mine = (files.values())
@@ -974,12 +978,6 @@ impl Writes {
             return Err(format!(
                 "{} files are being written already; try again later",
                 mine.max(all)
-            ));
-        }
-        let unrenamed = files.values().filter(|c| c.session.id() == sid).count();
-        if unrenamed >= MAX_UNRENAMED {
-            return Err(format!(
-                "{unrenamed} files are created and not renamed yet; rename or remove some"
             ));
         }
         Ok(())
@@ -993,11 +991,20 @@ impl Writes {
             return Err(format!("{NO_OPEN_FILE} (the session ended)"));
         }
         Self::room(&files, &sid)?;
+        let mine = (files.values())
+            .filter(|c| c.session.secret == session.secret)
+            .count();
+        if mine >= MAX_UNRENAMED {
+            return Err(format!(
+                "{mine} files are created and not renamed yet; rename or remove some"
+            ));
+        }
         let file = ps5_dump_forge_core::out::create_new(&p).map_err(|e| io_text(&p, &e))?;
         let handle = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         let c = Created {
             session: session.clone(),
             path: p,
+            closed: None,
             file: Some(Arc::new(file)),
             gate: Arc::default(),
             kept_until: None,
@@ -1133,6 +1140,11 @@ impl Writes {
     fn close(&self, sid: &str, handle: u64) -> Result<(), String> {
         match lock(&self.files).get_mut(&handle) {
             Some(c) if c.session.id() == sid && c.kept_until.is_none() => {
+                // A file that can't be stamped stays open: closed, it couldn't be reopened.
+                if let Some(f) = &c.file {
+                    let stamp = ps5_dump_forge_core::out::closed_stamp(f);
+                    c.closed = Some(stamp.map_err(|e| format!("close: {e}"))?);
+                }
                 c.file = None;
                 Ok(())
             }
@@ -1155,9 +1167,20 @@ impl Writes {
         self.check(&p, me)?;
         let mut files = lock(&self.files);
         let handle = Self::created(&files, sid, &p)?;
-        if files[&handle].file.is_none() {
+        // The writer's `unsupported: ` lead, as for a peer from before `reopen`: it keeps the
+        // file open rather than close one it can't have back.
+        let cant = || {
+            format!(
+                "unsupported: {}: this device can't reopen a file",
+                p.display()
+            )
+        };
+        if let Some(f) = &files[&handle].file {
+            ps5_dump_forge_core::out::closed_stamp(f).map_err(|_| cant())?;
+        } else {
             Self::room(&files, sid)?;
-            let file = ps5_dump_forge_core::out::reopen(&p).map_err(|e| io_text(&p, &e))?;
+            let stamp = files[&handle].closed.ok_or_else(cant)?;
+            let file = ps5_dump_forge_core::out::reopen(&p, stamp).map_err(|e| io_text(&p, &e))?;
             if let Some(c) = files.get_mut(&handle) {
                 c.file = Some(Arc::new(file));
             }
@@ -1246,13 +1269,18 @@ impl Writes {
 
     /// Removes a file this session created and hasn't renamed (its handle closed first); it
     /// stays this session's, removed when the session ends, if the removal fails.
+    // ponytail: removed by path, as the kept-file sweep does: a file someone else moved away and
+    // replaced at that name goes instead (open or closed). Compare `Created.id` (or the open
+    // handle's) with the path's identity first if a share is written by others during a job.
     fn remove(&self, sid: &str, root: Option<&Share>, rel: &str, me: &str) -> Result<(), String> {
         let p = locate(root, rel)?;
         self.check(&p, me)?;
         let mut files = lock(&self.files);
         let handle = Self::created(&files, sid, &p)?;
-        if let Some(c) = files.get_mut(&handle) {
-            c.file = None;
+        if let Some(c) = files.get_mut(&handle)
+            && let Some(f) = c.file.take()
+        {
+            c.closed = ps5_dump_forge_core::out::closed_stamp(&f).ok();
         }
         match fs::remove_file(&p) {
             Ok(()) => {}
@@ -3013,8 +3041,8 @@ impl remote::Remote for ConnectRemote {
     }
 
     /// `reopen` on the peer, which opens the closed file again (an open one is left as it is,
-    /// so a pack asks it of a file it hasn't closed to learn the peer can). A peer from before it
-    /// is `Unsupported`.
+    /// so a pack asks it of a file it hasn't closed to learn the peer can). A peer from before it,
+    /// or one that can't tell a file's identity (`unsupported: `), is `Unsupported`.
     fn reopen(&self, handle: u64) -> io::Result<()> {
         let c = lock(&self.files)
             .get(&handle)
@@ -3028,8 +3056,9 @@ impl remote::Remote for ConnectRemote {
                 })
             })
             .map_err(|e| {
-                if e.to_string().starts_with("unknown method") {
-                    io::Error::new(io::ErrorKind::Unsupported, e.to_string())
+                let text = e.to_string();
+                if text.starts_with("unknown method") || text.starts_with("unsupported: ") {
+                    io::Error::new(io::ErrorKind::Unsupported, text)
                 } else {
                     e
                 }
@@ -4366,6 +4395,21 @@ mod tests {
                 .unwrap();
             assert_eq!(fs::read(share.join(format!("v{i}"))).unwrap(), b"HEAD-tail");
         }
+
+        // A closed volume moved away and another file put at its name is never written.
+        let h = r.create(&at("swap.part")).unwrap();
+        r.close(h).unwrap();
+        fs::rename(share.join("swap.part"), share.join("moved")).unwrap();
+        fs::write(share.join("swap.part"), b"someone else's").unwrap();
+        let e = r.reopen(h).unwrap_err();
+        assert!(
+            e.to_string().contains("not the file that was created"),
+            "{e}"
+        );
+        assert_eq!(
+            fs::read(share.join("swap.part")).unwrap(),
+            b"someone else's"
+        );
 
         // A peer from before `reopen`: nothing to reopen, so the writer keeps its files open.
         a.writes().old.store(true, Ordering::SeqCst);

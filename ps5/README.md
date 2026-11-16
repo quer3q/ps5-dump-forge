@@ -202,7 +202,7 @@ chunks, a `Ping` on the lane every 2 s while its disk work runs, so a stall past
 the read, `put {tmp, path}` creates, writes, syncs and renames it): confined to the share root, links never followed, writes only to files that session created
 (exclusive, then a no-replace rename, or with `rename`'s `replace: true` one over a regular file only, never a folder or link (by user decision: a
 transfer or extract the user confirmed replacing; an older peer ignores the field and refuses the taken name); at most 32 open per session and
-64 on the device, a file closed and not yet renamed not counted (up to 8,192 per session), `reopen {path}` → `{handle, size}` opening such a file
+64 on the device, a file closed and not yet renamed not counted (up to 8,192 per paired device), `reopen {path}` → `{handle, size}` opening such a file
 again (a pack's volumes: closed once written, reopened for their headers; an older peer answers `unknown method`, keeps the old limit); unrenamed ones kept 60 s
 when it ends, for `reattach {path}` from the pairing that created them (the writer resumes on a fresh session, at most 3 times), then
 removed, at once on shutdown or Forget), PS5 syncs as a local output

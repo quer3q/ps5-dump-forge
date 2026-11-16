@@ -21,7 +21,7 @@ ps5upload-fpkg.workspace = true
 ps5-dump-forge-lz4.workspace = true
 ps5-dump-forge-zstd.workspace = true
 
-[target.'cfg(target_env = "ps5")'.dependencies]
+[target.'cfg(any(target_env = "ps5", target_env = "musl"))'.dependencies]
 ps5-dump-forge-ps5.workspace = true
 
 [lints.rust]

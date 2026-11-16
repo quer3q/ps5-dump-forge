@@ -96,9 +96,12 @@ impl Runtime {
 
     /// The action for a zstd-packed source converted as it is: its packs need the zstd
     /// runtime, whatever `eboot.bin` says, so any other one is replaced and none installed.
+    /// ampr-emu-ng is kept at the bundled version or newer (by user decision); an older one, or
+    /// one naming no version, is replaced by the bundled build (v0.3.4's 48 MiB index cap, #59).
     pub(crate) fn zstd_action(&self) -> RuntimeAction {
+        let current = self.version.as_deref().is_some_and(runtime::ng_not_older);
         match self.kind {
-            RuntimeKind::Zstd => RuntimeAction::Keep,
+            RuntimeKind::Zstd if self.bundled || current => RuntimeAction::Keep,
             RuntimeKind::None => RuntimeAction::Install,
             _ => RuntimeAction::Replace,
         }

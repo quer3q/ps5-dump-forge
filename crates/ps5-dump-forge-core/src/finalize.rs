@@ -461,9 +461,14 @@ pub(crate) fn create_new(path: &Path) -> io::Result<File> {
 }
 
 /// Opens a regular file this process created and closed, for writing again, without following
-/// a link at `path`.
-// ponytail: no identity check against the file that was closed.
-pub(crate) fn reopen(path: &Path) -> io::Result<File> {
+/// a link at `path`; refused unless it is on device `dev` and `len` bytes long, as it was when
+/// closed (one moved away and another put at its name is not written).
+// ponytail: device + length, not the inode: Linux vfat/exfat number an inode anew each time it is
+// read back in, so a closed volume's inode can change. A same-length file put there isn't caught;
+// only a process outside Forge can put one (its jobs, Delete, Move and the peer RPCs refuse every
+// unrenamed peer file). Keep the inode check where the filesystem's numbers are stable if that
+// ever matters (needs a per-OS filesystem-type probe).
+pub(crate) fn reopen(path: &Path, dev: u64, len: u64) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
     #[cfg(unix)]
@@ -479,6 +484,9 @@ pub(crate) fn reopen(path: &Path) -> io::Result<File> {
     let file = opts.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file"));
+    }
+    if handle_id(&file)?.0 != dev || file.metadata()?.len() != len {
+        return Err(io::Error::other("not the file that was created there"));
     }
     Ok(file)
 }

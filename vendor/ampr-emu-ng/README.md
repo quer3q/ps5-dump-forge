@@ -1,6 +1,6 @@
-# ampr-emu-ng v0.3.4 (release binaries and source)
+# ampr-emu-ng v0.4.1 (release binaries and source)
 
-The unmodified v0.3.4 release of ampr-emu-ng, the AMPR emulation runtime (a Rust hard fork of ampr_emu)
+The unmodified v0.4.1 release of ampr-emu-ng, the AMPR emulation runtime (a Rust hard fork of ampr_emu)
 that reads zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, format in `docs/zstd.md`) and LZ4 packs
 (`AMPRPAK4`), plus the tag's source archive. It serves fully packed games of either format (everything but
 executables, `sce_sys`, `sce_module`, `fakelib` and `.ini` files: the "pack everything except system files" strategy).
@@ -8,33 +8,33 @@ executables, `sce_sys`, `sce_module`, `fakelib` and `.ini` files: the "pack ever
 | | |
 |---|---|
 | Upstream | https://github.com/quer3q/ampr-emu-ng |
-| Release | https://github.com/quer3q/ampr-emu-ng/releases/tag/v0.3.4 |
-| Tag | `v0.3.4` (commit `cbdafd8d87f6e904524142dca210f1d1334bf505`) |
+| Release | https://github.com/quer3q/ampr-emu-ng/releases/tag/v0.4.1 (published 2026-11-15) |
+| Tag | `v0.4.1` (commit `8b61a06048717f9241a2d09e3db86031417d6d99`) |
 | Local changes | none: the binaries are the release assets byte for byte |
 
 | File here | Upstream asset | Bytes | SHA-256 |
 |---|---|---:|---|
-| `libSceAmpr.sprx` | `libSceAmpr.sprx` (release build) | 712144 | `7d1bb260f954b755ed687733e52ccfa38c31440a9b88a6fbba5b3b75e08bfa26` |
-| `libSceAmpr-debug.sprx` | `libSceAmpr-debug.sprx` (debug build) | 819776 | `717299ddd8122716ba11c89e03cc56d05207d0cae2ef898da8a9a65536640997` |
-| `SHA256SUMS` | `SHA256SUMS` | 170 | `a8dd28c5e3ae40573353e260477ff5c4d8cb529d7f9a286500f698e256d709af` |
-| `ampr-emu-ng-0.3.4-src.tar.gz` | `git archive --prefix=ampr-emu-ng-0.3.4/ v0.3.4`, gzip -n -9 | 510250 | `b9ecf547b3daaff5de905d0d98514730b8d78483875faec1de26d70b9c7466fa` |
+| `libSceAmpr.sprx` | `libSceAmpr.sprx` (release build) | 733104 | `9c7c41b3216bc4f877d67e3c2e5c9c8f9ffabdd5065f4f3fe0dd98fa7228386f` |
+| `libSceAmpr-debug.sprx` | `libSceAmpr-debug.sprx` (debug build) | 855408 | `f82e26aa9306f142a4120eb1ab70c52403a840b8441f136ec88ce19f2c7f97a2` |
+| `SHA256SUMS` | `SHA256SUMS` | 170 | `9f07f587de2cd7c22a6547fbefeb5b46942a2985af143a05b37edb05a9739b13` |
+| `ampr-emu-ng-0.4.1-src.tar.gz` | `git archive --prefix=ampr-emu-ng-0.4.1/ v0.4.1`, gzip -n -9 | 636909 | `322f4c923439bf963ea02774d70a70e2e5cf276489253f8fbd9842e5f87058f3` |
 
 The three release files match the digests GitHub lists for the assets. Check: `shasum -a 256 -c SHA256SUMS`
-in this folder. The release binary carries the strings `ampr-emu-ng 0.3.4`, `AMPRZPK1`, `AMPRPAK4` and
+in this folder. The release binary carries the strings `ampr-emu-ng 0.4.1`, `AMPRZPK1`, `AMPRPAK4` and
 `AMPRDAT3`.
 
-Changes since v0.3.2, the build Forge v0.5.4 shipped (release notes and the tag diffs). v0.3.3: a packed
-file's fd is a synthetic number in `512..1024`, not a reserved kernel descriptor, so a title keeps its
-whole fd table; the game's own kernel AIO (`sceKernelAioSubmitReadCommands*` and its poll, wait, delete
-and cancel) on a packed file is served; fully installed games no longer ask to continue the download;
-Marvel's Wolverine boots again, Ghost of Yotei's background reads through the system reach packed files,
-and Hollow Knight Silksong no longer stops at launch on a folder install on the internal SSD. v0.3.4: the
-runtime sizes its worker threads to the game
-(it starts small, grows while the game reads and gives threads back when the game needs them), so a game
-no longer goes black at launch or freezes when it can't start a thread of its own (Crimson Desert); the
-pack caches are twice as large; Crimson Desert's saves load and save from a plain folder and from a zstd
-pack. The zstd and LZ4 pack formats are unchanged (`crates/ampr-format` and `crates/ampr-zstd` only bump
-their versions), and so are the third-party dependencies (`Cargo.lock` only bumps the workspace crates).
+Changes since v0.3.4, the build Forge embedded before (release notes). v0.3.5 (2026-11-11) and v0.4.0
+(2026-11-13): FPKG (`.pkg`) games run (experimental); pack reads take one disk read per chunk, with a
+64 MiB decoded cache; large LZ4 reads are split into parallel jobs; a pack index too big for memory is read
+on demand; the zstd decoders no longer use the game's heap; a writable `/app0` game can create files beside
+its packed files (the packed files stay read-only). v0.4.1 (2026-11-15): a compact in-memory file index with
+no fixed 48 MiB cap (the "index tables need ... MiB, over the 48 MiB" failure: FF XVI, Demon's Souls,
+Returnal, God of War Ragnarok in Forge issue #59); fixes for Spider-Man Miles Morales' save-thread crash,
+AI LIMIT's CE-108255-1 and missing saves, Horizon Forbidden West's load stuck at 20% or 60%, packed folder
+handles below 1024, and a folder hidden by a same-named file in another case; `/data/ampr_cache` is hidden
+from file explorers. The zstd and LZ4 pack formats are unchanged (`crates/ampr-format`'s readers were
+rewritten, the magics and versions are the same), and so are the third-party dependencies (`Cargo.lock`
+bumps the workspace crates and adds the workspace crate `ampr-pkg`).
 
 ## Used by the build
 
@@ -42,7 +42,7 @@ their versions), and so are the third-party dependencies (`Cargo.lock` only bump
 zstd-compressed (`ZSTD_PACKED`, `ZSTD_LEN`) and `runtime::zstd()` decodes it on first use; a test pins its
 SHA-256 (`ZSTD_SHA256`, the value in `SHA256SUMS`). An upgrade replaces the files here (the path in `build.rs` names no version) and changes that hash.
 Forge installs it at `fakelib/libSceAmpr.sprx` on every zstd Pack and on an LZ4 Pack with runtime `ng` (the
-default), and keeps it there and in a zstd-packed game converted as it is. Every other conversion (a plain
+default), and keeps it there; a zstd-packed game converted as it is keeps an ampr-emu-ng at this version or newer and gets this one in place of an older one. Every other conversion (a plain
 convert, an LZ4 Unpack, an LZ4 Pack with `ampr_emu`, a zstd Unpack) replaces it with the upstream release
 runtime (`vendor/ampr_emu/`).
 
@@ -51,6 +51,9 @@ ampr-emu-ng (kept or replaced by the rule above):
 
 | Pin | Build | SHA-256 |
 |---|---|---|
+| `V040_ZSTD_SHA256` | v0.4.0 release (775696 bytes) | `8320eb65c16565f42031b9d88b15a447039f0fd7e5694faf5f1cb84cafdba218` |
+| `V035_ZSTD_SHA256` | v0.3.5 release (751504 bytes) | `998f2029b250d954725f864b57f2eee72aefbfb88054a3f1c3df550d4d6c8261` |
+| `V034_ZSTD_SHA256` | v0.3.4 release (712144 bytes), embedded before v0.4.1 | `7d1bb260f954b755ed687733e52ccfa38c31440a9b88a6fbba5b3b75e08bfa26` |
 | `V033_ZSTD_SHA256` | v0.3.3 release (701376 bytes) | `1c1051f91bc7cba19b15362b2b832114b53a4c3d6193f50c90fdf1ae5d78d268` |
 | `V032_ZSTD_SHA256` | v0.3.2 release (697072 bytes) | `9a8f553a68d4e6e6be11bd9f8d5519b5faa68560761881966abff1dd65bf19f7` |
 | `V031_ZSTD_SHA256` | v0.3.1 release (694256 bytes) | `bdd93ce2fbcc2d0986b16d77604cc0770d994ccc124b9051ba9f53aeac39f56f` |
@@ -65,7 +68,7 @@ debug build is kept for bring-up only and is never embedded.
 
 ## Corresponding source
 
-`ampr-emu-ng-0.3.4-src.tar.gz` is the `v0.3.4` tag's source archive, kept as the corresponding source of the
+`ampr-emu-ng-0.4.1-src.tar.gz` is the `v0.4.1` tag's source archive, kept as the corresponding source of the
 binaries so nothing depends on upstream staying online (by user decision: vendored, never downloaded at
 build or check time). `ps5/build-docker.sh` in it builds `libSceAmpr.sprx` and `libSceAmpr-debug.sprx`. The
 exact environment of the release build is not recorded; this is not a claim that the archive reproduces

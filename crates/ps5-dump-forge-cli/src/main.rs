@@ -376,8 +376,10 @@ fn default_output(
 #[used]
 static VERSION_MARKER: &&[u8] = &ps5_dump_forge_server::VERSION_MARKER;
 
-// The PS5 libc serializes every malloc across threads (ps5-dump-forge-ps5's docs).
-#[cfg(target_env = "ps5")]
+// The PS5 libc serializes every malloc across threads (ps5-dump-forge-ps5's docs); musl's
+// malloc takes one lock too (the static Linux CLI).
+// ponytail: measured on the PS5 only; musl's gain is assumed.
+#[cfg(any(target_env = "ps5", target_env = "musl"))]
 #[global_allocator]
 static ALLOC: ps5_dump_forge_ps5::Pool = ps5_dump_forge_ps5::Pool;
 

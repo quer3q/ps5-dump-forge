@@ -5,7 +5,7 @@ mounts (`.exfat`, `.ffpkg` UFS2, `.ffpfs` PFS, `.ffpfsc` compressed PFS containe
 debug FPKG `.pkg` (create and extract; on the PS5 also install), and edits a game's files in a folder or image (the Edit tab:
 in place or rebuilt) or copies some out (Extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`), a
 CLI (`ps5-dump-forge`), and a PS5 ELF payload (the CLI's `serve`: the same UI as a web page on port 8095).
-Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, the PS5 `.elf` (and `payloads.json`, its ps5-payload-manager catalog).
+Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, a static Linux x86-64 CLI (musl, `release.yml`'s `linux-musl` job, via cross), the PS5 `.elf` (and `payloads.json`, its ps5-payload-manager catalog).
 `ps5/README.md` holds the payload's details (harness, HTTP routes, tile/self copy/launch on open, U1–U10
 write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zstd.md` the zstd pack format; `docs/packing.md` the TOML profiles of the packing strategy (`docs/packing-sample.toml` a sample).
 
@@ -88,12 +88,12 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   reader (unpack view as a `SourceTree`), the AMPRIDX3 reader, the packing strategy (`rules.rs`, shared by zstd and LZ4 Pack), LZ4 blocks through
   the C liblz4 (`block.rs`, `lz4-sys`: `LZ4_compress_default` at level 0, `LZ4_compress_HC` at 3..=12,
   `LZ4_decompress_safe`), the embedded runtimes (`runtime.rs`: the release runtime `runtime::release()` and ampr-emu-ng
-  v0.3.4 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
+  v0.4.1 `runtime::zstd()`, functions: `build.rs` stores each `.sprx` as one zstd frame (level 22), decoded
   once on first use into a `OnceLock`; sizes and SHA-256 pinned (`pinned_sizes_and_hashes`); `classify` also recognizes by pinned
-  SHA-256 the old trace build and the old ng builds (`OLD_ZSTD_SHA256`, `NG_6972875_SHA256`, `V020_ZSTD_SHA256`, `V030_ZSTD_SHA256`, `V031_ZSTD_SHA256`, `V032_ZSTD_SHA256`, `V033_ZSTD_SHA256`, `PREVIOUS_ZSTD_SHA256`), none shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
+  SHA-256 the old trace build and the old ng builds (`OLD_ZSTD_SHA256`, `NG_6972875_SHA256`, `V020_ZSTD_SHA256`, `V030_ZSTD_SHA256`, `V031_ZSTD_SHA256`, `V032_ZSTD_SHA256`, `V033_ZSTD_SHA256`, `V034_ZSTD_SHA256`, `V035_ZSTD_SHA256`, `V040_ZSTD_SHA256`, `PREVIOUS_ZSTD_SHA256`), none shipped). Glue in `core/src/lz4.rs` (open/unpack of LZ4 and zstd packs, index,
   runtime swap). `tree.rs` is `PackedTree`, the packs served as a `SourceTree` from a `writer::measure` pass.
   `vendor/ampr_emu/`: the upstream 0.4.2.1 release `.sprx` + the source archive. `vendor/ampr-emu-ng/`: the
-  ampr-emu-ng v0.3.4 release (tag commit cbdafd8; `libSceAmpr.sprx`, embedded as `runtime::zstd()`;
+  ampr-emu-ng v0.4.1 release (tag commit 8b61a06; `libSceAmpr.sprx`, embedded as `runtime::zstd()`;
   `libSceAmpr-debug.sprx`, never embedded; `SHA256SUMS`, the release's) + the tag's source archive.
 - `crates/ps5-dump-forge-zstd`: zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak` volumes of at most 4 GiB -
   64 KiB, 256 KiB chunks, one zstd frame or raw each): the format (encode + validating decode), the
@@ -141,7 +141,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   A second Ctrl-C quits at once (unix `_exit(130)`; Windows the default handler), the first prints
   "cancelling... (press Ctrl-C again to quit now)"; the `.part` stays (`stale_parts`).
 - `crates/ps5-dump-forge-ps5`: the payload's global allocator (`Pool`, installed by the CLI only for
-  the PS5): freed blocks of 64 B..4 MiB kept in power-of-two classes, since the PS5 libc serializes
+  the PS5 and musl, the static Linux CLI; musl's gain unmeasured): freed blocks of 64 B..4 MiB kept in power-of-two classes, since the PS5 libc serializes
   every malloc across threads (a `.pkg`'s Kraken pool: 12.7 → 49.3 MB/s at 4 threads).
 - `crates/ps5-dump-forge-server`: `serve`, std-only HTTP/1.1 (`http.rs`), routes mirroring the Tauri commands
   (`api.rs`), job table for polling (`table.rs`), roots (`paths.rs`), PS5 tile (`tile.rs`), self copy
@@ -289,9 +289,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - zstd packs (`core/src/zstd_pack.rs`, `ps5-dump-forge-zstd`; spec `docs/zstd.md`; named zstd, files on disk AMPR
   style, by user decision: `ampr_zstd.index` (`AMPRZPK1`) + `ampr_zstd-NNN.pak` (`AMPRZDT1`, from 000)): volumes
   (zstd, 256 KiB chunks, a chunk kept raw when zstd doesn't shrink it) that ampr-emu-ng (`runtime::zstd()`,
-  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.3.4 release, size and SHA-256
+  `RuntimeKind::Zstd`, id `zstd`, `vendor/ampr-emu-ng/libSceAmpr.sprx`, the v0.4.1 release, size and SHA-256
   pinned (`ZSTD_SHA256`); the user's runtime, which reads LZ4 packs too and serves a fully packed zstd or LZ4 game;
-  the v0.3.3 release (`V033_ZSTD_SHA256`), the v0.3.2 release (`V032_ZSTD_SHA256`), the v0.3.1 release (`V031_ZSTD_SHA256`), the v0.3.0 release (`V030_ZSTD_SHA256`), the local 6972875 build embedded before v0.3.0 (`NG_6972875_SHA256`), the v0.2.0 release
+  the v0.4.0 release (`V040_ZSTD_SHA256`), the v0.3.5 release (`V035_ZSTD_SHA256`), the v0.3.4 release (`V034_ZSTD_SHA256`), the v0.3.3 release (`V033_ZSTD_SHA256`), the v0.3.2 release (`V032_ZSTD_SHA256`), the v0.3.1 release (`V031_ZSTD_SHA256`), the v0.3.0 release (`V030_ZSTD_SHA256`), the local 6972875 build embedded before v0.3.0 (`NG_6972875_SHA256`), the v0.2.0 release
   (`V020_ZSTD_SHA256`), the v0.1.0 release (`PREVIOUS_ZSTD_SHA256`) and the old local build (`OLD_ZSTD_SHA256`),
   their files removed, are still recognized by their hashes, so a game carrying it keeps it, and any other build holding the
   `AMPRZPK1`, `AMPRPAK4` and `AMPRDAT3` magics counts as ampr-emu-ng too) reads.
@@ -314,11 +314,11 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   A zstd-packed source (root `ampr_zstd.index` starting `AMPRZPK1`; `Inspection.zstd_packed`,
   `LibraryEntry.zstd_packed`) is otherwise an ordinary source: a plain conversion (any format, `.pkg`
   included) carries the packs as plain files, keeps its `ampr_emu.index` byte for byte (it lists the packed
-  files) and keeps ampr-emu-ng (`zstd_action`: installed where missing, any other runtime replaced); into a `.pkg` the builder
+  files) and keeps ampr-emu-ng (`zstd_action`: installed where missing; an ampr-emu-ng older than the bundled one (`runtime::NG_VERSION`, `ng_not_older`) or naming no version, and any other runtime, replaced, by user decision: v0.3.4's 48 MiB index cap, #59); into a `.pkg` the builder
   packages that index as it is (vendor patch 0030: `source::lz4_packed` answers true for it). Remove backport is
   refused in the UI for a packed source (`convert.zstdBackport`/`lz4Backport`: unpack first). Its label is
   shown wherever the LZ4 one is: the source card's AMPR tile (`AmprTile`, one for LZ4 and zstd, by user
-  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.3.4`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
+  decision: the runtime with its version as the title, e.g. `ampr-emu-ng 0.4.1`, `ampr_emu 0.4.2.1`, "No runtime" (with no notes, by user decision);
   the value Packed (zstd) / Packed (LZ4) in the green neon look, Damaged packs as before, Unpacked greyed
   `.tile.unpacked`), the Library's **zstd** chip and card/row badge.
   UI (by user decision): the **Pack** tab (`app/src/Pack.tsx`, after Edit; **How pack works** in `PackHelp.tsx`)
@@ -1057,7 +1057,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   for stat and list only; all in `locate`), links never followed, special files and non-UTF-8 names marked so the
   reader refuses them); writes only to files this session created (exclusive, then a no-replace rename, or with
   `replace` one over a file), at most 32 of them open per session and 64 on the device (a file closed and not
-  yet renamed doesn't count, up to 8,192 unrenamed per session: issue #42, a pack's volumes are closed once
+  yet renamed doesn't count, up to 8,192 unrenamed per paired device: issue #42, a pack's volumes are closed once
   written, `RemotePacks::finish`, reopened for their headers and renamed by `publish`; against an older peer
   the volumes stay open, so a pack of more than about 30 still fails there),
   unrenamed ones kept 60 s (`KEPT_FOR`) once the session ends, then removed (at once when the service stops
@@ -1420,7 +1420,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
 - zstd packs (`docs/zstd.md`): `ampr_zstd.index` (`AMPRZPK1`, version 1, 128-byte header, file, chunk and volume
   records, FNV-1a 64 path hashes, CRC-32 over header and tables) and `ampr_zstd-NNN.pak` volumes (`AMPRZDT1`, from 000; 64-byte header with
   the index's archive id, at most 4 GiB - 64 KiB, at most 4,096); 256 KiB chunks, each one zstd frame or raw
-  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.3.4, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
+  when zstd doesn't shrink it. Only ampr-emu-ng (`vendor/ampr-emu-ng/libSceAmpr.sprx`, v0.4.1, `runtime::zstd()`) reads them. Not an SMP image, as LZ4 packs.
 
 ## Commands
 ```sh

@@ -833,9 +833,15 @@ pub mod out {
     }
 
     /// A regular file made by [`create_new`] and closed, open again for writing (a link at
-    /// `path` not followed).
-    pub fn reopen(path: &Path) -> io::Result<File> {
-        crate::finalize::reopen(path)
+    /// `path` not followed); refused unless it still matches its [`closed_stamp`].
+    pub fn reopen(path: &Path, (dev, len): (u64, u64)) -> io::Result<File> {
+        crate::finalize::reopen(path, dev, len)
+    }
+
+    /// What [`reopen`] checks of a file being closed: its device (unix dev, Windows volume
+    /// serial) and length.
+    pub fn closed_stamp(file: &File) -> io::Result<(u64, u64)> {
+        Ok((crate::finalize::handle_id(file)?.0, file.metadata()?.len()))
     }
 
     /// One folder; its parent must exist.
