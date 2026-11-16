@@ -332,6 +332,13 @@ impl Conn {
         Ok(())
     }
 
+    /// Bounds every write by `timeout` from now on (reads keep theirs). A send that gets no byte
+    /// out for that long fails; `write_all` sends again after a partial send, so a peer that
+    /// stopped reading ends a write in up to twice it.
+    pub fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(timeout))
+    }
+
     fn reader(&self) -> Bounded<'_> {
         Bounded {
             stream: &self.stream,
