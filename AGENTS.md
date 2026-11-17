@@ -408,6 +408,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   (LZ4 or zstd) gets the runtime action and keeps its index, manifest, journal and logs byte for byte; a replaced
   runtime (or a signed executable) then differs from the LZ4 manifest's loose record, which `reader::unpack` lets pass
   for any loose record (the runtime reads loose files from the disk).
+  A damaged one is logged with its size and the reader's reason (`LZ4: ampr_emu.index does not read (damaged): 4096 bytes, ...`).
   `Lz4Facts.index` (`ok`/`stale`/`damaged`/`missing`; `None` when packed, when the action is `Untouched`, or for an
   archive's index over 16 MiB) is that comparison. Edit's game facts, Convert, the Pack tab and the CLI say a
   conversion refreshes it.

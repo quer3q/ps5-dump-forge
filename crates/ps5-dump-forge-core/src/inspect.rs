@@ -539,7 +539,7 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         match crate::lz4::index_state(tree, &files) {
             Ok(IndexState::Ok(_)) => Some("ok"),
             Ok(IndexState::Stale) => Some("stale"),
-            Ok(IndexState::Damaged) => Some("damaged"),
+            Ok(IndexState::Damaged(_)) => Some("damaged"),
             Ok(IndexState::Missing) => Some("missing"),
             Err(_) => None,
         }
