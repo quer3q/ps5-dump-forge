@@ -551,7 +551,7 @@ fn plain(
         IndexState::Stale => ctx.log(format!(
             "LZ4: {INDEX} does not list exactly the files written (stale)"
         )),
-        IndexState::Damaged => ctx.log(format!("LZ4: {INDEX} does not read (damaged)")),
+        IndexState::Damaged(why) => ctx.log(format!("LZ4: {INDEX} does not read (damaged): {why}")),
         IndexState::Missing => ctx.log(format!("LZ4: no {INDEX} yet")),
     }
     for f in all.iter().filter(|f| traces(f)) {
@@ -630,8 +630,8 @@ pub(crate) enum IndexState {
     Ok(Vec<u8>),
     /// It reads but lists other files or sizes, or is too big to list just these.
     Stale,
-    /// It does not read, or is too big to be any index.
-    Damaged,
+    /// It does not read, or is too big to be any index (why, for the log).
+    Damaged(String),
     Missing,
 }
 
@@ -653,8 +653,11 @@ pub(crate) fn index_states(
     let Some(size) = size_of(tree, INDEX) else {
         return Ok(listings.iter().map(|_| IndexState::Missing).collect());
     };
-    // Its bytes and records (`None`: it doesn't read), once a listing needs them.
-    let mut read: Option<(Vec<u8>, Option<ps5_dump_forge_lz4::index::PathIndex>)> = None;
+    // Its bytes and records (`Err`: why it doesn't read), once a listing needs them.
+    let mut read: Option<(
+        Vec<u8>,
+        Result<ps5_dump_forge_lz4::index::PathIndex, String>,
+    )> = None;
     let mut states = Vec::with_capacity(listings.len());
     let mut first_ok = None;
     for files in listings {
@@ -665,17 +668,25 @@ pub(crate) fn index_states(
             continue;
         }
         if size > MAX_INDEX_CHECK {
-            states.push(IndexState::Damaged);
+            states.push(IndexState::Damaged(format!(
+                "{size} bytes, over the {MAX_INDEX_CHECK} bytes read for a check"
+            )));
             continue;
         }
         if read.is_none() {
             let old = read_all(tree, INDEX, size)?;
-            let index = ps5_dump_forge_lz4::index::read_index(&old).ok();
+            let index = ps5_dump_forge_lz4::index::read_index(&old).map_err(|e| e.to_string());
             read = Some((old, index));
         }
-        let Some((old, Some(index))) = &read else {
-            states.push(IndexState::Damaged);
-            continue;
+        let Some((old, index)) = &read else {
+            unreachable!("read just above")
+        };
+        let index = match index {
+            Ok(index) => index,
+            Err(why) => {
+                states.push(IndexState::Damaged(format!("{size} bytes, {why}")));
+                continue;
+            }
         };
         let want: BTreeSet<(&str, u64)> = files.iter().map(|f| (f.path.as_str(), f.size)).collect();
         let have: BTreeSet<(&str, u64)> = (index.records.iter())
@@ -1438,10 +1449,11 @@ mod tests {
             IndexState::Stale
         ));
         let mut tree = Sized(vec![file(INDEX, 4096)]);
-        assert!(matches!(
-            index_state(&mut tree, &files).unwrap(),
-            IndexState::Damaged
-        ));
+        // Unreadable: the log line carries the parser's reason.
+        match index_state(&mut tree, &files).unwrap() {
+            IndexState::Damaged(why) => assert!(why.starts_with("4096 bytes, "), "{why}"),
+            _ => panic!("expected Damaged"),
+        }
         // 200,000 files of 60-byte paths: their index fits the bound.
         let many: Vec<SourceFile> = (0..200_000)
             .map(|i| file(&format!("data/{i:0>55}"), 1))
@@ -1460,7 +1472,7 @@ mod tests {
         let mut tree = Sized(vec![file(INDEX, 100 << 20)]);
         assert!(matches!(
             index_state(&mut tree, &many).unwrap(),
-            IndexState::Damaged
+            IndexState::Damaged(_)
         ));
     }
 }
