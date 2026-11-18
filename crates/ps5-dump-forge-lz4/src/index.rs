@@ -73,7 +73,9 @@ pub fn read_index(bytes: &[u8]) -> Result<PathIndex> {
     let table_end = slots_at
         .checked_add(u64::from(slot_count) * IDX_SLOT as u64)
         .ok_or_else(|| bad("slot table overflows"))?;
-    if slots_at % IDX_SLOT as u64 != 0 || slots_at < blob_end {
+    // 8-byte aligned, not 16: other tools pad the path blob to 8 (ampr-emu-ng opens such an
+    // index; every slot field is read at an offset of its own size).
+    if slots_at % 8 != 0 || slots_at < blob_end {
         return Err(bad(format!(
             "slot table at {slots_at} is misaligned or overlaps the path blob (ends {blob_end})"
         )));
@@ -219,6 +221,25 @@ mod tests {
         );
         for (p, s) in &src {
             assert!(idx.records.contains(&(p.clone(), *s)), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_slot_table_at_eight_bytes_reads_but_not_at_four() {
+        // A package's own index (Crisis Core's) has its slot table at 4328: a multiple of 8.
+        let wide = (1..40)
+            .map(|n| {
+                let name = "x".repeat(n);
+                built(&[name.as_str()])
+            })
+            .find(|b| u64_at(b, 32).unwrap() - (72 + u64_at(b, 24).unwrap()) >= 8)
+            .unwrap();
+        let at = u64_at(&wide, 32).unwrap() as usize;
+        for (cut, ok) in [(8, true), (4, false)] {
+            let mut b = wide.clone();
+            b.drain(at - cut..at);
+            b[32..40].copy_from_slice(&((at - cut) as u64).to_le_bytes());
+            assert_eq!(read_index(&b).is_ok(), ok, "slot table moved down {cut}");
         }
     }
 
