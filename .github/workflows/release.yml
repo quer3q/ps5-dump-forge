@@ -2,7 +2,7 @@ name: Release
 
 # A `v*` tag builds the macOS, Windows, Linux and PS5 releases and creates a *draft* GitHub Release
 # with the macOS universal (arm64 + Intel) zip, the two Windows x86-64 zips (with and without a
-# bundled WebView2 runtime), the Windows arm64 zip, the Linux x86-64 and arm64 tarballs, the static Linux x86-64 CLI tarball (musl), the PS5
+# bundled WebView2 runtime), the Windows arm64 zip, the Linux x86-64 and arm64 tarballs, the static Linux CLI tarballs (musl, x86-64 and arm64), the PS5
 # payload (one plain .elf), SHA256SUMS and payloads.json (the PS5 payload's catalog for ps5-payload-manager) (the source is GitHub's own archive of the tag); publishing the draft is a manual step on GitHub, after checking its assets.
 # `workflow_dispatch` is a dry run, even on a tag: same build, artifact kept on the run,
 # nothing published.
@@ -134,10 +134,19 @@ jobs:
           retention-days: 3
 
   linux-musl:
-    # The CLI alone, static (x86_64 musl; PR #57: a NAS, Alpine, an old glibc), the web UI
-    # embedded for `serve`. Built in the pinned Rust's Alpine image (scripts/release-linux-musl.sh).
-    name: linux-musl (x86-64 CLI)
-    runs-on: ubuntu-latest
+    # The CLI alone, static (x86-64 and arm64 musl; PR #57: a NAS, Alpine, an old glibc), the web UI
+    # embedded for `serve`. Built in the pinned Rust's Alpine image (scripts/release-linux-musl.sh),
+    # natively on each runner (the image is multi-arch).
+    name: linux-musl (${{ matrix.arch }} CLI)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86-64
+          - os: ubuntu-22.04-arm
+            arch: arm64
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -149,11 +158,11 @@ jobs:
         with:
           node-version: lts/*
       # The web UI, then the static CLI in rust:1.100.0-alpine (by digest); checks that it has no
-      # NEEDED libraries and starts, and writes dist/ps5-dump-forge-<v>-linux-x86-64-musl.tar.gz.
+      # NEEDED libraries and starts, and writes dist/ps5-dump-forge-<v>-linux-<arch>-musl.tar.gz.
       - run: scripts/release-linux-musl.sh
       - uses: actions/upload-artifact@v7
         with:
-          name: release-linux-musl
+          name: release-linux-musl-${{ matrix.arch }}
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 3
@@ -207,9 +216,10 @@ jobs:
           cd dist
           rm -f SHA256SUMS
           # merge-multiple lets a mislabelled leg overwrite another's archive, or a leg go missing:
-          # require exactly the eight archives of this tag before checksumming.
+          # require exactly the nine archives of this tag before checksumming.
           ver=${GITHUB_REF_NAME#v}
           printf '%s\n' \
+            "ps5-dump-forge-$ver-linux-arm64-musl.tar.gz" \
             "ps5-dump-forge-$ver-linux-arm64.tar.gz" \
             "ps5-dump-forge-$ver-linux-x86-64-musl.tar.gz" \
             "ps5-dump-forge-$ver-linux-x86-64.tar.gz" \
@@ -244,7 +254,7 @@ jobs:
             echo
             echo "Linux (x86-64 or arm64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer): extract the linux-x86-64 or linux-arm64 tarball (tar -xzf) to a folder you can write to (the app keeps its WebView data beside it), then run ./forge.sh."
             echo "It needs no FUSE and no install; keep the PS5 Dump Forge.AppDir folder next to forge.sh."
-            echo "Linux without a desktop (a NAS, Alpine, an older glibc): the linux-x86-64-musl tarball holds the ps5-dump-forge command-line tool alone, statically linked."
+            echo "Linux without a desktop (a NAS, Alpine, an older glibc): the linux-x86-64-musl or linux-arm64-musl tarball holds the ps5-dump-forge command-line tool alone, statically linked."
             echo
             echo "PS5 (jailbroken, with an ELF loader): load ps5-dump-forge-$ver-ps5.elf, e.g. send it to elfldr's port 9021 or list it in the webkit autoloader's autoload.txt, then open http://<ps5-ip>:8095 in a browser."
             echo "The web UI has no access control: use it on a trusted network."
