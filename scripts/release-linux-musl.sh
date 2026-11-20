@@ -3,7 +3,7 @@
 # embedded for `serve`. Built in the pinned Rust's Alpine image, a musl host, so the C and C++
 # parts (liblz4, libzstd, UnRAR, BLAKE3, ring) link statically with no cross toolchain. Writes
 # dist/ps5-dump-forge-<version>-linux-<arch>-musl.tar.gz for this machine's arch (the release
-# job runs it on x86-64). Needs Docker and npm.
+# job runs it on an x86-64 and an arm64 runner). Needs Docker and npm.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
