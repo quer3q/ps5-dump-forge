@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use ps5_dump_forge_core::{
-    ArchivePassword, ConvertRequest, Event, Format, Jobs, KrakenLevel, Lz4Mode, Lz4Runtime,
+    ArchivePassword, ConvertRequest, Edit, Event, Format, Jobs, KrakenLevel, Lz4Mode, Lz4Runtime,
     VerifyMode,
 };
 
@@ -27,12 +27,18 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
                          [--zstd-level 1..22]
                          (with --to lz4, --lz4-pack or --zstd-pack: [--pack-profile <toml>])
        ps5-dump-forge convert <zstd_packed> --to <format> --zstd-unpack
+       ps5-dump-forge edit <image> [--add <from>:<to>]... [--delete <path>]...
+                         [--rename <from>:<to>]... [--mkdir <path>]... [--rebuild] [--check]
        ps5-dump-forge serve [--port N] --root <dir> [--root <dir>]...
 
   inspect   describe a game folder, image (.exfat, .ffpkg, .ffpfs, .ffpfsc, .pkg) or archive
             holding one game folder (.zip, .7z, .rar; the first part of a multi-part set)
   convert   convert a source; progress is printed as JSON lines on stdout. An archive is
             read in place, with nothing unpacked to disk
+  edit      change a game folder's or image's files without mounting it: --add copies a file or
+            folder from this computer to a game path, --delete removes one, --rename moves one,
+            --mkdir makes an empty one; --rebuild writes a new image beside the source instead
+            of editing in place; --check only reports whether either fits (JSON on stdout)
   --password-stdin
             an archive's password: one line read from stdin (default: the
             FORGE_ARCHIVE_PASSWORD environment variable; never an argument)
@@ -91,13 +97,23 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --lz4-unpack
             unpack LZ4 packs to plain files first, for any target but lz4 (which always
             unpacks first)
+  --add     with edit: a file or folder on this computer, then a game path ('/'-separated):
+            <from>:<to>; splits at the first ':' (a Windows drive, C:\\x, stays with the
+            from side)
+  --delete  with edit: a game path, and everything in it
+  --rename  with edit: a game path, then the new game path: <from>:<to>
+  --mkdir   with edit: a new empty game folder (parents created too)
+  --rebuild with edit on an image: write a new image from the source plus the edits beside it,
+            then rename it over the source, instead of editing the image in place
+  --check   with edit: report whether the edits fit, in place or rebuilt (EditCheck JSON on
+            stdout), reading only; nothing is written
   serve     the web UI on http://<this computer>:<port> (default 8095); the file browser
             starts at the --root folders (on the PS5: /data and /mnt/usb0..7, /mnt/ext0..1
             while mounted, no --root; nothing else is listed). No protections: anyone on the
             network can use it
   -h, --help";
 
-// One value per run: Convert's size (over clippy's limit on Windows, whose PathBuf is larger) costs nothing.
+// One value per run: a request's size (over clippy's limit on Windows, whose PathBuf is larger) costs nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Cli {
@@ -109,6 +125,10 @@ enum Cli {
     Convert {
         request: ConvertRequest,
         password_stdin: bool,
+    },
+    Edit {
+        request: ConvertRequest,
+        check: bool,
     },
     Serve {
         port: u16,
@@ -127,6 +147,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     }
     if command == "serve" {
         return parse_serve(args);
+    }
+    if command == "edit" {
+        return parse_edit(args);
     }
     let mut positional = Vec::new();
     let (mut json, mut to, mut output) = (false, None, None);
@@ -355,6 +378,127 @@ fn parse_serve(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> 
     Ok(Cli::Serve { port, roots })
 }
 
+fn parse_edit(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> {
+    let (mut rebuild, mut check, mut edits, mut positional) =
+        (false, false, Vec::new(), Vec::new());
+    while let Some(arg) = args.next() {
+        let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
+        let text = |v: OsString| v.into_string().map_err(|_| "option values must be text");
+        match arg.to_str().unwrap_or("") {
+            "-h" | "--help" => return Ok(Cli::Help),
+            // Events are JSON lines already; the flag is only symmetry with convert.
+            "--json" => {}
+            "--rebuild" => rebuild = true,
+            "--check" => check = true,
+            "--add" => {
+                let pair = text(value("--add")?)?;
+                let (from, to) =
+                    split_from_to(&pair).ok_or("--add needs from:to, with neither side empty")?;
+                edits.push(Edit::Add {
+                    from: PathBuf::from(from),
+                    to: to.to_string(),
+                });
+            }
+            "--delete" => {
+                let path = text(value("--delete")?)?;
+                if path.is_empty() {
+                    return Err("--delete needs a path".into());
+                }
+                edits.push(Edit::Delete { path });
+            }
+            "--rename" => {
+                let pair = text(value("--rename")?)?;
+                let (from, to) = split_from_to(&pair)
+                    .ok_or("--rename needs from:to, with neither side empty")?;
+                edits.push(Edit::Rename {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                });
+            }
+            "--mkdir" => {
+                let path = text(value("--mkdir")?)?;
+                if path.is_empty() {
+                    return Err("--mkdir needs a path".into());
+                }
+                edits.push(Edit::Mkdir { path });
+            }
+            flag if flag.starts_with('-') && flag != "-" => {
+                return Err(format!("unknown option {flag:?}"));
+            }
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+    let [image] = <[PathBuf; 1]>::try_from(positional)
+        .map_err(|p| format!("expected one image, got {}", p.len()))?;
+    if edits.is_empty() {
+        return Err("edit needs at least one of --add, --delete, --rename or --mkdir".into());
+    }
+    let format = format_of(&image);
+    Ok(Cli::Edit {
+        request: ConvertRequest {
+            source: image,
+            format,
+            output: PathBuf::new(),
+            compression_threads: None,
+            inner: None,
+            remove_backport: false,
+            full_verify: false,
+            kraken_level: KrakenLevel::default(),
+            ffpfsc_level: ps5_dump_forge_core::DEFAULT_FFPFSC_LEVEL,
+            lz4: None,
+            lz4_level: 0,
+            lz4_runtime: Lz4Runtime::default(),
+            zstd_pack: false,
+            zstd_level: ps5_dump_forge_core::DEFAULT_ZSTD_LEVEL,
+            zstd_unpack: false,
+            pack_profile: None,
+            edits,
+            edit_rebuild: rebuild,
+            extract: Vec::new(),
+            transfer: Vec::new(),
+            replace: false,
+            install: None,
+            delete_source: false,
+            archive_password: None,
+        },
+        check,
+    })
+}
+
+/// Split `from:to` at the first `:`, keeping a Windows drive prefix (`C:\x:/y`) with `from`.
+fn split_from_to(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let start = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        2
+    } else {
+        0
+    };
+    let at = start + s[start..].find(':')?;
+    let (from, to) = (&s[..at], &s[at + 1..]);
+    (!from.is_empty() && !to.is_empty()).then_some((from, to))
+}
+
+/// An image's own format, so an edit request names one; core ignores it for an image edit.
+fn format_of(path: &Path) -> Format {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("exfat") => Format::Exfat,
+        Some("ffpkg") => Format::Ffpkg,
+        Some("ffpfs") => Format::Ffpfs,
+        Some("ffpfsc") => Format::Ffpfsc,
+        Some("pkg") => Format::Pkg,
+        _ => Format::Folder,
+    }
+}
+
 fn parse_format(s: &str) -> Result<Format, String> {
     serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| {
         format!("unknown format {s:?} (folder, exfat, ffpkg, ffpfs, ffpfsc, pkg, lz4)")
@@ -490,10 +634,17 @@ fn main() -> ExitCode {
                         Err(e) => return usage_error(&e),
                     }
                 }
-                convert(request)
+                run_request(request)
             }
             Err(e) => usage_error(&e),
         },
+        Cli::Edit { request, check } => {
+            if check {
+                check_edits(&request)
+            } else {
+                run_request(request)
+            }
+        }
         Cli::Serve { port, roots } => serve(port, roots),
     }
 }
@@ -744,7 +895,20 @@ fn print_out(text: &str) -> ExitCode {
     }
 }
 
-fn convert(request: ConvertRequest) -> ExitCode {
+/// `edit --check`: core's `EditCheck` as JSON, reading only.
+fn check_edits(request: &ConvertRequest) -> ExitCode {
+    let check = Jobs::new(|_| {}).edit_check(request);
+    match serde_json::to_string_pretty(&check) {
+        Ok(text) => print_out(&(text + "\n")),
+        Err(e) => {
+            eprintln!("ps5-dump-forge: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// convert, run and edit: JSONL events on stdout, a human summary on stderr.
+fn run_request(request: ConvertRequest) -> ExitCode {
     on_ctrl_c();
     let (tx, rx) = mpsc::channel();
     let jobs = Jobs::new(move |event| {
@@ -759,11 +923,15 @@ fn convert(request: ConvertRequest) -> ExitCode {
             let _ = tx.send(result);
         }
     });
-    eprintln!(
-        "ps5-dump-forge: {} -> {}",
-        request.source.display(),
-        request.output.display()
-    );
+    if request.output.as_os_str().is_empty() {
+        eprintln!("ps5-dump-forge: {}", request.source.display());
+    } else {
+        eprintln!(
+            "ps5-dump-forge: {} -> {}",
+            request.source.display(),
+            request.output.display()
+        );
+    }
     let job = jobs.start(request);
     let mut cancelled = false;
     let result = loop {
@@ -831,6 +999,86 @@ mod tests {
             Ok(_) => panic!("not a convert"),
             Err(e) => Err(e),
         }
+    }
+
+    fn edit(s: &str) -> Result<(ConvertRequest, bool), String> {
+        match parse_args(args(s)) {
+            Ok(Cli::Edit { request, check }) => Ok((request, check)),
+            Ok(_) => panic!("not an edit"),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[test]
+    fn edit_flags_become_edits_in_order() {
+        let (r, check) = edit(
+            "edit game.exfat --add /tmp/a.sprx:fakelib/libSceAmpr.sprx \
+             --delete data/old.bin --rename data/a.bin:data/b.bin --mkdir data/new --rebuild",
+        )
+        .unwrap();
+        assert_eq!(r.format, Format::Exfat);
+        assert!(r.output.as_os_str().is_empty());
+        assert!(r.edit_rebuild);
+        assert!(!check);
+        assert_eq!(
+            r.edits,
+            vec![
+                Edit::Add {
+                    from: PathBuf::from("/tmp/a.sprx"),
+                    to: "fakelib/libSceAmpr.sprx".into(),
+                },
+                Edit::Delete {
+                    path: "data/old.bin".into(),
+                },
+                Edit::Rename {
+                    from: "data/a.bin".into(),
+                    to: "data/b.bin".into(),
+                },
+                Edit::Mkdir {
+                    path: "data/new".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_add_keeps_a_windows_drive_with_from() {
+        let (r, _) =
+            edit(r"edit game.ffpkg --add C:\games\a.sprx:/fakelib/libSceAmpr.sprx").unwrap();
+        assert_eq!(
+            r.edits,
+            vec![Edit::Add {
+                from: PathBuf::from(r"C:\games\a.sprx"),
+                to: "/fakelib/libSceAmpr.sprx".into(),
+            }]
+        );
+        assert_eq!(r.format, Format::Ffpkg);
+    }
+
+    #[test]
+    fn edit_splits_at_the_first_colon() {
+        let (r, _) = edit("edit game.exfat --add a:b:c").unwrap();
+        assert_eq!(
+            r.edits,
+            vec![Edit::Add {
+                from: PathBuf::from("a"),
+                to: "b:c".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn edit_needs_its_flags() {
+        assert!(edit("edit game.exfat").is_err());
+        assert!(edit("edit game.exfat --rename a").is_err());
+        assert!(edit("edit game.exfat --add a:").is_err());
+        assert!(edit("edit game.exfat --delete").is_err());
+        assert!(edit("edit game.exfat --mkdir").is_err());
+    }
+
+    #[test]
+    fn edit_rejects_unknown_options() {
+        assert!(edit("edit game.exfat --bogus").is_err());
     }
 
     #[test]
