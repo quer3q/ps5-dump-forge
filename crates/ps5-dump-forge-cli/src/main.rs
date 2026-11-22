@@ -106,7 +106,8 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --rebuild with edit on an image: write a new image from the source plus the edits beside it,
             then rename it over the source, instead of editing the image in place
   --check   with edit: report whether the edits fit, in place or rebuilt (EditCheck JSON on
-            stdout), reading only; nothing is written
+            stdout); exits 1 when the mode the command would run doesn't. Nothing is edited,
+            but an interrupted edit's undo journal beside the image is settled first
   serve     the web UI on http://<this computer>:<port> (default 8095); the file browser
             starts at the --root folders (on the PS5: /data and /mnt/usb0..7, /mnt/ext0..1
             while mounted, no --root; nothing else is listed). No protections: anyone on the
@@ -895,16 +896,30 @@ fn print_out(text: &str) -> ExitCode {
     }
 }
 
-/// `edit --check`: core's `EditCheck` as JSON, reading only.
+/// `edit --check`: core's `EditCheck` as JSON; fails when the mode the same command would run
+/// (in place, or `--rebuild` for an image; a folder is changed directly) has findings.
 fn check_edits(request: &ConvertRequest) -> ExitCode {
     let check = Jobs::new(|_| {}).edit_check(request);
-    match serde_json::to_string_pretty(&check) {
-        Ok(text) => print_out(&(text + "\n")),
+    let text = match serde_json::to_string_pretty(&check) {
+        Ok(text) => text + "\n",
         Err(e) => {
             eprintln!("ps5-dump-forge: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    let findings = if request.edit_rebuild && !request.source.is_dir() {
+        &check.rebuild
+    } else {
+        &check.in_place
+    };
+    let printed = print_out(&text);
+    if findings.is_empty() {
+        return printed;
     }
+    for f in findings {
+        eprintln!("ps5-dump-forge: {f}");
+    }
+    ExitCode::FAILURE
 }
 
 /// convert, run and edit: JSONL events on stdout, a human summary on stderr.
@@ -1044,12 +1059,12 @@ mod tests {
     #[test]
     fn edit_add_keeps_a_windows_drive_with_from() {
         let (r, _) =
-            edit(r"edit game.ffpkg --add C:\games\a.sprx:/fakelib/libSceAmpr.sprx").unwrap();
+            edit(r"edit game.ffpkg --add C:\games\a.sprx:fakelib/libSceAmpr.sprx").unwrap();
         assert_eq!(
             r.edits,
             vec![Edit::Add {
                 from: PathBuf::from(r"C:\games\a.sprx"),
-                to: "/fakelib/libSceAmpr.sprx".into(),
+                to: "fakelib/libSceAmpr.sprx".into(),
             }]
         );
         assert_eq!(r.format, Format::Ffpkg);

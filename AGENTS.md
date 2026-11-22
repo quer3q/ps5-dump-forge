@@ -137,7 +137,10 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   Replace), `remove` (files only), `free_space`;
   absolute server paths). Glue: `core/src/nfs.rs`. ponytail: one connection per session, requests
   serialized, no reconnect; cached handles live 3 s; an idle v4.1 session may expire (dropped, reconnected).
-- `crates/ps5-dump-forge-cli`: binary `ps5-dump-forge` (`inspect`, `convert`, `serve`), JSON-lines events.
+- `crates/ps5-dump-forge-cli`: binary `ps5-dump-forge` (`inspect`, `convert`, `edit`, `serve`), JSON-lines events.
+  `edit` (PR #69, by user decision): `--add from:to`, `--delete`, `--rename from:to`, `--mkdir` in command-line
+  order into `ConvertRequest.edits`, `--rebuild` (`edit_rebuild`); `--check` prints `edit_check`'s JSON and exits 1
+  when the mode the command would run has findings.
   A second Ctrl-C quits at once (unix `_exit(130)`; Windows the default handler), the first prints
   "cancelling... (press Ctrl-C again to quit now)"; the `.part` stays (`stale_parts`).
 - `crates/ps5-dump-forge-ps5`: the payload's global allocator (`Pool`, installed by the CLI only for
@@ -600,7 +603,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
     in). An edit job of the source not started here (a reload, another viewer):
     the source is read again when it ends, the changes kept. Job rows: `.tag.edit` **Edit** or **Edit ·
     rebuild**, the error box led by "Can't apply the changes:"; a cancelled job's error that starts
-    "cancelled; " (what stays changed) is kept and shown as cancelled. No CLI subcommand for edits (ruling).
+    "cancelled; " (what stays changed) is kept and shown as cancelled. The CLI's `edit` (PR #69, by user decision) sends the same request.
   - **Room** (by user decision, as ps5upload): no growing an image and no FAT reserve; what an in-place
     edit adds must fit the free space inside, else one finding "the changes need N MB, the image has M MB
     free" (the editor's own count: data, new and grown folders, UFS2 indirect blocks) and Rebuild is
@@ -1436,6 +1439,7 @@ cargo run -p ps5-dump-forge-cli -- convert <packed_dir> --to folder --lz4-unpack
 cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to ffpkg --lz4-pack [--lz4-level N]   # pack straight into an image (also exfat|ffpfs|ffpfsc)
 cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to folder --zstd-pack [--zstd-level 1..22]   # zstd packs (default level 5; also exfat|ffpkg|ffpfs|ffpfsc)
 cargo run -p ps5-dump-forge-cli -- convert <zstd_packed_dir> --to folder --zstd-unpack   # back to the loose files (any target but lz4)
+cargo run -p ps5-dump-forge-cli -- edit <game_or_image> --add <file>:<game path> [--delete|--mkdir <path>] [--rename a:b] [--rebuild] [--check]
 scripts/check-lz4.sh <lz4_out_dir> <orig_dir> | --reverse   # upstream Python tools (Docker) inspect/verify our packs, unpack theirs
 cargo run -p ps5-dump-forge-cli -- convert <game_dir> --to ffpfsc --inner exfat   # inner: exfat | ffpkg | ffpfs; --level 0..9
 cargo run --release -p ps5-dump-forge-pfs --example pfs_tool -- ffpfs <dir> <out> <time>   # for MkPFS byte comparisons
