@@ -5,7 +5,7 @@ mounts (`.exfat`, `.ffpkg` UFS2, `.ffpfs` PFS, `.ffpfsc` compressed PFS containe
 debug FPKG `.pkg` (create and extract; on the PS5 also install), and edits a game's files in a folder or image (the Edit tab:
 in place or rebuilt) or copies some out (Extract). Rust core, Tauri 2 GUI (`PS5 Dump Forge.app`/`.exe`/`.AppDir`), a
 CLI (`ps5-dump-forge`), and a PS5 ELF payload (the CLI's `serve`: the same UI as a web page on port 8095).
-Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, a static Linux x86-64 CLI (musl, `release.yml`'s `linux-musl` job, via cross), the PS5 `.elf` (and `payloads.json`, its ps5-payload-manager catalog).
+Releases: macOS (one universal zip), Windows x86-64 and arm64, Linux x86-64 and arm64, a static Linux CLI for x86-64 and arm64 (musl, `release.yml`'s `linux-musl` job, one native runner each, via cross), the PS5 `.elf` (and `payloads.json`, its ps5-payload-manager catalog).
 `ps5/README.md` holds the payload's details (harness, HTTP routes, tile/self copy/launch on open, U1–U10
 write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zstd.md` the zstd pack format; `docs/packing.md` the TOML profiles of the packing strategy (`docs/packing-sample.toml` a sample).
 
