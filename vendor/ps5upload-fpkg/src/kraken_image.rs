@@ -578,12 +578,13 @@ fn anchor_record(position: u64) -> u128 {
 /// afid order, then the data end, the metadata base and the mount size.
 pub fn layout(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
     let blob = assemble(image, file_starts)?;
-    // Read it back the way the console will, and require exactly the blocks we stored.
-    let walked = describe(&blob)?;
-    if walked.len() != image.blocks.len() {
-        return format_err("the descriptor does not walk back to its blocks");
-    }
-    for (w, b) in walked.iter().zip(&image.blocks) {
+    // Read it back the way the console will, and require exactly the blocks we stored. Each
+    // walked block is compared as it comes, so no second block list is held.
+    let mut stored = image.blocks.iter();
+    describe_each(&blob, |w| {
+        let Some(b) = stored.next() else {
+            return format_err("the descriptor does not walk back to its blocks");
+        };
         if w.logical != b.logical
             || w.len != u64::from(b.len)
             || w.stored_at != b.stored_at
@@ -595,6 +596,10 @@ pub fn layout(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
                 b.logical
             ));
         }
+        Ok(())
+    })?;
+    if stored.next().is_some() {
+        return format_err("the descriptor does not walk back to its blocks");
     }
     Ok(blob)
 }
@@ -804,6 +809,22 @@ fn deshuffle(data: &mut [u8], pattern: u8) -> Result<()> {
 /// truncated or corrupt one is a [`crate::Error::Format`], never a panic. Each block it returns
 /// is at most 256 KiB long.
 pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+    let mut out = Vec::new();
+    describe_each(blob, |b| {
+        out.push(b);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// [`describe`], each block handed to `each` as the walk reaches it instead of collected, so a
+/// caller that keeps less per block, or counts the blocks first, holds no list of them (48 B a
+/// block; a 400 GB mount is over 1.5 M blocks). An error from `each` ends the walk and is
+/// returned as it is.
+pub fn describe_each(
+    blob: &[u8],
+    mut each: impl FnMut(DescribedBlock) -> Result<()>,
+) -> Result<()> {
     let word = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap());
     if blob.len() < 16 {
         return format_err("descriptor too short");
@@ -876,12 +897,12 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
         .collect();
     sparse.sort_unstable();
     sparse.dedup_by_key(|s| s.0);
-    let fill = |logical: &mut u64, out: &mut Vec<DescribedBlock>| {
+    let fill = |logical: &mut u64, each: &mut dyn FnMut(DescribedBlock) -> Result<()>| {
         while let Ok(i) = sparse.binary_search_by_key(logical, |s| s.0) {
             let end = sparse[i].1;
             while *logical < end {
                 let len = (end - *logical).min(UBLOCK);
-                out.push(DescribedBlock {
+                each(DescribedBlock {
                     logical: *logical,
                     len,
                     stored_at: 0,
@@ -891,10 +912,11 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
                     odd_lz: false,
                     mode_bits: 0,
                     shuffle: 0,
-                });
+                })?;
                 *logical += len;
             }
         }
+        Ok::<(), crate::Error>(())
     };
     // The three bytes before the records read `00 00 04` in every plain build measured (Sony's,
     // LibProsperoPkg's at 128 and 256 KiB blocks, ours). Other builders carry other values
@@ -907,7 +929,6 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
         x[..9].copy_from_slice(&blob[rec_at + i * 9..rec_at + i * 9 + 9]);
         u128::from_le_bytes(x)
     };
-    let mut out = Vec::new();
     let (mut cursor, mut logical) = (0u64, 0u64);
     let mut next_is_anchor = true; // index 0 is the start anchor
                                    // The previous record's bits 68–71: the low nibble of this record's key (see `layout`).
@@ -929,7 +950,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
             }
             continue;
         }
-        fill(&mut logical, &mut out);
+        fill(&mut logical, &mut each)?;
         if strict && i > 0 && nibble != logical & 0xF {
             return format_err(format!(
                 "record {i}: the exact start's low nibble disagrees (the console would read the \
@@ -1009,7 +1030,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
                 ))
             })?,
         };
-        out.push(DescribedBlock {
+        each(DescribedBlock {
             logical,
             len,
             stored_at: cursor,
@@ -1019,17 +1040,17 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
             odd_lz: f(36, 1) == 1,
             mode_bits: f(32, 5) as u8,
             shuffle,
-        });
+        })?;
         cursor = end;
         logical += len;
     }
-    fill(&mut logical, &mut out);
+    fill(&mut logical, &mut each)?;
     if logical != mount {
         return format_err(format!(
             "blocks tile to {logical:#x}, the mount is {mount:#x}"
         ));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode block `b` of a stored image. `b` comes from [`describe`]; one built by hand is
@@ -1130,6 +1151,32 @@ mod tests {
             delta: [false; 2],
             owner,
         }
+    }
+
+    /// `describe_each` hands out the blocks in order, and an error from its caller ends the walk
+    /// and comes back as it is, so a reader can count the blocks first and check each as it
+    /// keeps it.
+    #[test]
+    fn describe_each_stops_at_the_callers_error() {
+        let blocks = vec![
+            b(0, 0x60, 0, &[(0x60, false)], Owner::File(0)),
+            b(0x60, 0x31d0, 0x10000, &[(0x31d0, false)], Owner::File(1)),
+            b(0x3230, 0xa, 0x20000, &[(0xa, false)], Owner::File(2)),
+            b(0x323a, 0x3a5e, 0x2000a, &[(0x6cc, true)], Owner::File(3)),
+        ];
+        let img = image_of(blocks, 0x6c98, 0x6c98, 0x6c98);
+        let blob = layout(&img, &[0, 0x60, 0x3230, 0x323a]).unwrap();
+        let mut starts = Vec::new();
+        let e = describe_each(&blob, |b| {
+            starts.push(b.logical);
+            if starts.len() == 2 {
+                return format_err("stop here");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(e, crate::Error::Format(m) if m == "stop here"));
+        assert_eq!(starts, [0, 0x60]);
     }
 
     /// The Web Browser's own descriptor bytes, regenerated from its block list — every bit,
