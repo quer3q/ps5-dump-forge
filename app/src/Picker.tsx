@@ -1,10 +1,5 @@
-// Every picker (by user decision, no system dialog on any platform): the folder and file
-// browser over the backend's `list_dir`. A modal in its own React root; the app behind it is inert. Three modes: a
-// folder, a file, or (`folderToo`) either: a file click picks it, "Choose this folder" the
-// folder shown. `pickFiles`: file clicks select (in one folder), "Choose N files" takes them.
-// A picker that offers other devices (`devices`) gets a tab row while one is online: This device,
-// then each online paired Forge (`flink://<key_id>`), then each online saved NAS (not with
-// `peersOnly`); with none online it is exactly the picker without tabs.
+// Every picker (no system dialog on any platform): a modal over `list_dir`, the app behind it inert.
+// A folder, a file or (`folderToo`) either; `pickFiles` several of one folder; `devices` adds a tab per online device.
 
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 
@@ -14,6 +9,7 @@ import { Dots, FOCUSABLE, openOverlay, pairPromptUp, panelId, tabId, TabList } f
 import { useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
+import { Bookmarks } from "./bookmarks";
 import { joinPath, SEPARATORS } from "./paths";
 import type { PickOptions } from "./transport";
 
@@ -21,74 +17,31 @@ interface Entry {
   name: string;
   path: string;
   dir: boolean;
-  /** null for a folder. */
   size: number | null;
-  /** A saved NAS's root (`name` is the device's). */
   nas?: boolean;
 }
 
 export interface Listing {
-  /** null: the list of roots (drives). */
   path: string | null;
-  /** null at a root. */
   parent: string | null;
   entries: Entry[];
-  /** The server lists at most 10,000 entries. */
   truncated?: boolean;
 }
 
 /** Where the last browse ended, for the next one (kept until the page closes). */
 let lastDir: string | null = null;
 
-/** The user's shortcut folders (issue #18, by user decision): any device's folder paths, newest
- * last, in `localStorage` (a saved choice beside the UI language). Unreadable or invalid storage is
- * no shortcuts, never an error. */
-const SHORTCUTS = "forge.shortcuts";
-const MAX_SHORTCUTS = 9;
-
-function readShortcuts(): string[] {
-  try {
-    const v: unknown = JSON.parse(localStorage.getItem(SHORTCUTS) ?? "[]");
-    if (!Array.isArray(v)) return [];
-    const paths = v.filter((p): p is string => typeof p === "string" && p !== "");
-    const kept = paths.filter((p, i) => paths.lastIndexOf(p) === i).slice(-MAX_SHORTCUTS);
-    // An older build kept up to 20: the stored list is cut to the newest 9 too.
-    if (kept.length !== v.length) writeShortcuts(kept);
-    return kept;
-  } catch {
-    return [];
-  }
-}
-
-function writeShortcuts(paths: string[]) {
-  try {
-    localStorage.setItem(SHORTCUTS, JSON.stringify(paths));
-  } catch {
-    // Storage blocked or full: the shortcuts last until the picker closes.
-  }
-}
-
-/** A folder's last component (another device's paths take `/`), else the path itself (a root). */
-function lastPart(path: string): string {
-  const parts = path.split(isNet(path) ? /\// : SEPARATORS).filter(Boolean);
-  return parts.length > (isNet(path) ? 2 : 0) ? parts[parts.length - 1] : path;
-}
-
-/** Connect's saved devices, as its state lists them. */
 export interface SavedDevices {
   devices: { key_id: string; name: string; online: boolean }[];
   nas: { name: string; host: string; port: number; protocol?: NasProtocol; online: boolean }[];
 }
 
-/** How the picker lists: the backend's `list_dir` (`null`: its roots), and Connect's saved
- * devices: a picker that offers them adds the saved NAS devices to the roots as
- * `smb://`, `ftp://` or `nfs://host[:port]`, or, in tabs, the online ones. */
+/** `list_dir` (`null`: its roots) and Connect's saved devices, offered as roots or, in tabs, the online ones. */
 export interface PickerBackend {
   list(path: string | null): Promise<Listing>;
   saved(): Promise<SavedDevices>;
 }
 
-/** One tab: this device (`root` null: the backend's roots) or another device's root. */
 interface Tab {
   label: string;
   root: string | null;
@@ -97,12 +50,10 @@ interface Tab {
 
 const isNet = (p: string) => /^(smb|ftp|nfs|flink):\/\//i.test(p);
 const isNas = (p: string) => /^(smb|ftp|nfs):\/\//i.test(p);
-/** Whether the picker offers the saved NAS devices: a source picker (`o.nas`), and every other
- * one that offers devices (an output: a NAS takes them) but Edit's Add (`peersOnly`). */
+/** Whether the picker offers saved NAS devices: a source picker, and any output picker but Edit's Add (`peersOnly`). */
 const offered = (o: PickOptions) => !!o.nas || (!!o.devices && !o.peersOnly);
 const within = (p: string, root: string) => p === root || p.startsWith(`${root}/`);
 
-/** The tabs: none unless the picker offers devices and one is online. */
 async function tabsOf(o: PickOptions, b: PickerBackend): Promise<Tab[]> {
   if (!o.devices) return [];
   const s = await b.saved().catch(() => null);
@@ -114,9 +65,7 @@ async function tabsOf(o: PickOptions, b: PickerBackend): Promise<Tab[]> {
   return others.length === 0 ? [] : [{ label: "", root: null }, ...others];
 }
 
-/** A saved NAS's root path, as core spells it (`smb://`, `ftp://` for an FTP server, `nfs://` for
- * an NFS one; the port only when not the protocol's own, 445, 21 or 2049; IPv6 in brackets). */
-// Core lowercases the host (ASCII), so its listings' paths match this root.
+/** A saved NAS's root as core spells it (port only when not the protocol's; IPv6 in brackets; host lowercased). */
 export function nasRoot(host: string, port: number, protocol: NasProtocol = "smb"): string {
   const lower = host.replace(/[A-Z]/g, (c) => c.toLowerCase());
   const h = lower.includes(":") ? `[${lower}]` : lower;
@@ -126,21 +75,18 @@ export function nasRoot(host: string, port: number, protocol: NasProtocol = "smb
 export function picker(b: PickerBackend) {
   return {
     pick: (o: PickOptions): Promise<string | null> => open(o, false, b).then((p) => p?.[0] ?? null),
-    /** Several files of one folder (the folder shown when choosing). */
     pickFiles: (o: PickOptions): Promise<string[] | null> => open(o, true, b),
   };
 }
 
-/** A picker is looking up the devices: the page isn't inert yet, so a second click waits for
- * nothing (no second dialog). */
+/** A picker is looking up the devices: the page isn't inert yet, so a second click opens nothing. */
 let opening = false;
 
 async function open(o: PickOptions, multiple: boolean, b: PickerBackend): Promise<string[] | null> {
   if (opening) return null;
   opening = true;
   const tabs = await tabsOf(o, b).finally(() => (opening = false));
-  // common's overlay: counted with the others (File Transfer), so the app stays inert until
-  // the last one closes; a cancel from `closeOverlays` gives null.
+  // common's overlay: the app stays inert until the last one closes; `closeOverlays` gives null.
   return new Promise((resolve) => {
     let picked: string[] | null = null;
     openOverlay(
@@ -171,16 +117,14 @@ function shows(o: PickOptions, e: Entry): boolean {
 
 /** The rows shown at most (the explorers' limit; old WebKit mounts every button). */
 const MAX_ROWS = 2000;
-/** Parent folder's row as the list's Tab stop. */
 const UP = "\u0000up";
 
 const IMAGES = ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
-/** Game archives and the first parts of split ones (common.tsx's ARCHIVE_EXTENSIONS). */
+/** common.tsx's ARCHIVE_EXTENSIONS. */
 const ARCHIVES = ["7z", "rar", "001", "z01"];
 const ext = (name: string) => name.slice(name.lastIndexOf(".") + 1).toLowerCase();
 
-/** A file row's icon: a disc for an image, the zipped file for an archive (and a plain .zip
- * where the picker lists only those: LZ4 traces). */
+/** A file row's icon: a disc for an image, the zipped file for an archive (or a .zip where only those are listed). */
 function fileIcon(o: PickOptions, name: string): IconName {
   const e = ext(name);
   if (IMAGES.includes(e)) return "disc";
@@ -188,14 +132,12 @@ function fileIcon(o: PickOptions, name: string): IconName {
   return ARCHIVES.includes(e) || (sources && e === "zip") ? "archive" : "file";
 }
 
-/** A file mode's empty listing names what it lists: PS5 images and archives, or ".zip files". */
 function noFiles(t: Messages["picker"], o: PickOptions): string {
   const ext = o.extensions;
   if (!ext) return t.nothing;
   return ext.some((e) => IMAGES.includes(e)) ? t.noImages : t.noFiles(ext);
 }
 
-/** "Drives", then the root holding `path`, then each folder below it. */
 function crumbs(drives: string, path: string | null, roots: string[]): { label: string; path: string | null }[] {
   const out: { label: string; path: string | null }[] = [{ label: drives, path: null }];
   if (path === null) return out;
@@ -215,8 +157,7 @@ function crumbs(drives: string, path: string | null, roots: string[]): { label: 
   return out;
 }
 
-/** The roots: the backend's, then each saved NAS the picker offers (not
- * with tabs: an online NAS has its own). A NAS list that fails to load adds none. */
+/** The backend's roots, then each saved NAS offered (not with tabs); a NAS list that fails adds none. */
 async function roots(o: PickOptions, b: PickerBackend, tabbed: boolean): Promise<Listing> {
   const [base, nas] = await Promise.all([
     b.list(null),
@@ -244,30 +185,24 @@ function Picker({
   const tabAt = useRef(0);
   const dev = tabs[tab] ?? { label: "", root: null };
   const done = (path: string | null) => give(path === null ? null : [path]);
-  /** `multiple`: the files selected in the folder shown (a new folder starts with none). */
   const [chosen, setChosen] = useState<string[]>([]);
   const toggle = (path: string) => setChosen((c) => (c.includes(path) ? c.filter((p) => p !== path) : [...c, path]));
   const [listing, setListing] = useState<Listing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rootPaths, setRoots] = useState<string[]>([]);
-  // Read once as the picker opens; written on each change.
-  const [shortcuts, setShortcuts] = useState(readShortcuts);
   // A listing is on its way: what shows is still the previous folder's, so it can't be chosen.
   const [pending, setPending] = useState(true);
   const seq = useRef(0);
-  /** The row that is the list's Tab stop (`UP`: Parent folder). */
   const [cursor, setCursor] = useState<string | null>(null);
   const box = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLUListElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
 
-  // Focus moves in at once, so keys (Esc, the trap) reach the dialog while the first listing
-  // loads or after it fails; old WebKit has no `inert` to keep them from the app behind.
+  // Focus moves in at once (old WebKit has no `inert`), so keys reach the dialog while the first listing loads.
   useEffect(() => {
     if (!pairPromptUp()) cancel.current?.focus();
   }, []);
 
-  // `null`: the tab's top (this device's roots, another device's root).
   const go = async (path: string | null, fallBack = false) => {
     const mine = ++seq.current;
     const at = path ?? tabs[tabAt.current]?.root ?? null;
@@ -293,8 +228,7 @@ function Picker({
   };
 
   useEffect(() => {
-    // Another device's folder is a start only on its tab; without tabs, a NAS folder only for a
-    // picker that lists NAS devices.
+    // Another device's folder is a start only on its tab, or, without tabs, a NAS folder for a picker listing NAS.
     let start = o.start ?? lastDir;
     if (o.local && start !== null && isNet(start)) start = null;
     const at = start === null ? -1 : tabs.findIndex((d) => d.root !== null && within(start!, d.root));
@@ -304,13 +238,11 @@ function Picker({
       void go(start, true);
       return;
     }
-    // A peer's folder only for a picker that offers devices.
     const keep =
       (o.start !== undefined && (o.devices || !/^flink:\/\//i.test(o.start))) ||
       (isNas(start ?? "") && offered(o));
     if (start !== null && isNet(start) && (tabs.length > 0 || !keep)) start = null;
     if (start !== null) {
-      // The crumbs need the roots too.
       roots(o, b, tabs.length > 0).then(
         (l) => setRoots(l.entries.map((e) => e.path)),
         () => {},
@@ -320,7 +252,6 @@ function Picker({
   }, []);
 
 
-  // A new listing: focus its first entry (else Up, else the dialog's buttons).
   useEffect(() => {
     if (!listing) return;
     if (list.current) list.current.scrollTop = 0;
@@ -337,7 +268,6 @@ function Picker({
       e.preventDefault();
       done(null);
     } else if (e.key === "Tab" && box.current) {
-      // Focus stays in the dialog (old WebKit has no `inert`).
       const all = [...box.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
       if (all.length === 0) return;
       const i = all.indexOf(document.activeElement as HTMLElement);
@@ -350,7 +280,6 @@ function Picker({
         all[0].focus();
       }
     } else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && list.current) {
-      // Arrow keys walk the rows.
       const rows = [...list.current.querySelectorAll<HTMLElement>(".pick-row")];
       const i = rows.indexOf(document.activeElement as HTMLElement);
       if (i < 0) return;
@@ -360,20 +289,17 @@ function Picker({
   };
 
   const here = listing?.path ?? null;
-  // On a saved NAS or another Forge core reads only `nasExtensions`: the rest (archives, .pkg) is
-  // listed greyed out, not pickable, with one short note (issue #20).
+  // On another device core reads only `nasExtensions`: the rest is listed greyed out, not pickable (issue #20).
   const files = here !== null && isNet(here) && o.nasExtensions ? { ...o, extensions: o.nasExtensions } : o;
   const off = (e: Entry) => files !== o && !shows(files, e);
   // Greyed rows after the rest, so they never push a pickable one past MAX_ROWS.
   const listed = listing ? listing.entries.filter((e) => shows(o, e)) : [];
   const entries = files === o ? listed : [...listed.filter((e) => !off(e)), ...listed.filter(off)];
   const atTop = here === null || here === dev.root;
-  // At most MAX_ROWS rows (as the explorers), one Tab stop among them: the row last focused, else the first.
   const rows = entries.slice(0, MAX_ROWS);
   const anyOff = rows.some(off);
   const stop = cursor !== null && (cursor === UP ? !atTop : rows.some((e) => e.path === cursor)) ? cursor : atTop ? rows[0]?.path : UP;
   const top = t.drives;
-  // Another device's tab starts at its root, named by the device.
   const trail =
     dev.root === null
       ? crumbs(top, here, rootPaths)
@@ -384,63 +310,6 @@ function Picker({
     setTab(i);
     setListing(null);
     void go(null);
-  };
-
-  // Shortcuts shown only while reachable here, as a start folder is: a net one on the tab whose
-  // root holds it, or, without tabs, under a root listed at the top (a peer's only for a picker
-  // that offers devices, a NAS's only for one that offers NAS devices).
-  // The tab a shortcut opens on (-1: no tabs), or null: not reachable here.
-  const tabOfShortcut = (p: string): number | null => {
-    if (!isNet(p)) return tabs.length > 0 ? 0 : -1;
-    if (o.local) return null;
-    if (tabs.length > 0) {
-      const i = tabs.findIndex((d) => d.root !== null && within(p, d.root));
-      return i > 0 ? i : null;
-    }
-    if (/^flink:\/\//i.test(p) ? !o.devices : !offered(o)) return null;
-    return rootPaths.some((r) => within(p, r)) ? -1 : null;
-  };
-  const shown = shortcuts.flatMap((path) => {
-    const i = tabOfShortcut(path);
-    return i === null ? [] : [{ path, i }];
-  });
-  // At 9, a new one takes the place of the oldest this picker can't show (an offline device's), so
-  // hidden shortcuts never block one. ponytail: that one goes without a word; a list per device if it matters.
-  const hidden = shortcuts.find((p) => !shown.some((x) => x.path === p));
-  const full = shortcuts.length >= MAX_SHORTCUTS && hidden === undefined;
-  const pinned = here !== null && shortcuts.includes(here);
-  const save = (next: string[]) => {
-    setShortcuts(next);
-    writeShortcuts(next);
-  };
-  // The foot button: the folder shown becomes a shortcut (none past MAX_SHORTCUTS), or stops being one.
-  const pin = () => {
-    if (here === null) return;
-    if (pinned) return save(shortcuts.filter((p) => p !== here));
-    if (full) return;
-    const kept = shortcuts.length >= MAX_SHORTCUTS ? shortcuts.filter((p) => p !== hidden) : shortcuts;
-    const next = [...kept, here];
-    save(next);
-    // The button goes off with the 9th that it can't make room for: focus stays in the dialog.
-    if (next.length >= MAX_SHORTCUTS && next.every((p) => p === here || shown.some((x) => x.path === p))) box.current?.focus();
-  };
-  // A chip's x: the shortcut goes, focus stays in the dialog (Escape, the trap).
-  const unpin = (path: string) => {
-    save(shortcuts.filter((p) => p !== path));
-    box.current?.focus();
-  };
-  const openShortcut = (path: string, i: number) => {
-    if (i >= 0 && i !== tabAt.current) {
-      tabAt.current = i;
-      setTab(i);
-      setListing(null);
-    }
-    void go(path);
-  };
-  const shortcutName = (path: string, i: number) => {
-    const d = i > 0 ? tabs[i] : null;
-    if (d && path === d.root) return d.label;
-    return d ? `${d.label}: ${lastPart(path)}` : lastPart(path);
   };
 
   return (
@@ -514,30 +383,8 @@ function Picker({
               </Fragment>
             ))}
           </nav>
-          {shown.length > 0 && (
-            <div className="pick-shortcuts" role="group" aria-label={t.shortcuts}>
-              {shown.map(({ path, i }) => {
-                const name = shortcutName(path, i);
-                return (
-                  <span key={path} className={path === here ? "pick-shortcut here" : "pick-shortcut"}>
-                    <button type="button" className="pick-shortcut-go" title={path} onClick={() => openShortcut(path, i)}>
-                      <Icon name="folder" />
-                      <span className="pick-shortcut-name">{name}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="pick-shortcut-x"
-                      aria-label={t.removeShortcutNamed(name)}
-                      title={t.removeShortcut}
-                      onClick={() => unpin(path)}
-                    >
-                      <Icon name="x" />
-                    </button>
-                  </span>
-                );
-              })}
-            </div>
-          )}
+          {/* This device's bookmarks (the Transfer screen's and File explorer's), to jump to a folder. */}
+          {dev.root === null && <Bookmarks root={null} here={here} onOpen={(path) => path !== here && void go(path)} />}
           {anyOff && (
             <p className="note-line muted">
               <Icon name="info" />
@@ -609,16 +456,6 @@ function Picker({
           )}
         </div>
         <div className="row end pick-foot">
-          <button
-            type="button"
-            className="pick-pin"
-            disabled={here === null || pending || error !== null || (!pinned && full)}
-            title={!pinned && full ? t.shortcutsFull : undefined}
-            onClick={pin}
-          >
-            <Icon name={pinned ? "minus" : "folder-plus"} />
-            {pinned ? t.removeShortcut : t.addShortcut}
-          </button>
           <button type="button" ref={cancel} onClick={() => done(null)}>
             {t.cancel}
           </button>

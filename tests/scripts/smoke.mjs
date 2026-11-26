@@ -409,7 +409,7 @@ test('NAS: saved on both Forges (guest), online, its share and game listed', asy
   }
 });
 
-test('NAS games and refusals: the console converts and copies one, A copies one; no edit or delete', async () => {
+test('NAS games and refusals: the console converts and copies one, A copies one; no edit, a share root not deleted', async () => {
   const src = nasGame();
   const out = bPath('nas.ffpkg');
   await run(B, request({ source: src, format: 'ffpkg', output: out }));
@@ -420,7 +420,7 @@ test('NAS games and refusals: the console converts and copies one, A copies one;
   await run(A, transfer([src], path.join(ctx.aRun, 'pulled')));
   same(hashTree(path.join(ctx.nasDir, 'game-nas')), hashTree(path.join(ctx.aRun, 'pulled/game-nas')), 'NAS game on A');
   await refused('edit a NAS game', /./, () => start(A, request({ source: src, format: 'folder', edits: [{ op: 'delete', path: 'data/zero.bin' }] })));
-  await refused('delete on a share', /./, () => call(A, 'delete_path', { path: src }));
+  await refused('delete a share root', /./, () => call(A, 'delete_path', { path: src.replace(/\/game-nas$/, '') }));
 });
 
 test('NAS outputs: A writes an .exfat, an fpkg (streamed) and a transfer onto the share, hashed; forgotten', async () => {
@@ -493,7 +493,7 @@ test('FTP: saved on both (login), online; the console converts its game, A write
   same(want, got, 'fpkg on FTP, extracted');
 });
 
-test('FTP from the console: an image and a transfer written onto it; no edit or delete', async () => {
+test('FTP from the console: an image and a transfer written onto it; no edit, its root not deleted', async () => {
   const root = ftpRoot();
   const img = `${RUN}-b.exfat`;
   await run(B, request({ source: fA(ctx.game), format: 'exfat', output: `${root}/out/${img}` }));
@@ -502,7 +502,7 @@ test('FTP from the console: an image and a transfer written onto it; no edit or 
   await run(B, transfer([fA(ctx.runExtra)], `${root}/out`));
   same(hashTree(ctx.extra), hashTree(path.join(ctx.ftpDir, 'out', path.basename(ctx.runExtra))), 'transfer onto FTP');
   await refused('edit an FTP game', /./, () => start(A, request({ source: `${root}/game-ftp`, format: 'folder', edits: [{ op: 'delete', path: 'eboot.bin' }] })));
-  await refused('delete on FTP', /./, () => call(A, 'delete_path', { path: `${root}/game-ftp` }));
+  await refused('delete the FTP root', /./, () => call(A, 'delete_path', { path: `${root}/` }));
   fs.rmSync(path.join(ctx.ftpDir, 'out', img), { force: true });
   fs.rmSync(path.join(ctx.ftpDir, 'out', `${RUN}-a.pkg`), { force: true });
   fs.rmSync(path.join(ctx.ftpDir, 'out', path.basename(ctx.runExtra)), { recursive: true, force: true });
@@ -564,12 +564,12 @@ async function nfsCase(ver) {
     fs.rmSync(local, { force: true });
   }
   await refused('edit an NFS game', /./, () => start(A, request({ source: src, format: 'folder', edits: [{ op: 'delete', path: 'eboot.bin' }] })));
-  await refused('delete on NFS', /./, () => call(A, 'delete_path', { path: src }));
+  await refused('delete an NFS export root', /./, () => call(A, 'delete_path', { path: src.slice(0, src.lastIndexOf('/')) }));
   await forgetNas(a, b);
 }
 
-test('NFSv3: saved on both, listed; the console converts its game, A writes an .ffpkg onto it; no edit or delete', () => nfsCase(3));
-test('NFSv4.1: saved on both, listed; the console converts its game, A writes an .ffpkg onto it; no edit or delete', () => nfsCase(4));
+test('NFSv3: saved on both, listed; the console converts its game, A writes an .ffpkg onto it; no edit, the export not deleted', () => nfsCase(3));
+test('NFSv4.1: saved on both, listed; the console converts its game, A writes an .ffpkg onto it; no edit, the export not deleted', () => nfsCase(4));
 
 test('forget and pair again: one saved entry on each side, online', async () => {
   ok(await call(A, 'connect/forget', { key_id: ctx.keyB }), 'forget returned false');

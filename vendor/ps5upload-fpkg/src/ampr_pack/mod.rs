@@ -1,3 +1,5 @@
+// Ported from drakmor's ampr_emu tools (https://github.com/drakmor/ampr_emu, GPL-3.0). This
+// Rust port is part of ps5upload, GPL-3.0-or-later.
 //! AMPR seekable LZ4 asset packs: a game's files stored as independent LZ4 blocks in a few
 //! large volumes, which `ampr_emu` 0.4 and later (a backport's `fakelib/libSceAmpr.sprx`) serves
 //! back to the title as the original files. The game image gets smaller; the packed originals
@@ -33,12 +35,17 @@ pub mod format;
 pub mod glob;
 pub mod image;
 pub mod lz4;
+pub mod ng;
 pub mod pack;
 pub mod profile_gen;
 pub mod read;
+pub mod regen;
 
-pub use config::{default_profile, Config};
-pub use pack::{build, Control, Output};
+pub use config::{
+    default_profile, default_profile_for, default_profile_name, large_files_profile, unity_profile,
+    unreal_profile, Config, GameEngine, LARGE_FILE_MIN,
+};
+pub use pack::{build, measure, Control, Output};
 pub use read::Reader;
 
 /// Does this `libSceAmpr.sprx` serve asset packs, and which version is it? Read from the
@@ -53,6 +60,9 @@ pub struct RuntimeSupport {
 pub fn runtime_support(module: &[u8]) -> RuntimeSupport {
     let has = |needle: &[u8]| module.windows(needle.len()).any(|w| w == needle);
     let packs = has(format::INDEX_MAGIC) && has(b"ampr_assets");
+    // The banner is one C string ending in the marker: "0.4.2.1 (c) Drakmor", and in the
+    // 0.3 series "0.3.6 (public beta) (c) Drakmor" (#449). The version is its first token
+    // made of digits and dots.
     let marker = b" (c) Drakmor";
     let version = module
         .windows(marker.len())
@@ -60,10 +70,13 @@ pub fn runtime_support(module: &[u8]) -> RuntimeSupport {
         .and_then(|end| {
             let start = module[..end]
                 .iter()
-                .rposition(|&b| !(b.is_ascii_digit() || b == b'.'))
+                .rposition(|&b| b == 0)
                 .map_or(0, |p| p + 1);
-            let v = std::str::from_utf8(&module[start..end]).ok()?;
-            (!v.is_empty() && v.contains('.')).then(|| v.to_string())
+            let banner = std::str::from_utf8(&module[start..end]).ok()?;
+            banner
+                .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .find(|t| t.contains('.') && t.starts_with(|c: char| c.is_ascii_digit()))
+                .map(|t| t.trim_end_matches('.').to_string())
         });
     RuntimeSupport { packs, version }
 }

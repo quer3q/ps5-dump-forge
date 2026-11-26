@@ -1,6 +1,5 @@
-//! An in-place image edit (a request with [`ConvertRequest::edits`]): scan, preflight and the
-//! format editor's plan of the writes, then `patch::apply` (undo journal first), a check of
-//! the image through its reader, and commit; any failure after the apply rolls it back.
+//! An in-place image edit: scan, preflight, the format editor's plan, `patch::apply` (undo
+//! journal first), a check through the image's reader, commit; a failure after apply rolls back.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -27,8 +26,7 @@ use crate::{ConvertRequest, EditCheck, Format, JobReport};
 /// The `Progress` stages of an edit job, in order.
 pub(crate) const STAGES: [&str; 5] = ["scan", "preflight", "write", "verify", "finalize"];
 
-/// How the undo journal and the image are made durable: on the PS5 with ps5upload's retries
-/// (a sync that only succeeded on a retry fails), elsewhere std's.
+/// On the PS5 a sync that only succeeded on a retry fails.
 #[cfg(target_os = "freebsd")]
 pub(crate) const SYNCS: Syncs = Syncs {
     file: sync_file,
@@ -46,8 +44,7 @@ fn sync_file(file: &File) -> io::Result<()> {
     }
 }
 
-/// Room beyond the journal's own size its folder must have: what the filesystem spends on
-/// the new file.
+/// Room beyond the journal's own size: what the filesystem spends on the new file.
 const JOURNAL_MARGIN: u64 = 1 << 20;
 
 /// What the request asks for that an edit doesn't take.
@@ -59,8 +56,7 @@ pub(crate) fn request_findings(req: &ConvertRequest) -> Vec<String> {
                 .into(),
         );
     }
-    // A paired device's files (`flink://`) are added like this device's; a NAS's (SMB, NFS,
-    // FTP) aren't.
+    // A peer's files (`flink://`) are added like this device's; a NAS's aren't.
     let from_nas: Vec<String> = (req.edits.iter())
         .filter_map(|e| match e {
             crate::Edit::Add { from, .. }
@@ -97,8 +93,7 @@ pub(crate) fn request_findings(req: &ConvertRequest) -> Vec<String> {
     findings
 }
 
-/// Why `kind` can't be edited in place, or rebuilt with the edits when `rebuild` (`None`: it
-/// can).
+/// Why `kind` can't be edited in place, or rebuilt when `rebuild`.
 fn kind_finding(kind: Kind, rebuild: bool) -> Option<String> {
     match kind {
         Kind::Archive(_) => Some("archives can be browsed but not edited; convert it first".into()),
@@ -124,10 +119,8 @@ fn format_of(kind: Kind) -> Format {
     }
 }
 
-/// The format an edit request rebuilds its image as: the source's own, when the request has
-/// edits and [`ConvertRequest::edit_rebuild`] and the source is an image (`None` otherwise: an
-/// in-place edit, a folder's included, or an archive the edit job refuses). Such a request is
-/// a conversion of the edited image to that format, replacing the source.
+/// The source image's own format when the request is an `edit_rebuild` (`None`: in place, a
+/// folder or an archive).
 pub(crate) fn rebuild_format(req: &ConvertRequest) -> Option<Format> {
     if req.edits.is_empty() || !req.edit_rebuild {
         return None;
@@ -138,8 +131,7 @@ pub(crate) fn rebuild_format(req: &ConvertRequest) -> Option<Format> {
     }
 }
 
-/// The format of the image inside a `.ffpfsc`, by its name's extension (SMP picks the inner
-/// driver by it): what a rebuild writes inside the new container.
+/// The format inside a `.ffpfsc`, by the inner name's extension (SMP picks its driver by it).
 pub(crate) fn inner_format(image: &Path) -> anyhow::Result<Format> {
     let (_, info) = crate::convert::open_ffpfsc(image)?;
     let ext = Path::new(&info.inner_name)
@@ -157,17 +149,13 @@ pub(crate) fn inner_format(image: &Path) -> anyhow::Result<Format> {
     }
 }
 
-/// Why the image can't be edited because ShadowMount+ has it mounted (PS5 only; `None`
-/// elsewhere, where there is no ShadowMount+). Checked in preflight and again before apply.
+/// Why ShadowMount+ having the image mounted refuses it (PS5 only).
 #[cfg(target_os = "freebsd")]
 pub(crate) fn smp_finding(image: &Path) -> Option<String> {
     smp_inside(image).or_else(|| smp_mount(image, &mut smp_list, &mut smp_is_mount))
 }
 
-/// Why `path` can't be edited: it is ShadowMount+'s mount folder or inside it (as typed or
-/// resolved), so it belongs to a mounted game, changed only through the image it was
-/// mounted from. Folder edits, the LZ4 folder patch and Extract's destination check it too
-/// (PS5 only).
+/// Why `path` is refused: at or inside ShadowMount+'s mount folder, as typed or resolved (PS5 only).
 pub(crate) fn smp_inside(path: &Path) -> Option<String> {
     crate::listing::smp_hidden(path).then(|| {
         format!(
@@ -183,8 +171,7 @@ pub(crate) fn smp_finding(_: &Path) -> Option<String> {
     None
 }
 
-/// A folder's entry names, for [`smp_mounts`] on the real filesystem. A name that is not
-/// UTF-8 is an error (fails closed): changed to fit, it would be stat'ed as another path.
+/// A non-UTF-8 name is an error (fails closed): changed to fit, it would be another path.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn smp_list(dir: &Path) -> io::Result<Vec<String>> {
     std::fs::read_dir(dir)?
@@ -197,7 +184,7 @@ pub(crate) fn smp_list(dir: &Path) -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// Whether `entry` is a mount point: its `st_dev` differs from its folder's.
+/// A mount point: its `st_dev` differs from its folder's.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn smp_is_mount(entry: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
@@ -214,8 +201,7 @@ const SMP_DIRS: [&str; 2] = ["/mnt/shadowmnt", "/mnt/shadowmnt/pfsc"];
 #[cfg(any(target_os = "freebsd", test))]
 const SMP_EXTENSIONS: [&str; 4] = ["exfat", "ffpkg", "ffpfs", "ffpfsc"];
 
-/// The stem SMP names `name`'s mount by (the name without its extension), when `name` has an
-/// extension SMP mounts (any case).
+/// The stem SMP names `name`'s mount by, when its extension is one SMP mounts (any case).
 #[cfg(any(target_os = "freebsd", test))]
 pub(crate) fn smp_stem(name: &str) -> Option<&str> {
     let (stem, ext) = name.rsplit_once('.')?;
@@ -225,10 +211,8 @@ pub(crate) fn smp_stem(name: &str) -> Option<&str> {
         .then_some(stem)
 }
 
-/// ShadowMount+'s mounts whose stem `wanted` accepts, as (stem, mount point), over `list` (a
-/// folder's entry names) and `is_mount` (an entry is a mount point): SMP mounts an image at
-/// `<dir>/<stem>_<8 hex digits>`, the stem being its file name without the extension. Fails
-/// closed: a listing or stat error other than "not found" is the `Err`, with where it was.
+/// ShadowMount+'s mounts (`<dir>/<stem>_<8 hex>`) whose stem `wanted` accepts, as (stem, mount
+/// point). Fails closed: a listing or stat error other than "not found" is the `Err`.
 #[cfg(any(target_os = "freebsd", test))]
 pub(crate) fn smp_mounts(
     list: &mut dyn FnMut(&Path) -> io::Result<Vec<String>>,
@@ -296,12 +280,8 @@ pub(crate) struct Scanned {
     pub recovery: Recovery,
 }
 
-/// Checks the request, the image's kind and name and that ShadowMount+ hasn't mounted it
-/// ([`smp_finding`]); only then settles a journal an interrupted edit left
-/// ([`ps5_dump_forge_patch::recover`]: it restores the image's own bytes, which any edit
-/// needs first), stamps and opens the image. The inner `Err` lists why the request or the
-/// image can't be edited in place (or rebuilt, when `rebuild`); the outer one is an error
-/// reading it.
+/// Checks the request, kind, name and ShadowMount+; only then recovers a leftover journal,
+/// stamps and opens the image. Inner `Err`: findings; outer: a read error.
 pub(crate) fn scan(
     req: &ConvertRequest,
     rebuild: bool,
@@ -310,7 +290,6 @@ pub(crate) fn scan(
     scan_with(req, rebuild, cancel, &smp_finding, true)
 }
 
-/// [`scan`] with its ShadowMount+ check given.
 fn scan_with(
     req: &ConvertRequest,
     rebuild: bool,
@@ -332,7 +311,6 @@ fn scan_with(
     if !findings.is_empty() {
         return Ok(Err(findings));
     }
-    // The name ShadowMount+ mounts it by, as a conversion's output name is checked.
     findings.extend(preflight::stem_finding(&image, format_of(kind)));
     // Before anything is written, recovery included.
     findings.extend(mounted(&image));
@@ -373,23 +351,18 @@ pub(crate) struct Planned {
     pub kind: Kind,
     pub image: PathBuf,
     pub stamp: SourceStamp,
-    /// The format editor's ops, the fresh `ampr_emu.index` last when there is one.
     pub ops: Vec<Op>,
     /// What applying them writes into the image.
     pub writes: Vec<Write>,
-    /// The host files `Data::Source` ids name (by index).
     pub hosts: Vec<HostFile>,
     /// The tree the edited image must read back as.
     pub expected: Box<dyn SourceTree>,
-    /// The undo journal's size (the live writes' old bytes and its framing).
     pub journal_bytes: u64,
     /// Lines for the job log.
     pub notes: Vec<String>,
 }
 
-/// Scan and preflight of an in-place edit. It writes nothing but a leftover journal's
-/// recovery (see [`scan`]), which stays done when preflight refuses. The inner `Err` lists
-/// every finding; the outer one is a cancel or an error reading.
+/// Scan and preflight; writes nothing but a leftover journal's recovery.
 #[cfg(test)]
 pub(crate) fn plan_in_place(
     req: &ConvertRequest,
@@ -409,14 +382,12 @@ fn busy(image: &Path) -> String {
     )
 }
 
-/// Settles a journal an interrupted edit left beside `req`'s image, as every edit does first
-/// (not while ShadowMount+ has it mounted: the check says so), for [`check`]; the error says
-/// why it couldn't be. The caller holds the job table, so no job is editing the image.
+/// Settles a leftover journal for [`check`] (not while ShadowMount+ has the image mounted).
+/// The caller holds the job table, so no job is editing the image.
 pub(crate) fn settle(req: &ConvertRequest) -> Option<String> {
     let image = &req.source;
     let journal = ps5_dump_forge_patch::journal_path(image);
-    // A NAS or peer path is never edited (`request_findings`), and `smb://` / `flink://` also
-    // spell a relative local path: never recover a journal there.
+    // `smb://` / `flink://` also spell a relative local path: never recover a journal there.
     if crate::net::is_network(image)
         || std::fs::symlink_metadata(&journal).is_err()
         || !matches!(Kind::of(image), Ok(k) if !matches!(k, Kind::Folder | Kind::Archive(_)))
@@ -433,8 +404,7 @@ pub(crate) fn settle(req: &ConvertRequest) -> Option<String> {
     })
 }
 
-/// [`crate::Jobs::edit_check`] once [`settle`] ran (`settled`: its error): the in-place job's
-/// scan and preflight, and the rebuild's scan, fold, checks and sizing, writing nothing.
+/// [`crate::Jobs::edit_check`] once [`settle`] ran: both modes' checks, writing nothing.
 pub(crate) fn check(req: &ConvertRequest, settled: Option<String>) -> EditCheck {
     if let Some(why) = settled {
         return EditCheck {
@@ -466,8 +436,7 @@ pub(crate) fn check(req: &ConvertRequest, settled: Option<String>) -> EditCheck 
     check
 }
 
-/// The rebuild half of [`check`]: what [`crate::convert::convert`]'s rebuild checks before it
-/// writes, filling its sizes into `out`.
+/// The rebuild half of [`check`], filling its sizes into `out`.
 fn check_rebuild(
     req: &ConvertRequest,
     cancel: &AtomicBool,
@@ -525,8 +494,7 @@ fn check_rebuild(
     })
 }
 
-/// The size of the image a rebuild writes of `tree`: the source's own format, a `.ffpfsc`
-/// at its worst case (every block raw) around an inner image of the source's inner format.
+/// The rebuilt image's size; a `.ffpfsc` at its worst case (every block raw).
 fn rebuilt_size(
     req: &ConvertRequest,
     kind: Kind,
@@ -563,14 +531,12 @@ fn now() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// The undo journal's framing (`ps5_dump_forge_patch`'s layout): its header and trailer, and
-/// each entry's offset and length.
+/// The undo journal's framing: header, trailer and each entry's offset and length.
 const JOURNAL_FRAME: u64 = 30 + 12;
 const JOURNAL_ENTRY: u64 = 16;
 
-/// Preflight of a scanned image: the edits folded over its tree ([`Edited`]), the checks a
-/// conversion runs on the edited tree, a fresh `ampr_emu.index` when an AMPR title's file set
-/// changes, the format editor's plan and room beside the image for the undo journal. `mtime` stamps a fresh index.
+/// The edits folded, a conversion's checks on the edited tree, the format editor's plan and
+/// room for the undo journal. `mtime` stamps a fresh index.
 pub(crate) fn preflight(
     scanned: Scanned,
     req: &ConvertRequest,
@@ -580,16 +546,13 @@ pub(crate) fn preflight(
     preflight_sized(scanned, req, mtime, cancel, &mut None)
 }
 
-/// The room inside an image an in-place plan counted, in bytes: what it allocates (data,
-/// new and grown directories, indirect blocks; what it lacked room for too) and the free
-/// space it started from.
+/// The room an in-place plan counted: what it allocates and the free space it started from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Inside {
     pub needed: u64,
     pub free: u64,
 }
 
-/// [`preflight`], filling in `inside` once the format editor planned.
 fn preflight_sized(
     scanned: Scanned,
     req: &ConvertRequest,
@@ -614,8 +577,7 @@ fn preflight_sized(
         Ok(folded) => folded,
         Err(findings) => return Ok(Err(findings)),
     };
-    // The checks a conversion runs, on the edited tree: the game root, depth, and the
-    // writer's names (bad or colliding names, every offender listed).
+    // A conversion's checks: game root, depth, the writer's names.
     let (info, input) = preflight::input(expected.as_mut());
     findings.extend(input);
     findings.extend(preflight::too_deep(expected.as_ref()));
@@ -642,9 +604,7 @@ fn preflight_sized(
             });
             planned
         }
-        // PFS keeps no free count, and an in-place `.ffpfs` edit only overwrites runs, so
-        // there are no sizes to report (`inside` stays `None`). Its "one run" refusal is
-        // given once, not per op.
+        // PFS keeps no free count (`inside` stays `None`); its "one run" refusal once, not per op.
         Kind::Ffpfs => ps5_dump_forge_pfs::edit::plan(&mut file, &ops).map_err(|mut f| {
             let mut seen = false;
             f.retain(|f| {
@@ -689,28 +649,19 @@ fn preflight_sized(
     }))
 }
 
-/// The edits folded over a scanned image's tree, what an in-place edit and a rebuild both
-/// write.
+/// The edits folded over a scanned image's tree, for both modes.
 pub(crate) struct Folded {
-    /// The edited tree ([`Edited`], with the fresh `ampr_emu.index` when there is one).
     pub tree: Box<dyn SourceTree>,
-    /// The format editor's ops, the fresh index last when there is one.
+    /// The fresh index last when there is one.
     pub ops: Vec<Op>,
-    /// The host files `Data::Source` ids name (by index).
     pub hosts: Vec<HostFile>,
     pub notes: Vec<String>,
     /// What the edited tree can't be written as (the edits themselves applied).
     pub findings: Vec<String>,
 }
 
-/// Folds `req`'s edits over `tree`, the scanned `image`: the edits must apply ([`Edited`];
-/// the inner `Err` lists every offender), an add of the image itself is a finding, and an AMPR
-/// title whose file set changes gets a fresh `ampr_emu.index` ([`fresh_index`]; the journal
-/// and logs then go with the old one, the runtime is never swapped). An LZ4-packed game is
-/// edited too, but its pack files and `ampr_emu.index` stay byte for byte and nothing may
-/// appear at or under a packed path ([`Packs`]; the inner `Err` lists each offender); it gets
-/// no fresh index, and a `.pkg` rebuild of it leaves nothing out (the builder keeps a packed
-/// source's own index). `mtime` stamps a fresh index.
+/// Folds `req`'s edits over `tree`: an AMPR title whose file set changes gets a fresh index
+/// (the runtime never swapped); a packed game's packs stay byte for byte ([`Packs`]).
 pub(crate) fn fold(
     image: &Path,
     mut tree: Box<dyn SourceTree>,
@@ -759,7 +710,6 @@ pub(crate) fn fold(
     }
     let index = if let Some(packs) = &packs {
         // The runtime matches the index's records to the manifest's by file id: both stay.
-        // The runtime, journal and logs aren't looked up through the index.
         let listing = crate::lz4::plain_listing(edited.files(), RuntimeAction::Keep);
         let own = |p: &str| p == RUNTIME || p == JOURNAL || LOGS.contains(&p);
         let after = sizes(&listing);
@@ -784,8 +734,7 @@ pub(crate) fn fold(
     };
     let tree: Box<dyn SourceTree> = match index {
         Some(bytes) => {
-            // The journal's file ids, and the logs, follow the old index's record order: a
-            // fresh index takes them away, as a conversion does.
+            // The journal's file ids, and the logs, follow the old index's record order.
             let traces = |p: &str| p == JOURNAL || LOGS.contains(&p);
             let gone: Vec<String> = (edited.files().iter())
                 .filter(|f| traces(&f.path))
@@ -819,11 +768,10 @@ pub(crate) fn fold(
         }
         None => Box::new(edited),
     };
-    // Into a `.pkg` (a rebuild of one), an AMPR title's journal and logs always go, and its
-    // old index: the builder writes a fresh one from what it packages, as for a conversion.
-    // A packed game keeps all three: the builder keeps a packed source's own index.
-    let tree = if pkg && packs.is_none() {
-        for_pkg(tree, had_index, &mut notes)
+    // Into a `.pkg` the runtime always goes, and (unless packed) the journal, logs and old
+    // index: the builder indexes what it packages.
+    let tree = if pkg {
+        for_pkg(tree, had_index, packs.is_some(), &mut notes)
     } else {
         tree
     };
@@ -836,22 +784,26 @@ pub(crate) fn fold(
     }))
 }
 
-/// [`fold`]'s edited tree as a `.pkg` takes it: for an AMPR title (`eboot.bin` imports
-/// libSceAmpr, or the image held an index) what [`crate::lz4::leave_out_for_pkg`] leaves out,
-/// each noted.
+/// [`fold`]'s edited tree as a `.pkg` takes it ([`crate::lz4::leave_out_for_pkg`]), each noted.
 fn for_pkg(
     mut tree: Box<dyn SourceTree>,
     had_index: bool,
+    packed: bool,
     notes: &mut Vec<String>,
 ) -> Box<dyn SourceTree> {
     let ampr = crate::lz4::imports_ampr(tree.as_mut());
-    if !(ampr || had_index) {
-        return tree;
-    }
     let mut files = tree.files().to_vec();
     let before = files.len();
-    for path in crate::lz4::leave_out_for_pkg(&mut files, ampr) {
+    let runtime = files.iter().any(|f| f.path == RUNTIME);
+    let traces = !packed && (ampr || had_index);
+    for path in crate::lz4::leave_out_for_pkg(&mut files, ampr, traces) {
         notes.push(format!("LZ4: leaving out {path}"));
+    }
+    if runtime {
+        notes.push(format!(
+            "LZ4: leaving out {}: a .pkg carries no AMPR runtime, the console's loader provides it",
+            RUNTIME
+        ));
     }
     if files.len() == before {
         return tree;
@@ -859,14 +811,11 @@ fn for_pkg(
     crate::lz4::overlay(tree, files, HashMap::new())
 }
 
-/// What an edit of an LZ4-packed game must leave as it is. Only the packs themselves are
-/// locked: the runtime, the journal, logs, `eboot.bin` and every loose file may change (the
-/// runtime reads a loose file from the disk as it is).
+/// What an edit of a packed game must leave as it is: only the packs themselves.
 struct Packs {
     /// `LZ4` or `zstd`, for the findings.
     kind: &'static str,
-    /// The manifest, its two sidecars, every volume it names and `ampr_emu.index` (its records
-    /// match the manifest's by file id), each with its size in the source (`None`: absent).
+    /// Each locked file with its size in the source (`None`: absent).
     locked: Vec<(String, Option<u64>)>,
     /// Every packed record's path, ASCII lower-cased: the packs' own namespace.
     packed: HashSet<String>,
@@ -880,8 +829,7 @@ fn parents(path: &str) -> impl Iterator<Item = &str> {
 }
 
 impl Packs {
-    /// The packs of `tree`, which [`reader::detect`] found packed; a manifest that can't be
-    /// read is a finding.
+    /// A manifest that can't be read is a finding.
     fn of(tree: &mut dyn SourceTree) -> anyhow::Result<Result<Packs, Vec<String>>> {
         let size_of = |tree: &dyn SourceTree, path: &str| {
             (tree.files().iter())
@@ -924,9 +872,7 @@ impl Packs {
         }))
     }
 
-    /// The zstd packs of `tree`, which holds a root `ampr_zstd.index`: the index, every volume it
-    /// names and `ampr_emu.index` (it lists the packed files) are locked. An index that can't
-    /// be read is a finding.
+    /// The zstd index, its volumes and `ampr_emu.index` locked; an unreadable index is a finding.
     fn of_zstd(tree: &mut dyn SourceTree) -> anyhow::Result<Result<Packs, Vec<String>>> {
         use crate::zstd_pack::PACK_INDEX;
         // ponytail: the index is read whole; 256 MiB is about 8 million chunk records.
@@ -970,9 +916,8 @@ impl Packs {
         }))
     }
 
-    /// What the edits do to the packs, one line per offender: an op naming a locked file, a
-    /// locked file gone or resized (a folder deleted or renamed with it), and a file or empty
-    /// folder at or under a packed path (or a file at a folder of one).
+    /// One line per offender: an op naming a locked file, one gone or resized, and anything at
+    /// or under a packed path.
     fn findings(&self, edited: &Edited) -> Vec<String> {
         let locked = |p: &str| self.locked.iter().any(|(l, _)| l == p);
         let mut changed = BTreeSet::new();
@@ -1030,12 +975,8 @@ fn sizes(files: &[SourceFile]) -> BTreeSet<(String, u64)> {
     files.iter().map(|f| (f.path.clone(), f.size)).collect()
 }
 
-/// A fresh `ampr_emu.index` for an AMPR title (its `eboot.bin` imports libSceAmpr, or the
-/// image held an index) whose file set or a size the edits change (`before`: the image's,
-/// as [`crate::lz4::plain_listing`] lists it), unless its index already lists exactly the
-/// edited files; and always when an op touches the index itself (deletes, replaces or renames
-/// it: a replacement of the user's own is overwritten too). [`fold`] then removes the journal
-/// and logs; the runtime is never swapped.
+/// A fresh `ampr_emu.index` for an AMPR title whose (path, size) set the edits change, unless
+/// its index already lists exactly the edited files; always when an op touches the index.
 fn fresh_index(
     edited: &mut Edited,
     had_index: bool,
@@ -1083,8 +1024,6 @@ fn fresh_index(
 
 /// The edit job: scan, preflight, then [`apply`] and its check.
 pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
-    // A game folder is changed directly (`edit_folder`).
-    // A NAS or peer source goes to `scan`'s refusal unasked.
     if !crate::net::is_network(&req.source) && Kind::of(&req.source)? == Kind::Folder {
         return crate::edit_folder::run(req, ctx);
     }
@@ -1097,9 +1036,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     apply(planned, req.full_verify, ctx, &hooks)
 }
 
-/// What [`apply`] calls that a test replaces: the syncs, the journal's removal at commit
-/// ([`Applied::commit`], given syncs that leave the folder to [`Pending::commit`]) and a
-/// check after the verification.
+/// What [`apply`] calls that a test replaces.
 struct Hooks<'a> {
     sync: Syncs,
     keep: fn(Applied, Syncs) -> io::Result<()>,
@@ -1150,12 +1087,8 @@ fn plan_job(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<Planned> {
 /// What the job says when an applied edit is undone because of `e`.
 const NOT_VERIFIED: &str = "the edit did not verify; the image was restored";
 
-/// Writes the plan into the image and checks it. The expected tree is hashed first, from
-/// the image as it is and the host files (what `full` or a fast sample compares), so a
-/// write that damaged an untouched file is caught. Then the stamp and ShadowMount+ are
-/// checked again and `patch::apply` writes, the image is reopened by its reader and compared
-/// (plus `extra`, a test's own check), and the journal is committed. Any failure after the
-/// apply rolls the image back.
+/// The expected tree is hashed before the write, so one that damaged an untouched file is
+/// caught; the stamp and ShadowMount+ re-checked; any failure after the apply rolls back.
 fn apply(mut planned: Planned, full: bool, ctx: &Ctx, hooks: &Hooks) -> anyhow::Result<JobReport> {
     let sync = hooks.sync;
     let image = planned.image.clone();
@@ -1170,7 +1103,6 @@ fn apply(mut planned: Planned, full: bool, ctx: &Ctx, hooks: &Hooks) -> anyhow::
     };
     let checked = verify::summary(planned.expected.files(), mode).checked_bytes;
     let written = planned.writes.iter().map(|w| w.data.len()).sum::<u64>();
-    // Hashing, writing, reading back.
     ctx.expect_rest(checked.saturating_mul(2).saturating_add(written));
     ctx.progress("write", 0, 1);
     let expected = verify::expected_sampled(planned.expected.as_mut(), ctx, mode, "write")?;
@@ -1247,18 +1179,21 @@ fn apply(mut planned: Planned, full: bool, ctx: &Ctx, hooks: &Hooks) -> anyhow::
     pending.commit(&image)?;
     checks.push(format!("edited {} in place", image.display()));
     ctx.progress("finalize", 1, 1);
+    let summary = verify::summary(&expected.files, mode);
     Ok(JobReport {
         output: image.clone(),
         bytes: std::fs::metadata(&image).map_or(0, |m| m.len()),
         files: expected.files.len() as u64,
         checks,
-        verify: verify::summary(&expected.files, mode),
+        verify: summary,
+        source_bytes: summary.total_bytes,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
-/// An applied edit not yet kept: dropped without [`Pending::commit`] (an error or a panic on
-/// the way) it rolls the image back, so the image is restored before the job ends and its
-/// paths are released. (On the PS5 a panic aborts; the next edit's `recover` restores it.)
+/// Dropped without [`Pending::commit`] it rolls the image back before the job's paths are
+/// released. (On the PS5 a panic aborts; the next edit's `recover` restores it.)
 struct Pending {
     applied: Option<Applied>,
     sync: Syncs,
@@ -1271,9 +1206,8 @@ impl Pending {
         applied.rollback(self.sync)
     }
 
-    /// Keeps the edit: the undo journal is deleted, then its folder synced. A journal that
-    /// can't be deleted is still complete, so the image is restored from it; a failed sync
-    /// after the delete can't be undone, and says the image holds the edit.
+    /// A journal that can't be deleted is still complete, so the image is restored from it; a
+    /// failed sync after the delete can't be undone and says the image holds the edit.
     fn commit(mut self, image: &Path) -> anyhow::Result<()> {
         let applied = self.applied.take().expect("taken only once");
         let sync = self.sync;
@@ -1302,8 +1236,7 @@ impl Pending {
     }
 }
 
-/// The folder holding `image` (and its journal); `.` for a bare file name, whose parent is
-/// empty (as the patch crate's own folder sync takes it).
+/// The folder holding `image`; `.` for a bare file name.
 fn folder_of(image: &Path) -> &Path {
     match image.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -1319,8 +1252,7 @@ impl Drop for Pending {
     }
 }
 
-/// The host files an apply copies ([`Data::Source`] ids index `files`), each checked to be the
-/// file the edit was planned with (identity, size, modification time) before it is read.
+/// Each host file checked to be the one planned with (identity, size, mtime) before a read.
 struct Hosts<'a> {
     files: &'a [HostFile],
     open: Option<(u32, Opened)>,

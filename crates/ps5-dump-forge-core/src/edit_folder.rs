@@ -1,13 +1,6 @@
-//! An edit of a plain game folder (a request with [`ConvertRequest::edits`] whose source is a
-//! folder), applied straight into it by the user's explicit request (an exception to "never
-//! touch the source", like the LZ4 folder patch). Every check runs before the first change:
-//! the edits folded over the scanned folder ([`crate::edit_job::fold`], its AMPR index rule
-//! included), the checks a conversion runs on the edited tree, the names a folder can hold and
-//! free space for the added bytes. Then each op in order: a delete (`remove_file` /
-//! `remove_dir_all`, never following a link), a rename ([`rename_no_replace`]), a new folder,
-//! an add (each file through an exclusive temporary name beside its target, synced, renamed
-//! over it). Verify re-reads every added file against what was copied, and the folder against
-//! the planned listing; the touched folders are synced last.
+//! An edit of a plain game folder, applied straight into it. Every check runs before the first
+//! change; then each op in order (links never followed, adds through an exclusive temporary
+//! name, synced, renamed over); verify re-reads the added files and the planned listing.
 // ponytail: no rollback for a folder: a failure part way leaves the earlier ops applied and says
 // which; each file write itself is atomic (a temporary name renamed over the target).
 
@@ -34,18 +27,14 @@ use crate::{ConvertRequest, EditCheck, JobReport, VerifyMode, VerifySummary};
 
 /// Room beyond the added bytes the folder must have: what the filesystem spends on them.
 const MARGIN: u64 = 1 << 20;
-/// One read of a copy or of the check.
 const CHUNK: usize = 1 << 20;
 
-/// A folder edit, checked: nothing changed yet.
 pub(crate) struct Planned {
-    /// The game folder, canonical (as the scan resolved it).
     root: PathBuf,
     /// What `root` named when it was planned (a link put there since is never followed).
     root_id: FileId,
-    /// The ops in order, the fresh `ampr_emu.index` last when there is one.
+    /// The fresh `ampr_emu.index` last when there is one.
     ops: Vec<Op>,
-    /// The host files `Data::Source` ids name (by index).
     hosts: Vec<HostFile>,
     /// What the folder must list once edited: every (path, size) and the empty folders.
     files: Vec<(String, u64)>,
@@ -64,16 +53,13 @@ impl Planned {
     }
 }
 
-/// The job's timestamp in whole seconds, for a fresh `ampr_emu.index`.
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// Every check of a folder edit, changing nothing (on the PS5 the destination probe writes and
-/// deletes its own probe file, as every write there does first). The inner `Err` lists every
-/// finding; the outer one is a cancel or an error reading the folder.
+/// Every check of a folder edit, changing nothing (on the PS5 but the destination probe's file).
 pub(crate) fn plan(
     req: &ConvertRequest,
     cancel: &AtomicBool,
@@ -107,7 +93,6 @@ pub(crate) fn plan(
     };
     findings.extend(folded);
     findings.extend(skipped_names(&ops));
-    // The checks a conversion runs, on the edited tree: the game root, depth, names.
     let (_, input) = preflight::input(expected.as_mut());
     findings.extend(input);
     findings.extend(preflight::too_deep(expected.as_ref()));
@@ -168,8 +153,7 @@ pub(crate) fn plan(
     }))
 }
 
-/// Why an `Add.from` can't be copied into the game folder at `root`: it is inside it, or holds
-/// it (compared by identity). A missing or linked `from` is left to [`crate::edit::Edited`].
+/// An `Add.from` inside the game folder, or holding it (by identity), is refused.
 fn host_findings(root: &Path, edits: &[crate::Edit]) -> Vec<String> {
     let Ok(game) = followed_id(root) else {
         return Vec::new();
@@ -202,8 +186,7 @@ fn host_findings(root: &Path, edits: &[crate::Edit]) -> Vec<String> {
     findings
 }
 
-/// The new names a folder scan would skip (junk such as `.DS_Store`): written, they would
-/// never read back as part of the game.
+/// New names a folder scan would skip (junk such as `.DS_Store`): they'd never read back.
 fn skipped_names(ops: &[Op]) -> Vec<String> {
     let mut findings: Vec<String> = new_paths(ops)
         .filter_map(|path| {
@@ -217,7 +200,6 @@ fn skipped_names(ops: &[Op]) -> Vec<String> {
     findings
 }
 
-/// Every path an op makes (a file, a folder, a rename's target).
 fn new_paths(ops: &[Op]) -> impl Iterator<Item = &String> {
     ops.iter().filter_map(|op| match op {
         Op::Put { path, .. } | Op::Mkdir { path } => Some(path),
@@ -226,7 +208,6 @@ fn new_paths(ops: &[Op]) -> impl Iterator<Item = &String> {
     })
 }
 
-/// One op, as the log and a failure name it.
 fn label(op: &Op) -> String {
     match op {
         Op::Delete { path } => format!("deleted {path}"),
@@ -236,8 +217,7 @@ fn label(op: &Op) -> String {
     }
 }
 
-/// [`crate::Jobs::edit_check`] for a folder: it is always changed directly, so only the
-/// in-place list can hold findings, and no sizes are given.
+/// [`crate::Jobs::edit_check`] for a folder: findings in the in-place list only, no sizes.
 pub(crate) fn check(req: &ConvertRequest) -> EditCheck {
     let cancel = AtomicBool::new(false);
     let in_place = match plan(req, &cancel) {
@@ -251,7 +231,6 @@ pub(crate) fn check(req: &ConvertRequest) -> EditCheck {
     }
 }
 
-/// The folder edit job: scan + preflight ([`plan`]), the ops, their check, the folder syncs.
 pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     ctx.stages(&STAGES);
     ctx.progress("scan", 0, 1);
@@ -273,7 +252,6 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     ));
     ctx.progress("preflight", 1, 1);
     ctx.check()?;
-    // Writing, then reading back what was written.
     ctx.expect_rest(written.saturating_mul(2));
     let mut work = Work {
         root: &planned.root,
@@ -346,11 +324,13 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             samples: 0,
             seed: 0,
         },
+        source_bytes: written,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
-/// The ops being applied, and what they left: each added file's final path with its length
-/// and the hash of what was copied, and the folders whose entries changed.
+/// The ops being applied, and what they left (added files' hashes, changed folders).
 struct Work<'a> {
     root: &'a Path,
     root_id: FileId,
@@ -359,16 +339,12 @@ struct Work<'a> {
     partly: bool,
     hosts: &'a [HostFile],
     ctx: &'a Ctx<'a>,
-    /// Bytes written so far, of `total`.
     done: u64,
     total: u64,
     added: BTreeMap<String, (u64, blake3::Hash)>,
     touched: BTreeSet<PathBuf>,
-    /// Folders' exact entry names by folder identity (one folder may be spelled two ways on
-    /// a volume that folds case), listed once when a replace first asks ([`Self::spelled`])
-    /// and kept as the ops add and remove names; a listing is dropped (listed again) when a
-    /// change leaves it unsure: a removed name it doesn't hold, or an added non-ASCII one the
-    /// volume may store normalized otherwise.
+    /// Folders' exact entry names by folder identity (a case-folding volume spells one folder
+    /// two ways), kept as ops add and remove names; dropped when a change leaves it unsure.
     names: HashMap<FileId, HashSet<OsString>>,
 }
 
@@ -429,8 +405,7 @@ impl Work<'_> {
         Ok(())
     }
 
-    /// `rel` in the game folder, every folder on the way checked to be a real folder (never a
-    /// link) or not there yet.
+    /// `rel` in the game folder, every folder on the way a real folder (never a link) or absent.
     fn under(&self, rel: &str) -> anyhow::Result<PathBuf> {
         let mut at = self.root.to_path_buf();
         let mut parts = rel.split('/').peekable();
@@ -469,7 +444,6 @@ impl Work<'_> {
         Ok(())
     }
 
-    /// Adds or replaces file `rel` through a temporary name beside it.
     fn put(&mut self, rel: &str, len: u64, data: &Data) -> anyhow::Result<()> {
         let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
         if !dir.is_empty() {
@@ -559,7 +533,6 @@ impl Work<'_> {
         Ok(found)
     }
 
-    /// `path` was made: its name joins its folder's listed names.
     fn came(&mut self, path: &Path) {
         let Some((id, name)) = self.listed(path) else {
             return;
@@ -571,8 +544,7 @@ impl Work<'_> {
         }
     }
 
-    /// `path` went (deleted, or renamed away): its name leaves its folder's listed names. A
-    /// deleted folder drops every listing (its folders' ids may be reused).
+    /// A deleted folder drops every listing (its folders' ids may be reused).
     fn gone(&mut self, path: &Path, deleted_dir: bool) {
         if deleted_dir {
             self.names.clear();
@@ -583,8 +555,7 @@ impl Work<'_> {
         }
     }
 
-    /// The identity of `path`'s folder when it is listed, with `path`'s name; every listing
-    /// is dropped when the folder can't be told.
+    /// Every listing is dropped when the folder can't be told.
     fn listed(&mut self, path: &Path) -> Option<(FileId, OsString)> {
         let id = path.parent().and_then(|dir| path_id(dir).ok());
         let (Some((id, _)), Some(name)) = (id, path.file_name()) else {
@@ -596,7 +567,6 @@ impl Work<'_> {
             .then(|| (id, name.to_os_string()))
     }
 
-    /// Records that `path`'s folder changed.
     fn touch(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.touched.insert(parent.to_path_buf());
@@ -635,8 +605,7 @@ impl Work<'_> {
         fsync_dir(&root).with_context(|| format!("syncing {}", root.display()))
     }
 
-    /// Every added file re-read against what was copied, then the folder against the planned
-    /// listing. A failure leaves the changes applied (there is no rollback) and says so.
+    /// A failure leaves the changes applied (there is no rollback) and says so.
     fn verify(&mut self, planned: &Planned) -> anyhow::Result<Vec<String>> {
         let ctx = self.ctx;
         let failed =
@@ -725,21 +694,21 @@ fn spelled(folder: &Path, name: &str) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-/// Renames `from` to another case of its own name through a temporary name: FreeBSD's and
-/// Linux's rename of a file onto itself succeeds and changes nothing. Put back if the second
-/// step fails.
+/// Through a temporary name: FreeBSD's and Linux's rename onto itself changes nothing.
 fn recase(from: &Path, to: &Path) -> std::io::Result<()> {
     let name = from.file_name().unwrap_or_default().to_string_lossy();
     let tmp = from.with_file_name(crate::temp_file::temp_name(&name));
     crate::finalize::rename_no_replace(from, &tmp)?;
-    crate::finalize::rename_no_replace(&tmp, to).inspect_err(|_| {
-        let _ = crate::finalize::rename_no_replace(&tmp, from);
+    crate::finalize::rename_no_replace(&tmp, to).map_err(|e| {
+        match crate::finalize::rename_no_replace(&tmp, from) {
+            Ok(()) => e,
+            Err(_) => std::io::Error::new(e.kind(), format!("{e}; it is at {}", tmp.display())),
+        }
     })
 }
 
-/// A case-only rename on a case-insensitive volume, where the no-replace rename finds `from`
-/// itself at `to` (`delete::move_`'s rule): the same file at both names, one folder, no entry
-/// spelled `to`.
+/// A case-only rename on a case-insensitive volume: the same file at both names, no entry
+/// spelled `to` (`delete::move_`'s rule).
 fn recased(from: &Path, to: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -781,9 +750,7 @@ fn push(at: &mut PathBuf, part: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Copies `len` bytes at `offset` of host file `host` into `emit`, which takes each chunk;
-/// `host` must still be the file the edit was planned with (identity, size, modification
-/// time), before and after.
+/// `host` must still be the file planned with (identity, size, mtime), before and after.
 fn copy_host(
     host: &HostFile,
     offset: u64,

@@ -8,8 +8,7 @@ use std::thread::JoinHandle;
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 use ps5upload_fpkg::{Error, Result};
 
-/// Only ranges up to this size are read ahead; with the one the writer holds, at most twice
-/// this is in memory.
+/// Only ranges up to this size are read ahead (at most twice this in memory).
 const AHEAD_MAX: usize = 8 << 20;
 
 enum Ask {
@@ -25,22 +24,13 @@ struct Ahead {
     got: Result<Vec<u8>>,
 }
 
-/// A source whose reads run on a worker thread. After serving `read_range(path, offset, len)`
-/// with `n` bytes the worker reads `(path, offset + n, len)` before the writer asks for it.
-/// Any other request drops that guess, so the bytes served are always those a direct read
-/// would give; a failed guess fails only the request that asks for that range.
-///
-/// With a `window` ([`Prefetch::with_window`]) each guess reads at least `window` bytes and
-/// the writer's side keeps what the request did not take, serving the next requests of that
-/// range from it while the worker reads the window after it. In memory then: the window held,
-/// the one read ahead and the answer in flight, about three windows (12 MiB at 4 MiB).
-///
-/// The writer still checks its cancel flag between reads. Dropping this waits for the worker,
-/// so a read already in a syscall finishes first.
-///
-/// With [`Prefetch::sequential`] a range that ends its file is followed by the first `chunk`
-/// bytes of the next non-empty file of `files()`: for a writer that reads the files in that
-/// order (the folder writer), so an archive's decoder runs on across the file boundary.
+/// A source whose reads run on a worker thread: after serving `(path, offset, len)` with `n`
+/// bytes the worker reads `(path, offset + n, len)`. Any other request drops that guess, so the
+/// bytes served are a direct read's; a failed guess fails only a request for that range.
+/// With a `window` each guess reads at least `window` bytes and the rest serves the next
+/// requests (about three windows in memory). Dropping this waits for the worker.
+/// With [`Prefetch::sequential`] a range that ends its file is followed by the next non-empty
+/// file's first `chunk` bytes (the folder writer's order), so an archive's decoder runs on.
 // ponytail: the image, `.pkg` and LZ4 writers read in their own orders, so for them the next
 // file is not read ahead. Upgrade: let each writer name its order.
 pub(crate) struct Prefetch {
@@ -61,15 +51,13 @@ impl Prefetch {
         Self::start(tree, 0, None)
     }
 
-    /// Also reads the next file ahead; only for a writer that reads `files()` in order, each
-    /// front to back in reads of `chunk` bytes at most (else a wrong guess costs a read, and an
-    /// archive a restart).
+    /// Also reads the next file ahead: only for a writer reading `files()` in order, front to
+    /// back in reads of `chunk` bytes at most.
     pub(crate) fn sequential(tree: Box<dyn SourceTree>, chunk: usize) -> std::io::Result<Self> {
         Self::start(tree, 0, Some(chunk))
     }
 
-    /// Reads ahead at least `window` bytes at a time: for a source that pays per read (a
-    /// `.pkg`'s decode threads) and a writer that asks for less.
+    /// Reads ahead at least `window` bytes at a time (a `.pkg`'s decode threads pay per read).
     pub(crate) fn with_window(tree: Box<dyn SourceTree>, window: usize) -> std::io::Result<Self> {
         Self::start(tree, window, None)
     }
@@ -111,8 +99,7 @@ impl Prefetch {
         {
             return answer;
         }
-        // The worker is gone: only a panic in the source ends it early. Rethrow it here, so
-        // the job's `catch_unwind` sees it as it would without read-ahead.
+        // The worker ends early only on a panic in the source: rethrow it for `catch_unwind`.
         if let Some(Err(panic)) = self.worker.take().map(JoinHandle::join) {
             std::panic::resume_unwind(panic);
         }
@@ -150,9 +137,8 @@ fn serve(
             Ask::Whole(path) => (tree.read(&path), None),
             Ask::Range(path, offset, len) => {
                 let answer = match ahead.take() {
-                    // A prefix of a longer read at the same offset is what a read of `len` gives.
-                    // With a window the writer's side keeps the rest, and a window that failed
-                    // is no answer for the shorter range asked: that range is read itself.
+                    // A prefix of a longer read at the same offset is what a read of `len` gives;
+                    // a failed window is no answer for the shorter range: that is read itself.
                     Some(a) if a.path == path && a.offset == offset && len <= a.len => {
                         match a.got {
                             Err(_) if window > 0 && len < a.len => {
@@ -251,8 +237,7 @@ mod tests {
     /// What the inner tree was asked, in order: (path, offset, len).
     type Log = Arc<Mutex<Vec<(String, u64, usize)>>>;
 
-    /// An in-memory tree that logs its range reads, fails at `bad` offsets, can be held at a
-    /// gate, and says when it is dropped.
+    /// An in-memory tree that logs reads, fails at `bad` offsets, can be gated, notes its drop.
     struct Mem {
         files: Vec<SourceFile>,
         data: Vec<Vec<u8>>,

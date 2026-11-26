@@ -23,25 +23,21 @@ const PENDING: u32 = 0x0000_0103;
 const NO_MORE_FILES: u32 = 0x8000_0006;
 const END_OF_FILE: u32 = 0xC000_0011;
 const BUFFER_OVERFLOW: u32 = 0x8000_0005;
-/// The largest read or write asked for at once (multi-credit, SMB 2.1's large MTU).
+/// The largest read or write at once (multi-credit, SMB 2.1's large MTU).
 const READ_MAX: usize = 1 << 20;
 
-/// How [`Conn::open`] opens a path.
+/// How [`Conn::create`] opens a path; `Delete`/`DeleteDir` delete when closed.
 #[derive(Clone, Copy)]
 pub(crate) enum Open {
-    /// An existing file, folder or (`pipe`) named pipe, for reading.
     Read { pipe: bool },
-    /// A new file for writing (never over one: `AlreadyExists`); also renamable.
     NewFile,
-    /// A new folder.
     NewDir,
-    /// An existing file or folder, to be renamed.
     Rename,
-    /// An existing file, deleted when closed.
     Delete,
+    DeleteDir,
 }
 
-/// A request: command, tree and the body after the 64-byte header.
+/// The body is what follows the 64-byte header.
 pub(crate) struct Req {
     cmd: u16,
     tree: u32,
@@ -52,7 +48,7 @@ pub(crate) struct Req {
 pub(crate) struct Resp {
     pub status: u32,
     pub head: Vec<u8>,
-    /// The whole message, header included (offsets in bodies count from the header).
+    /// Header included: offsets in bodies count from the header.
     pub msg: Vec<u8>,
 }
 
@@ -77,8 +73,7 @@ impl Resp {
             .get(off..off.saturating_add(len))
             .ok_or_else(|| bad("a short reply"))
     }
-    /// `len` bytes at the server's offset `off`, which must point past the reply's fixed part
-    /// (`fixed` bytes after the header): never the header's own bytes taken as data.
+    /// `len` bytes at the server's offset `off`, which must point past the reply's fixed part.
     fn data(&self, off: usize, len: usize, fixed: usize) -> io::Result<&[u8]> {
         if len == 0 {
             return Ok(&[]);
@@ -90,8 +85,7 @@ impl Resp {
     }
 }
 
-/// Replies skipped while one request waits (interim `STATUS_PENDING` ones, late ones for a
-/// request given up on): a server that sends nothing else can't hold a job forever.
+/// Replies skipped while one request waits (interim or late ones), so none holds a job forever.
 const MAX_SKIPPED: usize = 64;
 
 impl Req {
@@ -120,7 +114,6 @@ pub(crate) struct Conn {
     sign_required: bool,
 }
 
-/// A WRITE reply's count of `len` bytes sent: none, or more than were sent, is a bad reply.
 fn written(n: usize, len: usize) -> io::Result<usize> {
     match n {
         0 => Err(bad("a WRITE that wrote nothing")),
@@ -133,7 +126,6 @@ fn bad(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("SMB: {what}"))
 }
 
-/// An NT status as an error.
 pub(crate) fn status_error(status: u32, what: &str) -> io::Error {
     use io::ErrorKind::*;
     let (kind, text) = match status {
@@ -149,6 +141,7 @@ pub(crate) fn status_error(status: u32, what: &str) -> io::Error {
         0xC000_0043 => (ResourceBusy, "in use"),
         0xC000_0101 => (DirectoryNotEmpty, "the folder isn't empty"),
         0xC000_00BA => (IsADirectory, "a folder"),
+        0xC000_0103 => (NotADirectory, "not a folder"),
         _ => (Other, "failed"),
     };
     io::Error::new(kind, format!("{what}: {text} (NT status 0x{status:08X})"))
@@ -170,7 +163,6 @@ impl Conn {
         }
     }
 
-    /// Sends one request and waits for its final reply (interim `STATUS_PENDING` replies skipped).
     pub(crate) fn send(&mut self, r: Req) -> io::Result<Resp> {
         let charge = if self.dialect >= 0x0210 {
             r.charge.max(1)
@@ -209,16 +201,14 @@ impl Conn {
             let mut n = [0u8; 4];
             self.tcp.read_exact(&mut n)?;
             let len = (u32::from_be_bytes(n) & 0x00FF_FFFF) as usize;
-            // Grown as bytes arrive (a large read's size reserved): a length alone allocates
-            // little, so a server that names 16 MiB and stalls costs no 16 MiB.
+            // Grown as bytes arrive: a server naming 16 MiB and stalling costs no 16 MiB.
             let mut msg = Vec::with_capacity(len.min(2 << 20));
             (&mut self.tcp).take(len as u64).read_to_end(&mut msg)?;
             if msg.len() != len {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
             if len < 64 || &msg[..4] != b"\xFESMB" {
-                // Out of step (a reply cut short by a timeout): a connection-level error, so
-                // the session cache logs in afresh instead of keeping this conn.
+                // Out of step: a connection-level error, so the session cache logs in afresh.
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "SMB: not an SMB2 reply",
@@ -230,7 +220,6 @@ impl Conn {
             let flags = u32::from_le_bytes(msg[16..20].try_into().unwrap());
             let mid = u64::from_le_bytes(msg[24..32].try_into().unwrap());
             if status == PENDING && flags & 2 != 0 || mid != id {
-                // An interim reply, or one for a request we gave up on.
                 skipped += 1;
                 if skipped > MAX_SKIPPED {
                     return Err(io::Error::new(
@@ -279,7 +268,6 @@ impl Conn {
         Ok(())
     }
 
-    /// NEGOTIATE offering dialects 2.0.2 and 2.1.
     pub(crate) fn negotiate_req() -> io::Result<Req> {
         let mut b = Vec::new();
         b.extend_from_slice(&36u16.to_le_bytes());
@@ -360,7 +348,6 @@ fn filetime_to_unix(ft: u64) -> i64 {
 }
 
 impl Conn {
-    /// Opens `name` as `how` says; its id and what it is.
     pub(crate) fn create(
         &mut self,
         tree: u32,
@@ -368,18 +355,16 @@ impl Conn {
         how: Open,
     ) -> io::Result<([u8; 16], Entry)> {
         let name16 = ntlm::utf16(name);
-        // READ_DATA/LIST_DIRECTORY | READ_EA | READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
-        // writing adds WRITE_DATA | APPEND_DATA | WRITE_EA | WRITE_ATTRIBUTES, renaming and
-        // deleting DELETE. Dispositions: FILE_OPEN 1, FILE_CREATE 2 (never over anything).
-        // Options: FILE_DIRECTORY_FILE 1, FILE_NON_DIRECTORY_FILE 0x40, FILE_DELETE_ON_CLOSE
-        // 0x1000.
+        // Dispositions FILE_OPEN 1, FILE_CREATE 2. Options: DIRECTORY 1, NON_DIRECTORY 0x40,
+        // DELETE_ON_CLOSE 0x1000, OPEN_REPARSE_POINT 0x20_0000 (a delete removes a link itself).
         let (access, disposition, options): (u32, u32, u32) = match how {
             Open::Read { pipe: true } => (0x0012_019F, 1, 0),
             Open::Read { pipe: false } => (0x0012_0089, 1, 0),
             Open::NewFile => (0x0013_019F, 2, 0x40),
             Open::NewDir => (0x0012_0089, 2, 1),
             Open::Rename => (0x0011_0080, 1, 0),
-            Open::Delete => (0x0011_0080, 1, 0x1040),
+            Open::Delete => (0x0011_0080, 1, 0x0020_1040),
+            Open::DeleteDir => (0x0011_0080, 1, 0x0020_1001),
         };
         let mut b = vec![57, 0, 0, 0];
         b.extend_from_slice(&2u32.to_le_bytes()); // impersonation
@@ -413,11 +398,12 @@ impl Conn {
             dir: r.u32(56) & 0x10 != 0,
             size: r.u64(48),
             mtime: filetime_to_unix(r.u64(24)),
+            link: r.u32(56) & REPARSE_POINT != 0,
         };
         Ok((r.bytes(64 + 64, 16)?.try_into().unwrap(), e))
     }
 
-    /// One batch of a folder's entries (FileDirectoryInformation); `None` once there are no more.
+    /// One batch of FileDirectoryInformation; `None` once there are no more.
     pub(crate) fn query_dir(
         &mut self,
         tree: u32,
@@ -468,6 +454,7 @@ impl Conn {
                 dir: u32at(56) & 0x10 != 0,
                 size: u64at(40),
                 mtime: filetime_to_unix(u64at(24)),
+                link: u32at(56) & REPARSE_POINT != 0,
             });
             if next == 0 {
                 break;
@@ -481,7 +468,6 @@ impl Conn {
         Ok(Some(out))
     }
 
-    /// One READ at `offset` into the front of `buf`; the bytes read, 0 at the end.
     pub(crate) fn read(
         &mut self,
         tree: u32,
@@ -521,7 +507,6 @@ impl Conn {
         Ok(n)
     }
 
-    /// One WRITE of the front of `bytes` at `offset`; the bytes written.
     pub(crate) fn write(
         &mut self,
         tree: u32,
@@ -553,7 +538,6 @@ impl Conn {
         written(r.u32(4) as usize, len)
     }
 
-    /// FLUSH: what was written reaches the server's disk.
     pub(crate) fn flush(&mut self, tree: u32, id: &[u8; 16]) -> io::Result<()> {
         let mut b = vec![24, 0, 0, 0, 0, 0, 0, 0];
         b.extend_from_slice(id);
@@ -569,8 +553,7 @@ impl Conn {
         }
     }
 
-    /// Renames an open file or folder to `to` (a share path, `\`-separated), replacing a file
-    /// there only when `replace` (FileRenameInformation's ReplaceIfExists).
+    /// `to` a `\`-separated share path; `replace` is FileRenameInformation's ReplaceIfExists.
     pub(crate) fn rename(
         &mut self,
         tree: u32,
@@ -608,8 +591,7 @@ impl Conn {
             .status)
     }
 
-    /// Bytes this user may still write on the volume holding the open `id`
-    /// (FileFsFullSizeInformation's caller-available units).
+    /// FileFsFullSizeInformation's caller-available bytes.
     pub(crate) fn free_space(&mut self, tree: u32, id: &[u8; 16]) -> io::Result<u64> {
         let mut b = vec![41, 0, 2, 7]; // SMB2_0_INFO_FILESYSTEM, FileFsFullSizeInformation
         b.extend_from_slice(&64u32.to_le_bytes()); // output buffer length
@@ -642,7 +624,6 @@ impl Conn {
         Ok(units.saturating_mul(unit))
     }
 
-    /// FSCTL `code` on an open file (a pipe transceive for RPC); the output.
     pub(crate) fn ioctl(
         &mut self,
         tree: u32,
@@ -674,6 +655,9 @@ impl Conn {
         Ok(r.data(r.u32(32) as usize, r.u32(36) as usize, 48)?.to_vec())
     }
 }
+
+/// FILE_ATTRIBUTE_REPARSE_POINT (a server following links itself shows the target instead).
+const REPARSE_POINT: u32 = 0x400;
 
 #[cfg(test)]
 mod tests {

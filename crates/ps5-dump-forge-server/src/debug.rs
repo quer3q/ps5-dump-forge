@@ -1,13 +1,9 @@
-//! `POST /api/debug {path}`: what the platform's file calls return for `path`, raw and as std
-//! decodes them; `GET /probe`, the input probe page, which `POST`s each event it sees to
-//! `/api/debug_input` (read back with `GET /api/debug_input`). Only in builds made with
-//! `FORGE_DEBUG_API` set, to any value (`FORGE_DEBUG_API=1 ps5/build.sh`), for bringing up the
-//! PS5 payload; release builds have none of these routes.
+//! Bring-up routes, only with `FORGE_DEBUG_API` set: `POST /api/debug {path}` (the file calls'
+//! raw and std results), `GET /probe` and `/api/debug_input` (the input probe).
 
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::time::Instant;
+use std::io;
 
 use serde_json::{Value, json};
 
@@ -42,85 +38,6 @@ pub(crate) fn probe(path: &str) -> Value {
         "std_read_dir": listed,
         "raw": raw::probe(path),
     })
-}
-
-/// `POST /api/debug_bench {source, dir, mib}`: the drive's ceiling next to the reader's pattern.
-/// Reads `source` at 10/20/30 GiB in (far from what a job read last, so not cached), writes and
-/// removes two scratch files in `dir`.
-pub(crate) fn bench(source: &str, dir: &str, mib: u64) -> Value {
-    let run = || -> io::Result<Value> {
-        let bytes = mib << 20;
-        let rate = |b: u64, t: Instant| {
-            json!({ "mib": b >> 20, "secs": t.elapsed().as_secs_f64(),
-            "mb_per_s": b as f64 / t.elapsed().as_secs_f64() / 1e6 })
-        };
-        let mut src = fs::File::open(source)?;
-        // One 8 MiB read at a time.
-        let mut big = vec![0u8; 8 << 20];
-        src.seek(SeekFrom::Start(10 << 30))?;
-        let t = Instant::now();
-        for _ in 0..bytes / big.len() as u64 {
-            src.read_exact(&mut big)?;
-        }
-        let sequential_8m = rate(bytes, t);
-        // The UFS2 reader today: per 64 KiB block, two 8-byte pointer reads, then the block,
-        // each after a seek.
-        let mut block = vec![0u8; 64 << 10];
-        let mut ptr = [0u8; 8];
-        let base = 20u64 << 30;
-        let t = Instant::now();
-        for i in 0..bytes / block.len() as u64 {
-            for _ in 0..2 {
-                src.seek(SeekFrom::Start(4096 + (i % 512) * 8))?;
-                src.read_exact(&mut ptr)?;
-            }
-            src.seek(SeekFrom::Start(base + i * block.len() as u64))?;
-            src.read_exact(&mut block)?;
-        }
-        let reader_pattern = rate(bytes, t);
-        // 64 KiB blocks, one seek each, no pointer reads.
-        let base = 30u64 << 30;
-        let t = Instant::now();
-        for i in 0..bytes / block.len() as u64 {
-            src.seek(SeekFrom::Start(base + i * block.len() as u64))?;
-            src.read_exact(&mut block)?;
-        }
-        let blocks_64k = rate(bytes, t);
-        let write = |sync_every: Option<u64>| -> io::Result<Value> {
-            let path =
-                std::path::Path::new(dir).join(format!("forge-bench-{}.part", std::process::id()));
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            let t = Instant::now();
-            let mut since = 0;
-            for _ in 0..bytes / big.len() as u64 {
-                f.write_all(&big)?;
-                since += big.len() as u64;
-                if sync_every.is_some_and(|n| since >= n) {
-                    f.sync_all()?;
-                    since = 0;
-                }
-            }
-            let before_sync = t.elapsed().as_secs_f64();
-            f.sync_all()?;
-            let mut r = rate(bytes, t);
-            r["secs_before_final_sync"] = json!(before_sync);
-            drop(f);
-            fs::remove_file(&path)?;
-            Ok(r)
-        };
-        Ok(json!({
-            "read_sequential_8m": sequential_8m,
-            "read_reader_pattern": reader_pattern,
-            "read_64k_blocks": blocks_64k,
-            "write_8m_no_sync": write(None)?,
-            "write_8m_sync_64m": write(Some(64 << 20))?,
-            "write_8m_sync_256m": write(Some(256 << 20))?,
-        }))
-    };
-    run().unwrap_or_else(|e| json!({ "error": e.to_string() }))
 }
 
 fn mode(m: &fs::Metadata) -> u32 {
@@ -213,10 +130,7 @@ mod raw {
     }
 }
 
-/// `GET /probe`: a page of its own (no app, never cached: the manifest's `NETWORK: *`) that
-/// shows every input event the console's browser gives it, and `POST`s each line to
-/// `/api/debug_input`, read back with `GET /api/debug_input`, to learn what the PS5 browser
-/// makes of the controller (L2/R2, sent as F7/F8, for shoulders.ts).
+/// Every input event the console's browser gives it, each `POST`ed to `/api/debug_input`.
 pub(crate) const PROBE_PAGE: &[u8] = br##"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Forge input probe</title>
@@ -280,7 +194,7 @@ requestAnimationFrame(poll);
 
 static INPUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// One probe line (at most 1 KiB), the last 500 kept.
+/// At most 1 KiB, the last 500 kept.
 pub(crate) fn input_push(body: &[u8]) {
     let line = String::from_utf8_lossy(&body[..body.len().min(1024)]).into_owned();
     let mut all = INPUT.lock().unwrap_or_else(|e| e.into_inner());

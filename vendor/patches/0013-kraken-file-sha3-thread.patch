@@ -1,0 +1,173 @@
+diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
+index d0443f92e45ef12c08af3550e3f40c50458874a2..32c4a817c0de1328a8c9d5a3f32dde36dab1dfc5 100644
+--- a/ps5upload-fpkg/src/kraken_image.rs
++++ b/ps5upload-fpkg/src/kraken_image.rs
+@@ -222,6 +222,34 @@ fn pipeline_local<T: Send, U: Send>(
+     })
+ }
+ 
++/// Blocks queued for [`hash_files`]: at most 32 × 256 KiB in memory.
++const HASH_DEPTH: usize = 32;
++
++/// Each file's SHA3 from its blocks, `(afid, block, bytes of it that are the file's)`, which
++/// arrive file by file in order (a file's blocks are consecutive).
++fn hash_files(
++    blocks: std::sync::mpsc::Receiver<(usize, Vec<u8>, usize)>,
++    files: usize,
++) -> Vec<[u8; 32]> {
++    let mut digests = vec![[0u8; 32]; files];
++    let mut open: Option<(usize, Hasher)> = None;
++    for (afid, bytes, real) in blocks {
++        if open.as_ref().is_none_or(|(a, _)| *a != afid) {
++            if let Some((a, h)) = open.take() {
++                digests[a] = h.finish();
++            }
++            open = Some((afid, Hasher::new()));
++        }
++        if let Some((_, h)) = open.as_mut() {
++            h.update(&bytes[..real]);
++        }
++    }
++    if let Some((a, h)) = open.take() {
++        digests[a] = h.finish();
++    }
++    digests
++}
++
+ /// Compress the image described by `plan` into `spool` from byte `base` on. `read` fetches a byte range of a source
+ /// file, `metadata` is the metadata region's logical bytes and `keystone` the generated one.
+ #[allow(clippy::too_many_arguments)]
+@@ -250,11 +278,17 @@ pub fn compress(
+     let mut blocks: Vec<StoredBlock> = Vec::new();
+     let mut cursor = 0u64;
+     let files = plan.afid_order.len();
+-    let mut file_digests = vec![[0u8; 32]; files];
+     let mut file_stored_at = vec![0u64; files];
+-    let mut open: Option<(usize, Hasher)> = None;
++    let mut last: Option<usize> = None;
+     let mut done = 0u64;
+-    pipeline_local(
++    // Each file's SHA3 runs on a thread of its own, fed its blocks in order, so the thread that
++    // reads the source and keeps the pool fed does not also take it (~40% of its time). A panic
++    // drops the sender, which ends the hasher too.
++    let (to_hash, hashed) = std::sync::mpsc::sync_channel(HASH_DEPTH);
++    let hasher = std::thread::Builder::new()
++        .name("file-sha3".into())
++        .spawn(move || hash_files(hashed, files))?;
++    let piped = pipeline_local(
+         threads.max(1),
+         || {
+             let Some(t) = next.next() else {
+@@ -321,16 +355,13 @@ pub fn compress(
+             // Everything is stored back to back, so the stored position never jumps and the only
+             // anchors the descriptor needs are the ones that open each 16-record window.
+             if let Owner::File(afid) = t.owner {
+-                if open.as_ref().is_none_or(|(a, _)| *a != afid) {
+-                    if let Some((a, h)) = open.take() {
+-                        file_digests[a] = h.finish();
+-                    }
+-                    open = Some((afid, Hasher::new()));
++                if last != Some(afid) {
++                    last = Some(afid);
+                     file_stored_at[afid] = cursor;
+                 }
+-                if let Some((_, h)) = open.as_mut() {
+-                    h.update(&bytes[..t.real]);
+-                }
++                to_hash
++                    .send((afid, bytes, t.real))
++                    .map_err(|_| crate::Error::Format("the file hasher stopped".into()))?;
+             }
+             let stored_at = cursor;
+             let mut parts = Vec::with_capacity(2);
+@@ -354,10 +385,13 @@ pub fn compress(
+             progress(done, total);
+             Ok(())
+         },
+-    )?;
+-    if let Some((a, h)) = open.take() {
+-        file_digests[a] = h.finish();
+-    }
++    );
++    // Closing the channel ends the hasher, whatever the pipeline gave.
++    drop(to_hash);
++    let mut file_digests = hasher
++        .join()
++        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
++    piped?;
+     // Files with no bytes still have a digest: that of nothing.
+     for (afid, &fi) in plan.afid_order.iter().enumerate() {
+         if plan.files[fi].size == 0 {
+@@ -1953,4 +1987,72 @@ mod tests {
+         assert_eq!(out.len(), kraken::BLOCK);
+         assert!(out[kraken::HALF..].iter().all(|&b| b == 0));
+     }
++
++    /// The file digests the hasher thread takes are each file's SHA3, as the serial loop took
++    /// them: several files, one over many blocks, an empty one, the generated keystone.
++    #[test]
++    fn the_file_digests_are_each_files_sha3() {
++        let sizes = [
++            ("eboot.bin", 4000u64),
++            ("data/big.bin", 1_300_000),
++            ("data/empty.bin", 0),
++            ("data/small.bin", 5000),
++            ("sce_sys/param.json", 197),
++        ];
++        let files: Vec<crate::source::SourceFile> = sizes
++            .iter()
++            .map(|(p, s)| crate::source::SourceFile {
++                path: (*p).to_string(),
++                size: *s,
++            })
++            .collect();
++        let plan = plan::build(&files).unwrap();
++        let data = |path: &str, size: u64| -> Vec<u8> {
++            let salt = path.len() as u64;
++            (0..size).map(|i| ((i * 7 + salt) % 251) as u8).collect()
++        };
++        let keystone: Vec<u8> = (0..plan::KEYSTONE_LEN).map(|i| i as u8).collect();
++        let metadata = vec![0u8; (plan.ndblock * crate::BLOCK - plan.meta_base) as usize];
++        let path = std::env::temp_dir().join(format!("kraken-digests-{}", std::process::id()));
++        let spool = File::options()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&path)
++            .unwrap();
++        let mut read = |p: &str, off: u64, len: usize| -> Result<Vec<u8>> {
++            let size = sizes.iter().find(|(q, _)| *q == p).unwrap().1;
++            Ok(data(p, size)[off as usize..off as usize + len].to_vec())
++        };
++        let cancel = AtomicBool::new(false);
++        let image = compress(
++            &plan,
++            &metadata,
++            &keystone,
++            &mut read,
++            spool,
++            0,
++            3,
++            kraken::Level::Fast,
++            &cancel,
++            &mut |_, _| {},
++        );
++        std::fs::remove_file(&path).ok();
++        let image = image.unwrap();
++        for (afid, &fi) in plan.afid_order.iter().enumerate() {
++            let f = &plan.files[fi];
++            let bytes = if f.generated {
++                keystone.clone()
++            } else {
++                data(&f.path, f.size)
++            };
++            assert_eq!(
++                image.file_digests[afid],
++                crate::crypto::sha3(&bytes),
++                "{}",
++                f.path
++            );
++        }
++    }
+ }

@@ -1,8 +1,4 @@
-// The Connect tab: left, this device (its QR code in the web build) and Add a device (an address,
-// probed: a Forge pairs, a NAS is saved); right, the devices (paired Forge peers and saved NAS
-// devices, one list), File Transfer, and Autodiscovery's finds under Nearby. The service's state
-// comes from the shared 2 s poller (useConnectState.ts); every dialog opens in its own root
-// (common.tsx `openOverlay`) and reads the same state.
+// The Connect screen; state from the shared 2 s poller (useConnectState.ts), every dialog in its own root (`openOverlay`).
 
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -13,14 +9,11 @@ import { openConnectHelp } from "./ConnectHelp";
 import { getLang, msg, num, useMessages } from "./i18n";
 import { Icon } from "./icons";
 import { confirmInstall } from "./InstallDialog";
-import type { Action } from "./jobs";
 import { NAS_PORT, readable, type NasProtocol } from "./peers";
 import { nasRoot } from "./Picker";
-import { openTransfer } from "./Transfer";
 import { ps5Release } from "./update";
 import { refreshConnect, useConnectState } from "./useConnectState";
 
-/** The service's refusal codes in words; any other error as it is. */
 export function connectError(e: unknown): string {
   const t = msg().connect;
   const text = errorText(e);
@@ -35,13 +28,12 @@ export function connectError(e: unknown): string {
   return codes[text] ?? text;
 }
 
-/** A platform id as the UI names it (product names stay English). */
 export function platformName(p: string): string {
   const names: Record<string, string> = { ps5: "PS5", macos: "Mac", windows: "Windows", linux: "Linux", freebsd: "FreeBSD" };
   return names[p] ?? msg().connect.computer;
 }
 
-/** "seen: 5 hours ago" in the largest whole unit; null when never seen. */
+/** In the largest whole unit; null when never seen. */
 function seenAgo(s: number, now: number): string | null {
   if (!s) return null;
   const t = msg().connect;
@@ -52,7 +44,6 @@ function seenAgo(s: number, now: number): string | null {
   return t.seen(Math.floor(m / (24 * 60)), "d");
 }
 
-/** Unix seconds now, renewed each minute (the tiles' "seen" lines). */
 function useNow(): number {
   const [now, setNow] = useState(() => Date.now() / 1000);
   useEffect(() => {
@@ -62,14 +53,13 @@ function useNow(): number {
   return now;
 }
 
-/** `host` or `host:port` (a v6 host in brackets) as the NAS dialog takes it; the protocol's own
- * port (445, 21, 2049) left out. */
+/** As the NAS dialog takes it: the protocol's own port left out. */
 function hostPort(host: string, port: number, protocol: NasProtocol): string {
   if (port === NAS_PORT[protocol]) return host;
   return host.includes(":") ? `[${host}]:${port}` : `${host}:${port}`;
 }
 
-/** This device's IP: the page's own server address in the web build, else the service's. */
+/** The page's own server address in the web build, else the service's. */
 function deviceIp(fallback: string | null): string | null {
   const a = serverAddress();
   return a ? a.replace(/:\d+$/, "").replace(/^\[(.*)\]$/, "$1") : fallback;
@@ -81,7 +71,6 @@ function lastSeen(s: number): string {
   return new Date(s * 1000).toLocaleString(lang === "ar" ? "ar-u-nu-latn" : lang);
 }
 
-/** An error line (the backend's text keeps its own direction). */
 export function ErrorLine({ text, lead }: { text: string; lead?: string }) {
   return (
     <p className="note-line block" role="alert">
@@ -101,8 +90,7 @@ function OnlineDot({ online }: { online: boolean }) {
   return <span className={online ? "online-dot on" : "online-dot"} aria-hidden="true" />;
 }
 
-/** Speed tests (a paired Forge's row menu and its details dialog, each opening `SpeedDialog`): one at a
- * time, results kept in memory until the page closes. `running` is the key id of the test under way. */
+/** One at a time; results kept in memory until the page closes. `running`: the key id under way. */
 type Speed = { result?: string; error?: string };
 let speed: { running: string | null; byKey: Record<string, Speed> } = { running: null, byKey: {} };
 const speedListeners = new Set<() => void>();
@@ -120,15 +108,12 @@ function useSpeed() {
   );
 }
 
-/** The run under way (its id, sent with the test and its cancel, so a late cancel never stops
- * another run) and the one the user stopped (its outcome is dropped). */
+/** The run id goes with its cancel, so a late cancel never stops another run. */
 let speedCount = 0;
 let speedRun = "";
 let speedStopped = "";
 
-/** Runs a speed test with `keyId` (`name` for its dialog) unless one runs, in a dialog over the
- * page; its outcome lands in `speed.byKey` unless the user stopped it. Every close of the dialog
- * while it runs (Stop, Escape, a click outside, the quit prompt's `closeOverlays`) stops it. */
+/** Every close of the dialog while it runs (Stop, Escape, a click outside, `closeOverlays`) stops it. */
 async function runSpeedTest(keyId: string, name: string) {
   if (speed.running) return;
   // Not `crypto.randomUUID`: a page over plain HTTP (the PS5's) has none.
@@ -142,26 +127,21 @@ async function runSpeedTest(keyId: string, name: string) {
   let out: Speed;
   try {
     const r = await connect.speedTest(keyId, run);
-    // Decimal MB per second, one decimal under 10.
     const mb = (b: number) => num(b / 1e6, b < 10e6 ? 1 : 0);
     out = { result: msg().connect.speedResult(mb(r.up_bytes_per_s), mb(r.down_bytes_per_s)) };
   } catch (e) {
     out = { error: readable(connectError(e)) };
   }
-  // Stopped: no result and no error (the test's own "cancelled" included).
   if (speedStopped === run) out = {};
   setSpeed({ running: null, byKey: { ...speed.byKey, [keyId]: out } });
 }
 
-/** Stops run `run` with `keyId` while it runs; its outcome is dropped. */
 function stopSpeedTest(keyId: string, run: string) {
   if (speed.running !== keyId || speedRun !== run || speedStopped === run) return;
   speedStopped = run;
   connect.speedTestCancel(keyId, run).catch(() => {});
 }
 
-/** The speed test's dialog: "Testing" with Stop (focused; Escape and a click outside stop it
- * too: the test is cancelled and nothing kept), then the result or the error with Close. */
 function SpeedDialog(props: { keyId: string; name: string; run: string; close: () => void }) {
   const t = useMessages().connect;
   const running = useSpeed().running === props.keyId && speedRun === props.run;
@@ -204,8 +184,6 @@ function SpeedDialog(props: { keyId: string; name: string; run: string; close: (
   );
 }
 
-/** The details dialog's speed test button: "Testing" (busy, focus kept) while its own runs, off while
- * another does. A device row has it in its ⋯ menu. */
 function SpeedButton({ keyId, name, disabled }: { keyId: string; name: string; disabled?: boolean }) {
   const t = useMessages().connect;
   const s = useSpeed();
@@ -233,7 +211,6 @@ function SpeedButton({ keyId, name, disabled }: { keyId: string; name: string; d
   );
 }
 
-/** A speed test's outcome under a device (row or details): the result, or why it failed. */
 function SpeedLine({ keyId, row }: { keyId: string; row?: boolean }) {
   const t = useMessages().connect;
   const s = useSpeed().byKey[keyId];
@@ -247,22 +224,19 @@ function SpeedLine({ keyId, row }: { keyId: string; row?: boolean }) {
   );
 }
 
-/** Which saved devices the list shows. */
 type Show = "all" | "forge" | "nas";
 
-export function Connect(props: { dispatch: (a: Action) => void }) {
+export function Connect(props: { onTransfer: (root?: string) => void }) {
   const t = useMessages().connect;
   const { state, error } = useConnectState();
-  // The last good state stays while a poll fails (a service hiccup), so the list doesn't drop to
-  // "No saved devices yet"; the actions still wait for the service (`state`).
+  // The last good state stays while a poll fails, so the list doesn't drop to "No saved devices yet".
   const last = useRef<ConnectState | null>(null);
   if (state) last.current = state;
   const shown = state ?? last.current;
   const me = shown?.device;
   const peers = shown?.devices ?? [];
   const saved = shown?.nas ?? [];
-  // One list, at most 9, in its shown order (online first, Forge peers before NAS devices), so
-  // the cap never leaves out an online device for an offline one.
+  // At most 9 in shown order (online first), so the cap never leaves out an online device.
   const kept: unknown[] = [
     ...peers.filter((d) => d.online),
     ...saved.filter((n) => n.online),
@@ -275,12 +249,10 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
   const online = devices.filter((d) => d.online).length + nas.filter((n) => n.online).length;
   const now = useNow();
   const ip = deviceIp(me?.ip ?? null);
-  // An online device is seen now (a handshake or probe within seconds).
   const seen = (on: boolean, last: number) => (on ? t.online : [t.offline, seenAgo(last, now)].filter(Boolean).join(" · "));
   const [show, setShow] = useState<Show>("all");
-  // The filter only while both kinds are saved.
   const view: Show = devices.length > 0 && nas.length > 0 ? show : "all";
-  // A search this tab asked for: Nearby stays, its outcome too, until the tab is left for good.
+  // A search this tab asked for: Nearby and its outcome stay until the tab is left.
   const [asked, setAsked] = useState(false);
   const [nearbyError, setNearbyError] = useState<string | null>(null);
   const searching = state?.discovery.searching ?? false;
@@ -296,9 +268,7 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
     }
     setAsked(true);
   };
-  const send = (start: string) => openTransfer(props.dispatch, start);
-  // An online paired PS5's Install pkg: a package on this device, asked, then the PS5's install
-  // job (it reads the file over FLINK; mirrored here under Connect).
+  const send = (root: string) => props.onTransfer(root);
   const inst = useMessages().install;
   const [installed, setInstalled] = useState<{ ok: string } | { err: string } | null>(null);
   const installing = useRef(false);
@@ -319,7 +289,6 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
     }
   };
   const rows: ReactNode[] = [];
-  // Online devices first; within that, Forge peers, then NAS devices.
   for (const on of [true, false]) {
     if (view !== "nas")
       for (const d of devices.filter((x) => x.online === on))
@@ -334,7 +303,7 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
             onSend={() => send(`flink://${d.key_id}`)}
             onInstall={d.platform === "ps5" ? () => void installOn(d) : undefined}
             speedKey={d.key_id}
-            onDetails={() => openDevice(d.key_id, props.dispatch)}
+            onDetails={() => openDevice(d.key_id, props.onTransfer)}
           />,
         );
     if (view !== "forge")
@@ -406,8 +375,7 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
               type="button"
               className={total > 0 ? "small primary" : "small"}
               disabled={!state}
-              aria-haspopup="dialog"
-              onClick={() => openTransfer(props.dispatch)}
+              onClick={() => props.onTransfer()}
             >
               <Icon name="move" />
               {t.fileTransfer}
@@ -465,7 +433,6 @@ export function Connect(props: { dispatch: (a: Action) => void }) {
   );
 }
 
-/** The service's first answer not in yet. */
 function Loading() {
   const t = useMessages().connect;
   return (
@@ -479,7 +446,6 @@ function Loading() {
   );
 }
 
-/** A filter option's label and its count. */
 function Counted({ label, n }: { label: string; n: number }) {
   return (
     <>
@@ -488,9 +454,7 @@ function Counted({ label, n }: { label: string; n: number }) {
   );
 }
 
-/** A saved device in the list: online dot, name and kind, its facts, Send (online only) and
- * Details. */
-/** `live`: false while a failed poll shows the last good state; Send waits for the service. */
+/** `live`: false while a failed poll shows the last good state. */
 function DeviceRow(props: {
   name: string;
   kind: string;
@@ -499,9 +463,7 @@ function DeviceRow(props: {
   facts: ReactNode[];
   onSend: () => void;
   onDetails: () => void;
-  /** A paired PS5: Install pkg (online only). */
   onInstall?: () => void;
-  /** A paired Forge: its key id, for the menu's Speed test (online only) and the last result. */
   speedKey?: string;
 }) {
   const t = useMessages().connect;
@@ -532,7 +494,7 @@ function DeviceRow(props: {
           </button>
         )}
         {props.online && (
-          <button type="button" className="small" aria-haspopup="dialog" aria-label={t.sendFilesTo(props.name)} disabled={!props.live} onClick={props.onSend}>
+          <button type="button" className="small" aria-label={t.sendFilesTo(props.name)} disabled={!props.live} onClick={props.onSend}>
             <Icon name="move" />
             {t.send}
           </button>
@@ -573,20 +535,16 @@ function DeviceRow(props: {
   );
 }
 
-/** A saved PS5's host (its last address without the port), for Install on PS5's address box. */
 function ps5Host(devices: ConnectDevice[]): string {
   const a = devices.find((d) => d.platform === "ps5" && d.address)?.address ?? "";
   const v6 = /^\[([^\]]+)\]/.exec(a);
   return v6 ? v6[1] : a.replace(/:\d+$/, "");
 }
 
-/** Install on PS5 (the desktop app): the console's elfldr downloads Dump Forge's release from
- * GitHub (this app's version when released, else the latest) and starts it; Send a payload
- * streams any other ELF file of this computer to it. One action at a time. */
+/** Install on PS5 (desktop app): elfldr downloads the release and starts it; Send a payload streams any ELF. */
 function InstallPs5({ devices }: { devices: ConnectDevice[] }) {
   const t = useMessages().connect;
   const [address, setAddress] = useState("");
-  // The typed address wins; until then a saved PS5's.
   const typed = useRef(false);
   const saved = ps5Host(devices);
   useEffect(() => {
@@ -614,7 +572,6 @@ function InstallPs5({ devices }: { devices: ConnectDevice[] }) {
   const install = () =>
     run(async () => {
       setBusy(t.findingRelease);
-      // No version known (the command failed): the latest release.
       const current = (await api.updateTarget().catch(() => null))?.version ?? "";
       const v = await ps5Release(current);
       if (!v) throw t.noRelease;
@@ -696,19 +653,15 @@ function InstallPs5({ devices }: { devices: ConnectDevice[] }) {
   );
 }
 
-/** Add a device by its address: what answers there decides, a Forge pairs (the waiting dialog), a
- * NAS opens its protocol's Add dialog prefilled; or Add SMB / FTP / NFS by hand. */
 function AddDevice({ ready }: { ready: boolean }) {
   const t = useMessages().connect;
   const out = useConnectState().state?.outgoing ?? null;
   const [address, setAddress] = useState("");
-  // The address being probed, then paired.
   const [probing, setProbing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Set at once, so a second Enter before the next render can't start another probe.
   const busy = useRef(false);
-  // While our pair request runs: the request before it (`undefined`: none). The typed address
-  // stays until it pairs, so a denied, timed out or busy request can be sent again as typed.
+  // The request before ours (`undefined`: none); the typed address stays until it pairs, so a refused one can be sent again.
   const sent = useRef<number | null | undefined>(undefined);
   useEffect(() => {
     if (sent.current === undefined || !out || out.id === sent.current || out.state === "asking" || out.state === "waiting") return;
@@ -793,15 +746,12 @@ function AddDevice({ ready }: { ready: boolean }) {
   );
 }
 
-/** Autodiscovery's finds that aren't saved here yet: a Forge gets Pair, a NAS (SMB, FTP, NFS)
- * Save, its protocol's Add dialog prefilled. Shown while a search runs, when it found something, or
- * after a search this tab asked for (its outcome); Stop ends a search. */
+/** Autodiscovery's finds not saved here yet; shown while a search runs, when it found something, or after one this tab asked for. */
 function Nearby(props: { state: ConnectState | null; asked: boolean; error: string | null }) {
   const t = useMessages().connect;
   const { state } = props;
   const [failed, setFailed] = useState<string | null>(null);
   const found = state?.discovery;
-  // A new search starts clean: the last Stop or Pair failure belongs to the one before.
   const searching = found?.searching ?? false;
   useEffect(() => {
     if (searching) setFailed(null);
@@ -915,21 +865,19 @@ function Nearby(props: { state: ConnectState | null; asked: boolean; error: stri
 
 // ---- Dialogs ----
 
-/** A saved device: address, key ID, last seen, Forget. */
-function openDevice(keyId: string, dispatch: (a: Action) => void) {
-  openOverlay((close) => <DeviceDetails keyId={keyId} dispatch={dispatch} close={close} />);
+function openDevice(keyId: string, onTransfer: (root: string) => void) {
+  openOverlay((close) => <DeviceDetails keyId={keyId} onTransfer={onTransfer} close={close} />);
 }
 
-function DeviceDetails({ keyId, dispatch, close }: { keyId: string; dispatch: (a: Action) => void; close: () => void }) {
+function DeviceDetails({ keyId, onTransfer, close }: { keyId: string; onTransfer: (root: string) => void; close: () => void }) {
   const t = useMessages().connect;
   const { state } = useConnectState();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const kept = useRef<ConnectDevice | null>(null);
-  // The last known row stays while a poll fails (a service hiccup), so the dialog stays put.
+  // The last known row stays while a poll fails, so the dialog stays put.
   const d = state?.devices.find((x) => x.key_id === keyId) ?? (state ? null : kept.current);
   kept.current = d;
-  // Forgotten elsewhere (another window, the server API): nothing left to show.
   useEffect(() => {
     if (state && !d) close();
   }, [state, d, close]);
@@ -978,10 +926,9 @@ function DeviceDetails({ keyId, dispatch, close }: { keyId: string; dispatch: (a
         <button
           type="button"
           disabled={!d || !d.online}
-          aria-haspopup="dialog"
           onClick={() => {
             close();
-            openTransfer(dispatch, `flink://${keyId}`);
+            onTransfer(`flink://${keyId}`);
           }}
         >
           <Icon name="move" />
@@ -999,18 +946,12 @@ function DeviceDetails({ keyId, dispatch, close }: { keyId: string; dispatch: (a
   );
 }
 
-/** The check number as both screens show it: "123 456". */
 const spaced = (check: string) => `${check.slice(0, 3)} ${check.slice(3)}`;
 
-/** Set from a pair request until its waiting dialog closes: one request at a time, so a double
- * click, or a probe that ends after Nearby's Pair, can't send a second (the service would replace
- * the first, and two dialogs would follow the newest). */
+/** One request at a time: a double click, or a probe ending after Nearby's Pair, can't send a second. */
 let pairing = false;
 
-/** Asks the Forge at `address` (host:port, from Add a device's probe or Nearby) to pair, then
- * shows the waiting dialog. `before`: the last request before this one (`outgoing` keeps it), so the
- * dialog follows only the new one. False (nothing sent) while another request's dialog is open;
- * rejects when the request can't be sent (the caller shows why). */
+/** `before`: the request before this one, so the dialog follows only the new one; false while another's dialog is open. */
 async function startPair(address: string, before: number | null): Promise<boolean> {
   if (pairing) return false;
   pairing = true;
@@ -1025,17 +966,13 @@ async function startPair(address: string, before: number | null): Promise<boolea
   return true;
 }
 
-/** This device's pairing request while the other device's user decides: the check number both
- * show and Cancel; an outcome (denied, timed out, busy, already paired) replaces it; paired closes. */
 function PairWait({ before, close }: { before: number | null; close: () => void }) {
   const t = useMessages().connect;
   const { state } = useConnectState();
   const kept = useRef<PairOutgoing | null>(null);
-  // The last known request stays while a poll fails, so the number or outcome stays put.
   const out = state?.outgoing ?? null;
   const mine = state ? (out && out.id !== before ? out : null) : kept.current;
   kept.current = mine;
-  // Not in the poll yet: still being sent.
   const running = !mine || mine.state === "asking" || mine.state === "waiting";
   useEffect(() => {
     if (mine?.state === "paired" || mine?.state === "cancelled") close();
@@ -1044,15 +981,13 @@ function PairWait({ before, close }: { before: number | null; close: () => void 
   const waiting = useRef(running);
   waiting.current = running;
   const mounted = useRef(false);
-  // Closing while it waits cancels the request (the other device's prompt goes too).
+  // Closing while it waits cancels the request.
   const dismiss = () => {
     if (waiting.current) void connect.pairCancel().then(refreshConnect, () => {});
     waiting.current = false;
     close();
   };
-  // Closed from outside too (the quit flow's `closeOverlays`): the request is taken back. A tick
-  // later, so StrictMode's test unmount in development (mounted again at once) doesn't. However it
-  // closes, another pair request may start then.
+  // Closed from outside too (`closeOverlays`): taken back a tick later, so StrictMode's dev remount doesn't.
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -1105,14 +1040,11 @@ function PairWait({ before, close }: { before: number | null; close: () => void 
   );
 }
 
-/** Another device's pairing request, over any screen and any dialog: who asks, the check number
- * both screens show, Allow or Deny (closing it denies). Rendered into `body`, outside `#root`, which
- * an open dialog makes inert; `.pair-layer` keeps it above dialogs opened after it. */
+/** Over any screen and dialog, rendered into `body` outside `#root` (which an open dialog makes inert); closing it denies. */
 export function PairPrompt() {
   const t = useMessages().connect;
   const { state } = useConnectState();
-  // The last request shown stays while a poll fails (a service hiccup), so the prompt doesn't
-  // vanish mid-decision and come back; at most its 60 s, and not once it has been answered.
+  // The last request shown stays while a poll fails, at most its 60 s, and not once answered.
   const kept = useRef<{ req: PairRequest; at: number } | null>(null);
   const shown = kept.current && Date.now() - kept.current.at < 60_000 ? kept.current.req : null;
   const req = state ? (state.pending[0] ?? null) : shown;
@@ -1120,8 +1052,7 @@ export function PairPrompt() {
   const [busy, setBusy] = useState(false);
   // One answer per request: an Escape after Allow must not send a Deny that could land first.
   const answering = useRef(false);
-  // Where focus was when the prompt came (read before its autoFocus moves it), given back when the
-  // last request goes; it isn't an `openOverlay`, which would do it.
+  // Focus as the prompt came, given back when the last request goes (it isn't an `openOverlay`).
   const back = useRef<HTMLElement | null>(null);
   if (req && !back.current) back.current = document.activeElement instanceof HTMLElement ? document.activeElement : document.body;
   const open = req !== null;
@@ -1139,7 +1070,6 @@ export function PairPrompt() {
     try {
       await connect.approve(req.id, allow);
     } catch {
-      // Gone meanwhile (it timed out, or the other device gave up): the poll drops it.
     }
     kept.current = null;
     await refreshConnect();
@@ -1173,12 +1103,10 @@ export function PairPrompt() {
   );
 }
 
-/** A NAS's tag, in the saved grid and Autodiscovery's list alike: SMB, FTP or NFS. */
 function nasKind(protocol: string): string {
   return protocol.toUpperCase();
 }
 
-/** A saved NAS: address, user, password saved or not (not for NFS: no login), status; Edit, Forget. */
 function openNasDetails(id: string) {
   openOverlay((close) => <NasDetails id={id} close={close} />);
 }
@@ -1191,7 +1119,6 @@ function NasDetails({ id, close }: { id: string; close: () => void }) {
   const kept = useRef<NasDevice | null>(null);
   const n = state?.nas.find((x) => x.id === id) ?? (state ? null : kept.current);
   kept.current = n;
-  // Forgotten elsewhere (another window, the server API): nothing left to show.
   useEffect(() => {
     if (state && !n) close();
   }, [state, n, close]);
@@ -1262,11 +1189,9 @@ function NasDetails({ id, close }: { id: string; close: () => void }) {
   );
 }
 
-/** A NAS Autodiscovery or Add a device found: its name, address and protocol prefill Add NAS. */
 type Found = { name: string; host: string; port: number; protocol: NasProtocol };
 
-/** Add a NAS of one protocol (Add a device's SMB / FTP / NFS), prefilled from Nearby or Add a
- * device's probe (`Found`), or edit a saved one (its protocol kept). */
+/** Prefilled from Nearby or a probe (`Found`), or edit a saved one (its protocol kept). */
 function openNas(from: NasDevice | Found | NasProtocol) {
   openOverlay((close) => <NasDialog from={from} close={close} />);
 }
@@ -1292,8 +1217,7 @@ function NasDialog(props: { from: NasDevice | Found | NasProtocol; close: () => 
     setBusy(true);
     setError(null);
     try {
-      // An empty password keeps the saved one, except for a guest (no user name), who has none.
-      // NFS has no login: none is sent (the service drops a saved one).
+      // An empty password keeps the saved one, except for a guest (no user), who has none; NFS sends none.
       const u = user.trim();
       const login = nfs ? {} : { user: u, password: password !== "" || u === "" ? password : undefined };
       await connect.nasSave({ id: n?.id, name: name.trim(), host: address.trim(), protocol, ...login });
@@ -1304,8 +1228,7 @@ function NasDialog(props: { from: NasDevice | Found | NasProtocol; close: () => 
       setBusy(false);
     }
   };
-  // The hint describes its input, outside the label (so not part of the input's name). Read-only, not
-  // disabled, while it saves: focus stays put, and Escape still reaches the dialog.
+  // The hint is outside the label (not the input's name); read-only, not disabled, while saving, so focus stays and Escape reaches the dialog.
   const field = (id: string, label: string, value: string, set: (v: string) => void, extra: { hint?: string; type?: string; ltr?: boolean; focus?: boolean }) => (
     <div className="field-label">
       <label htmlFor={id}>{label}</label>

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Host check of entry.c's launch modes (none, "serve" as elfldr's args=serve passes it, others), args-file parsing, log redirection and the old folder's rename: builds it with the
-# host cc against stubs for __real_main (prints its arguments to stdout and a marker to stderr;
-# LONGNOTE makes it call ps5_notify with 4,000 bytes, FAIL makes it return 3) and the PS5
-# notification call (appends the message and its length to $NOTES, never to the redirected
-# streams).
+# Host check of entry.c (launch modes, args file, log redirection, the old folder's rename) with
+# the host cc against stubs: __real_main prints its arguments (LONGNOTE: a 4,000-byte ps5_notify,
+# FAIL: returns 3); the notification call appends to $NOTES.
 # ponytail: dup2 failures aren't injected (that needs symbol interposition); a closed fd 1/2 is.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -40,10 +38,8 @@ EOF
 cc -Wall -Wextra -Werror -DFORGE_DIR="\"$tmp/forge\"" -DOLD_FORGE_DIR="\"$tmp/ro/old\"" -DFORGE_LINK="\"../forge\"" entry.c "$tmp/stub.c" -o "$tmp/entry"
 
 closed= old=
-# run <args-file bytes, or "" for no args file> <expected exit> <expected log text, or "" for no
-# log> [notification]. The log is checked on its own, so broken redirection can't hide behind the
-# notifications. An args file must be gone afterwards, its bytes in args.done (old=1 leaves an
-# older args.done for it to replace).
+# run <args-file bytes or ""> <exit> <log text or ""> [notification]. An args file must end up as
+# args.done (old=1 leaves an older args.done to replace).
 run() {
   rm -rf "$tmp/forge" "$tmp/notes"
   mkdir "$tmp/forge"
@@ -88,8 +84,7 @@ set +e; NOTES="$tmp/notes" "$tmp/entry" > "$tmp/out"; code=$?; set -e
 
 # elfldr's args=serve (the web launcher starting the saved copy): the same serve launch, the
 # folder created, an args file left as it is.
-# launch <args...>: runs the entry with a fresh folder holding an args file; $code, $out, $log,
-# $notes as above.
+# launch <args...>: a fresh folder holding an args file; sets $code, $out, $log, $notes.
 launch() {
   rm -rf "$tmp/forge" "$tmp/notes"
   mkdir "$tmp/forge"

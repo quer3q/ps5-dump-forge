@@ -1,6 +1,4 @@
-// Paired devices' and saved NAS devices' names for text the backend writes: a leaf module (no
-// imports), so `api` and `useConnectState`, which import each other through the transport, both
-// use it safely.
+// Saved devices' names for backend text: a leaf module (no imports), since api and useConnectState import each other.
 
 /** How a saved NAS is reached; core spells its paths `<protocol>://host[:port]/...`. */
 export type NasProtocol = "smb" | "ftp" | "nfs";
@@ -12,7 +10,6 @@ type SavedNas = { name: string; host: string; port: number; protocol?: NasProtoc
 let devices: { key_id: string; name: string }[] = [];
 let nas: SavedNas[] = [];
 
-/** Connect's saved devices, as the latest poll gave them. */
 export function setDevices(next: { key_id: string; name: string }[], saved: SavedNas[] = []): void {
   devices = next;
   nas = saved;
@@ -26,24 +23,20 @@ function savedName(scheme: string, host: string, port: string | undefined, list:
   return list.find((n) => (n.protocol ?? "smb") === p && n.host.toLowerCase() === h && n.port === at)?.name ?? null;
 }
 
-/** The NAS a path is on (`smb://`, `ftp://`, `nfs://`): its saved name, else its address; null
- * for any other path. */
+/** The NAS a path is on: its saved name, else its address; null for any other path. */
 export function nasName(path: string, list: SavedNas[] = nas): string | null {
   const m = /^(smb|ftp|nfs):\/\/(\[[^\]\s]*\]|[^/\\\s:[\]]+)(?::(\d+))?/i.exec(path);
   return m ? (savedName(m[1], m[2], m[3], list) ?? m[0].slice(m[1].length + 3)) : null;
 }
 
-/** A path on a saved NAS as "<saved name>: /<path>" (the server's root: "/"); null for any other
- * path, and for a NAS that isn't saved. */
+/** A saved NAS path as "<saved name>: /<path>"; null for any other path or an unsaved NAS. */
 export function nasPath(path: string, list: SavedNas[] = nas): string | null {
   const m = /^(smb|ftp|nfs):\/\/(\[[^\]\s]*\]|[^/\\\s:[\]]+)(?::(\d+))?(?=$|[/\\])/i.exec(path);
   const name = m && savedName(m[1], m[2], m[3], list);
   return m && name ? `${name}: ${path.slice(m[0].length) || "/"}` : null;
 }
 
-/** The backend's text with each saved device's `flink://<key_id>`, and each saved NAS's
- * `smb://`/`ftp://`/`nfs://` address, as its name: a path as "<name>: /<path>", otherwise just
- * "<name>"; an unknown one stays as it is. */
+/** Backend text with each saved device's address shown as its name ("<name>: /<path>"); an unknown one stays. */
 export function readable(text: string): string {
   if (devices.length) {
     text = text.replace(/flink:\/\/([0-9a-f]{32})(?=([/\\]?))/gi, (whole, key: string, sep: string) => {

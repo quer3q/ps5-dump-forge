@@ -1,14 +1,14 @@
 diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
-index f1db2c7..3725439 100644
+index 5fd95612a34328d8fb9f7b5a841a884b108c0df7..bf536de506b14a5cf9f90bd817799f4d69a61045 100644
 --- a/ps5upload-fpkg/src/build.rs
 +++ b/ps5upload-fpkg/src/build.rs
-@@ -292,6 +292,19 @@ impl Stage {
+@@ -317,6 +317,19 @@ impl Stage {
      }
  }
  
 +/// Whether the caller's flag asks for a stop.
 +fn stopped(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
-+    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
++    crate::workshop::checkpoint_opt(cancel)
 +}
 +
 +/// Stop with [`crate::Error::Cancelled`] once the caller's flag is set.
@@ -22,7 +22,7 @@ index f1db2c7..3725439 100644
  fn enter(control: &mut BuildControl, stage: Stage) {
      if let Some(f) = control.stage.as_deref_mut() {
          f(stage);
-@@ -303,7 +316,8 @@ fn enter(control: &mut BuildControl, stage: Stage) {
+@@ -328,7 +341,8 @@ fn enter(control: &mut BuildControl, stage: Stage) {
  pub struct BuildControl<'a> {
      /// Bytes written of the mount image, reported as the write proceeds.
      pub bytes: Option<&'a mut dyn FnMut(u64, u64)>,
@@ -32,7 +32,7 @@ index f1db2c7..3725439 100644
      pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
      /// Called as each [`Stage`] begins.
      pub stage: Option<&'a mut dyn FnMut(Stage)>,
-@@ -551,7 +565,10 @@ fn prepare_with(
+@@ -590,7 +604,10 @@ fn prepare_with(
          log.push(line.to_string());
          progress(line);
      };
@@ -43,7 +43,7 @@ index f1db2c7..3725439 100644
      let mut files: Vec<SourceFile> = tree.files().to_vec();
      if files.is_empty() {
          return format_err(format!("{} has no files", tree.describe()));
-@@ -585,6 +602,7 @@ fn prepare_with(
+@@ -624,6 +641,7 @@ fn prepare_with(
          ));
      }
      let readiness = source::readiness(tree);
@@ -51,32 +51,24 @@ index f1db2c7..3725439 100644
      let warnings: Vec<String> = readiness
          .warnings()
          .map(|c| format!("{}: {}", c.name, c.detail))
-@@ -633,6 +651,8 @@ fn prepare_with(
-     let mut repairs: std::collections::HashMap<String, (self_repair::SelfRepair, u64)> =
-         std::collections::HashMap::new();
-     for f in files.iter_mut() {
-+        // One header read per file: a quarter of a million of them on a large game.
-+        check_cancel(control)?;
-         // A backport's `fakelib/` holds newer system libraries the game loads in place of the
-         // console's own; working releases ship some with the PS4 signature, and every one of
-         // them is used exactly as shipped. Rewriting them is not a repair.
-@@ -708,19 +728,29 @@ fn prepare_with(
+@@ -791,20 +809,30 @@ fn prepare_with(
          return format_err("the source has no eboot.bin");
      }
      let content_version = source::content_version_word(&param_json).unwrap_or(0);
 +    check_cancel(control)?;
      // The container's payloads, read once: the streaming arm hands them to the writer,
      // and reading them here keeps the source free for the range reader below.
-     let icon_png = tree.read("sce_sys/icon0.png").unwrap_or_default();
+     let mut small = |path: &str| source::read_small(&mut *tree, path, source::MAX_ARTWORK_BYTES);
+     let icon_png = small("sce_sys/icon0.png").unwrap_or_default();
 +    check_cancel(control)?;
-     let icon_dds = tree.read("sce_sys/icon0.dds").unwrap_or_default();
+     let icon_dds = small("sce_sys/icon0.dds").unwrap_or_default();
      // Only files still in the package: an excluded one must not reappear in the container.
 +    // A stop skips the reads still to come; the check after them reports it.
      let mut extras = cnt_write::presentation_extras(&mut |path| {
 +        if stopped(control.cancel) {
 +            return None;
 +        }
-         sizes_of(&files, path).and_then(|_| tree.read(path).ok())
+         sizes_of(&files, path).and_then(|_| small(path).ok())
      });
      // The dump's own title and NP binding files, as protected entries (see `PROTECTED`). They
      // stay in the image too; the container copy is what the console's launch checks read.
@@ -84,13 +76,13 @@ index f1db2c7..3725439 100644
 +        if stopped(control.cancel) {
 +            return None;
 +        }
-         sizes_of(&files, path).and_then(|_| tree.read(path).ok())
+         sizes_of(&files, path).and_then(|_| small(path).ok())
      }));
 +    check_cancel(control)?;
      // The debug license the console's launch checks need (see `license`), generated for this
      // content id. A dump's own license files are never used: they belong to another console.
      extras.extend(cnt_write::license_extras(&content_id));
-@@ -753,6 +783,7 @@ fn prepare_with(
+@@ -855,6 +883,7 @@ fn prepare_with(
          .collect();
      files.retain(|f| !container_only_file(f));
      let time = request.time.unwrap_or_else(now);
@@ -98,7 +90,7 @@ index f1db2c7..3725439 100644
      // A libSceAmpr title looks its files up through `ampr_emu.index` at the image root (see
      // `ampr_index`), and `ampr_emu` trusts its sizes. It is always generated from exactly the
      // files packaged: a dump's own copy lists the folder as it was, before the param.json
-@@ -793,13 +824,20 @@ fn prepare_with(
+@@ -919,13 +948,20 @@ fn prepare_with(
          crate::ImageMode::Native => request.seed.unwrap_or_else(random_seed),
      };
  
@@ -121,7 +113,7 @@ index f1db2c7..3725439 100644
      // Refuse an over-large source here, before a single byte is read.
      if plan.ndblock > outer_write::max_inner_blocks() {
          return format_err(format!(
-@@ -906,15 +944,17 @@ fn prepare_with(
+@@ -1032,15 +1068,17 @@ fn prepare_with(
  
  /// Write the package `prepared` describes into `out`, then verify it.
  ///
@@ -147,7 +139,7 @@ index f1db2c7..3725439 100644
  pub fn write_package(
      prepared: &Prepared,
      tree: &mut dyn source::SourceTree,
-@@ -923,6 +963,7 @@ pub fn write_package(
+@@ -1049,6 +1087,7 @@ pub fn write_package(
      progress: &mut dyn FnMut(&str),
      control: &mut BuildControl,
  ) -> Result<BuildReport> {
@@ -155,7 +147,7 @@ index f1db2c7..3725439 100644
      if out.metadata()?.len() != 0 {
          return format_err(format!(
              "{} is not empty; the package is written into a new file",
-@@ -938,7 +979,7 @@ pub fn write_package(
+@@ -1064,7 +1103,7 @@ pub fn write_package(
          control,
          Mode::Streaming,
      )?;
@@ -164,7 +156,7 @@ index f1db2c7..3725439 100644
      let size = out.metadata()?.len();
      if size != written {
          return format_err(format!(
-@@ -1006,8 +1047,8 @@ fn build_mode(
+@@ -1141,8 +1180,8 @@ fn build_mode(
          control,
          mode,
      )?;
@@ -174,7 +166,7 @@ index f1db2c7..3725439 100644
      if final_path.exists() {
          return format_err(format!(
              "output appeared during conversion: {}",
-@@ -1028,23 +1069,33 @@ fn build_mode(
+@@ -1167,14 +1206,16 @@ fn build_mode(
      })
  }
  
@@ -190,7 +182,11 @@ index f1db2c7..3725439 100644
  ) -> Result<crate::verify::Report> {
      enter(control, Stage::Verify);
 +    let file = crate::PkgFile::from_reader(Box::new(out.try_clone()?), out.metadata()?.len());
-     progress("verifying");
+     match control.sample {
+         Some(seed) => progress(&format!(
+             "verifying (fast: sampled blocks, seed {seed}, policy {})",
+@@ -1184,19 +1225,22 @@ fn verify_written(
+     }
      // The streaming verifier reads the package block by block, so the self-check of a
      // 155 GB package does not need 155 GB of memory.
 +    let cancel = control.cancel;
@@ -199,31 +195,31 @@ index f1db2c7..3725439 100644
              f(done, total);
          }
      };
--    let report = verify::verify_streaming(path, &prepared.request.passcode, &mut verify_bytes)?;
+     // Stop ends the read-back as it does the write (a 155 GB package takes minutes to check).
+-    let report = verify::verify_streaming_controlled(
+-        path,
 +    let report = verify::verify_file_controlled(
 +        file,
-+        &prepared.request.passcode,
-+        &mut verify_bytes,
+         &prepared.request.passcode,
+         control.sample,
+-        control.cancel,
 +        cancel,
-+    )?;
+         &mut verify_bytes,
+     )?;
 +    // A stop asked for during the last read is still a stop: the package is not accepted.
 +    check_cancel(control)?;
      if !report.ok() {
          return format_err(format!("the built package failed verification:\n{report}"));
      }
-@@ -1067,11 +1118,6 @@ fn write_mode(
+@@ -1219,7 +1263,6 @@ fn write_mode(
      let param_json = &prepared.param_json;
      let content_version = prepared.content_version;
      let (time, seed) = (prepared.time, prepared.seed);
--    let cancelled = || {
--        control
--            .cancel
--            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
--    };
+-    let cancelled = || crate::workshop::checkpoint_opt(control.cancel);
  
      let written = match mode {
          Mode::Streaming => {
-@@ -1125,9 +1171,7 @@ fn write_mode(
+@@ -1273,9 +1316,7 @@ fn write_mode(
              stream::write_package(out, &stream_request, &mut read_range, &mut p, cancel)?.size
          }
          Mode::InMemory => {
@@ -235,32 +231,32 @@ index f1db2c7..3725439 100644
                  match prepared.sizes.get(path) {
                      Some(0) => Ok(Vec::new()),
 diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
-index e2e8d1d..300e33b 100644
+index 03d29177eabe8d747224441baa4eab5ba5bc8f13..e0313fb60d59855b315a4390d3dc4a79460511a1 100644
 --- a/ps5upload-fpkg/src/kraken_image.rs
 +++ b/ps5upload-fpkg/src/kraken_image.rs
-@@ -257,7 +257,7 @@ pub fn compress(
+@@ -261,7 +261,7 @@ pub fn compress(
                  return Ok(None);
              };
-             if cancel.load(Ordering::Relaxed) {
+             if crate::workshop::checkpoint(cancel) {
 -                return format_err("the build was cancelled");
 +                return Err(crate::Error::Cancelled);
              }
              let bytes = match (&t.owner, &t.source) {
                  (Owner::File(_), Some((path, off))) => {
-@@ -291,6 +291,11 @@ pub fn compress(
+@@ -295,6 +295,11 @@ pub fn compress(
              Ok(Some((t, bytes)))
          },
          |(t, bytes)| {
 +            // A stop asked for while the pool is full ends the blocks still queued, not only the
 +            // reading: each one would otherwise be compressed and checked first.
-+            if cancel.load(Ordering::Relaxed) {
++            if crate::workshop::checkpoint(cancel) {
 +                return Err(crate::Error::Cancelled);
 +            }
              // Stored (`Level::Stored`, or `PS5UPLOAD_FPKG_KRAKEN_STORE=1` through the build, see
              // `store_only`): every half raw, the same layout with nothing for the console's
              // decoder to decompress.
 diff --git a/ps5upload-fpkg/src/si.rs b/ps5upload-fpkg/src/si.rs
-index 47299c2..b2debf8 100644
+index 29638a9621bdc0913982a2b39278080b30743489..3e3205b32ebe58611d88320870c1756147a895e3 100644
 --- a/ps5upload-fpkg/src/si.rs
 +++ b/ps5upload-fpkg/src/si.rs
 @@ -78,9 +78,22 @@ pub fn read(file: &mut PkgFile) -> Result<Option<Si>> {
@@ -280,17 +276,17 @@ index 47299c2..b2debf8 100644
      let blocks = zip_start.div_ceil(BLOCK);
      let mut out = Vec::with_capacity(blocks as usize * 4);
      for i in 0..blocks {
-+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
++        if cancel.is_some_and(crate::workshop::checkpoint) {
 +            return Err(crate::Error::Cancelled);
 +        }
          let start = i * BLOCK;
          let len = (zip_start - start).min(BLOCK) as usize;
          out.extend_from_slice(&crc32c(&file.read_at(start, len)?).to_le_bytes());
 diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
-index b56dce2..fc1f362 100644
+index f0b327b4c3b960cf262fbc5b59ae1e3e48fa8261..2c78f0a1843913c50db5ca5602dbf8452f0b873b 100644
 --- a/ps5upload-fpkg/src/stream.rs
 +++ b/ps5upload-fpkg/src/stream.rs
-@@ -182,7 +182,7 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
+@@ -183,7 +183,7 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
  }
  
  fn cancelled() -> crate::Error {
@@ -299,113 +295,143 @@ index b56dce2..fc1f362 100644
  }
  
  /// Write the whole package to `out`, which must be empty and seekable.
-@@ -208,6 +208,10 @@ pub fn write_package(
+@@ -209,6 +209,10 @@ pub fn write_package(
      // its length, which is only known once every block is compressed.
      // A stored build passes through this stage at once.
      (progress.stage)(crate::build::Stage::Compress);
 +    // Before the block list and the metadata region are built for the compressor.
-+    if cancel.load(Ordering::Relaxed) {
++    if crate::workshop::checkpoint(cancel) {
 +        return Err(cancelled());
 +    }
      let kraken = match &request.kraken_spool {
          Some(where_to) => {
              (progress.phase)("compressing the image");
-@@ -329,6 +333,9 @@ pub fn write_package(
+@@ -330,6 +334,9 @@ pub fn write_package(
      };
  
      // ── the outer metadata ───────────────────────────────────────────────────────────
-+    if cancel.load(Ordering::Relaxed) {
++    if crate::workshop::checkpoint(cancel) {
 +        return Err(cancelled());
 +    }
      (progress.phase)("writing the layout");
      let mut game_digest = [0u8; 32];
      let mut superblock = Vec::new();
-@@ -341,6 +348,9 @@ pub fn write_package(
+@@ -342,6 +349,9 @@ pub fn write_package(
          image_time(request.image_mode, request.time),
          kraken.as_ref().map(|_| inner_size),
      )? {
-+        if cancel.load(Ordering::Relaxed) {
++        if crate::workshop::checkpoint(cancel) {
 +            return Err(cancelled());
 +        }
          if index != lay.superblock_block {
              if let Some(xts) = &xts {
                  let sector = if index < lay.superblock_block {
-@@ -382,6 +392,9 @@ pub fn write_package(
+@@ -383,6 +393,9 @@ pub fn write_package(
      out.write_all(&fih)?;
  
      // ── the container ────────────────────────────────────────────────────────────────
-+    if cancel.load(Ordering::Relaxed) {
++    if crate::workshop::checkpoint(cancel) {
 +        return Err(cancelled());
 +    }
      (progress.phase)("writing the container");
      // PlayGo maps files to chunks by where their bytes sit in the mount image — for a compressed
      // image, where their compressed blocks are.
-@@ -450,6 +463,9 @@ pub fn write_package(
+@@ -451,6 +464,9 @@ pub fn write_package(
      crc_table.extend_from_slice(&si_write::chunk_crc(&cnt.bytes));
  
      // ── the install metadata ─────────────────────────────────────────────────────────
-+    if cancel.load(Ordering::Relaxed) {
++    if crate::workshop::checkpoint(cancel) {
 +        return Err(cancelled());
 +    }
      (progress.phase)("writing the install metadata");
      let digests_18 = si_write::InnerDigests {
          blocks: block_digests,
-@@ -514,6 +530,10 @@ pub fn write_package(
+@@ -515,6 +531,10 @@ pub fn write_package(
      let si = si_write::zip(&members, request.time);
      out.seek(SeekFrom::Start(cnt_offset + cnt.bytes.len() as u64))?;
      out.write_all(&si)?;
 +    // Flushing a large package to disk takes a while; a stop asked for by now skips it.
-+    if cancel.load(Ordering::Relaxed) {
++    if crate::workshop::checkpoint(cancel) {
 +        return Err(cancelled());
 +    }
      out.sync_all()?;
  
      let size = cnt_offset + cnt.bytes.len() as u64 + si.len() as u64;
 diff --git a/ps5upload-fpkg/src/verify.rs b/ps5upload-fpkg/src/verify.rs
-index 1437ba6..580ca03 100644
+index 84a715544af963c995517cac1a6839a0ef57fe0b..478670d9f7923179c086a718eb43c389f45dcbf0 100644
 --- a/ps5upload-fpkg/src/verify.rs
 +++ b/ps5upload-fpkg/src/verify.rs
 @@ -2,6 +2,7 @@
  
  use std::fmt;
  use std::path::Path;
-+use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::AtomicBool;
  
  use crate::cnt::{self, EntryDigest};
  use crate::crypto::sha3;
-@@ -370,7 +371,39 @@ pub fn verify_streaming(
-     passcode: &str,
+@@ -383,44 +384,53 @@ pub fn verify_streaming_sampled(
+     seed: Option<u64>,
      progress: &mut dyn FnMut(u64, u64),
  ) -> Result<Report> {
--    let mut file = PkgFile::open(path)?;
-+    verify_streaming_controlled(path, passcode, progress, None)
-+}
-+
-+/// [`verify_streaming`], stopping with [`crate::Error::Cancelled`] once `cancel` is set. A
-+/// verification reads the whole package (twice: the block sweep and the CRC table), minutes
-+/// for a large game, so every block read checks the flag.
-+pub fn verify_streaming_controlled(
-+    path: &Path,
-+    passcode: &str,
-+    progress: &mut dyn FnMut(u64, u64),
+-    verify_streaming_inner(path, passcode, seed, None, progress)
++    verify_streaming_controlled(path, passcode, seed, None, progress)
+ }
+ 
+-/// [`verify_streaming`] that stops with a "cancelled" error once `cancel` is set (checked
+-/// between batches of blocks): the Collection's copy check runs it on packages of 100+ GB.
++/// [`verify_streaming`] that stops with [`crate::Error::Cancelled`] once `cancel` is set: the
++/// Collection's copy check runs it on packages of 100+ GB.
+ pub fn verify_streaming_cancellable(
+     path: &Path,
+     passcode: &str,
+-    cancel: &std::sync::atomic::AtomicBool,
++    cancel: &AtomicBool,
+     progress: &mut dyn FnMut(u64, u64),
+ ) -> Result<Report> {
+-    verify_streaming_inner(path, passcode, None, Some(cancel), progress)
++    verify_streaming_controlled(path, passcode, None, Some(cancel), progress)
+ }
+ 
+-/// [`verify_streaming_sampled`] that also stops with a "cancelled" error once `cancel` is set
+-/// (checked between batches of blocks): a build's Stop ends its read-back too.
++/// [`verify_streaming_sampled`] that also stops with [`crate::Error::Cancelled`] once `cancel`
++/// is set. A verification reads the whole package (twice: the block sweep and the CRC table),
++/// minutes for a large game, so every block read checks the flag: a build's Stop ends its
++/// read-back too.
+ pub fn verify_streaming_controlled(
+     path: &Path,
+     passcode: &str,
+     seed: Option<u64>,
+-    cancel: Option<&std::sync::atomic::AtomicBool>,
 +    cancel: Option<&AtomicBool>,
-+) -> Result<Report> {
-+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+     progress: &mut dyn FnMut(u64, u64),
+ ) -> Result<Report> {
+-    verify_streaming_inner(path, passcode, seed, cancel, progress)
++    if cancel.is_some_and(crate::workshop::checkpoint) {
 +        return Err(crate::Error::Cancelled);
 +    }
-+    verify_file_controlled(PkgFile::open(path)?, passcode, progress, cancel)
-+}
-+
++    verify_file_controlled(PkgFile::open(path)?, passcode, seed, cancel, progress)
+ }
+ 
+-fn verify_streaming_inner(
+-    path: &Path,
 +/// [`verify_streaming_controlled`] over a package already open, e.g. through the handle it was
 +/// just written with, so the bytes checked are that file's whatever its path now names.
 +pub fn verify_file_controlled(
 +    mut file: PkgFile,
-+    passcode: &str,
-+    progress: &mut dyn FnMut(u64, u64),
+     passcode: &str,
+     seed: Option<u64>,
+-    cancel: Option<&std::sync::atomic::AtomicBool>,
 +    cancel: Option<&AtomicBool>,
-+) -> Result<Report> {
+     progress: &mut dyn FnMut(u64, u64),
+ ) -> Result<Report> {
+-    let cancelled = || cancel.is_some_and(crate::workshop::checkpoint);
+-    if cancelled() {
+-        return format_err("cancelled");
+-    }
+-    let mut file = PkgFile::open(path)?;
 +    let stop = || -> Result<()> {
-+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
++        if cancel.is_some_and(crate::workshop::checkpoint) {
 +            return Err(crate::Error::Cancelled);
 +        }
 +        Ok(())
@@ -414,7 +440,7 @@ index 1437ba6..580ca03 100644
      let fih_block = file.read_at(0, BLOCK as usize)?;
      let fih = fih::parse(&fih_block)?;
      let cnt = cnt::read(&mut file, fih.cnt_offset)?;
-@@ -420,6 +453,7 @@ pub fn verify_streaming(
+@@ -470,6 +480,7 @@ fn verify_streaming_inner(
      // The sector rule the samples follow: data blocks carry their own index, metadata
      // blocks set bit 47, and the superblock is not encrypted at all.
      let read_block = |file: &mut PkgFile, index: u64| -> Result<Vec<u8>> {
@@ -422,28 +448,49 @@ index 1437ba6..580ca03 100644
          let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
          if index == sb_index {
              return Ok(raw);
-@@ -463,6 +497,7 @@ pub fn verify_streaming(
-     let mut bad = 0u64;
-     let mut done = 0u64;
-     for index in 0..count {
+@@ -533,6 +544,7 @@ fn verify_streaming_inner(
+         Some(v) => Box::new(v.into_iter().flat_map(span).chain(data..count)),
+     };
+     for index in indices {
 +        stop()?;
          // The superblock is not encrypted; it was matched against the game digest above.
          if index != sb_index {
              let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
-@@ -542,7 +577,7 @@ pub fn verify_streaming(
-             match s.members.iter().find(|m| m.name == crc_name) {
-                 Some(m) => {
+@@ -556,16 +568,10 @@ fn verify_streaming_inner(
+         }
+         done += 1;
+         if done.is_multiple_of(256) {
+-            if crate::workshop::checkpoint_opt(cancel) {
+-                return format_err("cancelled");
+-            }
+             progress(done * BLOCK, sweep * BLOCK);
+         }
+     }
+-    // Every 256 blocks above; a smaller package (or the last few blocks) is checked here.
+-    if cancelled() {
+-        return format_err("cancelled");
+-    }
++    stop()?;
+     progress(done * BLOCK, sweep * BLOCK);
+     r.push(
+         if plaintext_mode {
+@@ -625,7 +631,10 @@ fn verify_streaming_inner(
                      let stored = file.read_at(m.offset, m.size as usize)?;
--                    let expected = si::chunk_crc_table(&mut file, s.zip_start)?;
-+                    let expected = si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
-                     r.push(
-                         "si playgo-chunk.crc",
-                         stored == expected,
+                     // Sampled with the sweep: the whole table would read the package again.
+                     let ok = match seed {
+-                        None => stored == si::chunk_crc_table(&mut file, s.zip_start)?,
++                        None => {
++                            stored
++                                == si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?
++                        }
+                         Some(seed) => si::chunk_crc_sampled(&mut file, s.zip_start, &stored, seed)?,
+                     };
+                     r.push("si playgo-chunk.crc", ok, format!("{} bytes", m.size));
 diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
-index 6e833d0..4aae569 100644
+index 6e833d0c98561d463ef6614f93e9eae56b9ab930..3e0a31a892bdd5f1e2aeae255f56d397c4d09790 100644
 --- a/ps5upload-fpkg/tests/prepared.rs
 +++ b/ps5upload-fpkg/tests/prepared.rs
-@@ -531,3 +531,133 @@ fn a_thread_cap_builds_the_same_package() {
+@@ -531,3 +531,139 @@ fn a_thread_cap_builds_the_same_package() {
      };
      assert!(built(Some(1), "threads-one") == built(None, "threads-all"));
  }
@@ -521,8 +568,9 @@ index 6e833d0..4aae569 100644
 +    let report = verify::verify_streaming_controlled(
 +        &built.path,
 +        DEFAULT_PASSCODE,
-+        &mut |_, _| {},
++        None,
 +        Some(&flag),
++        &mut |_, _| {},
 +    )
 +    .unwrap();
 +    assert!(report.ok(), "{report}");
@@ -536,8 +584,13 @@ index 6e833d0..4aae569 100644
 +    // Stopped from the progress callback, i.e. halfway through the block sweep.
 +    let mut stop = |_: u64, _: u64| flag.store(true, Ordering::Relaxed);
 +    flag.store(false, Ordering::Relaxed);
-+    let stopped =
-+        verify::verify_streaming_controlled(&built.path, DEFAULT_PASSCODE, &mut stop, Some(&flag));
++    let stopped = verify::verify_streaming_controlled(
++        &built.path,
++        DEFAULT_PASSCODE,
++        None,
++        Some(&flag),
++        &mut stop,
++    );
 +    assert!(matches!(stopped, Err(ps5upload_fpkg::Error::Cancelled)));
 +}
 +

@@ -1,7 +1,5 @@
-//! The `.part` transaction: write to a unique sibling, verify, fsync, then
-//! publish it with a rename that refuses to replace anything. `std::fs::rename` replaces
-//! silently, so a check-then-rename would race with whatever appears in between; it is the
-//! fallback only where no exclusive rename exists (macOS exFAT, see [`rename_no_replace`]).
+//! The `.part` transaction: write to a unique sibling, verify, fsync, then publish it with a
+//! rename that never replaces (check-then-rename only where no exclusive rename exists).
 
 use std::ffi::OsString;
 use std::fs::{File, FileType, OpenOptions};
@@ -12,40 +10,30 @@ use anyhow::Context;
 
 use crate::JobId;
 
-/// Windows `CreateFile` flag: open a reparse point itself, never what it points at.
 #[cfg(windows)]
 pub(crate) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-/// `<output>.<job>-<pid>.part`, next to the output. The pid keeps two processes (the app
-/// and a CLI run) from picking the same name; creation is exclusive either way.
+/// `<output>.<job>-<pid>.part`; the pid keeps the app and a CLI run apart.
 pub(crate) fn part_path(output: &Path, job: JobId) -> PathBuf {
     let mut name = output.file_name().map(OsString::from).unwrap_or_default();
     name.push(format!(".{job}-{}.part", std::process::id()));
     output.with_file_name(name)
 }
 
-/// A `.part` this job created. Dropping it without [`Part::publish`] deletes it, so a
-/// failure, a cancel or a panic (the guard drops while unwinding) never leaves it behind.
-/// Before publishing and before deleting, the path is checked to still name what this job
-/// created, so a `.part` swapped for something else is neither published nor deleted.
-///
-/// A file part keeps a duplicate of its creation handle and compares the handle's current
-/// identity with the path's: macOS's exFAT and FAT drivers give a new, empty file a
-/// placeholder inode number and a real one only once it has a cluster, so an identity
-/// captured at creation goes stale with the first write. A directory gets its real inode
-/// at `mkdir`, so a dir part keeps the identity it captured then.
+/// A `.part` this job created; dropped unpublished (failure, cancel, panic) it is deleted.
+/// Publish and delete first check the path still names what this job created.
+/// A file part compares its handle's current identity: macOS exFAT/FAT give a new empty file a
+/// placeholder inode until it has a cluster. A dir gets its real inode at `mkdir`.
 pub(crate) struct Part {
     path: PathBuf,
     dir: bool,
-    /// Captured at creation; a file part uses it only until it holds `handle`.
     id: FileId,
-    /// Only ever used for its identity: it shares the caller's cursor.
+    /// Only used for its identity: it shares the caller's cursor.
     handle: Option<File>,
     published: bool,
     /// From the destination probe: publish a file by hard link (U3).
     #[cfg(target_os = "freebsd")]
     hard_links: bool,
-    /// The device the probe saw the output folder on.
     #[cfg(target_os = "freebsd")]
     dev: Option<u64>,
 }
@@ -61,7 +49,7 @@ impl Part {
                 return Err(e).with_context(|| format!("identifying {}", path.display()));
             }
         };
-        // The guard exists before the fallible clone, so a failed clone still cleans up.
+        // Guard before the fallible clone, so a failed clone cleans up.
         let mut part = Self::new(path, false, id);
         part.handle = Some(file.try_clone().context("duplicating the .part handle")?);
         Ok((part, file))
@@ -70,7 +58,6 @@ impl Part {
     pub(crate) fn create_dir(path: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir(path).with_context(|| format!("creating {}", path.display()))?;
         if let Err(e) = make_dir_open(path) {
-            // Ours, just created and still empty.
             let _ = std::fs::remove_dir(path);
             return Err(e).with_context(|| format!("setting the mode of {}", path.display()));
         }
@@ -98,8 +85,7 @@ impl Part {
         }
     }
 
-    /// What the job's destination probe saw, so publishing acts on it without probing again.
-    /// In place: the caller's `file` must still drop before its part (U6).
+    /// The destination probe's result. The caller's `file` must drop before its part (U6).
     #[cfg(target_os = "freebsd")]
     pub(crate) fn set_dest(&mut self, dest: &crate::dest::Dest) {
         self.hard_links = dest.hard_links;
@@ -110,7 +96,6 @@ impl Part {
         &self.path
     }
 
-    /// What this job created, as it is now.
     fn held(&self) -> io::Result<FileId> {
         match &self.handle {
             Some(handle) => handle_id(handle),
@@ -118,13 +103,11 @@ impl Part {
         }
     }
 
-    /// Whether `id` (of an open handle) is this part.
     pub(crate) fn is(&self, id: FileId) -> bool {
         self.held().is_ok_and(|held| held == id)
     }
 
-    /// Whether the path still names the object this job created. Any error means it does
-    /// not.
+    /// Whether the path still names what this job created; any error means no.
     fn still_ours(&self) -> bool {
         match (self.held(), path_id(&self.path)) {
             (Ok(held), Ok((at, kind))) => held == at && (self.dir || kind.is_file()),
@@ -132,8 +115,7 @@ impl Part {
         }
     }
 
-    /// Renames the (already verified and fsynced) part to `output`, then fsyncs the folder
-    /// so the new name survives a crash.
+    /// Renames the verified, fsynced part to `output`, then fsyncs the folder.
     pub(crate) fn publish(mut self, output: &Path) -> anyhow::Result<()> {
         // ponytail: identity is checked, then the path is renamed; a swap inside that
         // window needs renameat on held handles, which no OS offers for the source.
@@ -158,15 +140,10 @@ impl Part {
         }
     }
 
-    /// Puts the (already verified and fsynced) file part in place of `target`, the source image
-    /// it replaces ([`crate::ConvertRequest::edit_rebuild`]), keeping the original recoverable
-    /// until the new one is durable: the original gets a second name beside it (`*.orig.part`,
-    /// a hard link, or a rename where the volume has no hard links: macOS exFAT/FAT), the folder
-    /// is synced, the part renamed to `target`, the folder synced again, and only then the
-    /// backup removed (folder synced once more). A failure before that last step puts the original back under `target`
-    /// and leaves neither the part nor the backup; where even that fails, the error names the
-    /// backup to rename back. Returns the backup's path when only its removal at the end
-    /// failed. The caller has checked the source unchanged and closed its handles.
+    /// Puts the verified file part in place of `target` (an edit rebuild), the original kept as
+    /// `*.orig.part` (hard link, else rename) until the new one is durable. A failure before the
+    /// backup's removal puts the original back (else the error names the backup). Returns the
+    /// backup's path when only its removal failed. The caller closed the source's handles.
     // ponytail: the source's stamp is checked, then the original moves; a rewrite of the source
     // inside that window is lost. Without hard links `target` is briefly absent; a crash right
     // then leaves the original as `*.orig.part` (which `stale_parts` lists) for the user.
@@ -181,7 +158,7 @@ impl Part {
         imp::same_device(&self.path, target, self.dev)
             .with_context(|| format!("replacing {}", target.display()))?;
         let parent = target.parent().unwrap_or(Path::new("."));
-        // `<output>.<job>-<pid>.orig.part`: still a `.part`, so `stale_parts` lists a leftover.
+        // Still a `.part`, so `stale_parts` lists a leftover.
         let part_name = self.path.file_name().unwrap_or_default().to_string_lossy();
         let stem = part_name.strip_suffix(".part").unwrap_or(&part_name);
         let backup = self.path.with_file_name(format!("{stem}.orig.part"));
@@ -195,20 +172,24 @@ impl Part {
                 false
             }
         };
-        // From here a failure puts the original back. The part's handle stays until its rename
-        // lands, so `Drop` can still recognize (and delete) it before then.
+        // The part's handle stays until its rename lands, so `Drop` still recognizes it.
         let restore = |e: anyhow::Error| -> anyhow::Error {
-            let back = std::fs::rename(&backup, target).and_then(|()| fsync_dir(parent));
-            match back {
-                Ok(()) => e,
+            match std::fs::rename(&backup, target) {
+                Ok(()) => match fsync_dir(parent) {
+                    Ok(_) => e,
+                    // Back at `target`, but a crash now could leave it under the backup name.
+                    Err(s) => e.context(format!(
+                        "the original image is back at {t}, but its folder didn't sync ({s}): \
+                         after a crash look for {b}"
+                    )),
+                },
                 Err(b2) => e.context(format!(
                     "putting the original back failed ({b2}): the original image is {b}; \
                      rename it to {t}"
                 )),
             }
         };
-        // Before the original can be replaced, its backup name is made durable: a crash after
-        // the rename below then leaves the original reachable under it.
+        // The backup name is made durable before the original is replaced.
         let undo = |e: anyhow::Error| -> anyhow::Error {
             if linked {
                 let _ = std::fs::remove_file(&backup);
@@ -235,7 +216,6 @@ impl Part {
         if let Err(e) = renamed {
             return Err(undo(e));
         }
-        // The part's name is gone: nothing for `Drop` to delete.
         self.published = true;
         let synced = inject(Step::Sync)
             .and_then(|()| fsync_dir(parent))
@@ -244,8 +224,7 @@ impl Part {
             // Renaming the backup over `target` also drops the new image.
             return Err(restore(e));
         }
-        // The new image is in place and durable; a backup that can't be removed is left for the
-        // caller to report (and `stale_parts` lists it).
+        // The new image is durable; a backup that can't be removed is the caller's to report.
         if std::fs::remove_file(&backup).is_err() {
             return Ok(Some(backup));
         }
@@ -253,9 +232,8 @@ impl Part {
         Ok(None)
     }
 
-    /// U3: the device guard, then a hard link (a file, where the probe saw hard links) or a
-    /// checked rename. Once the output name exists the job has succeeded: removing the
-    /// part's own name and syncing the folder are best effort.
+    /// U3: the device guard, then a hard link (a file, where the probe saw them) or a checked
+    /// rename. Once the output name exists, unlinking the part and the folder sync are best effort.
     #[cfg(target_os = "freebsd")]
     fn publish_here(&mut self, output: &Path) -> anyhow::Result<()> {
         let (from, to) = (self.path.display(), output.display());
@@ -272,8 +250,7 @@ impl Part {
         }
         self.published = true;
         if link {
-            // ponytail: a failed unlink leaves a second name of the output, which
-            // `stale_parts` lists; deleting it leaves the output intact. Part has no log.
+            // ponytail: a failed unlink leaves a second name `stale_parts` lists; Part has no log.
             self.handle = None;
             let _ = std::fs::remove_file(&self.path);
         }
@@ -293,7 +270,7 @@ impl Drop for Part {
         // U6: an open handle can hold back the space a delete frees.
         #[cfg(target_os = "freebsd")]
         drop(self.handle.take());
-        // `remove_dir_all` does not follow links, so a link planted inside cannot widen it.
+        // `remove_dir_all` does not follow links.
         let _ = if self.dir {
             std::fs::remove_dir_all(&self.path)
         } else {
@@ -311,25 +288,19 @@ impl Drop for Part {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Step {
-    /// The hard link to the original (as on a volume without them).
     Link,
-    /// The folder sync that makes the backup name durable.
     BackupSync,
     Rename,
     Sync,
-    /// `open_up` in [`create_new`].
-    OpenUp,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The step that fails on this thread, in tests.
     pub(crate) static FAIL: std::cell::Cell<Option<Step>> = const { std::cell::Cell::new(None) };
-    /// [`Step::Link`] fails too.
+    /// [`Step::Link`] fails too (a volume without hard links).
     pub(crate) static NO_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// An injected failure of `step` (tests only; always `Ok` otherwise).
 fn inject(step: Step) -> io::Result<()> {
     #[cfg(test)]
     if FAIL.with(|f| f.get()) == Some(step) || (step == Step::Link && NO_LINKS.with(|n| n.get())) {
@@ -339,8 +310,7 @@ fn inject(step: Step) -> io::Result<()> {
     Ok(())
 }
 
-/// What a path names, independent of its spelling: (device, inode) on Unix, (volume
-/// serial, file id) on Windows.
+/// (device, inode) on Unix, (volume serial, file id) on Windows.
 pub(crate) type FileId = (u64, u128);
 
 #[cfg(unix)]
@@ -349,7 +319,6 @@ pub(crate) fn meta_id(meta: &std::fs::Metadata) -> FileId {
     (meta.dev(), u128::from(meta.ino()))
 }
 
-/// The identity of an open handle.
 #[cfg(unix)]
 pub(crate) fn handle_id(file: &File) -> io::Result<FileId> {
     Ok(meta_id(&file.metadata()?))
@@ -362,7 +331,6 @@ pub(crate) fn path_id(path: &Path) -> io::Result<(FileId, FileType)> {
     Ok((meta_id(&meta), meta.file_type()))
 }
 
-/// What `path` names, following links.
 #[cfg(unix)]
 pub(crate) fn followed_id(path: &Path) -> io::Result<FileId> {
     Ok(meta_id(&path.metadata()?))
@@ -395,8 +363,7 @@ fn path_handle_id(path: &Path, file: &File) -> io::Result<FileId> {
     }
 }
 
-/// Opens a file or folder for its attributes only. It shares everything, so it never
-/// stands in the way of a rename or a delete; `follow: false` opens a link itself.
+/// Opens for attributes only, sharing everything; `follow: false` opens a link itself.
 #[cfg(windows)]
 pub(crate) fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -414,8 +381,7 @@ pub(crate) fn open_attributes(path: &Path, follow: bool) -> io::Result<File> {
         .open(path)
 }
 
-// Elsewhere there are no identities, so no path is ever recognised as a part: nothing is
-// published or deleted (and `rename_no_replace` refuses there anyway).
+// No identities elsewhere: no path is ever recognised as a part.
 #[cfg(not(any(unix, windows)))]
 fn no_ids() -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, "no file identities on this OS")
@@ -451,8 +417,7 @@ pub(crate) fn create_new(path: &Path) -> io::Result<File> {
         opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = opts.open(path)?;
-    if let Err(e) = inject(Step::OpenUp).and_then(|()| open_up(&file)) {
-        // Ours, just created: nothing else knows it yet.
+    if let Err(e) = open_up(&file) {
         drop(file);
         let _ = std::fs::remove_file(path);
         return Err(e);
@@ -460,14 +425,10 @@ pub(crate) fn create_new(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Opens a regular file this process created and closed, for writing again, without following
-/// a link at `path`; refused unless it is on device `dev` and `len` bytes long, as it was when
-/// closed (one moved away and another put at its name is not written).
-// ponytail: device + length, not the inode: Linux vfat/exfat number an inode anew each time it is
-// read back in, so a closed volume's inode can change. A same-length file put there isn't caught;
-// only a process outside Forge can put one (its jobs, Delete, Move and the peer RPCs refuse every
-// unrenamed peer file). Keep the inode check where the filesystem's numbers are stable if that
-// ever matters (needs a per-OS filesystem-type probe).
+/// Reopens a file this process created and closed, link not followed; refused unless on `dev`
+/// and `len` bytes long, as when closed.
+// ponytail: device + length, not the inode (Linux vfat/exfat renumber inodes when read back in);
+// a same-length file put there by a process outside Forge isn't caught.
 pub(crate) fn reopen(path: &Path, dev: u64, len: u64) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
@@ -491,9 +452,8 @@ pub(crate) fn reopen(path: &Path, dev: u64, len: u64) -> io::Result<File> {
     Ok(file)
 }
 
-/// CE-107750-0: the game cannot read files made with the process default mode on the PS5, so
-/// everything Forge creates in a game folder is 0777 (like the UFS2 writer's inodes), set
-/// explicitly because the create mode is masked by the umask. A no-op off FreeBSD.
+/// CE-107750-0: on the PS5 the game can't read files made with the default mode, so everything
+/// Forge creates is 0777, set explicitly past the umask. A no-op off FreeBSD.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn open_up(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -519,7 +479,6 @@ pub(crate) fn open_up_at(dir: libc::c_int, name: &std::ffi::CStr) -> io::Result<
     }
 }
 
-/// `open_up` for a directory made by path.
 pub(crate) fn make_dir_open(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "freebsd")]
     {
@@ -537,7 +496,7 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// With ps5upload's retries; a filesystem without directory fsync is fine (U4).
+/// With retries; a filesystem without directory fsync is fine (U4).
 #[cfg(target_os = "freebsd")]
 pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     use std::sync::atomic::AtomicBool;
@@ -546,31 +505,21 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     crate::durable::sync_retry(&File::open(dir)?, true, &NO_CANCEL).map(drop)
 }
 
-// ponytail: Windows has no directory fsync through std (it needs FILE_FLAG_BACKUP_SEMANTICS);
-// NTFS journals the rename itself.
+// ponytail: no directory fsync through std on Windows; NTFS journals the rename itself.
 #[cfg(not(unix))]
 pub(crate) fn fsync_dir(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists. Works for files
-/// and directories on the same volume. Atomic everywhere except on volumes without an
-/// exclusive rename (macOS exFAT, Linux NFS and FUSE; FreeBSD always), where it checks `to`
-/// and then renames.
+/// Renames `from` to `to`, `AlreadyExists` if `to` exists (files and folders, one volume).
+/// Atomic except where no exclusive rename exists (macOS exFAT, Linux NFS/FUSE, FreeBSD).
 pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename_no_replace(from, to)
 }
 
-/// For volumes without an exclusive rename (macOS exFAT; Linux NFS and FUSE; FreeBSD has none
-/// at all). macOS's
-/// kernel lookup still fails an existing `to` (in any case) with `EEXIST` before asking the
-/// driver, so there this check only catches what appeared since: nothing at `to`, in any
-/// case, since the lookup follows the volume's case rules, then rename. Nothing is created at
-/// `to` first, so a crash leaves only the `.part`.
-// ponytail: an entry created at `to` by another process between the check and the rename
-// is replaced (a window of microseconds, the one the user accepted). macOS offers no way to
-// close it on exFAT today: link(), RENAME_EXCL and clonefile are all unsupported; FreeBSD has
-// no RENAME_EXCL, and a file there is published by hard link where the folder has them.
+/// Nothing at `to` (in the volume's case rules), then rename; a crash leaves only the `.part`.
+// ponytail: an entry created at `to` between the check and the rename is replaced (microseconds,
+// accepted); macOS exFAT supports neither link(), RENAME_EXCL nor clonefile.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn checked_rename(from: &Path, to: &Path) -> io::Result<()> {
     match to.symlink_metadata() {
@@ -665,7 +614,7 @@ mod imp {
     pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
         let (from, to) = (wide(from), wide(to));
-        // No MOVEFILE_REPLACE_EXISTING: the move fails if `to` exists.
+        // No MOVEFILE_REPLACE_EXISTING.
         // SAFETY: both are valid NUL-terminated wide strings.
         if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
             return Err(io::Error::last_os_error());
@@ -681,14 +630,12 @@ mod imp {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    /// The device guard, then the checked rename. No probe here, so no hard links.
     pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         same_device(from, to, None)?;
         checked_rename(from, to)
     }
 
-    /// Refuses unless `from` (not followed) and the folder `to` goes in are on one device,
-    /// and on `dev` when the probe saw one. Any stat error refuses too.
+    /// Refuses unless `from` and `to`'s folder are on one device (and `dev`); a stat error too.
     pub(super) fn same_device(from: &Path, to: &Path, dev: Option<u64>) -> io::Result<()> {
         let parent = match to.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -710,7 +657,6 @@ mod imp {
         Ok(())
     }
 
-    /// The link is the publication: it fails if `to` exists, and nothing replaces it.
     pub(super) fn link_no_replace(from: &Path, to: &Path) -> io::Result<()> {
         std::fs::hard_link(from, to).map_err(|e| {
             // Sony's 0x8002xxxx form of EEXIST, as the plain one.
@@ -741,8 +687,7 @@ mod imp {
     }
 }
 
-/// `*.part` entries in `dir`, sorted. Listing only: the user
-/// decides what to delete.
+/// `*.part` entries in `dir`, sorted; the user decides what to delete.
 pub(crate) fn stale_parts(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -789,8 +734,7 @@ mod tests {
 
     use std::io::Write;
 
-    /// A file part with `bytes` written, fsynced and the caller's handle closed, the way
-    /// the image jobs leave it before publishing.
+    /// A file part written, fsynced and its caller's handle closed.
     fn written(dir: &Path, name: &str, bytes: &[u8]) -> Part {
         let (part, mut file) = Part::create_file(&dir.join(name)).unwrap();
         file.write_all(bytes).unwrap();
@@ -826,8 +770,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// Moves the part aside and plants `plant` at its path. Neither publish nor drop may
-    /// touch the planted entry, the moved original or the output name.
+    /// Moves the part aside and plants an entry at its path: publish and drop touch nothing.
     fn replaced_part_is_left_alone(name: &str, plant: impl Fn(&Path, &Path)) {
         let dir = crate::test_dir(name);
         for publish in [true, false] {
@@ -857,8 +800,7 @@ mod tests {
         });
     }
 
-    /// The exFAT fallback's check, run here directly: on a volume with `RENAME_EXCL` the
-    /// kernel answers first, and on exFAT only a race reaches it. FreeBSD's only rename.
+    /// The exFAT fallback's check, run directly (FreeBSD's only rename).
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn the_checked_rename_never_replaces() {
@@ -907,8 +849,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    /// U3 on FreeBSD: a file is published by hard link, the link refuses a taken name, and a
-    /// part on another device than the probe saw is never renamed.
+    /// U3: publish by hard link, a taken name refused, another device never renamed.
     #[cfg(target_os = "freebsd")]
     #[test]
     fn freebsd_publishes_by_link_behind_the_device_guard() {
@@ -977,7 +918,6 @@ mod tests {
         );
     }
 
-    /// Only `keep` is left in `dir`.
     fn only(dir: &Path, keep: &[&str]) {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -987,7 +927,6 @@ mod tests {
         assert_eq!(names, keep);
     }
 
-    /// With a hard link to the original, and without (the original renamed aside).
     #[test]
     fn replace_puts_the_part_in_place_and_drops_the_backup() {
         for no_links in [false, true] {
@@ -1003,8 +942,7 @@ mod tests {
         }
     }
 
-    /// A failed rename of the part, or a failed folder sync after it, puts the original back
-    /// byte for byte and leaves neither the part nor the backup, with or without hard links.
+    /// A failed step puts the original back and leaves neither part nor backup.
     #[test]
     fn a_failed_replace_puts_the_original_back() {
         for no_links in [false, true] {

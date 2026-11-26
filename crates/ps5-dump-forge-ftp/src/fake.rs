@@ -9,8 +9,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const MDTM: &str = "20261021091500";
-
 pub struct Fake {
     pub port: u16,
     pub root: PathBuf,
@@ -147,7 +145,7 @@ fn command(s: &mut State, w: &mut TcpStream, verb: &str, arg: &str) -> io::Resul
         "PASS" => send(w, "230 logged in"),
         "FEAT" => send(
             w,
-            "211-Features:\r\n SIZE\r\n MDTM\r\n REST STREAM\r\n UTF8\r\n211 End",
+            "211-Features:\r\n SIZE\r\n REST STREAM\r\n UTF8\r\n211 End",
         ),
         "OPTS" | "TYPE" => send(w, "200 ok"),
         "PWD" => send(w, &format!("257 \"{}\" is the current directory", s.cwd)),
@@ -210,10 +208,6 @@ fn command(s: &mut State, w: &mut TcpStream, verb: &str, arg: &str) -> io::Resul
         }
         "SIZE" => match real.filter(|p| p.is_file()) {
             Some(p) => send(w, &format!("213 {}", fs::metadata(p)?.len())),
-            None => send(w, NOT_FOUND),
-        },
-        "MDTM" => match real.filter(|p| p.is_file()) {
-            Some(_) => send(w, &format!("213 {MDTM}")),
             None => send(w, NOT_FOUND),
         },
         "REST" => match arg.parse() {
@@ -297,6 +291,11 @@ fn command(s: &mut State, w: &mut TcpStream, verb: &str, arg: &str) -> io::Resul
         "DELE" => match real.filter(|p| p.is_file()) {
             Some(p) if fs::remove_file(&p).is_ok() => send(w, "250 deleted"),
             _ => send(w, NOT_FOUND),
+        },
+        // vsftpd's one answer to every failure, so the client finds out why itself.
+        "RMD" => match real.filter(|p| p.is_dir()) {
+            Some(p) if fs::remove_dir(&p).is_ok() => send(w, "250 removed"),
+            _ => send(w, "550 Remove directory operation failed."),
         },
         "ABOR" => send(w, "225 no transfer to abort"),
         "NOOP" => send(w, "200 ok"),

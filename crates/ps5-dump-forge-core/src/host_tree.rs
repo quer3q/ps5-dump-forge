@@ -1,8 +1,5 @@
-//! The Edit tab's preview of a host file or folder the user adds: what `Edited` would add.
-//! A bounded walk (no links followed, junk filtered as a conversion filters it) stops at the
-//! limits below; a folder within them is then listed by core's own folder scanner, so the
-//! preview holds exactly what `Edited` scans, refusals included. Reads metadata only. A
-//! paired device's file or folder (`flink://`) is walked the same way through its listing.
+//! The Edit tab's preview of a file or folder to add: a bounded walk, then (within the limits)
+//! core's folder scanner, so it holds exactly what `Edited` scans. Reads metadata only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,23 +14,19 @@ use crate::preflight::listing;
 use crate::remote::{FlinkPath, Remote};
 use crate::scan::{ScannedFolder, is_junk};
 
-/// Directory entries enumerated (junk and folders included); past it the walk stops and the
-/// listing is truncated.
+/// Directory entries enumerated (junk and folders included) before the listing is truncated.
 const MAX_ENTRIES: usize = 200_000;
 /// The walk's and the scan's time budget; past it the listing is truncated.
 const BUDGET: Duration = Duration::from_secs(15);
 
-/// What a host path holds, as the Edit tab shows it before adding it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostTree {
     pub kind: HostKind,
-    /// A file's size, or the total of the listed files.
     pub size: u64,
-    /// A folder's files, relative and `/`-separated, sorted; empty for a file.
+    /// Relative, `/`-separated, sorted; empty for a file.
     pub files: Vec<HostFile>,
-    /// A folder's empty directories (one holding only junk counts), relative, sorted.
+    /// One holding only junk counts.
     pub empty_dirs: Vec<String>,
-    /// The walk hit [`MAX_ENTRIES`] or the time budget; the listing is what it saw by then.
     pub truncated: bool,
 }
 
@@ -50,8 +43,7 @@ pub struct HostFile {
     pub size: u64,
 }
 
-/// Lists `path`: a regular file or a folder. A link or special file at `path` is an error, as
-/// is anything the scanner refuses inside a folder (links, special files, bad names).
+/// A link or special file at `path` is an error, as is anything the scanner refuses inside.
 pub fn host_tree(path: &Path, cancel: &AtomicBool) -> anyhow::Result<HostTree> {
     host_tree_with(path, cancel, MAX_ENTRIES, BUDGET)
 }
@@ -149,7 +141,6 @@ fn peer_tree(
     walked(path, walk)
 }
 
-/// The walk's listing of the folder at `path`, unless it refused anything.
 fn walked(path: &Path, mut walk: Walk) -> anyhow::Result<HostTree> {
     if !walk.refused.is_empty() {
         bail!(
@@ -169,8 +160,7 @@ fn walked(path: &Path, mut walk: Walk) -> anyhow::Result<HostTree> {
     })
 }
 
-/// The bounded walk: the scanner's junk filter and link rule, stopping at `max` entries or the
-/// deadline. Refused entries are collected (the scanner reports them itself when it runs).
+/// The scanner's junk filter and link rule, stopping at `max` entries or the deadline.
 // ponytail: a truncated listing doesn't check hard links or unreadable files; the scanner
 // does, for a folder within the limits and for the Edit job.
 struct Walk<'a> {
@@ -198,8 +188,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Walks one directory; returns whether anything under it was kept (or refused), so a
-    /// directory holding only junk counts as empty. A cut-short directory counts as kept.
+    /// Whether anything under it was kept (or refused): only junk counts as empty.
     fn dir(&mut self, dir: &Path, rel: &str) -> anyhow::Result<bool> {
         let shown = |name: &str| match rel {
             "" => name.to_string(),

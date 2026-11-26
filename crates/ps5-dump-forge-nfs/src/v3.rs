@@ -1,13 +1,6 @@
 //! NFSv3 (RFC 1813) with MOUNT v3 and the portmapper (RFC 1833's v2 GETPORT).
-//!
-//! Paths are absolute server paths. A path resolves through the longest export that is a
-//! component-wise prefix of it (MNT once, the root handle cached), then LOOKUPs of the rest;
-//! paths above or between exports form a virtual read-only folder tree, as v4's pseudo-fs does.
-//! Reads: GETATTR, LOOKUP, READ in FSINFO rtmax chunks, READDIRPLUS (READDIR
-//! where the server has none), FSSTAT. Writes: CREATE
-//! GUARDED (never replacing), WRITE UNSTABLE in wtmax chunks and COMMIT on sync (refused when the
-//! server's write verifier changed), MKDIR, REMOVE, and a no-replace rename (LINK + REMOVE, else
-//! a check and RENAME).
+//! A path resolves through the longest export that is a component-wise prefix of it; paths
+//! above or between exports form a virtual read-only folder tree, as v4's pseudo-fs does.
 
 use crate::Entry;
 use crate::rpc::{self, Client, Xdr, XdrReader, bad};
@@ -42,6 +35,7 @@ const NFSPROC3_WRITE: u32 = 7;
 const NFSPROC3_CREATE: u32 = 8;
 const NFSPROC3_MKDIR: u32 = 9;
 const NFSPROC3_REMOVE: u32 = 12;
+const NFSPROC3_RMDIR: u32 = 13;
 const NFSPROC3_RENAME: u32 = 14;
 const NFSPROC3_LINK: u32 = 15;
 const NFSPROC3_READDIR: u32 = 16;
@@ -52,24 +46,20 @@ const NFSPROC3_COMMIT: u32 = 21;
 /// stable_how UNSTABLE, createmode3 GUARDED.
 const UNSTABLE: u32 = 0;
 const GUARDED: u32 = 1;
-/// Modes of what Forge creates.
 const FILE_MODE: u32 = 0o666;
 const DIR_MODE: u32 = 0o777;
 /// NFS3_FHSIZE.
 const MAX_FH: usize = 64;
-/// ftype3 values.
 const NF3REG: u32 = 1;
 const NF3DIR: u32 = 2;
 const NF3LNK: u32 = 5;
-/// A folder with more entries than this (`.` and `..` counted, so a server repeating only
-/// them can't page forever), or more name bytes in all, is an error.
+/// More entries (`.` and `..` counted, so a server repeating them can't page forever) or name
+/// bytes than this is an error.
 pub(crate) const MAX_LIST: usize = 200_000;
 pub(crate) const MAX_LIST_NAMES: usize = 64 << 20;
-/// READDIRPLUS sizes asked for: names + cookies, and the whole reply (READDIR's count: the latter).
 const DIRCOUNT: u32 = 32 * 1024;
 const MAXCOUNT: u32 = 256 * 1024;
-/// READ and WRITE chunks when the server's FSINFO gives no rtmax / wtmax, and the most we move
-/// in one call (well inside rpc::MAX_RECORD).
+/// READ and WRITE chunks without FSINFO's rtmax / wtmax, and the most moved in one call.
 const DEFAULT_XFER: u32 = 32 * 1024;
 const MAX_XFER: u32 = 4 * 1024 * 1024;
 
@@ -80,7 +70,6 @@ const AUTH_SYS: u32 = 1;
 const MAX_HANDLES: usize = 4096;
 const HANDLE_TTL: Duration = Duration::from_secs(3);
 
-/// An nfsstat3 (MOUNT's mountstat3 shares its numbers) as an `io::Error`.
 pub(crate) fn nfs_error(code: u32) -> io::Error {
     let (kind, text) = match code {
         1 => (ErrorKind::PermissionDenied, "not owner"),
@@ -119,7 +108,7 @@ pub(crate) fn nfs_error(code: u32) -> io::Error {
     io::Error::new(kind, format!("NFS: {text} ({code})"))
 }
 
-/// True when `e` came from NFS3ERR_STALE (drop the cached handle, look it up again).
+/// NFS3ERR_STALE: drop the cached handle, look it up again.
 pub(crate) fn is_stale(e: &io::Error) -> bool {
     e.kind() == ErrorKind::StaleNetworkFileHandle
 }
@@ -142,13 +131,11 @@ pub(crate) fn components(path: &str) -> io::Result<Vec<&str>> {
     Ok(comps)
 }
 
-/// The canonical form of `comps` (`/a/b`, `/` for none): the handle cache's key.
+/// The handle cache's key (`/a/b`, `/` for none).
 pub(crate) fn key(comps: &[&str]) -> String {
     format!("/{}", comps.join("/"))
 }
 
-/// One export: its path as the server gave it (for MNT), its components, its root handle once
-/// mounted.
 #[derive(Debug, Clone)]
 pub(crate) struct Export {
     path: String,
@@ -170,7 +157,6 @@ impl Export {
     }
 }
 
-/// Where a path lies among the exports.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Place<'a> {
     /// Inside export number `export`; `rest` is the path below its root.
@@ -183,8 +169,7 @@ pub(crate) enum Place<'a> {
     NotFound,
 }
 
-/// Resolves `comps` by the longest export that is a component-wise prefix of it; else a path
-/// that leads to exports is a virtual folder of their next components; else nothing is there.
+/// The longest export that is a component-wise prefix of `comps`; else a virtual folder.
 pub(crate) fn place<'a>(exports: &[Export], comps: &[&'a str]) -> Place<'a> {
     let prefix =
         |e: &Export| e.comps.len() <= comps.len() && e.comps.iter().zip(comps).all(|(a, b)| a == b);
@@ -212,7 +197,6 @@ pub(crate) fn place<'a>(exports: &[Export], comps: &[&'a str]) -> Place<'a> {
     Place::Virtual(children)
 }
 
-/// A virtual folder's entry (no size, no time).
 fn virtual_dir(name: &str) -> Entry {
     Entry {
         name: name.to_string(),
@@ -221,15 +205,13 @@ fn virtual_dir(name: &str) -> Entry {
         mtime: None,
         link: false,
         special: false,
+        fsid: None,
     }
 }
 
-/// File handles by canonical path ([`key`]), bounded: when full it starts over. A handle is
-/// trusted for [`HANDLE_TTL`] only, then the path is looked up again: another client may have
-/// renamed the object away and put another at its name (no STALE tells us so).
-// ponytail: no LRU; at MAX_HANDLES paths the walks LOOKUP from the export root again. Within
-// the TTL a name replaced by another client still reads the old object (as a kernel client's
-// attribute cache does).
+/// Handles by path, bounded (starts over when full), each trusted for [`HANDLE_TTL`] only:
+/// another client may have put another object at the name (no STALE says so).
+// ponytail: no LRU; within the TTL a name replaced by another client reads the old object.
 #[derive(Debug, Default)]
 pub(crate) struct Handles {
     map: HashMap<String, (Vec<u8>, Instant)>,
@@ -262,7 +244,6 @@ impl Handles {
     }
 }
 
-/// `host` (a name, an IP, or `[v6]`) as an address on `port` (the first the resolver gives).
 fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     (host, port)
@@ -271,7 +252,6 @@ fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, format!("{host}: no address found")))
 }
 
-/// The TCP ports of MOUNT v3 and NFS v3 on `ip`, from its portmapper.
 fn getports(ip: std::net::IpAddr) -> io::Result<(u16, u16)> {
     let mut pmap = Client::connect(SocketAddr::new(ip, PMAP_PORT))?;
     let mut get = |prog: u32, vers: u32, what: &str| -> io::Result<u16> {
@@ -291,8 +271,7 @@ fn getports(ip: std::net::IpAddr) -> io::Result<(u16, u16)> {
     Ok((mount, nfs))
 }
 
-/// An EXPORT reply: the export paths in the server's order, duplicates and non-UTF-8 ones left
-/// out (a path here is a `&str`).
+/// An EXPORT reply's paths in the server's order, duplicates and non-UTF-8 ones left out.
 fn parse_exports(r: &mut XdrReader) -> io::Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut seen = 0;
@@ -321,8 +300,7 @@ fn parse_exports(r: &mut XdrReader) -> io::Result<Vec<String>> {
     Ok(out)
 }
 
-/// A MNT reply: the export's root handle. An export that takes neither AUTH_SYS nor AUTH_NONE
-/// (Kerberos only) is refused.
+/// A MNT reply's root handle; a Kerberos-only export is refused.
 fn parse_mnt(r: &mut XdrReader) -> io::Result<Vec<u8>> {
     let stat = r.u32()?;
     if stat != 0 {
@@ -343,7 +321,6 @@ fn parse_mnt(r: &mut XdrReader) -> io::Result<Vec<u8>> {
     Ok(fh)
 }
 
-/// An nfsstat3: `Ok` for NFS3_OK, else the error (the failure's body is left unread).
 fn status(r: &mut XdrReader) -> io::Result<()> {
     match r.u32()? {
         0 => Ok(()),
@@ -351,7 +328,6 @@ fn status(r: &mut XdrReader) -> io::Result<()> {
     }
 }
 
-/// The parts of a fattr3 Forge uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fattr {
     pub kind: u32,
@@ -359,6 +335,7 @@ pub(crate) struct Fattr {
     pub fileid: u64,
     /// mtime: seconds and nanoseconds since the epoch.
     pub mtime: (u32, u32),
+    pub fsid: u64,
 }
 
 impl Fattr {
@@ -371,7 +348,7 @@ impl Fattr {
         let size = r.u64()?;
         r.u64()?; // used
         r.u64()?; // rdev (specdata3)
-        r.u64()?; // fsid
+        let fsid = r.u64()?;
         let fileid = r.u64()?;
         r.u64()?; // atime
         let mtime = (r.u32()?, r.u32()?);
@@ -381,6 +358,7 @@ impl Fattr {
             size,
             fileid,
             mtime,
+            fsid,
         })
     }
 
@@ -406,13 +384,12 @@ impl Fattr {
             ),
             link: self.kind == NF3LNK,
             special: !matches!(self.kind, NF3REG | NF3DIR | NF3LNK),
+            fsid: Some(self.fsid.into()),
         }
     }
 }
 
-/// One READDIRPLUS (or READDIR) entry: its name (`utf8` false: not UTF-8 or holding `/` or NUL,
-/// lossily decoded, never usable as a path),
-/// cookie, and the attributes and handle when the server sent them.
+/// One READDIRPLUS (or READDIR) entry; `utf8` false: never usable as a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirEntry {
     pub name: String,
@@ -422,7 +399,6 @@ pub(crate) struct DirEntry {
     pub fh: Option<Vec<u8>>,
 }
 
-/// One READDIRPLUS (or READDIR) page: its entries, the cookie verifier and whether it was the last.
 #[derive(Debug)]
 pub(crate) struct DirPage {
     pub entries: Vec<DirEntry>,
@@ -430,14 +406,12 @@ pub(crate) struct DirPage {
     pub eof: bool,
 }
 
-/// True when a listed name can be asked for again as a path component: UTF-8 without `/` or
-/// NUL (a hostile `a/b` must never be taken for a child of this folder).
+/// UTF-8 without `/` or NUL: a hostile `a/b` must never be taken for a child of this folder.
 fn usable(raw: &[u8]) -> bool {
     std::str::from_utf8(raw).is_ok_and(|n| !n.contains(['/', '\0']))
 }
 
-/// A READDIRPLUS reply (status included); `plus` false: a READDIR reply (no attributes or
-/// handles).
+/// `plus` false: a READDIR reply (no attributes or handles).
 fn parse_readdir(r: &mut XdrReader, plus: bool) -> io::Result<DirPage> {
     status(r)?;
     Fattr::post_op(r)?; // the folder's own
@@ -497,13 +471,11 @@ pub(crate) struct Nfs3 {
     plus: bool,
 }
 
-/// A file this session created: its handle and the write verifier its unstable writes got.
 pub(crate) struct Open {
     fh: Vec<u8>,
     verf: Mutex<Verf>,
 }
 
-/// The verifier the WRITEs since the last COMMIT gave, and whether it changed among them.
 #[derive(Debug, Default)]
 struct Verf {
     seen: Option<[u8; 8]>,
@@ -540,7 +512,6 @@ impl Open {
     }
 }
 
-/// Skips a wcc_data (a pre_op_attr of size, mtime and ctime, then a post_op_attr).
 fn skip_wcc(r: &mut XdrReader) -> io::Result<()> {
     if r.bool()? {
         r.fixed(24)?;
@@ -549,14 +520,12 @@ fn skip_wcc(r: &mut XdrReader) -> io::Result<()> {
     Ok(())
 }
 
-/// A sattr3 that sets only the mode.
 fn sattr_mode(a: &mut Xdr, mode: u32) {
     a.bool(true).u32(mode); // mode
     a.bool(false).bool(false).bool(false); // uid, gid, size
     a.u32(0).u32(0); // atime, mtime: DONT_CHANGE
 }
 
-/// A CREATE or MKDIR reply: the new object's handle when the server sent it.
 fn made(r: &mut XdrReader) -> io::Result<Option<Vec<u8>>> {
     status(r)?;
     let fh = if r.bool()? {
@@ -569,16 +538,14 @@ fn made(r: &mut XdrReader) -> io::Result<Option<Vec<u8>>> {
     Ok(fh)
 }
 
-/// LINK refusals that mean "no hard link here" (the server, the filesystem or a folder can't
-/// have one): the rename falls back to a check and RENAME. PERM, ACCES (unfs3 answers a
-/// folder's EPERM so; a real refusal fails the RENAME too), XDEV, ISDIR, INVAL, NOTSUPP.
+/// LINK refusals meaning "no hard link here" (unfs3 answers a folder's EPERM so): the rename
+/// falls back to a check and RENAME.
 fn link_falls_back(code: u32) -> bool {
     matches!(code, 1 | 13 | 18 | 21 | 22 | 10004)
 }
 
 impl Nfs3 {
-    /// Connects to NFS v3 on `host`: on `port` for both MOUNT and NFS (userspace servers serve
-    /// both on one), else on the ports its portmapper gives. Reads the export list.
+    /// `port` for both MOUNT and NFS (userspace servers serve both on one), else the portmapper's.
     pub fn connect(host: &str, port: Option<u16>) -> io::Result<Nfs3> {
         let ip = resolve(host, 0)?.ip();
         let (mount_port, nfs_port) = match port {
@@ -603,9 +570,8 @@ impl Nfs3 {
         Ok(s)
     }
 
-    /// Calls MOUNT v3 `proc`: over the NFS connection when they share a port, else over its
-    /// own, connected when first needed and once more when a kept one broke (mountd may close
-    /// an idle connection; MNT and EXPORT are safe to repeat).
+    /// MOUNT over the NFS connection when they share a port, else its own, reconnected once when
+    /// a kept one broke (MNT and EXPORT are safe to repeat).
     fn mount_call(&mut self, proc: u32, args: &[u8]) -> io::Result<rpc::Reply> {
         if self.mount_addr == self.nfs_addr {
             return self.nfs.call(MOUNT_PROG, MOUNT_VERS, proc, args);
@@ -625,7 +591,7 @@ impl Nfs3 {
         parse_exports(&mut r.reader())
     }
 
-    /// The server's exports, read again (a changed list starts the handle cache over).
+    /// Read again: a changed list starts the handle cache over.
     pub fn exports(&mut self) -> io::Result<Vec<String>> {
         let list = self.fetch_exports()?;
         if !list.iter().eq(self.exports.iter().map(|e| &e.path)) {
@@ -635,7 +601,6 @@ impl Nfs3 {
         Ok(list)
     }
 
-    /// Export `i`'s root handle (MNT once).
     fn root(&mut self, i: usize) -> io::Result<Vec<u8>> {
         if let Some(fh) = &self.exports[i].root {
             return Ok(fh.clone());
@@ -648,8 +613,7 @@ impl Nfs3 {
         Ok(fh)
     }
 
-    /// The handle of `path`: cached, else LOOKUPs from the nearest cached folder above it (or
-    /// its export's root). A path above or between exports has none (read-only, virtual).
+    /// Cached, else LOOKUPs from the nearest cached folder above; a virtual path has none.
     fn handle(&mut self, path: &str) -> io::Result<Vec<u8>> {
         let comps = components(path)?;
         let (export, base) = match place(&self.exports, &comps) {
@@ -664,8 +628,7 @@ impl Nfs3 {
                 return Err(io::Error::new(ErrorKind::NotFound, "not inside an export"));
             }
         };
-        // Only keys strictly below the export's root: one at or above it may hold another
-        // export's view (a nested export listed from its parent's).
+        // Only keys strictly below the export's root: one at or above may hold another export's view.
         let cached = (base + 1..=comps.len())
             .rev()
             .find_map(|n| Some((n, self.handles.get(&key(&comps[..n]))?.to_vec())));
@@ -680,8 +643,7 @@ impl Nfs3 {
         Ok(fh)
     }
 
-    /// Runs `f`; on STALE every cached handle (and the exports' roots) is dropped and it runs
-    /// once more from fresh LOOKUPs. Only for calls a STALE reply left undone.
+    /// On STALE every cached handle is dropped and `f` runs once more (only for calls STALE left undone).
     fn retry_stale<T>(&mut self, mut f: impl FnMut(&mut Self) -> io::Result<T>) -> io::Result<T> {
         match f(self) {
             Err(e) if is_stale(&e) => {
@@ -695,7 +657,6 @@ impl Nfs3 {
         }
     }
 
-    /// Runs `f` on `path`'s handle, once more from fresh LOOKUPs on STALE.
     fn with_handle<T>(
         &mut self,
         path: &str,
@@ -707,8 +668,7 @@ impl Nfs3 {
         })
     }
 
-    /// `path`'s parent folder and its own name, for making, renaming or removing it. An export
-    /// or a folder above one is never changed: `taken` (AlreadyExists for a new one there).
+    /// Parent and name for changing `path`; an export or a folder above one is never changed.
     fn parent(&self, path: &str, taken: ErrorKind) -> io::Result<(String, String)> {
         let comps = components(path)?;
         match place(&self.exports, &comps) {
@@ -727,13 +687,11 @@ impl Nfs3 {
         Ok((key(dir), name.to_string()))
     }
 
-    /// Calls NFS v3 `proc` with `args`.
     fn call(&mut self, proc: u32, args: &Xdr) -> io::Result<rpc::Reply> {
         self.nfs.call(NFS_PROG, NFS_VERS, proc, &args.buf)
     }
 
-    /// LOOKUP of `name` in folder `dir`: its handle, and its attributes when the server sent
-    /// them. A link is not followed (its own handle).
+    /// A link is not followed (its own handle).
     fn lookup_attr(&mut self, dir: &[u8], name: &str) -> io::Result<(Vec<u8>, Option<Fattr>)> {
         let mut a = Xdr::new();
         a.opaque(dir).string(name);
@@ -744,12 +702,10 @@ impl Nfs3 {
         Ok((fh, Fattr::post_op(&mut r)?))
     }
 
-    /// LOOKUP of `name` in folder `dir`.
     fn lookup(&mut self, dir: &[u8], name: &str) -> io::Result<Vec<u8>> {
         self.lookup_attr(dir, name).map(|(fh, _)| fh)
     }
 
-    /// GETATTR of a handle.
     fn getattr(&mut self, fh: &[u8]) -> io::Result<Fattr> {
         let mut a = Xdr::new();
         a.opaque(fh);
@@ -759,7 +715,7 @@ impl Nfs3 {
         Fattr::parse(&mut r)
     }
 
-    /// FSINFO's (rtmax, wtmax) for the filesystem holding `fh` (asked once), within our bounds.
+    /// FSINFO's (rtmax, wtmax), asked once, within our bounds.
     fn xfer(&mut self, fh: &[u8]) -> io::Result<(u32, u32)> {
         if let Some(x) = self.xfer {
             return Ok(x);
@@ -786,7 +742,6 @@ impl Nfs3 {
         Ok(x)
     }
 
-    /// One READ: the bytes and whether they reach the end of the file.
     fn read(&mut self, fh: &[u8], offset: u64, count: u32) -> io::Result<(Vec<u8>, bool)> {
         let mut a = Xdr::new();
         a.opaque(fh).u64(offset).u32(count);
@@ -806,7 +761,6 @@ impl Nfs3 {
         Ok((data, eof))
     }
 
-    /// One unstable WRITE: how many bytes the server took and its write verifier.
     fn write(&mut self, fh: &[u8], offset: u64, data: &[u8]) -> io::Result<(usize, [u8; 8])> {
         let mut a = Xdr::new();
         a.opaque(fh)
@@ -830,8 +784,7 @@ impl Nfs3 {
         Ok((count, verf))
     }
 
-    /// LINK of `file` as `name` in folder `dir`: the nfsstat3 (0 = linked) for the caller to
-    /// judge; STALE as an error (nothing done: [`Nfs3::retry_stale`] may run it again).
+    /// The nfsstat3 (0 = linked) for the caller to judge; STALE as an error.
     fn link(&mut self, file: &[u8], dir: &[u8], name: &str) -> io::Result<u32> {
         let mut a = Xdr::new();
         a.opaque(file).opaque(dir).string(name);
@@ -842,7 +795,6 @@ impl Nfs3 {
         }
     }
 
-    /// REMOVE of `name` in folder `dir`.
     fn remove_in(&mut self, dir: &[u8], name: &str) -> io::Result<()> {
         let mut a = Xdr::new();
         a.opaque(dir).string(name);
@@ -850,7 +802,14 @@ impl Nfs3 {
         status(&mut reply.reader())
     }
 
-    /// RENAME (replaces what is at the target: the caller checked first).
+    fn rmdir_in(&mut self, dir: &[u8], name: &str) -> io::Result<()> {
+        let mut a = Xdr::new();
+        a.opaque(dir).string(name);
+        let reply = self.call(NFSPROC3_RMDIR, &a)?;
+        status(&mut reply.reader())
+    }
+
+    /// Replaces what is at the target: the caller checked first.
     fn rename(&mut self, from: (&[u8], &str), to: (&[u8], &str)) -> io::Result<()> {
         let mut a = Xdr::new();
         a.opaque(from.0).string(from.1).opaque(to.0).string(to.1);
@@ -858,8 +817,7 @@ impl Nfs3 {
         status(&mut reply.reader())
     }
 
-    /// Every entry of folder `dir` (READDIRPLUS, page by page; READDIR where the server has no
-    /// READDIRPLUS), `.` and `..` left out.
+    /// READDIRPLUS page by page (READDIR where there is none), `.` and `..` left out.
     fn readdir(&mut self, dir: &[u8]) -> io::Result<Vec<DirEntry>> {
         let (mut cookie, mut verf) = (0u64, [0u8; 8]);
         let mut out: Vec<DirEntry> = Vec::new();
@@ -909,8 +867,7 @@ impl Nfs3 {
         }
     }
 
-    /// A path above or between exports, as a folder entry (`Some`), or `None` for one inside
-    /// an export. Nothing at all there is `NotFound`.
+    /// `Some` for a path above or between exports, `None` inside one; nothing there is `NotFound`.
     fn virtual_place(&self, path: &str) -> io::Result<Option<Vec<String>>> {
         match place(&self.exports, &components(path)?) {
             Place::Export { .. } => Ok(None),
@@ -940,7 +897,6 @@ impl Nfs3 {
         let mut out = Vec::with_capacity(entries.len());
         for e in entries {
             if !e.utf8 {
-                // Not a name Forge can ask for again: listed, marked, never read.
                 let mut entry = e
                     .attr
                     .map_or_else(|| virtual_dir(""), |a| a.entry(String::new()));
@@ -956,8 +912,7 @@ impl Nfs3 {
             }
             let attr = match e.attr {
                 Some(a) => a,
-                // The server left them out (it may; READDIR never sends them): LOOKUP by name,
-                // which usually brings them, else GETATTR.
+                // Left out by the server: LOOKUP by name, else GETATTR.
                 // ponytail: one or two calls per entry, one after another.
                 None => {
                     let found = self
@@ -971,8 +926,7 @@ impl Nfs3 {
                             self.handles.put(child, fh);
                             a
                         }
-                        // Renamed or removed since the READDIR (a temporary name renamed into
-                        // place): it isn't listed.
+                        // Renamed or removed since the READDIR: not listed.
                         Err(err)
                             if matches!(
                                 err.kind(),
@@ -1014,7 +968,6 @@ impl Nfs3 {
         })
     }
 
-    /// MKDIR (mode 0777); the server's EXIST is `AlreadyExists`.
     pub fn mkdir(&mut self, path: &str) -> io::Result<()> {
         let (dir, name) = self.parent(path, ErrorKind::AlreadyExists)?;
         let fh = self.with_handle(&dir, |s, dir| {
@@ -1033,7 +986,7 @@ impl Nfs3 {
         Ok(())
     }
 
-    /// CREATE GUARDED (mode 0666): never over something there (`AlreadyExists`).
+    /// GUARDED: never over something there (`AlreadyExists`).
     pub fn create(&mut self, path: &str) -> io::Result<Open> {
         let (dir, name) = self.parent(path, ErrorKind::AlreadyExists)?;
         let fh = self.with_handle(&dir, |s, dir| {
@@ -1049,7 +1002,6 @@ impl Nfs3 {
                 self.handles.put(key, fh.clone());
                 fh
             }
-            // The server may leave the handle out: look the new file up.
             None => {
                 self.handles.forget(&key);
                 self.handle(path)?
@@ -1061,11 +1013,8 @@ impl Nfs3 {
         })
     }
 
-    /// LINK `from` as `to` (refused when `to` is taken: atomic, never replacing), then REMOVE
-    /// `from`. Where the server or the object has no hard links (a folder, NOTSUPP, ...): `to`
-    /// must not be there, then RENAME.
-    // ponytail: no identity: REMOVE goes by name, so a file another client put at `from`
-    // between LINK and REMOVE is the one removed (NFS has no conditional remove).
+    /// LINK (atomic, never replacing) then REMOVE `from`; without hard links a check, then RENAME.
+    // ponytail: REMOVE goes by name: a file another client put at `from` meanwhile is removed.
     pub fn rename_no_replace(&mut self, from: &str, to: &str) -> io::Result<()> {
         let (from_dir, from_name) = self.parent(from, ErrorKind::ReadOnlyFilesystem)?;
         let (to_dir, to_name) = self.parent(to, ErrorKind::AlreadyExists)?;
@@ -1086,8 +1035,7 @@ impl Nfs3 {
         if !link_falls_back(code) {
             return Err(nfs_error(code));
         }
-        // ponytail: two steps; something made at `to` between the check and the RENAME is
-        // replaced (NFSv3's RENAME has no no-replace flag).
+        // ponytail: two steps; something made at `to` meanwhile is replaced (no no-replace RENAME).
         match self.handle(to) {
             Ok(_) => return Err(io::Error::new(ErrorKind::AlreadyExists, "already exists")),
             Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -1096,8 +1044,7 @@ impl Nfs3 {
         self.rename_replace(from, to)
     }
 
-    /// RENAME of `from` to `to`, replacing a file there (the server renames as POSIX does,
-    /// which refuses to put a file over a folder).
+    /// Replacing a file there (POSIX refuses a file over a folder).
     pub fn rename_replace(&mut self, from: &str, to: &str) -> io::Result<()> {
         let (from_dir, from_name) = self.parent(from, ErrorKind::ReadOnlyFilesystem)?;
         let (to_dir, to_name) = self.parent(to, ErrorKind::AlreadyExists)?;
@@ -1112,8 +1059,7 @@ impl Nfs3 {
         renamed
     }
 
-    /// REMOVE of a file. Some servers (unfs3: libc `remove`) take an empty folder too, so a
-    /// folder is refused first.
+    /// A folder is refused first: some servers (unfs3: libc `remove`) take an empty one.
     // ponytail: two calls; a folder put at the name between them is removed if empty.
     pub fn remove(&mut self, path: &str) -> io::Result<()> {
         let (dir, name) = self.parent(path, ErrorKind::ReadOnlyFilesystem)?;
@@ -1126,7 +1072,15 @@ impl Nfs3 {
         removed
     }
 
-    /// FSSTAT's abytes: what this user may still write there.
+    pub fn rmdir(&mut self, path: &str) -> io::Result<()> {
+        let (dir, name) = self.parent(path, ErrorKind::ReadOnlyFilesystem)?;
+        self.handles.forget(&key(&components(path)?));
+        let removed = self.with_handle(&dir, |s, dir| s.rmdir_in(dir, &name));
+        self.handles.forget(&key(&components(path)?));
+        removed
+    }
+
+    /// FSSTAT's abytes.
     pub fn free_space(&mut self, path: &str) -> io::Result<u64> {
         self.with_handle(path, |s, fh| {
             let mut a = Xdr::new();
@@ -1141,9 +1095,7 @@ impl Nfs3 {
         })
     }
 
-    /// Unstable WRITEs of `bytes` at `offset` in wtmax chunks (a short count continues where
-    /// the server stopped). A STALE handle fails: the file is never looked up again by path,
-    /// which could be another file by now.
+    /// In wtmax chunks; a STALE handle fails (never looked up by path again: another file by now).
     pub fn write_at(&mut self, open: &Open, offset: u64, bytes: &[u8]) -> io::Result<()> {
         let (_, wtmax) = self.xfer(&open.fh)?;
         let mut done = 0;
@@ -1162,7 +1114,7 @@ impl Nfs3 {
         Ok(())
     }
 
-    /// COMMIT of the whole file; fails when the write verifier changed since the WRITEs.
+    /// Fails when the write verifier changed since the WRITEs.
     pub fn sync(&mut self, open: &Open) -> io::Result<()> {
         let mut a = Xdr::new();
         a.opaque(&open.fh).u64(0).u32(0);

@@ -1,7 +1,5 @@
-//! Per-job verification: read the output back through its own reader and
-//! compare paths, empty dirs, sizes and BLAKE3 hashes against what the source held.
-//! Full mode hashes every byte back; fast mode a seeded sample of them ([`plan`]). Both
-//! compare 8 MiB slices, so the source is hashed once.
+//! Per-job verification: the output read back through its own reader and compared with the
+//! source (paths, empty dirs, sizes, BLAKE3 of 8 MiB slices); fast mode a seeded sample.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -21,8 +19,7 @@ pub(crate) const SLICE: u64 = 8 * 1024 * 1024;
 const WHOLE_MAX: u64 = 2 * SLICE;
 /// Fast mode's random slices: at most this many bytes, and at most 1% of the unsampled rest.
 const BUDGET_MAX: u64 = 1024 * 1024 * 1024;
-/// UFS2 with 64 KiB blocks maps a file's first 12 blocks directly and the next 8192 through
-/// one indirect block; the double indirect block starts here (512.75 MiB).
+/// UFS2 with 64 KiB blocks: the double indirect block starts here (512.75 MiB).
 const UFS2_SEAM: u64 = (12 + 8192) * 64 * 1024;
 /// The sample plan's version, logged with the seed so a run can be reproduced.
 const POLICY: u32 = 1;
@@ -45,21 +42,16 @@ pub(crate) fn fresh_seed() -> anyhow::Result<u64> {
     Ok(u64::from_le_bytes(bytes) & ((1 << 53) - 1))
 }
 
-/// A source file's BLAKE3 per [`SLICE`] (the last slice may be short; an empty file has
-/// none). Same size and same slices is the same bytes, so no whole-file hash is kept.
+/// A source file's BLAKE3 per [`SLICE`] (the last may be short); no whole-file hash is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Digest {
     pub slices: Vec<blake3::Hash>,
 }
 
-/// Builds a [`Digest`] from bytes fed front to back in pieces of any size: slice boundaries
-/// don't depend on how the file is read, and nothing is buffered.
-///
-/// A whole slice is hashed on the [`pool`], so the thread reading the source only copies it:
-/// one core hashes ~2.4 GB/s, which made hashing, not the disk, a write's limit.
+/// Builds a [`Digest`] from bytes fed front to back in pieces of any size, nothing buffered.
+/// Whole slices hash on the [`pool`]: one core's ~2.4 GB/s made hashing a write's limit.
 struct Digester {
     len: u64,
-    /// The current slice's bytes.
     buf: Vec<u8>,
     slices: Vec<Slice>,
 }
@@ -147,9 +139,8 @@ impl Sealed {
     }
 }
 
-/// Threads that hash whole slices, one per core up to [`POOL_MAX`], fed through a bounded queue;
-/// their buffers are reused. At most `2 × threads + POOL_MAX` slices exist at once (queued,
-/// being hashed, spare): 192 MiB at 8 threads, which still hash ~19 GB/s, past any disk.
+/// Threads that hash whole slices, one per core up to [`POOL_MAX`], buffers reused; at most
+/// `2 × threads + POOL_MAX` slices exist at once (192 MiB at 8 threads).
 struct Pool {
     jobs: SyncSender<(Vec<u8>, SyncSender<blake3::Hash>)>,
     spare: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -159,7 +150,7 @@ struct Pool {
 
 type Job = (Vec<u8>, SyncSender<blake3::Hash>);
 
-/// The most hashing threads (see [`Pool`]): a bound on memory, on the PS5 most of all.
+/// The most hashing threads: a bound on memory, on the PS5 most of all.
 const POOL_MAX: usize = 8;
 
 fn pool() -> &'static Pool {
@@ -171,9 +162,7 @@ fn pool() -> &'static Pool {
         let (jobs, queue) = sync_channel::<Job>(threads);
         let queue = Arc::new(Mutex::new(queue));
         let spare = Arc::new(Mutex::new(Vec::new()));
-        // Spares by the most threads, not these: on the PS5 (5 CPUs) 5 spares made a `.pkg`
-        // build half as fast (4.6 GB in its first 3 min of compress, 7.4 with 8), likely as
-        // fresh 8 MiB slices page-fault through a libc that serializes every thread.
+        // Spares by the most threads: on the PS5 5 spares made a `.pkg` build half as fast.
         let keep = POOL_MAX;
         let mut workers = 0;
         for i in 0..threads {
@@ -246,23 +235,20 @@ impl Pool {
 /// What the output must hold: the source's files with their digests, and its empty dirs.
 pub(crate) struct Expected {
     pub files: Vec<SourceFile>,
-    /// One per file, in the same order.
     pub digests: Vec<Digest>,
     pub empty_dirs: Vec<String>,
 }
 
-/// More files than this being read at once, or more partial slice bytes than the budget, means
-/// the writer is not reading front to back; their hashes are then dropped and computed by a
-/// second read instead.
+/// More files than this read at once, or more partial slice bytes than the budget: not front
+/// to back, so their hashes are dropped and computed by a second read.
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_IN_FLIGHT_BYTES: usize = 64 << 20;
 
-/// Files read whole whose last slices may still be hashing: the writer goes on to the next
-/// file instead of waiting at each file's end; past this many the oldest is waited for.
+/// Files read whole whose last slices may still be hashing; past this the oldest is awaited.
 const MAX_SEALED: usize = 64;
 
-/// A source that hashes each file as the writer reads it front to back, so the source is
-/// usually read once, not twice. Files read any other way are hashed afterwards.
+/// A source that hashes each file as the writer reads it front to back, so it is usually read
+/// once. Files read any other way are hashed afterwards.
 pub(crate) struct HashingTree<'a> {
     inner: &'a mut dyn SourceTree,
     sizes: HashMap<String, u64>,
@@ -421,8 +407,8 @@ impl SourceTree for HashingTree<'_> {
     }
 }
 
-/// Feeds `len` bytes of `path` from `offset` to `each`, read in bounded chunks: a short read
-/// is continued, one that is empty (the file ended early) or longer than asked fails.
+/// Feeds `len` bytes of `path` from `offset` to `each`; a file that ends early or a read
+/// longer than asked fails.
 fn read_each(
     tree: &mut dyn SourceTree,
     path: &str,
@@ -452,8 +438,7 @@ fn read_each(
     Ok(())
 }
 
-/// The part of sample `s` whose hash differs from `want`: its first bad slice for a whole
-/// file, `s` itself for a slice. `got` hashes the bytes `s` covers, slice by slice.
+/// The part of sample `s` whose hash differs from `want`: a whole file's first bad slice.
 fn mismatch(files: &[SourceFile], want: &Digest, s: Sample, got: Digest) -> Option<Sample> {
     match s.slice {
         None => {
@@ -486,14 +471,9 @@ fn slice(files: &[SourceFile], file: usize, s: u64) -> Sample {
     }
 }
 
-/// Fast mode's sample of `files` (policy 1), the same for the same files and seed:
-/// - files of 16 MiB or less whole;
-/// - of each larger file its first and last slice, the one holding [`UFS2_SEAM`] when `seam`
-///   and the file reaches past it, and one random interior slice, no slice twice;
-/// - then random slices of the rest, each as likely, without replacement: min(1 GiB, 1% of
-///   the rest), rounded up to whole slices. Mandatory reads can be far more (many small
-///   files); the budget is for the random part only.
-///
+/// Fast mode's sample of `files` (policy 1), the same for the same files and seed: files of
+/// 16 MiB or less whole; of each larger one its first and last slice, the [`UFS2_SEAM`] one
+/// with `seam`, and a random interior one; then random slices of the rest, min(1 GiB, 1%).
 /// Sorted by path and offset, so the output is read front to back.
 fn plan(files: &[SourceFile], seed: u64, seam: bool) -> Vec<Sample> {
     let mut order: Vec<usize> = (0..files.len()).collect();
@@ -603,8 +583,7 @@ fn shown(bytes: u64) -> String {
     }
 }
 
-/// What `mode` reads of `files`: full mode every file whole, fast mode its sample; both
-/// compare slice hashes.
+/// What `mode` reads of `files`.
 fn samples(files: &[SourceFile], mode: Mode) -> Vec<Sample> {
     match mode {
         Mode::Full => (0..files.len())
@@ -619,10 +598,8 @@ fn samples(files: &[SourceFile], mode: Mode) -> Vec<Sample> {
     }
 }
 
-/// The expected manifest of `tree` holding only what [`compare`] reads with the same `mode`:
-/// every slice in full mode, the sampled ones in fast mode (the rest a placeholder it never
-/// looks at). For a source that changes once read: an in-place edit hashes what the image
-/// must hold before it writes the image. Its progress is `stage`'s.
+/// The expected manifest of `tree` holding only what [`compare`] reads with the same `mode`
+/// (the rest a placeholder): an in-place edit hashes it before it writes the image.
 pub(crate) fn expected_sampled(
     tree: &mut dyn SourceTree,
     ctx: &Ctx,
@@ -672,9 +649,7 @@ pub(crate) fn expected_sampled(
     })
 }
 
-/// Compares `output` with `expected`; returns one line per check that passed, or fails
-/// listing every difference. Every reader reports its empty directories. The structural
-/// checks run in both modes; `mode` picks how much content is read back.
+/// Compares `output` with `expected`: one line per check that passed, else every difference.
 pub(crate) fn compare(
     expected: &Expected,
     output: &mut dyn SourceTree,
@@ -750,9 +725,8 @@ pub(crate) fn compare(
     };
     let mut wrong = Vec::new();
     let samples = samples(&expected.files, mode);
-    // Each sample hashes on the pool while the next is read; compared in order, at most
-    // `MAX_SEALED` behind. A slice sample is whole slices from a slice boundary, so its
-    // digester's slices are the file's.
+    // Each sample hashes on the pool while the next is read, compared in order, at most
+    // `MAX_SEALED` behind.
     let mut sealed = std::collections::VecDeque::new();
     let mut bad = Vec::new();
     let check = |(s, got): (Sample, Sealed)| {
@@ -819,8 +793,7 @@ mod tests {
     use super::*;
     use crate::Event;
 
-    /// An in-memory tree whose reads can come back short (`piece`), stop early (`cut`) or
-    /// return a byte more than asked (`oversize`).
+    /// An in-memory tree whose reads can come back short, stop early or return a byte more.
     struct Mem {
         files: Vec<SourceFile>,
         data: Vec<Vec<u8>>,

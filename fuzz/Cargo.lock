@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-fpkg"
-version = "7.0.22"
+version = "12.6.30"
 dependencies = [
  "aes",
  "crc32fast",
@@ -445,15 +445,17 @@ dependencies = [
  "ps5upload-pkg",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "sha3",
  "thiserror",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "ps5upload-pkg"
-version = "7.0.22"
+version = "12.6.30"
 dependencies = [
  "aes",
  "blake3",

@@ -1,5 +1,5 @@
-//! Checked AMPRIDX3 path-index reader. Stricter than the runtime's own parser: a forged index
-//! must not be able to attach file ids to the wrong files.
+//! Checked AMPRIDX3 path-index reader, stricter than the runtime: a forged index can't attach file
+//! ids to the wrong files.
 
 use std::collections::HashSet;
 
@@ -35,7 +35,6 @@ fn folded(path: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Parses and validates an `ampr_emu.index` image.
 pub fn read_index(bytes: &[u8]) -> Result<PathIndex> {
     check_magic(bytes, IDX_MAGIC, "a path index")?;
     if bytes.len() < IDX_HEADER {
@@ -73,8 +72,8 @@ pub fn read_index(bytes: &[u8]) -> Result<PathIndex> {
     let table_end = slots_at
         .checked_add(u64::from(slot_count) * IDX_SLOT as u64)
         .ok_or_else(|| bad("slot table overflows"))?;
-    // 8-byte aligned, not 16: other tools pad the path blob to 8 (ampr-emu-ng opens such an
-    // index; every slot field is read at an offset of its own size).
+    // 8-byte aligned, not 16: other tools pad the path blob to 8 and ampr-emu-ng opens such an
+    // index.
     if slots_at % 8 != 0 || slots_at < blob_end {
         return Err(bad(format!(
             "slot table at {slots_at} is misaligned or overlaps the path blob (ends {blob_end})"
@@ -150,8 +149,7 @@ pub fn read_index(bytes: &[u8]) -> Result<PathIndex> {
         return Err(bad(format!("record {i} has no slot")));
     }
 
-    // Probe pass, linear: a lookup from a record's home slot must cross only filled slots to reach
-    // it, i.e. the run of filled slots ending at its slot (cyclic) covers the distance from home.
+    // Probe pass: a lookup from a record's home slot must cross only filled slots to reach it.
     let mask = slot_count as usize - 1;
     let mut slot_of = vec![0usize; records.len()];
     let mut filled = vec![false; slot_count as usize];

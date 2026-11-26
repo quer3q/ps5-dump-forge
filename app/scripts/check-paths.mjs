@@ -1,5 +1,4 @@
-// Checks src/paths.ts with a plain `node scripts/check-paths.mjs` (type stripping): the
-// desktop rules per viewer OS, and the http build's server paths (`/` only) on a Windows viewer.
+// Checks src/paths.ts with a plain `node` (type stripping): desktop rules per OS, then the http build.
 
 import assert from "node:assert/strict";
 

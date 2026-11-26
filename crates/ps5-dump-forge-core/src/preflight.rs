@@ -1,5 +1,4 @@
-//! Checks made before anything is written. Each returns findings, so a
-//! job can report every problem at once instead of failing on the first.
+//! Checks made before anything is written; each returns findings, so a job reports them all.
 
 #[cfg(not(target_os = "freebsd"))]
 use std::io;
@@ -13,16 +12,13 @@ use serde_json::Value;
 use crate::Format;
 use crate::finalize::followed_id;
 
-/// The largest file FAT32 (`msdos`) can hold.
 pub(crate) const FAT_MAX_FILE: u64 = 4 * 1024 * 1024 * 1024 - 1;
 const MIB: u64 = 1024 * 1024;
 /// A `param.json` is a few KiB; anything bigger is not one, and is not read into memory.
 pub(crate) const MAX_PARAM_JSON: u64 = 4 * MIB;
-// ponytail: a findings list is capped per kind so a folder of 100k bad names still makes a
-// readable message; the count of the rest is given.
+// ponytail: findings capped per kind (100k bad names stay readable); the rest counted.
 const MAX_LISTED: usize = 200;
 
-/// `  kind: path` lines for `items`, capped at `MAX_LISTED`.
 pub(crate) fn listing(kind: &str, items: &[String]) -> Vec<String> {
     let mut out: Vec<String> = items
         .iter()
@@ -38,29 +34,23 @@ pub(crate) fn listing(kind: &str, items: &[String]) -> Vec<String> {
     out
 }
 
-/// What the source's `param.json` says about the game.
 #[derive(Debug, Default)]
 pub(crate) struct GameInfo {
     pub param_json: Option<Value>,
     pub title_id: Option<String>,
     pub content_id: Option<String>,
-    /// No `eboot.bin` at the root but a `param.json` with a title id: a DLC, an update or
-    /// another package (by user decision; not a finding).
+    /// No `eboot.bin` but a `param.json` with a title id: a DLC, an update, another package.
     pub additional_content: bool,
 }
 
-/// The finding for a source without `eboot.bin` that isn't additional content either.
 pub(crate) const NO_EBOOT: &str = "eboot.bin is missing at the game root";
 
-/// The finding for additional content converted to a target that needs a game.
 pub(crate) const ADDITIONAL_CONTENT_TARGET: &str =
     "additional content (no eboot.bin) can only be packaged as fpkg or written to a folder";
 
-/// The finding for a conversion of a patch package.
 pub(crate) const PATCH_SOURCE: &str = "a patch package (LIH) holds only what its update changed, \
      so it can't be converted: open it in Edit to extract its files";
 
-/// The finding for an edit of a patch package.
 pub(crate) const PATCH_EDIT: &str =
     "a patch package (LIH) can be browsed and extracted from, not edited";
 
@@ -116,15 +106,13 @@ pub(crate) fn parse_param(bytes: &[u8]) -> GameInfo {
     }
 }
 
-/// The title id a content id names, when it is a plain one.
 pub(crate) fn title_from_content_id(content_id: &str) -> Option<String> {
     title_id_from_content_id(content_id)
         .filter(|id| is_title_id(id))
         .map(str::to_string)
 }
 
-/// A title id becomes a file name, and `param.json` is untrusted: only plain ids pass
-/// (`PPSA01234`), never anything with a separator or a dot in it.
+/// A title id becomes a file name and `param.json` is untrusted: no separator or dot passes.
 fn is_title_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
@@ -150,10 +138,8 @@ pub(crate) fn output_path(output: &Path) -> anyhow::Result<PathBuf> {
     Ok(parent.join(name))
 }
 
-/// The extension that makes ShadowMountPlus pick the right driver.
 pub(crate) fn extension(format: Format) -> Option<&'static str> {
     match format {
-        // An LZ4 packed folder is a folder: SMP mounts nothing, so no extension.
         Format::Folder | Format::Lz4 => None,
         Format::Exfat => Some("exfat"),
         Format::Ffpkg => Some("ffpkg"),
@@ -163,9 +149,7 @@ pub(crate) fn extension(format: Format) -> Option<&'static str> {
     }
 }
 
-/// The longest output name for `format` (UTF-8 bytes, the extension and its dot excluded, a
-/// `-N` included): what ShadowMountPlus mounts an image from, and the same 63 bytes for a folder
-/// and a `.pkg` (not image-mounted), so every output follows one rule.
+/// The longest output stem for `format` in UTF-8 bytes (a `-N` included); 63 for non-images too.
 // SMP (drakmor/ShadowMountPlus src/sm_image.c, build_image_mount_point_for_fs) nmounts every
 // image at `<base>/<stem>_<8 hex: fnv1a32 of the full path>`, the stem cut at the name's last
 // dot, base `/mnt/shadowmnt` (`/mnt/shadowmnt/pfsc` for a `.ffpfsc` container). The PS5
@@ -250,8 +234,8 @@ pub(crate) fn stem_finding(path: &Path, format: Format) -> Option<String> {
     })
 }
 
-/// Whether `path` (absolute) lies inside the folder `dir`. Compared by identity, not by
-/// spelling, because a case-insensitive volume accepts `/Games/X` for `/games/x`.
+/// Whether `path` (absolute) lies inside `dir`, by identity (a case-insensitive volume takes
+/// `/Games/X` for `/games/x`).
 fn inside(path: &Path, dir: &Path) -> bool {
     if path.starts_with(dir) {
         return true;
@@ -264,14 +248,11 @@ fn inside(path: &Path, dir: &Path) -> bool {
         .any(|a| followed_id(a).is_ok_and(|id| id == dir))
 }
 
-/// Directory levels below the root an `.exfat`/`.ffpkg` output can hold.
-// ponytail: the vendored readers' walkers stop at MAX_DEPTH = 32 (vendor/ps5upload-fpkg
-// src/exfat.rs, src/ufs2_source.rs); our writers would go deeper, but nothing could read the
-// image back (verification, extraction), so deeper trees are refused up front.
+// ponytail: the vendored readers stop at MAX_DEPTH = 32 (vendor/ps5upload-fpkg src/exfat.rs,
+// src/ufs2_source.rs): our writers go deeper, but nothing could read the image back.
 pub(crate) const MAX_DIR_DEPTH: usize = 32;
 
-/// Paths nested deeper than [`MAX_DIR_DEPTH`] directories: a file's directories are the
-/// components before its name, an empty directory's are all of its own.
+/// Paths nested deeper than [`MAX_DIR_DEPTH`] directories.
 pub(crate) fn too_deep(tree: &dyn SourceTree) -> Vec<String> {
     let levels = |p: &str| p.split('/').count();
     let deep: Vec<String> = tree
@@ -299,14 +280,12 @@ pub(crate) fn estimate(tree: &dyn SourceTree) -> u64 {
     files.saturating_add(files / 50).saturating_add(64 * MIB)
 }
 
-/// What [`destination`] found: findings refuse the job, notes are logged.
+/// Findings refuse the job, notes are logged.
 pub(crate) struct Destination {
     pub findings: Vec<String>,
     pub notes: Vec<String>,
-    /// The folder's free bytes, when they could be read.
     pub free: Option<u64>,
-    /// What the probe saw, for folder findings and publishing; None when it failed (then
-    /// `findings` says why).
+    /// What the probe saw; None when it failed (`findings` says why).
     #[cfg(target_os = "freebsd")]
     pub dest: Option<crate::dest::Dest>,
 }
@@ -353,8 +332,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, _: &AtomicBool) -
     }
 }
 
-/// The same checks on what the destination probe saw (U1 in ps5/README.md). A USB drive is
-/// never tested on hardware, so this fails closed: a probe that fails refuses the job.
+/// The same checks on what the destination probe saw (U1); a failed probe refuses the job.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBool) -> Destination {
     let dest = match crate::dest::probe(dir, cancel) {
@@ -401,8 +379,7 @@ pub(crate) fn destination(dir: &Path, need: u64, largest: u64, cancel: &AtomicBo
     }
 }
 
-/// Folder output's name findings on a destination that `folds` names, plus every non-ASCII
-/// path when it refuses non-ASCII names (U2).
+/// Folder output's name findings, plus every non-ASCII path where those are refused (U2).
 #[cfg(any(target_os = "freebsd", test))]
 pub(crate) fn folder_names(
     files: &[String],
@@ -433,8 +410,7 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path holds a NUL byte"))
 }
 
-/// (free bytes for an unprivileged user, whether the filesystem is FAT). The FAT answer can
-/// fail on its own (Windows asks the volume root separately).
+/// (free bytes for an unprivileged user, whether the filesystem is FAT: can fail on its own).
 #[cfg(target_os = "macos")]
 pub(crate) fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     let c = c_path(dir)?;
@@ -479,8 +455,7 @@ pub(crate) fn fs_stat(dir: &Path) -> io::Result<(u64, io::Result<bool>)> {
     Ok((free, fat))
 }
 
-// ponytail: other OSes are not wired; the job logs that the checks were skipped and ENOSPC
-// still fails the write. FreeBSD (the PS5) probes the folder instead.
+// ponytail: other OSes not wired: the checks are logged as skipped; ENOSPC still fails the write.
 #[cfg(not(any(
     target_os = "macos",
     target_os = "linux",

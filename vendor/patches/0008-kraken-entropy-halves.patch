@@ -1,5 +1,5 @@
 diff --git a/ps5upload-fpkg/src/kraken.rs b/ps5upload-fpkg/src/kraken.rs
-index 0a06b7c..6016505 100644
+index 3377c5c7493e5c3f77be4d80c7a75d6574c9a46c..1ec6e05c55fa2da00df4e15baa55d2702e560eb7 100644
 --- a/ps5upload-fpkg/src/kraken.rs
 +++ b/ps5upload-fpkg/src/kraken.rs
 @@ -2,8 +2,8 @@
@@ -25,7 +25,7 @@ index 0a06b7c..6016505 100644
  
  mod huff;
  
-@@ -1189,6 +1190,9 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
+@@ -1210,6 +1211,9 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
              eb.get_length()?
          });
      }
@@ -35,24 +35,8 @@ index 0a06b7c..6016505 100644
      let mut esc = esc.into_iter();
      let mut lens = lens.iter().map(|&v| -> Result<usize> {
          Ok(3 + if v == 255 {
-@@ -1259,6 +1263,15 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
-     Ok(())
- }
- 
-+/// A non-LZ half can be a bare entropy array rather than a raw copy.
-+pub(crate) fn decode_entropy_half(src: &[u8], len: usize) -> Result<Vec<u8>> {
-+    let (out, used) = get_array(src, 0, src.len(), len)?;
-+    if used != src.len() || out.len() != len {
-+        return format_err("kraken: entropy half has the wrong length or trailing bytes");
-+    }
-+    Ok(out)
-+}
-+
- /// Decode a block of `len` logical bytes from its halves.
- pub fn decode_block(halves: &[Half], len: usize) -> Result<Vec<u8>> {
-     let mut out = vec![0u8; len];
 diff --git a/ps5upload-fpkg/src/kraken/huff.rs b/ps5upload-fpkg/src/kraken/huff.rs
-index be72096..b39e694 100644
+index be720967a9bf4012d9c7f62fb4dc63a2c5fa6b25..b39e6943f96d286aa23086f93bccc08318a837a4 100644
 --- a/ps5upload-fpkg/src/kraken/huff.rs
 +++ b/ps5upload-fpkg/src/kraken/huff.rs
 @@ -321,7 +321,11 @@ pub(super) fn decode(src: &[u8], n: usize) -> Result<Vec<u8>> {
@@ -84,10 +68,10 @@ index be72096..b39e694 100644
          let body = encode(data)?;
          assert_eq!(decode(&body, data.len()).unwrap(), data);
 diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
-index 7c39bbd..41ae2df 100644
+index f1a4225a7ffb938a24df91d4808ad2b036b50161..9de87b2734c9d775bfb0dfc2dcfe8405f350e7d8 100644
 --- a/ps5upload-fpkg/src/kraken_image.rs
 +++ b/ps5upload-fpkg/src/kraken_image.rs
-@@ -585,8 +585,8 @@ pub struct DescribedBlock {
+@@ -601,8 +601,8 @@ pub struct DescribedBlock {
      pub odd_lz: bool,
      /// The record's mode bits 32..=36, as stored: 32 and 35 mark delta literals (literal mode 0)
      /// in the even and odd halves, 33 and 36 mark LZ halves, 34 is `odd_reset` (the odd half restarts the decoder;
@@ -96,57 +80,18 @@ index 7c39bbd..41ae2df 100644
 +    /// set on every raw odd half and on bare entropy-array odd halves; it says nothing about
 +    /// the even half, and a bare entropy-array even half before an LZ odd one has it clear).
      pub mode_bits: u8,
- }
- 
-@@ -791,25 +791,31 @@ pub fn decode_described(image: &[u8], b: &DescribedBlock) -> Result<Vec<u8>> {
-     let even_logical = b.len.min(kraken::HALF as u64);
-     let mut halves = Vec::new();
-     let (e, o) = src.split_at((b.even_len as usize).min(src.len()));
--    let lz = |bytes: &[u8], delta: bool| {
--        if delta {
--            Half::LzDelta(bytes.to_vec())
-+    // An LZ flag selects the chunk decoder. A non-LZ half is either an exact-size raw
-+    // copy or a bare entropy array; its literal-mode bit does not apply to that array.
-+    let half = |bytes: &[u8], len: u64, is_lz: bool, delta: bool| -> Result<Half> {
-+        Ok(if is_lz {
-+            if delta {
-+                Half::LzDelta(bytes.to_vec())
-+            } else {
-+                Half::Lz(bytes.to_vec())
-+            }
-+        } else if bytes.len() as u64 == len {
-+            Half::Raw(bytes.to_vec())
-         } else {
--            Half::Lz(bytes.to_vec())
--        }
-+            Half::Raw(kraken::decode_entropy_half(bytes, len as usize)?)
-+        })
-     };
--    halves.push(if b.even_lz || (e.len() as u64) < even_logical {
--        lz(e, b.mode_bits & 1 != 0)
--    } else {
--        Half::Raw(e.to_vec())
--    });
-+    halves.push(half(e, even_logical, b.even_lz, b.mode_bits & 1 != 0)?);
+     /// The block's byte shuffle, an index into [`SHUFFLES`] (0: none).
+     pub shuffle: u8,
+@@ -997,6 +997,8 @@ pub fn decode_described(image: &[u8], b: &DescribedBlock) -> Result<Vec<u8>> {
      if b.len > kraken::HALF as u64 {
--        let odd_logical = b.len - kraken::HALF as u64;
--        halves.push(if b.odd_lz || (o.len() as u64) < odd_logical {
--            lz(o, b.mode_bits & 0b1000 != 0)
--        } else {
--            Half::Raw(o.to_vec())
--        });
-+        halves.push(half(
-+            o,
-+            b.len - kraken::HALF as u64,
-+            b.odd_lz,
-+            b.mode_bits & 0b1000 != 0,
-+        )?);
+         let odd_logical = b.len - kraken::HALF as u64;
+         halves.push(half(o, b.odd_lz, b.mode_bits & 0b1000 != 0, odd_logical));
 +    } else if !o.is_empty() {
 +        return format_err("kraken: unexpected odd half");
      }
-     kraken::decode_block(&halves, b.len as usize)
- }
-@@ -1266,4 +1272,67 @@ mod tests {
+     let mut data = kraken::decode_block(&halves, b.len as usize)?;
+     deshuffle(&mut data, b.shuffle)?;
+@@ -1892,4 +1894,69 @@ mod tests {
              "{e:?}"
          );
      }
@@ -167,6 +112,7 @@ index 7c39bbd..41ae2df 100644
 +            odd_lz: false,
 +            // Literal-mode bits are immaterial for non-LZ halves.
 +            mode_bits: 0b01101,
++            shuffle: 0,
 +        };
 +        assert_eq!(
 +            decode_described(&image, &block).unwrap(),
@@ -208,6 +154,7 @@ index 7c39bbd..41ae2df 100644
 +            even_lz: true,
 +            odd_lz: false,
 +            mode_bits: 0b00110,
++            shuffle: 0,
 +        };
 +        let out = decode_described(&image, &block).unwrap();
 +        assert_eq!(out.len(), kraken::BLOCK);

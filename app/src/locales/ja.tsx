@@ -12,17 +12,13 @@ const ja: Messages = {
   // App.tsx
   app: {
     screens: "画面",
-    convert: "変換",
     active: (n) => `、実行中 ${num(n)} 件`,
     edit: "編集",
-    pack: "パック",
     storage: "ストレージ",
     connect: "接続",
     disconnected: "未接続",
-    connected: (n: number) => `接続済み（${num(n)} 台）`,
+    connected: (n: number) => `${num(n)} 台`,
     about: "情報",
-    prevTab: "前のタブ (L2)",
-    nextTab: "次のタブ (R2)",
     offline: "オフライン、再試行中…",
     stop: "停止",
     stillRunning: (n) => (n === 1 ? "ジョブが実行中です" : `ジョブが ${num(n)} 件実行中です`),
@@ -53,39 +49,19 @@ const ja: Messages = {
     queued: "待機中",
     progress: (percent, left) => `${percent}% 完了${left ? `、残り ${left}` : ""}`,
   },
-  // Convert.tsx
+  // build/ (Build's convert settings and checks)
   convert: {
-    target: "出力形式",
-    targetFormat: "出力形式",
+    targetFormat: "形式",
     alreadyFolder: "ソースがすでにフォルダーです",
-    lz4Backport:
-      "このゲームのアセットは LZ4 でパックされており、LZ4 マニフェストにバックポートが含まれています。先に「パック」タブでアンパックしてから、ここでバックポートを除外してください。",
-    zstdBackport:
-      "このゲームのアセットは zstd でパックされており、zstd インデックスにバックポートが含まれています。先に「パック」タブでアンパックしてから、ここでバックポートを除外してください。",
-    unreadable: "ビルドできません：このソースを読み込めませんでした（「ソース」を参照）。",
     patchBlocked: "ビルドできません：これはパッチパッケージで、アップデートで変更された部分だけを含みます。ファイルを抽出するには「編集」で開いてください。",
     openInEdit: "「編集」で開く",
-    noContentId: "fpkg としてビルドできません：このゲームの param.json には、パッケージに必要な Content ID がありません。",
+    noContentId: "FPKG としてビルドできません：このゲームの param.json には、パッケージに必要な Content ID がありません。",
     blocked: (first, more) =>
       more > 0
         ? `ビルドできません：${first}（ほか ${num(more)} 件、「ソース」を参照）。`
         : `ビルドできません：${first}。`,
-    amprZstdRuntime: "この変換で fakelib/libSceAmpr.sprx に ampr-emu-ng がインストールされます。これらのパックに必要です。",
-    amprNgReplaced: (version) => `このゲームの ampr-emu-ng を ampr_emu ${version} に置き換えます。`,
-    amprRuntime: (a, own, version) => {
-      if (a === "install") return `このゲームは AMPR を使いますが ampr_emu がありません。変換すると同梱の ampr_emu ${version} をインストールします。`;
-      if (a === "trace") return `変換すると、このゲームの ampr_emu が同梱の ampr_emu ${version} に置き換わります。`;
-      if (a === "replace")
-        return own
-          ? `変換すると、このゲームの ampr_emu ${own} が同梱の ampr_emu ${version} に置き換わります。`
-          : `変換すると、バージョン不明のこのゲームの ampr_emu が同梱の ampr_emu ${version} に置き換わります。`;
-      return own
-        ? `このゲームの ampr_emu ${own} は同梱の ${version} と同じか新しいため、変換してもそのまま残ります。`
-        : `このゲームにはすでに同梱の ampr_emu ${version} があり、変換してもそのまま残ります。`;
-    },
     amprIndex: (state: "stale" | "damaged" | "missing") =>
       `${state === "stale" ? "ampr_emu.index がこのゲームのファイルと一致しません" : state === "damaged" ? "ampr_emu.index を読み込めません" : "このゲームには ampr_emu.index がありません"}。変換すると新しく書き込みます。`,
-    amprPkgIndex: "パッケージには、収録するファイルから作った新しい ampr_emu.index が入ります。",
     removeBackport: "バックポートを除外",
     removeHint: (libs, emulators, other) =>
       emulators.length === 0
@@ -119,9 +95,9 @@ const ja: Messages = {
         tagline: "ファームウェアが対応していれば最適",
         cells: ["ネイティブ、フルスピード", "ゲームにより 30〜60% 小さい"],
       },
-      zstd: { tagline: "ampr-emu-ng で動作", cells: ["読み込みが最大 80% 高速", "ゲームのサイズを最大で半分に"] },
+      zstd: { tagline: "ampr-emu-ng で動作", cells: ["読み込みが高速", "ゲームのサイズを最大で半分に"] },
       lz4: {
-        tagline: "ampr-emu-ng または ampr_emu で動作",
+        tagline: "ampr-emu-ng で動作",
         cells: ["読み込みが 30〜40% 速い（上流の数値）", "ゲームの約半分のサイズ（上流の数値）"],
       },
       ffpkg: { tagline: "ShadowMountPlus に推奨", cells: ["イメージとしてフルスピード", FLAT] },
@@ -133,34 +109,22 @@ const ja: Messages = {
       },
       folder: { tagline: "通常のゲームファイル", cells: ["ドライブのフルスピード", FLAT] },
     },
-    features: [
-      ["変換", "フォルダー、ffpkg、exfat、ffpfs、ffpfsc、fpkg の間で双方向に変換します。"],
-      ["転送", "SMB、FTP、NFS 経由で、PS5、コンピューター、NAS の間でファイルを送信し、ゲームを変換します。"],
-      ["編集", "ゲームのファイルをフォルダーのように変更し、ビルド前にカバー、ファームウェア、バックポート、DLC、ファイル名の問題を確認できます。"],
-      ["ストリーミング", "任意のソースから任意の出力先へ。一時コピーなしで、ffpfsc 内のイメージやアーカイブ内のゲームでも同様です。"],
-      ["アーカイブ", "ゲームを含む .zip、.7z、.rar をフォルダーのように閲覧、変換、パックできます。"],
-      ["USB と SD カード", "exFAT または FAT32 でフォーマットしたメモリーやカードに書き込めます。"],
-      ["パック", "zstd または LZ4 のアセットパックをスマート修復付きで作成します。"],
-      ["ストレージ", "ゲームのライブラリと、名前の変更・移動・削除ができるファイルエクスプローラー。"],
-      ["安全", "依頼しない限りゲームは変更されません。ジャンクファイルはスキップし、不正なファイル名は事前に報告します。"],
-    ],
-    about: "情報",
     compare: "形式を比較",
     compareLabel: "形式の比較",
     format: "形式",
     credits: "クレジット",
-    upstream: (app) =>
-      `上流の数値：ampr_emu と Lazy_AMPR の作者による報告値で、${app} が測定したものではありません。ゲームによって異なります。ampr_emu 0.4.2.1 は上流のテストビルドです。既知の問題：一部のゲームでセーブ時にクラッシュします。`,
-    bundled: "LZ4 でパックしたフォルダーは drakmor 氏の ampr_emu 0.4.2.1（GPL-3.0、無改変で同梱）で動作します。ソースコード：",
+    upstream: (app: string) =>
+      `上流の数値：ampr_emu と Lazy_AMPR の作者による報告値で、${app} が測定したものではありません。ゲームによって異なります。`,
+    bundled: "drakmor 氏の ampr_emu（GPL-3.0）。ampr-emu-ng はそのフォークです。Forge はもう同梱していません。「設定」で残すようにしない限り、ゲームの ampr_emu は ampr-emu-ng に置き換えられます。ソースコード：",
     lazy: "パック戦略は Nazky 氏の Lazy_AMPR を基にしています：",
-    ng: "zstd と LZ4 のパックは ampr-emu-ng で動作します。ソース：",
+    ng: "ZSTD と LZ4 のパックは ampr-emu-ng（GPL-3.0-or-later）で動作します。同梱する唯一の AMPR ランタイムで、無改変です。ソースコード：",
     logo: "ロゴは Xxcco 氏の作品です：",
     unrar:
       ".rar アーカイブは同梱の UnRAR ライブラリ（Alexander Roshal 作）で読み込みます（展開のみ、UnRAR ライセンスに基づく）。",
     language: "言語",
     system: "システム",
     notifications: "ジョブの完了時に通知する",
-    notificationsHint: "変換、パック、転送ジョブの通知を本体に表示します。",
+    notificationsHint: "ビルド、パック、転送ジョブが終わると本体に通知を表示します。",
     notificationsFailed: "通知設定を変更できませんでした。",
   },
   // Edit.tsx
@@ -182,11 +146,9 @@ const ja: Messages = {
     leftoversNote: (app) =>
       `未完成の出力で、通常は中断されたジョブの残りです。見覚えのあるものだけを、ジョブが実行されていないときに削除してください。${app} が自動で削除することはありません。`,
     checked: (n) => `確認したフォルダー（${num(n)}）`,
-    /** Edit's folds under the game card. */
     facts: "ゲーム情報",
     explorer: "ゲームのファイル",
     howTitle: "使い方",
-    /** The empty state's paragraphs. */
     how: (app) => [
       "ゲームの**フォルダー**か**イメージ**を開き、USB メモリー上のフォルダーと同じように変更します。**ファイルの追加と置き換え**（ドラッグするか「追加」を使用）、**名前の変更と削除**ができます。",
       `**「適用」を押すまで**何も変更されません。変更はここに積み重なり、${app} がそれらをまとめてイメージやフォルダーに直接書き込み、結果を確認します。**マウントされたドライブではありません**。${app} が変更を記録し、自分で適用します。`,
@@ -205,11 +167,14 @@ const ja: Messages = {
     matches: (n) => `${num(n)} 件一致`,
     emptyFolder: "このフォルダーは空です。",
     open: (name) => `${name} を開く`,
-    archiveNote: "アーカイブは閲覧できますが、編集はできません。変更するには、先にフォルダーかイメージに変換してください。",
-    nasNote: "NAS 上のゲームは閲覧と抽出はできますが、編集はできません。変更するには、先にこのデバイスへ変換または抽出してください。",
+    archiveNote: "アーカイブは閲覧できますが、編集はできません。変更するには、先にアーカイブからフォルダーかイメージをビルドしてください。",
+    rebuildTimePkg: (t) => `再ビルドはゲーム全体を圧縮し直します。PS5 では ~26 MB/s で約 ${t}（コンピューターではより高速）。避けるには、アンパックしたコピーを編集してください。`,
+    rebuildTimePs5: (t) => `再ビルドはイメージ全体を書き直します（この PS5 で約 ${t}）。`,
+    rebuildTimeHost: (t) => `再ビルドはイメージ全体を書き直します（このコンピューターで約 ${t}）。`,
+    rebuildTimeAny: (t) => `再ビルドはイメージ全体を書き直します（PS5 で約 ${t}）。`,
+    nasNote: "NAS 上のゲームは閲覧と抽出はできますが、編集はできません。変更するには、先にこのデバイスへビルドまたは抽出してください。",
     patchNote: "これはパッチパッケージで、アップデートで変更された部分だけを含みます。完全に含まれているファイルだけを表示しています。閲覧と抽出はできますが、編集はできません。",
-    peerNote: "別の Forge 上のゲームは閲覧と抽出はできますが、編集はできません。変更するには、先にこのデバイスへ変換または抽出してください。",
-    /** The explorer's changes: none is made until Apply. */
+    peerNote: "別の Forge 上のゲームは閲覧と抽出はできますが、編集はできません。変更するには、先にこのデバイスへビルドまたは抽出してください。",
     addFiles: "ファイルを追加",
     addFolder: "フォルダーを追加",
     pickAddFiles: "追加するファイルを選択",
@@ -220,7 +185,6 @@ const ja: Messages = {
     renameTip: "名前を変更（F2）",
     removeTip: "削除（Delete キー）",
     removeTipMac: "削除（fn+Delete キー）",
-    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
     extractItem: (name: string) => `${name} を展開`,
     extractTip: "選択したフォルダーにコピー",
     extractFolder: "フォルダーを展開",
@@ -268,7 +232,6 @@ const ja: Messages = {
     replace: "置き換え",
     skip: "スキップ",
     cancel: "キャンセル",
-    /** How the changes go in (the pending bar), from core's check before Apply. */
     modeLabel: "適用方法",
     checking: "変更の適用方法を確認しています",
     nothingToChange: "変更するものはありません。ゲームはそのままです。",
@@ -283,7 +246,7 @@ const ja: Messages = {
     inPlaceText: "イメージに書き込みます。",
     inPlaceNeeds: (need, free) => `イメージに書き込みます。空き ${free} のうち ${need} を使います。`,
     noRoom: (need, free) => `変更には ${need} 必要ですが、イメージの空きは ${free} です。`,
-    alwaysRebuilt: "ffpfsc と fpkg のイメージは常に再ビルドされます。",
+    alwaysRebuilt: "ffpfsc と FPKG のイメージは常に再ビルドされます。",
     rebuildText: "新しいイメージを隣に書き込み、検証後に元のイメージと置き換えます。",
     rebuildNeeds: (need, free) =>
       `新しいイメージを隣に書き込み（約 ${need} の空きが必要、空き ${free}）、検証後に元のイメージと置き換えます。`,
@@ -308,11 +271,9 @@ const ja: Messages = {
     uploading: (i, n, sent, total) => `ファイル ${num(i)}/${num(n)} をアップロード中：${sent} / ${total}`,
     uploadLabel: "アップロード",
     uploadCancelled: "アップロードをキャンセルしました。ゲームは何も変わっていません。",
-    applyRunning: "変更を適用しています。下のジョブが終わるまで編集はできません。",
+    applyRunning: "変更を適用しています。ジョブが終わるまで編集はできません（「キュー」を参照）。",
     applyFailed: "変更は適用されませんでした：",
     applyRefused: "この方法では変更を適用できません：",
-    applyCancelled: "ジョブはキャンセルされました。変更はここに残っています。",
-    folderPartly: "変更の一部はすでにフォルダーに書き込まれている可能性があります。表示中のファイルが現在の中身です。",
     interrupted: "このイメージの前回の編集が中断されています。次の変更を確認または適用する前に、イメージを元の状態に戻します。",
   },
   // JobList.tsx
@@ -348,6 +309,7 @@ const ja: Messages = {
     },
     stepsLabel: "ステップ",
     stepDone: (s) => `${s}（完了）`,
+    stepFailed: (s) => `${s}（失敗）`,
     stepLater: (s) => `${s}（未開始）`,
     packingWriting: "パックと書き込み中",
     rate: { read: "読み込み", compress: "圧縮", pack: "パック", write: "書き込み" },
@@ -358,12 +320,11 @@ const ja: Messages = {
     packTag: {
       lz4Pack: (level: string) => `LZ4 パック · ${level}`,
       lz4Unpack: "LZ4 アンパック",
-      zstdPack: (level: string) => `zstd パック · ${level}`,
+      zstdPack: (level: string) => `ZSTD パック · ${level}`,
       level: (n: number) => `レベル ${num(n)}`,
-      zstdUnpack: "zstd アンパック",
+      zstdUnpack: "ZSTD アンパック",
       withRules: (tag) => `${tag} · カスタムルール`,
     },
-    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "編集",
     editRebuild: "編集 · 再ビルド",
     transfer: "転送",
@@ -385,7 +346,6 @@ const ja: Messages = {
     from: "ソース：",
     left: (d) => `残り ${d}`,
     inStep: (time) => `このステップで ${time} 経過`,
-    result: (bytes, n) => `${bytes}、${num(n)} 個のファイル →`,
     outputPath: "出力先のパス",
     sourceDeleted: (v) => `ソースを削除しました：${v}`,
     sourceKept: (v) => `ソースを残しました：${v}`,
@@ -407,60 +367,27 @@ const ja: Messages = {
     log: (n) => `ログ（${num(n)}）`,
     logLabel: "ログ",
   },
-  // Library.tsx
+  // Storage text shared by Files.tsx, Packages.tsx, Edit.tsx and common.tsx (FreeSpace)
   library: {
-    pickTitle: "ライブラリのフォルダーを選択",
-    scanningIn: (name) => `${name} をスキャン中`,
-    scanning: "スキャン中",
-    cantScanFolder: "このフォルダーをスキャンできません",
-    chooseAnother: "別のフォルダーを選択",
-    pickPrompt: "スキャンするライブラリのフォルダーを選んでください",
-    choose: "フォルダーを選択",
-    cantScan: "ライブラリをスキャンできません：",
     cantDelete: "削除できません：",
     deleted: (path) => `${path} を削除しました`,
-    truncated: "スキャンの上限に達しました。この一覧は不完全な可能性があります。",
-    limits: "検索はフォルダー 6 階層まで、スキャン開始から約 15 秒で終了します。",
-    noRoots: "スキャンできるフォルダーがありません。",
-    none: "ゲームが見つかりませんでした。検索は 6 階層までで、システムフォルダーはスキップします。その他のソースは「編集」や「変換」で選択できます。",
-    skipped: "スキップした場所とファイル",
-    library: "ライブラリ",
     storageTip: "本体の内蔵ストレージ（/data）の空き容量",
     free: (free, total) => (
       <>
         空き <b>{free}</b> / {total}
       </>
     ),
-    refresh: "更新",
     cards: "カード表示",
     list: "リスト表示",
-    games: "ゲーム",
-    edit: (n) => `${n} を編集`,
-    convert: (n) => `${n} を変換`,
     remove: (n) => `${n} を削除`,
     deleting: (n) => `${n} を削除しています`,
-    lz4Tip: "LZ4 アセットパック",
-    zstdTip: "zstd アセットパック",
     showAs: "表示形式",
-    kinds: "種類で表示",
-    all: "すべて",
-    lz4Chip: "LZ4",
-    zstdChip: "zstd",
-    countIn: (n, path) => (
-      <>
-        <b>{num(n)}</b> 本のゲーム、場所： {path}
-      </>
-    ),
   },
-  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  // Storage.tsx, Files.tsx: the Storage tab (File explorer | Package installer)
   storage: {
     views: "ストレージの表示",
-    library: "ライブラリ",
     files: "ファイルエクスプローラー",
     title: "ファイルエクスプローラー",
-    pickTitle: "参照するフォルダーを選択",
-    pickPrompt: "ファイルを参照するフォルダーを選んでください",
-    choose: "フォルダーを選択",
     roots: "ドライブ",
     location: "場所",
     folders: "フォルダー",
@@ -503,45 +430,28 @@ const ja: Messages = {
     moved: (path) => `${path} に移動しました`,
     devices: "デバイス",
     thisDevice: "このデバイス",
-    otherDevice: "「移動」は 1 台のデバイス内だけで使えます。別のデバイスへコピーするには、そのデバイスのタブへドラッグしてください。",
-    dropCopy: (folder) => `ドロップして ${folder} にコピー`,
+    otherDevice: "「移動」は 1 台のデバイス内だけで使えます。デバイス間のコピーは「転送」画面で行います。",
+    loadingDevices: "デバイスを読み込み中",
+    noDevice: "接続されているデバイスはありません",
+    noDeviceHint: "PS5 やコンピューターをペアリングするか NAS を追加すると、ここでそのファイルを管理できます。",
+    openConnect: "「接続」を開く",
     dropMove: (folder) => `ドロップして ${folder} に移動`,
     cantCopy: "コピーできません：",
     copyNoFolder: "先にそのデバイスでフォルダーを開いてください。",
-    copyOne: (name, to) => `${name} を ${to} にコピーしています。転送は「接続」に表示されます。`,
-    copyMany: (n, to) => `${num(n)} 項目を ${to} にコピーしています。転送は「接続」に表示されます。`,
-    openConnect: "「接続」を開く",
+    copyOne: (name: string, to: string) => `${name} を ${to} にコピーしています。転送は「キュー」に表示されます。`,
+    copyMany: (n: number, to: string) => `${num(n)} 項目を ${to} にコピーしています。転送は「キュー」に表示されます。`,
   },
-  // Pack.tsx
+  // build/ (Build's pack settings and checks), JobList.tsx's pack tags
   pack: {
-    title: "パック",
     help: "パックの仕組み",
-    engine: "パックの種類",
-    engines: { zstd: "zstd", lz4: "LZ4" },
-    actions: { pack: "パック", unpack: "アンパック" },
-    info: (e, packed) =>
-      e === "zstd"
-        ? packed
-          ? "zstd パックを通常のファイルに戻します。"
-          : "ゲームのアセットを zstd ボリュームにパックします。"
-        : packed
-          ? "LZ4 パックを通常のファイルに戻します。"
-          : "一部のゲームは起動しない場合があります。ゲームのアセットを LZ4 ボリュームにパックします。",
-    noAmprRuntime: "このゲームには AMPR ランタイムがありません。Pack が ampr-emu-ng を注入します。",
-    strategy: (s) => `パック方式: ${s === "everything" ? "システムファイル以外をすべてパック" : "互換 LZ4 方式"}。`,
     patch: "パッチパッケージはパックできません。",
     additionalContent: "追加コンテンツ（eboot.bin なし）はパックできません。",
-    unreadable: "開始できません：ソースを読み込めませんでした（「ソース」を参照）。",
-    blocked: (a, first, more) =>
-      `${a === "pack" ? "パック" : "アンパック"}できません：${first}${more > 0 ? `（ほか ${num(more)} 件、「ソース」を参照）` : ""}。`,
-    target: "出力形式",
-    packFolder: (e) => `推奨。最速で遅延も最小：アセットを ${e === "zstd" ? "zstd" : "LZ4"} パックにした新しいゲームフォルダー。`,
     levels: { fast: "高速", medium: "標準", max: "最大" },
     levelNotes: {
       zstd: {
-        fast: { tone: "good", text: "推奨。zstd 5：速く、サイズも十分。" },
-        medium: { text: "zstd 9：より小さく、より遅い。" },
-        max: { text: "zstd 19：最小。かなり遅く、メモリも多く使います。" },
+        fast: { tone: "good", text: "推奨。ZSTD 5：速く、サイズも十分。" },
+        medium: { text: "ZSTD 9：より小さく、より遅い。" },
+        max: { text: "ZSTD 19：最小。かなり遅く、メモリも多く使います。" },
       },
       lz4: {
         fast: { tone: "good", text: "推奨。LZ4 の既定：最速。" },
@@ -549,39 +459,8 @@ const ja: Messages = {
         max: { text: "LZ4 HC 12：最小、最も遅い。" },
       },
     },
-    runtime: "ランタイム",
-    runtimeNotes: {
-      ng: { tone: "good", text: "推奨。zstd と LZ4 のパックを読み込めます。" },
-      ampr_emu: { text: "上流の ampr_emu。" },
-    },
-    ngNote: "必要なランタイム：ampr-emu-ng。パックすると fakelib/ にインストールされます。ShadowMount+ の fakelib 更新をオフにしてください。オンのままだとランタイムが置き換えられます。",
-    installsRuntime: (version) => `ampr_emu がありません：パックすると ampr_emu ${version} がインストールされます。`,
-    freshIndex: (state) =>
+    freshIndex: (state: "stale" | "damaged" | "missing") =>
       `${state === "stale" ? "ampr_emu.index が古くなっています" : state === "damaged" ? "ampr_emu.index が破損しています" : "ampr_emu.index がありません"}：パックすると新しく書き込まれます。`,
-    direct: "イメージに直接パックします。ゲームは 2 回読み込みます。",
-    unpackFolder: "通常のファイルからなる新しいゲームフォルダー。",
-    unpackHint: (n) =>
-      n === null
-        ? "パックされたファイルを通常のファイルに戻します。"
-        : `パックされた ${num(n)} 個のファイルを通常のファイルに戻します。`,
-    likelyFail: (fmt) => <>
-      <b>{fmt}</b> では失敗する可能性が高いです。「ソース」に表示されたファイル名を受け付けません。
-    </>,
-    collides: (a, folder) => a === "pack"
-      ? folder
-        ? "このフォルダーはすでにジョブが書き込み中です。パックするには別の名前が必要です。"
-        : "このファイルはすでにジョブが書き込み中です。パックするには別の名前が必要です。"
-      : folder
-        ? "このフォルダーはすでにジョブが書き込み中です。アンパックするには別の名前が必要です。"
-        : "このファイルはすでにジョブが書き込み中です。アンパックするには別の名前が必要です。",
-    already: (a, fmt) => a === "pack"
-      ? <>
-        このゲームはすでに <b>{fmt}</b> として書き込み中です。もう一度パックすると 2 つ目のコピーが作成されます。
-      </>
-      : <>
-        このゲームはすでに <b>{fmt}</b> として書き込み中です。もう一度アンパックすると 2 つ目のコピーが作成されます。
-      </>,
-    source: "ソース",
     rules: {
       title: "カスタムルール（TOML）",
       titleWith: (name) => `カスタムルール（TOML）：${name}`,
@@ -597,32 +476,32 @@ const ja: Messages = {
     close: "閉じる",
     body: () => (
       <>
-        <h3>zstd</h3>
+        <h3>ZSTD</h3>
         <ol>
-          <li>ゲームのアセットを zstd ボリュームにパックし、フォルダーかイメージに書き込みます。</li>
-          <li><b>高速</b>（zstd 5）は速く、<b>標準</b>（9）と<b>最大</b>（19）はより小さく、より遅くなります。</li>
-          <li>パック済みのゲームには<b>アンパック</b>が表示され、通常のファイルに戻せます。</li>
+          <li>ゲームのアセットを ZSTD ボリュームにパックし、フォルダーかイメージに書き込みます。</li>
+          <li><b>高速</b>（ZSTD 5）は速く、<b>標準</b>（9）と<b>最大</b>（19）はより小さく、より遅くなります。</li>
+          <li>ZSTD でパックしたゲームは<b>なし</b>を選ぶとアンパックされ、通常のファイルに戻ります。</li>
         </ol>
 
         <h3>LZ4</h3>
         <ol>
           <li><b>一部のゲームは起動しない場合があります。</b>コピーを残しておいてください。</li>
           <li>LZ4 ボリュームにパックし、フォルダーかイメージに書き込みます：<b>高速</b>（LZ4）、<b>標準</b>（HC 9）、<b>最大</b>（HC 12）。</li>
-          <li>ランタイム：<b>ampr-emu-ng</b>（既定）または上流の <b>ampr_emu</b>。</li>
-          <li>パック済みのゲームには<b>アンパック</b>が表示されます。</li>
+          <li>ZSTD のパックと同じく ampr-emu-ng で動作します。</li>
+          <li>LZ4 でパックしたゲームは<b>なし</b>を選ぶとアンパックされます。</li>
         </ol>
 
         <h3>ampr-emu-ng</h3>
         <ol>
-          <li>zstd と LZ4 のパックを読み込みます。パックすると fakelib/ にインストールされます。</li>
+          <li>Forge が同梱する唯一の AMPR ランタイムです。ZSTD と LZ4 のパックを読み込み、パックすると fakelib/ にインストールされます。</li>
+          <li>ビルドではゲームの ampr_emu がこれに置き換えられます（「設定」で ampr_emu を残す場合を除く）。FPKG にはランタイムが入らず、本体のローダーが提供します。</li>
           <li>ShadowMount+ の fakelib 更新をオフにしてください。オンのままだとランタイムが置き換えられ、ゲームがパックを読み込めなくなります。</li>
         </ol>
 
         <h3>パック戦略</h3>
         <ol>
-          <li><b>システムファイル以外をすべてパック</b> (zstd、および ampr-emu-ng を使う LZ4): eboot.bin、実行ファイルとモジュール、sce_sys、sce_module、fakelib、.ini ファイル (dlc_emu.ini は編集可能なまま) 以外のすべてのファイルをパックし、音声や動画を含む残りは ampr-emu-ng が提供します。</li>
-          <li><b>互換 LZ4 方式</b> (ampr_emu を使う LZ4): 設定、メディアなどゲームが直接読むファイルは個別に残します。</li>
-          <li>パックのみ：<b>カスタムルール（TOML）</b>で、ampr_pack.py と Lazy_AMPR の形式のプロファイルを、このデバイスまたは別のデバイスから選びます。</li>
+          <li><b>システムファイル以外をすべてパック</b> (ZSTD と LZ4): eboot.bin、実行ファイルとモジュール、sce_sys、sce_module、fakelib、.ini ファイル (dlc_emu.ini は編集可能なまま) 以外のすべてのファイルをパックし、音声や動画を含む残りは ampr-emu-ng が提供します。</li>
+          <li>パックするとき、<b>カスタムルール（TOML）</b>で、ampr_pack.py と Lazy_AMPR の形式のプロファイルを、このデバイスまたは別のデバイスから選べます。</li>
           <li>一致した最後のルールが優先され、システムファイルは常に個別に残ります。ルールが誤っていると、ゲームが起動しなくなることがあります。</li>
         </ol>
       </>
@@ -647,12 +526,21 @@ const ja: Messages = {
     cantList: "このフォルダーを開けません：",
     cancel: "キャンセル",
     chooseFolder: "このフォルダーを選択",
-    netOnlyHere: "アーカイブと fpkg はこのデバイスからのみ開けます。",
-    shortcuts: "ショートカット",
-    addShortcut: "ショートカットに追加",
-    removeShortcut: "ショートカットを削除",
-    shortcutsFull: "ショートカットは 9 個までです。先に 1 つ削除してください。",
-    removeShortcutNamed: (name: string) => `ショートカット ${name} を削除`,
+    netOnlyHere: "アーカイブと FPKG はこのデバイスからのみ開けます。",
+  },
+  // bookmarks.tsx: the bookmarked folders (Transfer and the File explorer)
+  bookmarks: {
+    label: "ブックマーク",
+    add: "このフォルダーをブックマーク",
+    remove: "ブックマークを削除",
+    removeNamed: (name: string) => `ブックマーク ${name} を削除`,
+    full: "ブックマークは 9 個までです",
+  },
+  // DeviceTabs.tsx
+  deviceTabs: {
+    add: "デバイスを追加",
+    offline: "オフライン",
+    offlineNamed: (name: string) => `${name} · オフライン`,
   },
   // common.tsx
   common: {
@@ -688,7 +576,7 @@ const ja: Messages = {
     traceRuntime: "旧 LZ4 トレース用ランタイム",
     noRuntime: "ランタイムなし",
     packed: (kind) => `パック済み (${kind})`,
-    zstdKept: "zstd のアセットパック：変換しても保持されます",
+    zstdKept: "ZSTD のアセットパック：変換しても保持されます",
     damaged: "パックが破損",
     unpacked: "未パック",
     packedDetail: (files, volumes, percent) =>
@@ -700,12 +588,14 @@ const ja: Messages = {
       damaged: "ampr_emu.index が破損：変換で書き直されます",
       missing: "ampr_emu.index なし：変換で書き込まれます",
     },
-    runtimeAction: (a, version) =>
+    runtimeAction: (a: "install" | "replace" | "keep" | "keepIfPacks") =>
       a === "install"
-        ? `変換で同梱の ampr_emu ${version} がインストールされます`
+        ? "変換で同梱の ampr-emu-ng がインストールされます"
         : a === "replace"
-          ? `変換でランタイムが同梱の ampr_emu ${version} に置き換わります`
-          : `変換後もそのまま残ります`,
+          ? "変換でランタイムが同梱の ampr-emu-ng に置き換わります"
+          : a === "keep"
+            ? "変換でもそのまま残ります（「設定」による）"
+            : "変換では、LZ4 のパックを読めるなら残し、読めなければ ampr-emu-ng に置き換えます",
     backportLibs: (exclusive, n) =>
       exclusive
         ? `fakelib2/（単独でマウント）、バックポートライブラリ ${num(n)} 個`
@@ -760,11 +650,11 @@ const ja: Messages = {
   password: {
     title: "このアーカイブにはパスワードが必要です",
     text: "開くにはパスワードを入力してください。",
-    wrong: "パスワードが正しくありません。",
+    wrong: "パスワードが正しくありません。確認してもう一度お試しください。",
     label: "パスワード",
     cancel: "キャンセル",
     unlock: "ロック解除",
-    checking: "確認中…",
+    checking: "確認中",
   },
   // main-http.tsx
   launch: {
@@ -794,36 +684,6 @@ const ja: Messages = {
   },
   // target.tsx
   target: {
-    format: {
-      folder: { text: "イメージやパッケージを通常のゲームフォルダーに戻します。" },
-      exfat: {
-        text: "ffpkg では正常に動かず、外部ドライブのコンテンツとしてのみ動作するゲーム向け。Mac や PC でも開けます。",
-      },
-      ffpkg: { text: "PS5 本来のファイルシステム（UFS2）です。書き込み可能なマウントにも対応します。" },
-      ffpfs: {
-        text: "PS5 の PFS ファイルシステム（非圧縮）です。ファイル名は ASCII のみ使用できます。",
-      },
-      ffpfsc: {
-        text: "最小サイズ：1 つのイメージを包む圧縮コンテナで、常に読み取り専用でマウントされます。",
-      },
-      pkg: { tone: "good", text: "推奨。ネイティブのゲームと同様に動作します（ファームウェアが対応している場合のみ）。" },
-      lz4: {
-        text: "アセットを LZ4 ボリュームにパックしたゲームフォルダーで、ゲームの実行中に同梱の AMPR エミュレーター（ampr_emu）が展開します。",
-      },
-    },
-    innerFfpkg: { text: "PS5 本来のファイルシステム（UFS2）です。" },
-    innerExfat: { tone: "good", text: "推奨。圧縮コンテナー内で最も安定したイメージです。" },
-    level0: { text: "圧縮なし：すべてのブロックをそのまま格納します。ファイルはイメージと同じサイズになります。" },
-    levelDefault: {
-      tone: "good",
-      text: "推奨。zlib の既定値です。1 はビルドが約 3 倍速く、ファイルは約 3% 大きくなります。9 はほとんど小さくなりません。",
-    },
-    levelLow: {
-      text: "6 よりビルドが速くなります（レベル 1 で約 3 倍）が、ファイルは大きくなります（レベル 1 で約 3%）。",
-    },
-    levelHigh: {
-      text: "6 よりわずかに小さくなります（レベル 9 で 0.04%）が、圧縮にかかる時間は長くなり（レベル 9 で約 25% 増）、その間すべてのコアが使用されます。",
-    },
     kraken: {
       fast: { label: "高速", note: { tone: "good", text: "推奨。最も速くビルドできます。" } },
       balanced: {
@@ -860,7 +720,7 @@ const ja: Messages = {
       folder
         ? `長すぎます：${bytes} バイト（上限 ${max} バイト、UTF-8）。`
         : `長すぎます：拡張子を除いて ${bytes} バイト（上限 ${max} バイト、UTF-8）。`,
-    pkgExt: (ext) => `末尾が .${ext} ですが、fpkg は .pkg として保存されます。ドライバーは拡張子で決まります。`,
+    pkgExt: (ext) => `末尾が .${ext} ですが、FPKG は .pkg として保存されます。ドライバーは拡張子で決まります。`,
     otherExt: (ext, target) =>
       `末尾が .${ext} ですが、出力形式は ${target} です。ドライバーは拡張子で決まります。`,
     extractInto: "このフォルダーに展開",
@@ -890,7 +750,6 @@ const ja: Messages = {
     versionOut: "余地を作るためにバージョンが省かれます。",
     cut: "名前は 63 バイトで切り詰められます。",
     idOnly: "テンプレートの文字で 63 バイトが埋まるため、タイトル ID が出力名になります。",
-    limit: "ShadowMount+ は名前が 63 バイト（ffpfsc は 58 バイト）を超えるイメージをマウントできないため、それより長い名前はまずタイトルが短くなります。",
     errors: {
       long: (max: number) => `テンプレートは最大 ${max} バイトです。`,
       open: "{ に対応する } がありません。",
@@ -911,7 +770,8 @@ const ja: Messages = {
     later: "後で",
     updating: "アップデート中…",
     updatingNote: "新しいバージョンをダウンロードしています。このページは自動で新しいバージョンに再読み込みされます。",
-    downloading: "ブラウザーでダウンロードしています。アーカイブを展開して、このコピーと置き換えてください。",
+    downloading: "ブラウザーでダウンロードが始まるので、ダウンロードしたファイルでこのコピーを置き換えてください（Mac では .dmg 内のアプリを「アプリケーション」へドラッグします）。",
+    downloadingCli: "ブラウザでダウンロードが始まります。ps5-dump-forge の CLI をダウンロードしたファイルに置き換えるか、実行中のコンピューターで ps5-dump-forge update --install を実行してください。",
     failed: (v) => `v${v} にアップデートできませんでした`,
     timeout: (v) => `v${v} が 1 分以内に起動しませんでした。ダウンロード済みの場合は、Dump Forge を停止してから開き直すと更新が完了します。`,
     retry: "再試行",
@@ -941,7 +801,6 @@ const ja: Messages = {
     all: "すべて",
     onlineOf: (n, total) => `${num(total)} 台中 ${num(n)} 台がオンライン`,
     sendFilesTo: (name) => `${name} にファイルを送信`,
-    details: (name) => `${name} の詳細`,
     userIs: (user) => `ユーザー ${user}`,
     nearby: "近くのデバイス",
     nearbyNone: "新しいデバイスは見つかりませんでした",
@@ -1006,40 +865,22 @@ const ja: Messages = {
     passwordNone: "なし",
     edit: "編集",
     nasForgetNote: "「登録解除」はこの NAS と保存済みのパスワードをこのデバイスから削除します。",
-    pickSendFiles: "送るファイル",
-    pickSendFolder: "送るフォルダー",
-    pickSaveTo: "保存先",
     thisBrowser: "このブラウザー",
-    browserHint: "このスマートフォンやコンピューターのファイルをこのデバイス上のフォルダーに入れ、このデバイス上のファイルをこのブラウザーで保存します。",
-    uploadTo: "アップロード先のフォルダー",
     uploadPick: "アップロードするファイルを選択",
     uploading: (name, i, n) => `${name} をアップロード中（${num(i)} / ${num(n)}）`,
     uploaded: "アップロードが終わりました",
     uploadSkipped: (names) => `アップロードしませんでした。そこには同じ名前のフォルダーまたはリンクがあります：${names}。`,
     uploadedBefore: (done, n) => `${num(n)} 個のうち ${num(done)} 個のファイルをアップロードしました。これらはこのデバイスに残ります。`,
-    cantStart: "転送を開始できません：",
     cantUpload: "アップロードできません：",
-    pickDownload: "ダウンロードするファイル",
-    transferIntro: "どのデバイスのファイルやフォルダーでも、このデバイス、ペアリング済みのデバイス、NAS のいずれかのフォルダーに送ります。転送はジョブ一覧のジョブとして実行されます。",
     send: "送信",
-    sendWhat: "送るもの",
-    sendTo: "送信先",
-    sendNeedsDevice: "先に別のデバイスを接続してください。Forge をペアリングするか、NAS を追加します。",
-    nothingChosen: "まだ何も選んでいません",
-    chooseFiles: "ファイルを選択",
-    chooseFolder: "フォルダーを選択",
-    startTransfer: "開始",
-    uploadHere: "このデバイスにアップロード",
     downloadHere: "このデバイスからダウンロード",
-    consoleNoFiles: "PS5 のブラウザーではファイルを選べません。スマートフォンかコンピューターでこのページを開いてください。",
     wholeRoot: "デバイス、共有、ドライブの全体は送れません。その中のフォルダーを選んでください。",
-    helpPhone: "QR コードをスキャンすると、スマートフォンでこのページが開きます。そこでは「ファイル転送」の「このデバイスにアップロード」と「このデバイスからダウンロード」で、スマートフォンのファイルをやり取りできます。",
-    /** How to connect: short paragraphs, in order (no headings). */
+    helpPhone: "QR コードをスキャンすると、スマートフォンでこのページが開きます。そこでは「転送」で、スマートフォンのファイルをこのデバイスにアップロードし、このデバイスのファイルをスマートフォンにダウンロードできます。",
     help: [
       "「接続」は、同じネットワーク上の PS5 とコンピューターにある Dump Forge どうしをつなぎます。",
       "ペアリングするには、「自動検出」を実行して「近くのデバイス」で「ペアリング」を選ぶか、「デバイスを追加」にアドレスを入力し、もう一方のデバイスで許可します。両方の画面に同じ確認番号が表示されているときだけ許可してください。",
       "NAS（SMB、FTP、NFS）も同じように追加します。ペアリングしたデバイスと NAS はゲームの読み込み元にも出力先にもなりますが、そこにあるゲームは編集されません。",
-      "「ファイル転送」は、これらの間でファイルやフォルダーをコピーします。転送先に同じ名前がある場合は、確認したあとにだけ置き換えます。",
+      "サイドメニューの「転送」は、これらの間でファイルやフォルダーをコピーします。転送先に同じ名前がある場合は、確認したあとにだけ置き換えます。",
     ],
     helpSecurity: "デバイス間で送信される内容は暗号化されないため、同じネットワークの誰でも読めます。保存した NAS のパスワードは暗号化されずにこのデバイスに保存されます。「接続」は自宅のネットワークでのみ使ってください。",
     helpSpeed: "ペアリングしたデバイスの行または詳細にある「速度テスト」は、相手に 128 MiB を送って 128 MiB を受け取り（ディスクには何も書きません）、ネットワークの速度を方向ごとに表示します。",
@@ -1080,7 +921,7 @@ const ja: Messages = {
     content: { game: "ゲーム", patch: "パッチ", additional_content: "追加コンテンツ", unknown: "不明" },
     install: "インストール",
     installName: (name) => `${name} をインストール`,
-    started: (name) => `${name} をインストールしています。ジョブは下に表示されます。`,
+    started: (name: string) => `${name} をインストールしています。ジョブは「キュー」に表示されます。`,
     tag: "インストール",
     title: "このパッケージをインストールしますか？",
     titleOn: (device) => `このパッケージを ${device} にインストールしますか？`,
@@ -1096,7 +937,253 @@ const ja: Messages = {
     installPkg: "pkg をインストール",
     installPkgOn: (device) => `${device} にパッケージをインストール`,
     pickTitle: "インストールするパッケージを選択",
-    sent: (device) => `${device} がパッケージをインストールしています。ジョブは下に表示されます。`,
+    sent: (device: string) => `${device} がパッケージをインストールしています。ジョブは「キュー」に表示されます。`,
+  },
+  // Build's and Edit's Restore metadata online switch (build/options.tsx, Edit.tsx)
+  metadata: {
+    tag: "メタデータ",
+    cant: "メタデータを復元できません：",
+    label: "メタデータをオンラインで復元",
+    buildHint: "ビルドの前に、このバージョンの param.json、画像、サウンド、PlayGo テーブルを Sony のアップデートサーバーからダウンロードし、異なるものを出力に入れます。ゲーム自体は変更しません。インターネットが必要です。接続がなければそのままビルドします。",
+    buildSummary: "Sony のメタデータを出力に入れます（ゲーム自体は変更しません）",
+    editHint: "このバージョンの param.json、画像、サウンド、PlayGo テーブルのうち異なるものを、あなたの変更と一緒に Sony のアップデートサーバーからこのゲームに適用します。フォルダーは直接、exfat または ffpkg はその場で変更し、ffpfs、ffpfsc、FPKG は再ビルドします。インターネットが必要です。ダウンロードに失敗した場合は何も変更しません。",
+    editOnly: "このバージョンの Sony のメタデータをこのゲームに適用",
+    editAlso: "このバージョンの Sony のメタデータも適用します（先にダウンロード）。",
+    editConfirm: "Sony のメタデータを適用しますか？",
+    editConfirmText: "先にメタデータをダウンロードします。失敗した場合は何も変更しません。",
+  },
+  // App.tsx: the side rail
+  rail: {
+    build: "ビルド",
+    settings: "設定",
+    queue: "キュー",
+    transfer: "転送",
+    collapse: "メニューを折りたたむ",
+    expand: "メニューを展開",
+  },
+  // Queue.tsx
+  queue: {
+    empty: "ジョブはまだありません。ビルド、編集、転送、インストールのジョブがここに表示されます。",
+    counts: (running: number, queued: number, failed: number, done: number): string =>
+      [
+        running && `実行中 ${num(running)} 件`,
+        queued && `待機中 ${num(queued)} 件`,
+        failed && `失敗 ${num(failed)} 件`,
+        done && `完了 ${num(done)} 件`,
+      ]
+        .filter(Boolean)
+        .join("、") || "表示するものはありません",
+    retryFailed: (n: number): string => (n > 0 ? `失敗したジョブを再試行（${num(n)}）` : "失敗したジョブを再試行"),
+    retrying: (i: number, n: number) => `再試行中：${num(n)} 件中 ${num(i)} 件目`,
+    clearFinished: "終了したジョブを消去",
+    filters: { all: "すべて", running: "実行中", failed: "失敗", done: "完了" },
+    filterLabel: "表示",
+    noneShown: "このフィルターに一致するジョブはありません。",
+  },
+  // Settings.tsx
+  settings: {
+    appearance: "外観",
+    theme: "テーマ",
+    themeHint: "ダークはテレビ向き、ライトは明るい部屋向きです。",
+    dark: "ダーク",
+    light: "ライト",
+    scheme: "配色",
+    schemeHint: "アプリ全体のアクセントカラーです。",
+    schemes: { abyss: "アビス", ember: "エンバー", moss: "モス", cobalt: "コバルト", dusk: "ダスク", rose: "ローズ", sand: "サンド", volt: "ボルト", mono: "モノ" },
+    advanced: "詳細オプション",
+    advancedOpen: "詳細オプションを常に表示",
+    advancedHint:
+      "すべてのパックと形式を「その他」なしで表示し、折りたたみをすべて開いたままにします。オフにすると「ビルド」が短く保たれます。",
+    bundled: (version: string) => `${version}（同梱）`,
+    replaceAmprEmu: "ampr_emu を ampr-emu-ng に置き換える",
+    languageHint: "言語を選ぶまではシステムの言語を使います。",
+    notificationsGroup: "PS5",
+  },
+  // JobList.tsx: a finished job's result
+  result: {
+    file: "出力",
+    type: "種類",
+    size: "サイズ",
+    files: "ファイル",
+    time: "所要時間",
+    verified: "検証済み",
+    verifiedFast: "検証済み（高速）",
+    verifiedFull: "検証済み（完全）",
+    notVerified: "検証の報告なし",
+    checks: "チェック：",
+    copy: "詳細をコピー",
+    copied: "コピーしました",
+    copyFailed: "ここではコピーできません",
+    ofSource: (pct: number) => `ゲームのファイルの ${num(pct, 1)}%`,
+    filesN: (n: number) => `${num(n)} 個のファイル`,
+    to: "書き込み先",
+    took: (d: string) => `所要時間 ${d}`,
+    kinds: {
+      pkg: "FPKG：FPKG 対応の PS5 にインストール可能",
+      exfat: "exfat イメージ：ShadowMount+ がマウント、書き込み可能",
+      ffpkg: "ffpkg イメージ（UFS2）：ShadowMount+ がマウント、書き込み可能",
+      ffpfs: "ffpfs イメージ（PFS）：ShadowMount+ がマウント",
+      ffpfsc: "ffpfsc イメージ（圧縮 PFS）：ShadowMount+ が読み取り専用でマウント",
+      folder: "ゲームフォルダー",
+    } as Record<string, string | undefined>,
+    zstdFolder: "ZSTD パック済みフォルダー",
+    lz4Folder: "LZ4 パック済みフォルダー",
+    withPacks: (image: string, kind: string) => `${image}、ファイルは ${kind} パック内`,
+    edited: (what: string) => `${what}、その場で変更`,
+    rebuilt: (what: string) => `${what}、再構築`,
+    extracted: "取り出したファイル",
+    transferred: "コピーしたファイル",
+    installed: "パッケージを PS5 のインストーラーに渡しました",
+  },
+  // JobList.tsx: the log panel
+  log: {
+    lines: (n: number, of?: number): string =>
+      of === undefined ? `${num(n)} 行` : `${num(n)} / ${num(of)} 行`,
+    filter: "フィルター",
+    follow: "自動スクロール",
+    copy: "コピー",
+    copied: "コピーしました",
+    copyFailed: "コピーに失敗しました",
+    save: "保存",
+    clear: "消去",
+    cleared: "消去しました",
+  },
+  // common.tsx: the source card's fact chips
+  sourceChips: {
+    sdk: (v: string) => `SDK ${v}`,
+    firmware: (v: string) => `FW ${v}+`,
+  },
+  // prefs.tsx: Advanced's badge
+  advanced: {
+    changed: "変更あり",
+    defaults: "既定",
+  },
+  // build/*: the Build screen
+  build: {
+    summary: "概要",
+    addToQueue: "キューに追加",
+    queued: "キューに追加しました",
+    openQueue: "キューを開く",
+    space: (free: string, dir: string, needed: string) => (
+      <>
+        <span className="path">{dir}</span> の空き {free}、必要なのは約 {needed}
+      </>
+    ),
+    needed: (needed: string) => `約 ${needed} 必要`,
+    spaceRaw: "空き容量は圧縮しない場合として確認します。",
+    estimate: "推定",
+    advanced: "詳細オプション",
+    options: "オプション",
+    fastVerify: "高速検証：すべての構造をチェックし、データの一部を読み直します。",
+    fullVerify: "完全検証：全バイトを読み直します。",
+    deleted: "ビルドが成功するとソースは削除されます。元に戻せません。",
+    zstdBackport: "このゲームのアセットは ZSTD でパックされており、その ZSTD インデックスにバックポートが含まれています。まず「パック：なし」で一度ビルドしてから、バックポートを除外してください。",
+    lz4Backport: "このゲームのアセットは LZ4 でパックされており、その LZ4 マニフェストにバックポートが含まれています。まず「パック：なし」で一度ビルドしてから、バックポートを除外してください。",
+    backportLeftOut: (n: number) => `バックポートライブラリ ${num(n)} 個を fakelib/ から除外します。`,
+    packsTitle: "ターゲット",
+    packs: "パック",
+    more: "その他",
+    moreTip: "その他のフォーマット",
+    cards: {
+      folder: "普通のファイル。どこにでもコピーでき、ShadowMount+ で起動",
+      pkg: "ゲームパッケージとして PS5 にインストール",
+      exfat: "ShadowMount+ でマウントでき、PC でも開ける",
+      ffpkg: "ShadowMount+ 用の UFS2 イメージ。書き込み可能なマウントも可",
+      ffpfs: "PFS イメージ。非圧縮、ファイル名は ASCII のみ",
+      ffpfsc: "最小のイメージ：圧縮済み、常に読み取り専用でマウント",
+      lz4: "アセットを LZ4 でパックした普通のフォルダー",
+    },
+    zstdFolderCard: "アセットを ZSTD でパックした普通のフォルダー",
+    packCards: {
+      nonePlain: "ゲームのファイルをそのまま",
+      unpack: "パックを普通のファイルに書き戻す",
+      keepZstd: "ZSTD パックをバイト単位でそのまま残す",
+      keepLz4: "LZ4 パックをバイト単位でそのまま残す",
+      zstd: "ゲームが小さく、読み込みが速い。ampr-emu-ng を使用",
+      repackZstd: "LZ4 パックをデコードし、ZSTD でパックし直す",
+      lz4: "アセットを LZ4 でパック。ampr-emu-ng を使用",
+      repackLz4: "ZSTD パックをデコードし、LZ4 でパックし直す",
+    },
+    naming: "出力：名前を作成中",
+    output: (name: string, dir: string) => (
+      <>
+        出力：<span className="path">{dir}</span> 内の <b className="path">{name}</b>
+      </>
+    ),
+    choices: { none: "なし", zstd: "ZSTD", lz4: "LZ4" },
+    levelLabel: (level: string, engine: string, n: number) => `${level}、${engine} ${n}`,
+    levelTip: (engine: string, n: number, note: string) => `${engine} ${n}。${note}`,
+    sumKeepZstd: "ZSTD パックはバイト単位でそのまま残ります。",
+    sumKeepLz4: "LZ4 パックはバイト単位でそのまま残ります。",
+    sumKeepPlain: "パックは作られません。ゲームのファイルはそのまま変換されます。",
+    sumUnpack: (engine: string) => `${engine} パックは普通のファイルに書き戻されます。`,
+    sumPack: (engine: string, level: string) => `ゲームのファイルは ${engine} ボリュームにパックされます（${level}）。`,
+    sumRepack: (from: string, to: string, level: string) => `${from} パックはデコードされ、${to} でパックし直されます（${level}）。`,
+    sumRules: (name: string) => `カスタムルール ${name} がパックするファイルを選びます。`,
+    sumInside: (format: string, level: number) => `内部：${format}、zlib レベル ${level}。`,
+    ngInstalled: "ampr-emu-ng は fakelib/libSceAmpr.sprx にインストールされます。",
+    ngReplaced: (old: string) => `ゲームの ${old} は ampr-emu-ng に置き換えられます。`,
+    ngReplacedTrace: "ゲームの古いトレースランタイムは ampr-emu-ng に置き換えられます。",
+    ngKept: (old: string) => `ゲームの ${old} はそのまま残ります。`,
+    ngUpdated: (v: string) => `ゲームの ampr-emu-ng${v} は同梱版に置き換えられます。`,
+    ngSame: (v: string) => `ゲームの ampr-emu-ng${v} はそのまま残ります。`,
+    pkgNoRuntime: "AMPR ランタイムは FPKG に含めません。本体のローダーが提供します。",
+    recommended: "推奨",
+    resultTitle: "ビルド後の目安",
+    resultNow: "現在のゲーム",
+    resultCustomRules: "カスタムルール：推定なし",
+    backportTitle: "バックポート",
+    backportNone: "このゲームにはバックポートがありません。",
+    backportPlain: "通常の変換のみ: パックの作成や展開をしない場合です。",
+  },
+  // TransferPane.tsx: one device's pane of the Transfer screen
+  transfer: {
+    pane: (device) => `${device} のファイル`,
+    roots: "ドライブ",
+    location: "場所",
+    up: "上へ",
+    upTip: "1 つ上のフォルダーへ",
+    refresh: "更新",
+    filter: "名前で絞り込み",
+    filterLabel: "このフォルダーを名前で絞り込み",
+    inFolder: (dirs, files) => `フォルダー ${num(dirs)} 個、ファイル ${num(files)} 個`,
+    matches: (n) => `${num(n)} 件一致`,
+    firstOf: (max, n) => `${num(n)} 件中、最初の ${num(max)} 件`,
+    truncated: "このフォルダーには 10,000 を超える項目があります。最初の 10,000 件だけを表示しています。",
+    name: "名前",
+    size: "サイズ",
+    select: (name) => `${name} を選択`,
+    open: (name) => `${name} を開く`,
+    selected: (n) => `${num(n)} 個の項目を選択中`,
+    clear: "クリア",
+    clearTip: "選択を解除",
+    dragItems: (n) => `${num(n)} 個の項目`,
+    dropHere: (path) => `ドロップして ${path} に送信`,
+    notHere: "ここにファイルを送るには、フォルダーを開いてください。",
+    emptyFolder: "このフォルダーは空です。",
+    noMatch: (f) => `「${f}」に一致する項目はありません。`,
+    noRoots: "参照できるドライブがありません。",
+    cantList: "このフォルダーを開けません：",
+    loading: "読み込み中",
+    link: "リンク",
+    linkTip: "リンク：開くことはできますが、選択はできません",
+    mounted: "マウント中",
+    mountedTip: "ShadowMount+ がマウント中です。選択するには、ゲームを終了して ShadowMount+ をオフにしてください",
+    withTitle: "転送する相手",
+    loadingDevices: "デバイスを読み込み中",
+    noneTitle: "転送できるデバイスがありません",
+    noneHint: "「接続」で別の Dump Forge をペアリングするか NAS を追加するか、保存済みのデバイスの電源を入れてください。",
+    openConnect: "「接続」を開く",
+    deviceOffline: (device) => `${device} はオフラインです。オンラインに戻ると、そのファイルが再び表示されます。`,
+    copyTo: (n, device) => `${num(n)} 個の項目を ${device} にコピー`,
+    copyNoFolder: (device) => `コピー先にする ${device} のフォルダーを開いてください。`,
+    installOn: (device) => `${device} にインストール`,
+    dropFiles: "ここにファイルをドロップしてアップロード",
+    uploadInto: (folder) => `ファイルは、このデバイスで表示中のフォルダー ${folder} に入ります。`,
+    uploadNoFolder: "アップロード先にする、このデバイスのフォルダーを開いてください。",
+    foldersLeftOut: (names) => `フォルダーはアップロードされず、ファイルだけがアップロードされます：${names}。`,
+    downloadFiles: (n) => `${num(n)} 個のファイルをダウンロード`,
+    downloadNone: "ダウンロードするには、このデバイスのファイルを選択してください（フォルダーはダウンロードされません）。",
   },
   duration: { s: (s) => `${s}秒`, ms: (m, s) => `${m}分${s}秒`, hm: (h, m) => `${h}時間${m}分` },
 };

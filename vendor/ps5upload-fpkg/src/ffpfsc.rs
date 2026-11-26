@@ -29,7 +29,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -87,6 +87,10 @@ pub struct WrapOptions {
     pub inner_name: Option<String>,
     /// Build timestamp (seconds); the current time when absent.
     pub time: Option<i64>,
+    /// Seed for a fast read-back: only the first and last block and a seeded ~1% (at most
+    /// 128 MiB) are decoded and matched; the header and block table are always checked.
+    /// `None` decodes every block.
+    pub sample: Option<u64>,
 }
 
 impl Default for WrapOptions {
@@ -97,6 +101,7 @@ impl Default for WrapOptions {
             threads: 0,
             inner_name: None,
             time: None,
+            sample: None,
         }
     }
 }
@@ -377,10 +382,12 @@ pub(crate) fn pipeline<T: Send, U: Send>(
         let (tx_out, rx_out) = sync_channel::<(u64, Result<U>)>(depth);
         let rx_in = Arc::new(Mutex::new(rx_in));
         let work = &work;
+        let lane = crate::workshop::Lane::current();
         for _ in 0..threads {
             let rx_in = Arc::clone(&rx_in);
             let tx_out = tx_out.clone();
             s.spawn(move || loop {
+                lane.enter();
                 // Holding the lock only to take the next item keeps the workers independent.
                 let next = rx_in.lock().map(|rx| rx.recv());
                 match next {
@@ -397,6 +404,7 @@ pub(crate) fn pipeline<T: Send, U: Send>(
         let tx_err = tx_out.clone();
         drop(tx_out);
         s.spawn(move || {
+            lane.enter();
             let mut i = 0u64;
             loop {
                 match produce() {
@@ -465,24 +473,34 @@ pub fn wrap(
             .unwrap_or(0)
     });
     let threads = match options.threads {
-        0 => std::thread::available_parallelism().map_or(4, |n| n.get()),
+        0 => crate::workshop::workshop_threads(),
         n => n,
     };
     let partial = PathBuf::from(format!("{}.partial", output.display()));
+    // Set once the image is written and checked: a rename that fails then leaves it in place.
+    let mut kept = false;
     let result = write_image(
         source, &partial, &inner, raw_size, time, threads, options, control,
     )
     .and_then(|(report, crcs)| {
         // Decoded and matched against the checksums taken as the source was read, so the
         // check costs no second pass over the source — on a slow disk, a third of the time.
-        check(&partial, Expect::Crcs(&crcs))?;
-        std::fs::rename(&partial, output)?;
+        check_controlled(
+            &partial,
+            Expect::Crcs(&crcs),
+            options.sample,
+            control.cancel,
+        )?;
+        if let Err(e) = crate::finish::rename(&partial, output) {
+            kept = true;
+            return crate::format_err(crate::finish::kept_message(&partial, output, &e));
+        }
         Ok(WrapReport {
             output: output.to_path_buf(),
             ..report
         })
     });
-    if result.is_err() {
+    if result.is_err() && !kept {
         std::fs::remove_file(&partial).ok();
     }
     result
@@ -526,7 +544,7 @@ fn write_image(
             if read >= raw_size {
                 return Ok(None);
             }
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            if crate::workshop::checkpoint_opt(cancel) {
                 return format_err("cancelled");
             }
             let n = (raw_size - read).min(BLOCK) as usize;
@@ -647,7 +665,7 @@ pub fn verify(image: &Path, source: Option<&Path>) -> Result<Inspection> {
         Some(p) => Expect::Source(File::open(p)?),
         None => Expect::Nothing,
     };
-    check(image, expect)
+    check(image, expect, None)
 }
 
 /// Where a single-file image keeps its file, read off the header, inode and uroot.
@@ -721,7 +739,17 @@ pub(crate) fn layout<R: Read + Seek>(f: &mut R) -> Result<Layout> {
     })
 }
 
-fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
+fn check(image: &Path, expect: Expect, sample: Option<u64>) -> Result<Inspection> {
+    check_controlled(image, expect, sample, None)
+}
+
+/// [`check`], pausable and cancellable through the job's `cancel` flag.
+fn check_controlled(
+    image: &Path,
+    mut expect: Expect,
+    sample: Option<u64>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Inspection> {
     let mut f = File::open(image)?;
     let Layout {
         name,
@@ -730,6 +758,12 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
         compressed,
         base,
     } = layout(&mut f)?;
+    // The sizes are the image's own claims: held to its length before they size anything.
+    let image_len = f.metadata()?.len();
+    let fits = |end: Option<u64>| end.is_some_and(|e| e <= image_len);
+    if !fits(base.checked_add(stored)) {
+        return format_err("the image is shorter than the file it holds");
+    }
     let le64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
     let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
     if let Expect::Crcs(c) = &expect {
@@ -738,31 +772,38 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
         }
     }
     let has_expectation = !matches!(expect, Expect::Nothing);
-    // The next block's expected content, in order.
-    let mut index = 0usize;
-    let mut next_want = |n: usize| -> Result<Want> {
-        let w = match &mut expect {
+    // The first and last block and a seeded ~1% (at most 128 MiB) when sampling.
+    let picked = sample.map(|seed| crate::sample::pick(raw_size.div_ceil(BLOCK), seed, 2048));
+    // Block `i`'s expected content, `n` bytes of it; the source is only sought when the
+    // blocks asked for are not in order.
+    let mut src_at = 0u64;
+    let mut want_of = |i: u64, n: usize| -> Result<Want> {
+        Ok(match &mut expect {
             Expect::Nothing => Want::Nothing,
             Expect::Source(src) => {
+                if src_at != i * BLOCK {
+                    src.seek(SeekFrom::Start(i * BLOCK))?;
+                }
                 let mut e = vec![0u8; n];
                 src.read_exact(&mut e)?;
+                src_at = i * BLOCK + n as u64;
                 Want::Bytes(e)
             }
-            Expect::Crcs(c) => Want::Crc(c[index]),
-        };
-        index += 1;
-        Ok(w)
+            Expect::Crcs(c) => Want::Crc(c[i as usize]),
+        })
     };
     if !compressed && has_expectation {
         // Stored as it is: compare in place.
-        f.seek(SeekFrom::Start(base))?;
         let mut got = vec![0u8; BLOCK as usize];
-        let mut left = raw_size;
-        while left > 0 {
-            let n = left.min(BLOCK) as usize;
+        let all: Box<dyn Iterator<Item = u64>> = match &picked {
+            Some(v) => Box::new(v.iter().copied()),
+            None => Box::new(0..raw_size.div_ceil(BLOCK)),
+        };
+        for i in all {
+            let n = (raw_size - i * BLOCK).min(BLOCK) as usize;
+            f.seek(SeekFrom::Start(base + i * BLOCK))?;
             f.read_exact(&mut got[..n])?;
-            next_want(n)?.check(&got[..n])?;
-            left -= n as u64;
+            want_of(i, n)?.check(&got[..n])?;
         }
     }
     if !compressed {
@@ -783,17 +824,63 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
     if blocks != raw_size.div_ceil(BLOCK) {
         return format_err("the container's length disagrees with the file size");
     }
-    let mut table = vec![0u8; ((blocks + 1) * 8) as usize];
-    f.seek(SeekFrom::Start(base + le64(&ph, 0x18)))?;
+    // The table must lie inside the image before it is allocated.
+    let table_len = blocks.checked_add(1).and_then(|n| n.checked_mul(8));
+    let table_at = base.checked_add(le64(&ph, 0x18));
+    let (Some(table_len), Some(table_at)) = (table_len, table_at) else {
+        return format_err("the container's block table is out of range");
+    };
+    if !fits(table_at.checked_add(table_len)) {
+        return format_err("the container's block table runs past the image");
+    }
+    let mut table = vec![0u8; table_len as usize];
+    f.seek(SeekFrom::Start(table_at))?;
     f.read_exact(&mut table)?;
     let offsets: Vec<u64> = table.chunks(8).map(|c| le64(c, 0)).collect();
     if *offsets.last().unwrap() != stored {
         return format_err("the container's last offset is not the stored size");
     }
+    if let Some(picked) = &picked {
+        // The table is always walked whole; only the decode and match are sampled.
+        if offsets
+            .windows(2)
+            .any(|w| w[1] <= w[0] || w[1] - w[0] > BLOCK)
+        {
+            return format_err("a block offset does not move forward by 1 to 64 KiB");
+        }
+        for &i in picked {
+            let (from, to) = (offsets[i as usize], offsets[i as usize + 1]);
+            let mut stored_block = vec![0u8; (to - from) as usize];
+            f.seek(SeekFrom::Start(base + from))?;
+            f.read_exact(&mut stored_block)?;
+            let plain = if stored_block.len() == BLOCK as usize {
+                stored_block
+            } else {
+                let mut d = Vec::with_capacity(BLOCK as usize);
+                // Bounded: a hostile stream cannot inflate past one block.
+                ZlibDecoder::new(&stored_block[..])
+                    .take(BLOCK + 1)
+                    .read_to_end(&mut d)?;
+                if d.len() != BLOCK as usize {
+                    return format_err("a compressed block does not decode to 64 KiB");
+                }
+                d
+            };
+            let n = (raw_size - i * BLOCK).min(BLOCK) as usize;
+            want_of(i, n)?.check(&plain[..n])?;
+        }
+        return Ok(Inspection {
+            inner_name: name,
+            raw_size,
+            stored_size: stored,
+            compressed,
+        });
+    }
     // Every block decoded on every core, each checked against the source as it comes.
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = crate::workshop::workshop_threads();
     let mut pairs = offsets.windows(2);
     let mut left = raw_size;
+    let mut block = 0u64;
     f.seek(SeekFrom::Start(base + offsets[0]))?;
     let mut f = std::io::BufReader::with_capacity(8 << 20, f);
     pipeline(
@@ -802,6 +889,9 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
             let Some(pair) = pairs.next() else {
                 return Ok(None);
             };
+            if crate::workshop::checkpoint_opt(cancel) {
+                return format_err("cancelled");
+            }
             let len = pair[1]
                 .checked_sub(pair[0])
                 .filter(|l| *l <= BLOCK)
@@ -810,14 +900,18 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
             f.read_exact(&mut stored_block)?;
             let n = left.min(BLOCK) as usize;
             left -= n as u64;
-            Ok(Some((stored_block, n, next_want(n)?)))
+            block += 1;
+            Ok(Some((stored_block, n, want_of(block - 1, n)?)))
         },
         |(stored_block, n, expected)| {
             let plain = if stored_block.len() == BLOCK as usize {
                 stored_block
             } else {
                 let mut d = Vec::with_capacity(BLOCK as usize);
-                ZlibDecoder::new(&stored_block[..]).read_to_end(&mut d)?;
+                // Bounded: a hostile stream cannot inflate past one block.
+                ZlibDecoder::new(&stored_block[..])
+                    .take(BLOCK + 1)
+                    .read_to_end(&mut d)?;
                 if d.len() != BLOCK as usize {
                     return format_err("a compressed block does not decode to 64 KiB");
                 }
@@ -839,11 +933,28 @@ fn check(image: &Path, mut expect: Expect) -> Result<Inspection> {
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
+    /// A test's folder, removed when the test ends, whichever way it ends: these hold images of
+    /// tens of MiB.
+    struct TempDir(PathBuf);
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp(name: &str) -> TempDir {
         let d = std::env::temp_dir().join(format!("ffpfsc-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        TempDir(d)
     }
 
     #[test]

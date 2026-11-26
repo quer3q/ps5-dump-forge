@@ -10,11 +10,12 @@ name = "ps5-dump-forge"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 ps5-dump-forge-core.workspace = true
 ps5-dump-forge-server.workspace = true
+# `update`: the latest release asked of GitHub, the CLI downloaded and checked.
+ps5-dump-forge-updater.workspace = true
 
 [dev-dependencies]
 ps5upload-fpkg.workspace = true

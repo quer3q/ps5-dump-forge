@@ -1,49 +1,36 @@
-// The Storage tab's File explorer: one folder at a time, drawn as Edit's explorer, where every
-// action happens at once (no pending list, no Apply): delete (after the shared question),
-// rename in place, move to a folder the picker chooses, and open a folder or an image/archive
-// in Edit or Convert. On a computer it browses the chosen folder (shared with the Library; Up
-// stops there), until one is chosen the home folder (the app; not shared, so the Library doesn't
-// scan it) or the server's roots (the http build); on the PS5 the server's browse roots. Links
-// are listed and can be opened, never changed. The folder is listed again after each action and
-// whenever the view shows. From 880px a folder tree beside the list shows the way from the root
-// to the folder shown, each folder on it with its subfolders (listed lazily, kept while the view
-// shows, dropped on Refresh); narrower, the crumbs do that. On a computer each online paired PS5
-// gets a tab of its own (FilesTabs.tsx): its files, changed as these are; drags copy between them.
+// Storage's File explorer: Edit's explorer where every action happens at once, a tab per device.
+// Links are opened, never changed; nothing copies from here (the Transfer screen does).
 
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
-import { api, errorText, onDrop, pick, prettyBytes, runtimePlatform, web, type DirEntry, type DirListing, type RuntimePlatform } from "./api";
+import { api, errorText, pick, prettyBytes, runtimePlatform, type DirEntry, type DirListing, type RuntimePlatform } from "./api";
+import { Bookmarks, BookmarkToggle } from "./bookmarks";
 import {
   ARCHIVE_EXTENSIONS,
-  basename,
   ChooseMenu,
   dirname,
   Dots,
+  FreeSpace,
   IMAGE_EXTENSIONS,
   isMac,
   isWithin,
   joinPath,
   notifyDeleted,
   onDeleted,
-  panelId,
-  PathLine,
-  tabId,
-  TabList,
   type SourceSelection,
 } from "./common";
 import { confirmDelete, type DeletedFile } from "./delete";
+import { DeviceTabs, tabPanelProps, type DeviceTab } from "./DeviceTabs";
 import { installHere } from "./InstallDialog";
 import type { Action } from "./jobs";
 import { readable } from "./peers";
 import { confirmReplace } from "./replace";
 import { MAX_ROWS, NameInput } from "./Edit";
-import { CopyStatus, FILES_TABS, LOCAL, tabAt, useCopy, usePs5Tabs, useRowDrag, type DeviceTab, type DragTarget } from "./FilesTabs";
-import { FreeSpace } from "./Library";
+import { FILES_TABS, LOCAL, useFilesDevices, useRowDrag, type FilesDevice } from "./FilesTabs";
 import { useMessages } from "./i18n";
 import { Icon } from "./icons";
 import type { HandOff } from "./Storage";
 
-/** One folder of the way down from the explorer's root; `path` null: the PS5's browse roots. */
 interface Crumb {
   path: string | null;
   name: string;
@@ -51,12 +38,15 @@ interface Crumb {
   row?: string;
 }
 
+const isNet = (p: string) => /^(smb|ftp|nfs|flink):\/\//i.test(p);
+/** Another device's paths always take `/` (a Windows app's `joinPath` takes `\`). */
+const join = (dir: string, name: string) => (isNet(dir) ? `${dir.replace(/\/+$/, "")}/${name}` : joinPath(dir, name));
+
 const extOf = (name: string) => {
   const i = name.lastIndexOf(".");
   return i > 0 ? name.slice(i + 1).toLowerCase() : "";
 };
 
-/** What Edit and Convert would open a file as, by extension; null: not a source. */
 function sourceKind(name: string): SourceSelection["kind"] | null {
   const ext = extOf(name);
   if (IMAGE_EXTENSIONS.includes(ext)) return ext as SourceSelection["kind"];
@@ -70,7 +60,7 @@ function deletedFile(name: string): DeletedFile {
   return kind === null ? "file" : ["zip", "7z", "rar"].includes(kind) ? "archive" : "image";
 }
 
-/** From 880px the folder tree shows beside the list. The PS5's old WebKit has `addListener` only. */
+/** The PS5's old WebKit has `addListener` only. */
 function useWide(): boolean {
   const query = "(min-width: 880px)";
   const [wide, setWide] = useState(() => typeof matchMedia === "function" && matchMedia(query).matches);
@@ -89,160 +79,26 @@ function useWide(): boolean {
   return wide;
 }
 
-/** Core gives a link's resolved target as its `path`, which can name another row of the same
- * folder; a link row keeps its own path (unique; links get no actions) and its `target`, where
- * opening it goes. */
+/** A link's `path` is its resolved target (maybe another row): the row keeps its own path, the target as `target`. */
 const rowsOf = (l: DirListing): DirListing => ({
   ...l,
   entries: l.entries.map((e) =>
-    e.link && l.path !== null ? { ...e, path: joinPath(l.path, e.name), target: e.path } : e,
+    e.link && l.path !== null ? { ...e, path: join(l.path, e.name), target: e.path } : e,
   ),
 });
 
-/** Storage's File explorer view: one explorer, or on a computer with a paired PS5 online, a tab
- * per device (each kept mounted, so it keeps its folder). */
 export function Files(props: {
   visible: boolean;
-  folder: string | null;
-  onFolder: (folder: string) => void;
   onEdit: HandOff;
   onConvert: HandOff;
   dispatch: (a: Action) => void;
-  /** Opens the Connect tab (a started copy's button). */
-  onConnect: () => void;
   switcher?: ReactNode;
+  onConnect?: () => void;
 }) {
   const t = useMessages().storage;
   const [platform, setPlatform] = useState<RuntimePlatform | null>(null);
-  useEffect(() => {
-    runtimePlatform().then(setPlatform, () => {});
-  }, []);
-  const peers = usePs5Tabs(platform === "host");
-  const [tab, setTab] = useState(LOCAL);
-  const [overTab, setOverTab] = useState<string | null>(null);
-  // Each tab's folder shown (null: none to copy into), where a drag onto its tab lands.
-  const heres = useRef(new Map<string, string | null>());
-  const { copy, line } = useCopy(props.dispatch);
-  const online = peers.all.filter((d) => peers.online.has(d.id));
-  // A device gone offline: its explorer stays (and its folder), its tab goes, This device shows.
-  const shown = online.some((d) => d.id === tab) ? tab : LOCAL;
-  const tabs =
-    online.length === 0 ? undefined : (
-      <TabList
-        label={t.devices}
-        prefix={FILES_TABS}
-        className="files-tabs"
-        tabs={[
-          { id: LOCAL, label: t.thisDevice, className: overTab === LOCAL ? "drop" : undefined },
-          ...online.map((d) => ({ id: d.id, label: <span title={d.name}>{d.name}</span>, className: overTab === d.id ? "drop" : undefined })),
-        ]}
-        value={shown}
-        onChange={setTab}
-      />
-    );
-  const pane = (key: string, device?: DeviceTab) => (
-    <div key={key} hidden={key !== shown} {...(tabs && { role: "tabpanel", id: panelId(FILES_TABS, key), "aria-labelledby": tabId(FILES_TABS, key) })}>
-      <Explorer
-        {...props}
-        visible={props.visible && key === shown}
-        device={device}
-        tabKey={key}
-        // One tab bar in the page (its buttons' ids are unique): only the shown pane renders it.
-        tabs={key === shown ? tabs : undefined}
-        copy={(paths, dest) => void copy(paths, dest)}
-        folderOf={(k) => heres.current.get(k) ?? null}
-        copyLine={<CopyStatus line={line} onConnect={props.onConnect} />}
-        // A PS5's root (`/`: list only, data and drives below) takes no copy: none to drop into.
-        onHere={(p) => heres.current.set(key, device && p === device.root ? null : p)}
-        onOverTab={setOverTab}
-      />
-    </div>
-  );
-  return (
-    <>
-      {pane(LOCAL)}
-      {peers.all.map((d) => pane(d.id, d))}
-    </>
-  );
-}
-
-function Explorer(props: {
-  visible: boolean;
-  /** The folder both Storage views share (computer). */
-  folder: string | null;
-  onFolder: (folder: string) => void;
-  onEdit: HandOff;
-  onConvert: HandOff;
-  /** Starts an install job's row (a `.pkg` row's Install, the PS5 only). */
-  dispatch: (a: Action) => void;
-  /** Storage's Library | File explorer switch, first in this view's card. */
-  switcher?: ReactNode;
-  /** Another device's tab (a paired PS5): its share root, no Choose folder. */
-  device?: DeviceTab;
-  /** This explorer's tab id, and the device tabs (under the head; none without a peer online). */
-  tabKey: string;
-  tabs?: ReactNode;
-  /** Copies `paths` into `dest` as a transfer job; `folderOf`: a tab's folder shown. */
-  copy: (paths: string[], dest: string | null) => void;
-  folderOf: (tab: string) => string | null;
-  /** The started copy's line (shared by the tabs). */
-  copyLine: ReactNode;
-  /** The folder shown (null: the server's roots), for drags onto this tab. */
-  onHere: (path: string | null) => void;
-  /** The device tab a drag is over, to ring it. */
-  onOverTab: (tab: string | null) => void;
-}) {
-  const device = props.device;
-  const t = useMessages().storage;
-  const inst = useMessages().install;
-  const tabs = useMessages().app;
-  const deleting = useMessages().library.deleting;
-  const actionsHead = useMessages().edit.actions;
-  const loading = useMessages().picker.loading;
-  const [platform, setPlatform] = useState<RuntimePlatform | null>(null);
-  // The app's start before a folder is chosen: undefined while asked, null when there is none.
-  const [home, setHome] = useState<string | null | undefined>(undefined);
-  const [trail, setTrail] = useState<Crumb[]>([]);
-  // The listing and the trail it belongs to (another folder's shows as loading).
-  // `n`: the load that answered, so focus waits for the listing it was asked against.
-  const [listed, setListed] = useState<{ key: string; n: number; listing: DirListing } | null>(null);
-  const [listError, setListError] = useState<{ key: string; n: number; text: string } | null>(null);
-  const [filter, setFilter] = useState("");
-  const [focus, setFocus] = useState(0);
-  const [renaming, setRenaming] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [actError, setActError] = useState<{ lead: string; text: string } | null>(null);
   const [lookupError, setLookupError] = useState<string | null>(null);
-  const seq = useRef(0);
-  // A folder's spinner shows only once its listing takes over 150ms (key: that folder's trail),
-  // so a fast one doesn't flash it.
-  const [slowKey, setSlowKey] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const [storage, setStorage] = useState<{ free: number; total: number } | null>(null);
-  const acting = useRef(false);
-  // The row an action is changing (shown, and every row's actions locked, until it ends).
-  const [busy, setBusy] = useState<{ path: string; deleting: boolean } | null>(null);
-  /** The row to focus ("" = the first) once load `after` (or a later one) has rendered. */
-  const want = useRef<{ path: string; after: number } | null>(null);
-  const focusAfterLoad = (path: string) => (want.current = { path, after: seq.current + 1 });
-  const grid = useRef<HTMLDivElement>(null);
-  const treeNav = useRef<HTMLElement>(null);
-  const wide = useWide();
-  // The tree's subfolders of each folder above the one shown (key: its path, "" the PS5's
-  // roots); the folder shown takes its own from the listing. `gen`: the `treeGen` it was listed
-  // in; an older one is listed again, and shown until its answer replaces it (so the tree keeps
-  // its shape). `treeGen` also drops a stale answer.
-  const [subdirs, setSubdirs] = useState<Map<string, { gen: number; dirs: DirEntry[] }>>(() => new Map());
-  const treeGen = useRef(0);
-  const treeBusy = useRef(false);
-  /** Lists the tree again; `drop` (a new root) forgets it at once. Folders off the trail go. */
-  const clearTree = (drop = false) => {
-    treeGen.current++;
-    treeBusy.current = false;
-    const on = new Set(trailRef.current.map((c) => c.path ?? ""));
-    setSubdirs((m) => (drop ? new Map() : new Map([...m].filter(([k]) => on.has(k)))));
-  };
-
+  const [retrying, setRetrying] = useState(false);
   const lookup = () =>
     runtimePlatform().then(
       (p) => {
@@ -252,38 +108,163 @@ function Explorer(props: {
       (e) => setLookupError(errorText(e)),
     );
   useEffect(() => void lookup(), []);
+  const { devices, loaded } = useFilesDevices();
+  const ps5 = platform === "ps5";
+  const all: (FilesDevice | null)[] = [...(ps5 ? [null] : []), ...devices];
+  const idOf = (d: FilesDevice | null) => d?.id ?? LOCAL;
+  const tabs: DeviceTab[] = all.map((d) =>
+    d ? { id: d.id, name: d.name, icon: d.icon, online: d.online, tag: d.tag } : { id: LOCAL, name: t.thisDevice, icon: "disc", online: true },
+  );
+  const [tab, setTab] = useState<string | null>(null);
+  const online = tabs.filter((d) => d.online);
+  // The chosen tab while online, else the first online one, which then stays chosen.
+  const shown = online.some((d) => d.id === tab) ? tab : (online[0]?.id ?? null);
   useEffect(() => {
-    if (!web) api.homeFolder().then(setHome, () => setHome(null));
-  }, []);
+    if (shown !== null && shown !== tab) setTab(shown);
+  }, [shown, tab]);
 
-  // The root: the server's roots (named at render; the PS5, or a computer's http build before a
-  // folder is chosen), the chosen folder, else the app's home; a new one starts the trail again.
-  // undefined: not known yet (or none), so no trail.
-  const root: string | null | undefined = device
-    ? device.root
-    : platform === "ps5"
-      ? null
-      : platform === "host"
-        ? (props.folder ?? (web ? null : (home ?? undefined)))
-        : undefined;
-  useEffect(() => {
-    setTrail(root === undefined ? [] : [{ path: root, name: root === null ? "" : device ? device.name : basename(root) || root }]);
-    setFilter("");
-    setFocus(0);
-    setRenaming(null);
-    setNotice(null);
-    setActError(null);
-    clearTree(true);
-  }, [root]);
-  const crumbName = (c: Crumb) => (c.path === null ? t.roots : c.name);
+  if (!platform)
+    return lookupError ? (
+      <section className="card explorer files storage-card bare" aria-label={t.title}>
+        <div className="storage-head">
+          <div className="storage-actions">
+            <button
+              type="button"
+              className="small"
+              onClick={() => !retrying && (setRetrying(true), void lookup().finally(() => setRetrying(false)))}
+              aria-disabled={retrying || undefined}
+              aria-busy={retrying || undefined}
+            >
+              <Icon name="refresh" />
+              {t.refresh}
+              {retrying && <Dots />}
+            </button>
+          </div>
+        </div>
+        <p className="note-line block" role="alert">
+          <Icon name="alert" />
+          <span>
+            {t.cantList} <span className="backend">{lookupError}</span>
+          </span>
+        </p>
+      </section>
+    ) : null;
+
+  const bar = tabs.length > 0 && <DeviceTabs label={t.devices} prefix={FILES_TABS} tabs={tabs} value={shown ?? ""} onChange={setTab} onAdd={props.onConnect} />;
+  const none =
+    shown === null &&
+    (loaded ? (
+      <section className={`card storage-card bare${bar ? " dev-window" : ""}`} aria-label={t.title}>
+        <div className="empty library-empty">
+          <span className="empty-icon">
+            <Icon name="link" />
+          </span>
+          <p className="empty-title">{t.noDevice}</p>
+          <p className="muted">{t.noDeviceHint}</p>
+          {props.onConnect && (
+            <div className="row center">
+              <button type="button" className="primary" onClick={props.onConnect}>
+                <Icon name="link" />
+                {t.openConnect}
+              </button>
+            </div>
+          )}
+        </div>
+      </section>
+    ) : (
+      <section className="card storage-card bare" aria-label={t.title}>
+        <div className="library-busy" role="status" aria-live="polite">
+          <span className="spinner" aria-hidden="true" />
+          <span>
+            {t.loadingDevices}
+            <Dots />
+          </span>
+        </div>
+      </section>
+    ));
+  return (
+    <>
+      {bar}
+      {none}
+      {all.map((d) => {
+        const id = idOf(d);
+        return (
+          <Explorer
+            key={id}
+            onEdit={props.onEdit}
+            onConvert={props.onConvert}
+            dispatch={props.dispatch}
+            platform={platform}
+            visible={props.visible && id === shown}
+            hidden={id !== shown}
+            panel={tabPanelProps(FILES_TABS, id)}
+            device={d ?? undefined}
+            switcher={id === shown ? props.switcher : undefined}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+function Explorer(props: {
+  visible: boolean;
+  hidden: boolean;
+  panel: ReturnType<typeof tabPanelProps>;
+  platform: RuntimePlatform;
+  onEdit: HandOff;
+  onConvert: HandOff;
+  dispatch: (a: Action) => void;
+  switcher?: ReactNode;
+  /** None: the PS5's own roots. */
+  device?: FilesDevice;
+}) {
+  const { device, platform } = props;
+  const t = useMessages().storage;
+  const inst = useMessages().install;
+  const tabs = useMessages().app;
+  const build = useMessages().rail.build;
+  const deleting = useMessages().library.deleting;
+  const actionsHead = useMessages().edit.actions;
+  const loading = useMessages().picker.loading;
+  const root: string | null = device ? device.root : null;
+  const [trail, setTrail] = useState<Crumb[]>(() => [{ path: root, name: "" }]);
+  // `n`: the load that answered, so focus waits for the listing it was asked against.
+  const [listed, setListed] = useState<{ key: string; n: number; listing: DirListing } | null>(null);
+  const [listError, setListError] = useState<{ key: string; n: number; text: string } | null>(null);
+  const [filter, setFilter] = useState("");
+  const [focus, setFocus] = useState(0);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [actError, setActError] = useState<{ lead: string; text: string } | null>(null);
+  const seq = useRef(0);
+  // A spinner only past 150ms, so a fast listing doesn't flash it.
+  const [slowKey, setSlowKey] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [storage, setStorage] = useState<{ free: number; total: number } | null>(null);
+  const acting = useRef(false);
+  // The row an action is changing (every row's actions locked until it ends).
+  const [busy, setBusy] = useState<{ path: string; deleting: boolean } | null>(null);
+  const want = useRef<{ path: string; after: number } | null>(null);
+  const focusAfterLoad = (path: string) => (want.current = { path, after: seq.current + 1 });
+  const grid = useRef<HTMLDivElement>(null);
+  const treeNav = useRef<HTMLElement>(null);
+  const wide = useWide();
+  // Subfolders of each folder above the one shown; an older `gen` is listed again, shown until its answer (the tree keeps its shape).
+  const [subdirs, setSubdirs] = useState<Map<string, { gen: number; dirs: DirEntry[] }>>(() => new Map());
+  const treeGen = useRef(0);
+  const treeBusy = useRef(false);
+  const clearTree = () => {
+    treeGen.current++;
+    treeBusy.current = false;
+    const on = new Set(trailRef.current.map((c) => c.path ?? ""));
+    setSubdirs((m) => new Map([...m].filter(([k]) => on.has(k))));
+  };
+
+  const crumbName = (c: Crumb) => (c.path === null ? t.roots : device && c.path === device.root ? device.name : c.name);
 
   const key = trail.map((c) => c.path ?? "").join("\0");
   const here = trail.length > 0 ? trail[trail.length - 1] : null;
-  const onHere = props.onHere;
-  useEffect(() => {
-    onHere(here ? here.path : null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [here?.path]);
 
   const load = async () => {
     if (!here) return;
@@ -294,9 +275,8 @@ function Explorer(props: {
     try {
       const listing = rowsOf(await api.listDir(here.path));
       if (mine !== seq.current) return;
-      // The PS5's free space, renewed with every listing (an action lists again); only the
-      // newest listing's answer is kept.
-      if (platform === "ps5") {
+      // The PS5's free space (its own tab), renewed with every listing; only the newest answer kept.
+      if (platform === "ps5" && !device) {
         const kept = (s: { free: number; total: number } | null) => mine === seq.current && setStorage(s);
         api.storage().then(kept, () => kept(null));
       }
@@ -322,8 +302,7 @@ function Explorer(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.visible, key]);
 
-  // Deleted, renamed or moved elsewhere (Edit, the Library): leave a folder that went, else list
-  // again. Heard while this view's own action runs (its own `gone` aside), it waits for the end.
+  // Deleted or moved elsewhere: leave a folder that went, else list again; during this view's own action it waits.
   // Refs and setters only, so the subscription's first copy stays right.
   const ownGone = useRef<string | null>(null);
   const missed = useRef<string[]>([]);
@@ -351,7 +330,6 @@ function Explorer(props: {
     [],
   );
 
-  // Kept while the view shows; one folder listed at a time, from the root down.
   useEffect(() => {
     if (!props.visible) clearTree();
   }, [props.visible]);
@@ -375,7 +353,8 @@ function Explorer(props: {
   // A load that succeeds clears the error, so one shown is always newer than the listing kept.
   const error = listError && listError.key === key ? listError.text : null;
   const listing = !error && listed && listed.key === key ? listed.listing : null;
-  const roots = here !== null && here.path === null; // the PS5's browse roots: nothing to change
+  // The PS5's browse roots, or an SMB/NFS root's shares or exports: nothing to change there.
+  const roots = here !== null && (here.path === null || (!!device?.fixedRoot && here.path === device.root));
   const query = filter.trim().toLowerCase();
   const all = listing?.entries ?? [];
   const entries = query ? all.filter((e) => e.name.toLowerCase().includes(query)) : all;
@@ -393,13 +372,11 @@ function Explorer(props: {
     if (focusPath === undefined) want.current = null;
     else focusAfterLoad(focusPath ?? "");
   };
-  // Not the row an action is changing (a folder being deleted or moved).
   const open = (e: DirEntry) =>
     e.dir && busy?.path !== e.path && go([...trail, { path: e.target ?? e.path, name: e.name, row: e.path }], null);
   const up = () => trail.length > 1 && go(trail.slice(0, -1), here ? (here.row ?? here.path) : null);
 
-  // The tree keeps the folder shown in view (subfolders listed above it push it down); only the
-  // tree scrolls, never the page.
+  // Only the tree scrolls to keep the folder shown in view, never the page.
   useEffect(() => {
     const nav = treeNav.current;
     const b = nav?.querySelector<HTMLElement>('[aria-current="true"]');
@@ -416,7 +393,6 @@ function Explorer(props: {
     if (props.visible && pending && want.current !== null && document.activeElement === document.body) grid.current?.focus();
   });
 
-  // Focus the row asked for, once the listing it is in has rendered.
   const shownN = listing ? listed?.n : error ? listError?.n : undefined;
   useEffect(() => {
     if (!props.visible || want.current === null || shownN === undefined || shownN < want.current.after) return;
@@ -435,8 +411,7 @@ function Explorer(props: {
   const act = async (lead: string, run: () => Promise<string | null>, gone: string, moving = false) => {
     if (acting.current) return;
     acting.current = true;
-    // The tree keeps the folders above the one shown: a change in the folder shown leaves them
-    // as they are; a move (its target may be one of them) or a change elsewhere doesn't.
+    // A change in the folder shown keeps the tree above it; a move or a change elsewhere doesn't.
     const staleTree = () => {
       const s = trailRef.current;
       if (moving || s[s.length - 1]?.path !== dirname(gone)) clearTree();
@@ -445,15 +420,13 @@ function Explorer(props: {
     try {
       const done = await run();
       if (done === null) return;
-      // The user may have moved on while it ran (another folder, the other view, the filter):
-      // no notice over another folder, and focus stays where they took it.
+      // The user may have moved on while it ran: no notice over another folder, focus left where they took it.
       const moved = trailRef.current.map((c) => c.path ?? "").join("\0") !== from;
       const el = document.activeElement;
       if (moved || !visibleRef.current || (el && el !== document.body && !grid.current?.contains(el))) want.current = null;
       setActError(null);
       setNotice(moved ? null : done);
       staleTree();
-      // The folder shown now.
       await loadRef.current();
       ownGone.current = gone;
       if (gone) notifyDeleted(gone);
@@ -474,8 +447,7 @@ function Explorer(props: {
     const i = shown.findIndex((x) => x.path === e.path);
     return (shown[i + 1] ?? shown[i - 1])?.path ?? "";
   };
-  // A `.pkg` row's Install (the PS5): asked, then an install job listed under Storage. Nothing
-  // here changes, so the folder isn't listed again.
+  // A `.pkg` row's Install (the PS5): nothing here changes, so the folder isn't listed again.
   const install = async (e: DirEntry) => {
     if (acting.current) return;
     acting.current = true;
@@ -505,12 +477,10 @@ function Explorer(props: {
     setRenaming(null);
     want.current = { path: e.path, after: 0 };
     if (name === null) return;
-    const to = joinPath(dirname(e.path), name);
-    // The input refuses a name of the other kind (or a link); one of the same kind is replaced
-    // once the user confirms (a folder merged).
-    // Case-insensitively (a drive may fold case), never itself (a case-only rename).
+    const to = join(dirname(e.path), name);
+    // Case-insensitively (a drive may fold case), never itself; one of the same kind is replaced once confirmed.
     const taken = all.some((x) => x.path !== e.path && x.name.toLowerCase() === name.toLowerCase());
-    // The question's Cancel gives focus back to what had it: the row, not the input just removed.
+    // The question's Cancel gives focus back to the row, not the input just removed.
     if (taken) [...(grid.current?.querySelectorAll<HTMLElement>("[role=row][data-path]") ?? [])].find((r) => r.dataset.path === e.path)?.focus();
     void act(
       t.cantRename,
@@ -524,22 +494,19 @@ function Explorer(props: {
       e.path,
     );
   };
-  // `into`: a folder row it was dragged onto; else the picker asks (on a peer's tab, its tabs:
-  // core moves within one device only).
+  // `into`: a folder row it was dragged onto; else the picker asks (core moves within one device only).
   const move = (e: DirEntry, into?: string) =>
     act(
       t.cantMove,
       async () => {
         const dir =
-          into ?? (await pick({ directory: true, title: t.moveTitle(e.name), start: here?.path ?? undefined, ...(device && { devices: true, peersOnly: true }) }));
+          into ?? (await pick({ directory: true, title: t.moveTitle(e.name), start: here?.path ?? undefined, ...(device && { devices: true, peersOnly: !device.nas }) }));
         if (dir === null) return null;
-        if (device && !isWithin(dir, device.root)) throw new Error(t.otherDevice);
+        if (device ? !isWithin(dir, device.root) : isNet(dir)) throw new Error(t.otherDevice);
         if (dirname(e.path) === dir) throw new Error(t.sameFolder);
-        const to = joinPath(dir, e.name);
-        // A file onto a file, a folder onto a folder (merged): asked, then replaced. Any other
-        // clash (another kind, a link) goes without `replace`, so core refuses it as before.
-        // ponytail: `listDir` stops at 10,000 entries; a name past that isn't asked about, so the
-        // move goes without `replace` and the server refuses it ("already exists").
+        const to = join(dir, e.name);
+        // Same kind: asked, then replaced (a folder merged); any other clash goes without `replace` and core refuses it.
+        // ponytail: `listDir` stops at 10,000 entries; a name past that isn't asked about and the server refuses it.
         // An exact name wins over a case variant (a case-sensitive folder may hold both).
         const listed = (await api.listDir(dir)).entries;
         const there = listed.find((x) => x.name === e.name) ?? listed.find((x) => x.name.toLowerCase() === e.name.toLowerCase());
@@ -553,11 +520,30 @@ function Explorer(props: {
       e.path,
       true,
     );
-  const choose = async () => {
-    const p = await pick({ directory: true, title: t.pickTitle, start: root ?? undefined });
-    if (p === null) return;
-    if (p === root) go([{ path: p, name: basename(p) || p }], null);
-    props.onFolder(p);
+  // A bookmark: the way down to it from the root, so Up and the tree work as if opened folder by folder.
+  const openAt = async (path: string) => {
+    setNotice(null);
+    setActError(null);
+    try {
+      let base: Crumb[];
+      if (device) base = [{ path: device.root, name: device.name }];
+      else {
+        const holder = (await api.listDir(null)).entries
+          .filter((r) => r.dir && isWithin(path, r.path))
+          .sort((a, b) => b.path.length - a.path.length)[0];
+        if (!holder) throw new Error(path);
+        base = [{ path: null, name: "" }, { path: holder.path, name: holder.name, row: holder.path }];
+      }
+      const next = [...base];
+      let at = base[base.length - 1].path ?? "";
+      for (const name of path.slice(at.length).split("/").filter(Boolean)) {
+        at = join(at, name);
+        next.push({ path: at, name });
+      }
+      go(next, null);
+    } catch (e) {
+      setActError({ lead: t.cantList, text: errorText(e) });
+    }
   };
   // Busy until its answer: the button keeps focus (aria-disabled) and ignores presses meanwhile.
   const refresh = () => {
@@ -566,17 +552,14 @@ function Explorer(props: {
     setActError(null);
     clearTree();
     setRefreshing(true);
-    void (platform ? load() : lookup()).finally(() => setRefreshing(false));
+    void load().finally(() => setRefreshing(false));
   };
   const handOff = (to: HandOff, e: DirEntry) => {
     const kind = e.dir ? "folder" : sourceKind(e.name);
     if (kind) to({ path: e.path, kind });
   };
 
-  // Drags: a row onto a folder row of this tab moves it there, onto another device's tab copies
-  // it into that tab's folder shown. Files dropped from the system copy into the folder row
-  // under them, the tab under them, else the folder shown. ponytail: the web build's browser
-  // files have no path here, so its drops are ignored (Upload under Connect sends them).
+  // Drags: a row onto a folder row of this tab moves it there.
   const card = useRef<HTMLElement>(null);
   const folderRow = (el: Element, not?: DirEntry): DirEntry | undefined => {
     const row = el.closest<HTMLElement>("[role=row][data-path]");
@@ -586,58 +569,15 @@ function Explorer(props: {
   const rowDrag = useRowDrag({
     target: (x, y, e) => {
       const el = document.elementFromPoint(x, y);
-      if (!el) return null;
-      const tab = tabAt(el);
-      if (tab !== undefined) return tab !== props.tabKey ? { tab } : null;
-      if (!card.current?.contains(el) || busy !== null || acting.current) return null;
+      if (!el || !card.current?.contains(el) || busy !== null || acting.current) return null;
       const d = folderRow(el, e);
       return d ? { dir: d } : null;
     },
-    drop: (e, to) => ("tab" in to ? props.copy([e.path], props.folderOf(to.tab)) : void move(e, to.dir.path)),
+    drop: (e, to) => void move(e, to.dir.path),
   });
-  type Landing = { tab: string } | { into: string | null };
-  const [osOver, setOsOver] = useState<Landing | null>(null);
-  const osHit = (x: number, y: number): Landing | null => {
-    if (!props.visible || roots) return null;
-    const el = document.elementFromPoint(x, y);
-    if (!el || !card.current?.contains(el)) return null;
-    const tab = tabAt(el);
-    return tab !== undefined ? { tab } : { into: folderRow(el)?.path ?? here?.path ?? null };
-  };
-  const land = (l: Landing): string | null =>
-    "tab" in l ? (l.tab === props.tabKey ? (here?.path ?? null) : props.folderOf(l.tab)) : l.into;
-  const liveDrop = useRef({ osHit, land, copy: props.copy });
-  liveDrop.current = { osHit, land, copy: props.copy };
-  useEffect(() => {
-    if (web) return;
-    return onDrop(
-      (d) => {
-        const l = liveDrop.current;
-        const at = l.osHit(d.x, d.y);
-        setOsOver(null);
-        const paths = d.items.flatMap((i) => (i.path ? [i.path] : []));
-        if (at && paths.length > 0) l.copy(paths, l.land(at));
-      },
-      (pt) => setOsOver(pt ? liveDrop.current.osHit(pt.x, pt.y) : null),
-    );
-  }, []);
-  const over: DragTarget | Landing | null = rowDrag.over ?? osOver;
-  const overTab = over && "tab" in over ? over.tab : null;
-  const onOverTab = props.onOverTab;
-  useEffect(() => {
-    if (props.visible) onOverTab(overTab);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overTab, props.visible]);
-  // The folder row (or the folder shown) a drop would land in, ringed, and what the count line says.
-  const dropAt = over && "dir" in over ? over.dir.path : over && "into" in over ? over.into : null;
-  const dropNote = !over
-    ? null
-    : "dir" in over
-      ? t.dropMove(readable(over.dir.path))
-      : (() => {
-          const dest = land(over);
-          return dest === null ? null : t.dropCopy(readable(dest));
-        })();
+  const over = rowDrag.over;
+  const dropAt = over ? over.dir.path : null;
+  const dropNote = over ? t.dropMove(readable(over.dir.path)) : null;
 
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.defaultPrevented || (e.target as HTMLElement).closest?.("[role=menu]")) return; // a row's ⋯ menu
@@ -675,61 +615,6 @@ function Explorer(props: {
     }
   };
 
-  // A computer's own files (a peer's tab has its root: no Choose folder).
-  const host = platform === "host" && !device;
-  // A computer with no folder to show (no home, or the start can't be listed): choose one.
-  const unrooted = host && !props.folder && (root === undefined ? home === null : !!error && trail.length === 1);
-  if (unrooted)
-    return (
-      <section className="card explorer files storage-card bare" aria-label={t.title}>
-        <div className="storage-head">{props.switcher}</div>
-        {props.tabs}
-        {error && (
-          <p className="note-line block" role="alert">
-            <Icon name="alert" />
-            <span>
-              {t.cantList} <span className="backend">{error}</span>
-            </span>
-          </p>
-        )}
-        <div className="empty library-empty">
-          <span className="empty-icon">
-            <Icon name="folder" />
-          </span>
-          <p className="empty-title">{t.pickPrompt}</p>
-          <div className="row center">
-            <button type="button" className="primary" onClick={() => void choose()}>
-              <Icon name="folder" />
-              {t.choose}
-            </button>
-          </div>
-        </div>
-      </section>
-    );
-
-  // Where the backend runs isn't known (the server didn't answer): Refresh asks again.
-  if (!platform && lookupError)
-    return (
-      <section className="card explorer files storage-card bare" aria-label={t.title}>
-        <div className="storage-head">
-          {props.switcher}
-          <div className="storage-actions">
-            <button type="button" className="small" onClick={refresh} aria-disabled={refreshing || undefined} aria-busy={refreshing || undefined}>
-              <Icon name="refresh" />
-              {t.refresh}
-              {refreshing && <Dots />}
-            </button>
-          </div>
-        </div>
-        <p className="note-line block" role="alert">
-          <Icon name="alert" />
-          <span>
-            {t.cantList} <span className="backend">{lookupError}</span>
-          </span>
-        </p>
-      </section>
-    );
-
   const dirs = all.filter((e) => e.dir).length;
   const count = !listing
     ? ""
@@ -739,8 +624,7 @@ function Explorer(props: {
         ? t.matches(entries.length)
         : t.inFolder(dirs, all.length - dirs);
 
-  // The tree: the way from the root to the folder shown, each folder on it with its subfolders
-  // (the first MAX_ROWS); the next folder on the way is always there, listed or not.
+  // The tree: root to the folder shown, each with its subfolders (the first MAX_ROWS).
   const tree = wide && trail.length > 0;
   const treeItem = (key: string, name: string, icon: "folder" | "drive", current: boolean, onClick: () => void, nested?: ReactNode) => (
     <li key={key}>
@@ -771,7 +655,7 @@ function Explorer(props: {
     return treeItem(c.row ?? c.path ?? "", crumbName(c), c.path === null ? "drive" : "folder", last, onClick, branch(i));
   };
 
-  // One tab stop (the folder shown); the arrows, Home and End move between the tree's folders.
+  // One tab stop; the arrows, Home and End move between the tree's folders.
   const treeKey = (e: KeyboardEvent<HTMLElement>) => {
     const all = [...e.currentTarget.querySelectorAll<HTMLElement>("button")];
     const i = all.indexOf(document.activeElement as HTMLElement);
@@ -782,31 +666,19 @@ function Explorer(props: {
   };
 
   return (
-    <section className="card explorer files storage-card" aria-label={t.title} ref={card}>
+    <section className="card dev-window explorer files storage-card" {...props.panel} hidden={props.hidden} ref={card}>
       {rowDrag.ghost}
       <div className="storage-head">
         {props.switcher}
         <div className="storage-actions">
           <FreeSpace storage={storage} />
-          {host && root && (
-            <div className="library-folder">
-              <PathLine path={root} />
-            </div>
-          )}
           <button type="button" className="small" onClick={refresh} aria-disabled={refreshing || undefined} aria-busy={refreshing || undefined}>
             <Icon name="refresh" />
             {t.refresh}
             {refreshing && <Dots />}
           </button>
-          {host && (
-            <button type="button" className="small" onClick={() => void choose()}>
-              <Icon name="folder" />
-              {t.choose}
-            </button>
-          )}
         </div>
       </div>
-      {props.tabs}
       <div className={`files-panes${tree ? " tree" : ""}`}>
         {tree && (
           <nav className="files-tree" ref={treeNav} aria-label={t.folders} onKeyDown={treeKey}>
@@ -845,7 +717,9 @@ function Explorer(props: {
                 );
               })}
             </nav>
+            <BookmarkToggle path={here?.path ?? null} root={root} />
           </div>
+          <Bookmarks root={root} rootName={device?.name} here={here?.path ?? null} onOpen={(p) => void openAt(p)} />
           {actError && (
             <p className="note-line block" role="alert">
               <Icon name="alert" />
@@ -854,7 +728,6 @@ function Explorer(props: {
               </span>
             </p>
           )}
-          {props.copyLine}
           {/* Always there, so screen readers announce the text when it arrives. */}
           <p className="muted files-notice" role="status">
             {notice}
@@ -889,8 +762,8 @@ function Explorer(props: {
               {dropNote ?? count}
             </span>
           </div>
-          <div className={dropAt !== null && dropAt === here?.path ? "explorer-well drop" : "explorer-well"}>
-            {/* Mounted while a folder lists too (its head row only), so focus can rest on it. */}
+          <div className="explorer-well">
+            {/* Mounted while a folder lists too, so focus can rest on it. */}
             <div
               role="grid"
               ref={grid}
@@ -999,7 +872,7 @@ function Explorer(props: {
                             disabled={acted}
                             items={[
                               { id: "edit", icon: "pencil", label: tabs.edit },
-                              { id: "convert", icon: "convert", label: tabs.convert },
+                              { id: "convert", icon: "convert", label: build },
                             ]}
                             onChoose={(what) => handOff(what === "edit" ? props.onEdit : props.onConvert, e)}
                           />

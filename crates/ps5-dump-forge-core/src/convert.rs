@@ -27,8 +27,7 @@ use crate::{ConvertRequest, Format, JobReport, Lz4Mode};
 
 /// Every SMP image size and cluster is a multiple of this.
 const IMAGE_ALIGN: u64 = 64 * 1024;
-/// The maker's mark, `PS5-FORGE-v<version>`: an `.exfat` holds it in an OEM Parameters
-/// record, an `.ffpkg` as its `fs_volname` (31 bytes at most), a `.ffpfsc` in its inner image.
+/// The maker's mark: an `.exfat`'s OEM Parameters record, an `.ffpkg`'s `fs_volname`, a `.ffpfsc`'s inner image.
 pub(crate) const MAKER_PREFIX: &str = "PS5-FORGE-v";
 const _: () = assert!(
     MAKER_PREFIX.len() + env!("CARGO_PKG_VERSION").len() <= 31,
@@ -39,12 +38,7 @@ fn maker() -> Option<String> {
     Some(format!("{MAKER_PREFIX}{}", env!("CARGO_PKG_VERSION")))
 }
 
-/// When a folder output puts `path` in place: everything else (0), then `sce_sys/` (1), then
-/// the root `eboot.bin` (2). ShadowMount+ takes a folder holding both for a game, so a folder
-/// written part way (a `.part`, or one on a peer or NAS written in place) never reads as one.
-/// A plain local folder (`extract::write`) keeps the source's read order (a solid archive is
-/// decoded once): it writes these under temporary names and renames them last. A remote or
-/// packed folder reads them in a last pass of their own.
+/// When a folder output puts `path` in place: the rest (0), `sce_sys/` (1), the root `eboot.bin` (2), so ShadowMount+ never takes a half-written folder for a game.
 pub(crate) fn launch_order(path: &str) -> u8 {
     if path == "eboot.bin" {
         2
@@ -169,9 +163,7 @@ impl Kind {
     }
 }
 
-/// Refuses an image whose undo journal (`<image>.forge-undo`) is beside it: an in-place edit
-/// was interrupted, so the image may be half edited. Only an edit settles the journal; a job
-/// that only reads the image (or replaces it, LZ4 in place) must not take it as it is.
+/// Refuses an image with an undo journal beside it (an interrupted in-place edit): only an edit settles it.
 pub(crate) fn refuse_interrupted_edit(path: &Path, kind: Kind) -> anyhow::Result<()> {
     if !matches!(kind, Kind::Folder | Kind::Archive(_))
         && !crate::net::is_network(path)
@@ -185,8 +177,7 @@ pub(crate) fn refuse_interrupted_edit(path: &Path, kind: Kind) -> anyhow::Result
     Ok(())
 }
 
-/// The source as a tree. Image readers are wrapped in [`JunkFiltered`], so every source
-/// drops the same junk the folder scanner does.
+/// The source as a tree; image readers are [`JunkFiltered`] as the folder scanner filters.
 pub(crate) fn open_source(
     path: &Path,
     kind: Kind,
@@ -235,12 +226,8 @@ fn reopen(e: ps5upload_fpkg::Error) -> anyhow::Error {
     anyhow::Error::new(e).context("reading the output back")
 }
 
-/// What an image source file looked like when the job opened it. Checked again before
-/// publishing, so an image rewritten mid-conversion fails the job; a folder source checks
-/// each file on every read instead.
-// ponytail: on FAT (FreeBSD's msdosfs) a file's id comes from its directory slot and mtimes
-// have 2-second steps, so a same-size file renamed over the source within 2 s goes unnoticed.
-// Upgrade: also hash a sample of the contents.
+/// An image source's stamp, checked again before publishing (a folder source checks each file on every read).
+// ponytail: on msdosfs ids come from the directory slot and mtimes step 2 s, so a same-size rename within 2 s goes unnoticed.
 #[derive(Clone)]
 pub(crate) struct SourceStamp {
     path: PathBuf,
@@ -274,9 +261,7 @@ impl SourceStamp {
         })
     }
 
-    /// The stamp of the file `file` (opened from `path`) is, from the handle, so it describes
-    /// exactly what is read; [`SourceStamp::unchanged`] then also says that `path` still names
-    /// that file (identity, length, modification time).
+    /// Stamped from the handle, so it describes exactly what is read.
     pub(crate) fn of_handle(path: &Path, file: &File) -> anyhow::Result<Self> {
         let shown = || format!("{}", path.display());
         let meta = file.metadata().with_context(shown)?;
@@ -308,8 +293,7 @@ impl SourceStamp {
         self.path == other.path && self.seen == other.seen && self.parts == other.parts
     }
 
-    /// The file still has the length, modification time and identity it had when stamped
-    /// (always true for a folder's stamp, which holds none).
+    /// Same length, mtime and identity as when stamped (always true for a folder's stamp).
     pub(crate) fn unchanged(&self) -> bool {
         let same = |path: &Path, seen: &Seen| Self::seen(path).ok().as_ref() == Some(seen);
         self.seen.as_ref().is_none_or(|seen| same(&self.path, seen))
@@ -342,9 +326,7 @@ impl SourceStamp {
         let (meta, id) = {
             let file = File::open(path).with_context(shown)?;
             let meta = file.metadata().with_context(shown)?;
-            // ponytail: a source on a volume that reports file id 0 (some NAS/SMB) is still read;
-            // its stamp then catches a swap by length and mtime only. Ceiling: a same-size,
-            // same-mtime replacement there goes unnoticed.
+            // ponytail: a volume reporting file id 0 (some NAS/SMB) is stamped by length and mtime only.
             #[cfg(windows)]
             let id = crate::win::raw_file_id(&file);
             #[cfg(not(windows))]
@@ -389,11 +371,9 @@ impl Image {
                     .flat_map(|id| id.chars())
                     .take(11)
                     .collect();
-                // `.into()` accepts both `label: String` and the coming `label: Option<String>`.
-                #[allow(clippy::useless_conversion)]
                 let opts = ps5_dump_forge_exfat::Options {
                     free_bytes: 0,
-                    label: label.into(),
+                    label: Some(label),
                     maker: maker(),
                 };
                 ps5_dump_forge_exfat::plan(tree, &opts, cancel)
@@ -432,8 +412,7 @@ impl Image {
         }
     }
 
-    /// Writes the image into `out` (a `.part`, or a `.ffpfsc`'s stream); returns its size
-    /// and a log line.
+    /// Writes the image into `out` (a `.part` or a `.ffpfsc`'s stream); returns its size and a log line.
     fn write<W: Write + Seek>(
         &self,
         tree: &mut dyn SourceTree,
@@ -462,8 +441,7 @@ impl Image {
     }
 }
 
-/// The size of a fresh `format` image of `tree` (exFAT, UFS2 or PFS), or the layout's refusal
-/// (bad names, case collisions, ...): the name checks a conversion runs, for an edited tree.
+/// A fresh `format` image's size for `tree`, or the layout's refusal (the name checks, for an edited tree).
 pub(crate) fn image_size(
     format: Format,
     tree: &dyn SourceTree,
@@ -473,8 +451,7 @@ pub(crate) fn image_size(
     Image::plan(format, tree, info, cancel).map(|image| image.size())
 }
 
-/// Free bytes an image of `size` bytes needs at its destination: 64 MiB more covers what the
-/// destination's own file system spends on the new file.
+/// Free bytes an image of `size` needs: 64 MiB more for the destination filesystem's own use.
 pub(crate) fn room(size: u64) -> u64 {
     size.saturating_add(64 * 1024 * 1024)
 }
@@ -482,9 +459,7 @@ pub(crate) fn room(size: u64) -> u64 {
 /// The writer's layout, fixed in preflight.
 enum Plan {
     Folder,
-    /// A folder of loose files and LZ4 packs.
     Lz4(crate::lz4::PackPlan),
-    /// A folder of loose files and zstd packs.
     Zstd(crate::zstd_pack::Plan),
     Image(Image),
     /// The image inside, and its name in the container.
@@ -499,8 +474,7 @@ enum Measured {
 }
 
 impl Measured {
-    /// The packed output as a tree over `source` (the tree it was measured on): loose files
-    /// and the pack files, made on demand on `threads`.
+    /// The packed output as a tree over `source`: loose files and the pack files, made on demand.
     fn tree<'a>(
         &'a self,
         source: &'a mut dyn SourceTree,
@@ -538,10 +512,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     convert(req, ctx)
 }
 
-/// `source` with its unsigned PS5 executables served as fake-signed SELFs (the console won't
-/// launch a plain ELF), `ampr_emu.index`'s records of them resized; a repair, never a finding.
-/// A packed game too: its packs hold no executable the loader opens, and the LZ4 manifest's
-/// loose records may differ from the disk.
+/// `source` with unsigned PS5 executables served as fake-signed SELFs, `ampr_emu.index` resized to them.
 fn sign_executables(source: Box<dyn SourceTree>, ctx: &Ctx) -> Box<dyn SourceTree> {
     let (tree, signed, refused) = crate::fself::Signed::new(source);
     for (path, why) in refused {
@@ -568,8 +539,7 @@ fn sign_executables(source: Box<dyn SourceTree>, ctx: &Ctx) -> Box<dyn SourceTre
     Box::new(tree)
 }
 
-/// `--remove-backport`: `source` without fakelib's backport libraries, when they can go (else a
-/// finding, or a log line when there are none).
+/// `--remove-backport`: `source` without fakelib's backport libraries, else a finding (a log line when none).
 fn leave_out_backport(
     req: &ConvertRequest,
     mut source: Box<dyn SourceTree>,
@@ -616,8 +586,7 @@ fn leave_out_backport(
     source
 }
 
-/// U5 on FreeBSD: `write` puts every byte of the image through `SyncEvery`, sharing the
-/// job's `cadence`; its finish is the image's sync.
+/// U5 on FreeBSD: every image byte goes through `SyncEvery` at the job's `cadence`.
 #[cfg(target_os = "freebsd")]
 fn synced<T>(
     file: &mut File,
@@ -645,13 +614,13 @@ pub(crate) fn log_cadence(cadence: &mut crate::durable::Cadence, ctx: &Ctx) {
     }
 }
 
-/// The `Progress` stages a job reports, in order ([`crate::Event::Stages`]). The request
-/// decides them: no source kind (folder, image, `.pkg`, archive) adds or drops one, nor does
-/// full verification. `.pkg`'s middle ones are the builder's `Stage` ids (`verify` is both
-/// the builder's read-back and ours).
+/// The `Progress` stages a job reports, in order: the request decides them (`.pkg`'s middle ones are the builder's).
 pub(crate) fn stages(req: &ConvertRequest) -> Vec<&'static str> {
     if req.install.is_some() {
         return crate::install::STAGES.to_vec();
+    }
+    if req.recover_metadata.is_some() {
+        return crate::metadata::STAGES.to_vec();
     }
     if !req.transfer.is_empty() {
         return crate::transfer::STAGES.to_vec();
@@ -697,6 +666,19 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 .to_string(),
         ]));
     }
+    if req.restore_metadata
+        && (req.install.is_some()
+            || req.recover_metadata.is_some()
+            || !req.transfer.is_empty()
+            || !req.extract.is_empty()
+            || !req.edits.is_empty())
+    {
+        return Err(preflight_failed(vec![
+            "Sony's metadata goes into a conversion's or a pack's output only: not an edit, an \
+             extract, a transfer, an install or a metadata recovery"
+                .to_string(),
+        ]));
+    }
     if req.pack_profile.is_some()
         && (req.install.is_some()
             || !req.transfer.is_empty()
@@ -710,20 +692,19 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 .to_string(),
         ]));
     }
-    // A package handed to the PS5's installer, nothing converted.
+    if req.recover_metadata.is_some() {
+        return crate::metadata::run(req, ctx);
+    }
     if req.install.is_some() {
         return crate::install::run(req, ctx);
     }
-    // Files and folders copied from anywhere into a folder, nothing converted.
     if !req.transfer.is_empty() {
         return crate::transfer::run(req, ctx);
     }
-    // Files and folders copied out of the source, nothing converted.
     if !req.extract.is_empty() {
         return crate::extract_paths::run(req, ctx);
     }
-    // An edit rebuilds its image (a conversion to the image's own format, replacing it), or is
-    // applied in place by the edit job.
+    // An edit rebuilds its image (a conversion to its own format), else runs in place.
     let rebuild = crate::edit_job::rebuild_format(req).map(|format| ConvertRequest {
         format,
         ..req.clone()
@@ -743,8 +724,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     // A rebuilt `.ffpfsc` keeps its inner image's format.
     let mut inner = req.inner;
     let (source, stamp) = if rebuild {
-        // The edit job's scan: request, kind, name, ShadowMount+, then an interrupted edit
-        // settled before the image is stamped and opened.
+        // The edit job's scan; an interrupted edit is settled before the image is stamped and opened.
         let scanned = crate::edit_job::scan(req, true, ctx.cancel)?.map_err(preflight_failed)?;
         crate::edit_job::log_recovery(scanned.recovery, ctx);
         if kind == Kind::Ffpfsc {
@@ -757,7 +737,6 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         let stamp = SourceStamp::take(&req.source, kind)?;
         let (source, stamp) = match kind {
             Kind::Archive(format) => crate::archive::open(req, ctx, format, stamp)?,
-            // What is converted is listed, so only that folder is deleted afterwards.
             Kind::Folder if req.delete_source => {
                 let (tree, listing) = FolderListing::open(&req.source, ctx.cancel)?;
                 let read = ReadSource::Folder(req.source.clone(), listing);
@@ -772,13 +751,40 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         (source, stamp)
     };
     ctx.log(format!("source: {}", source.describe()));
-    // The job's one timestamp, in whole seconds, for what it generates (an LZ4 manifest and
-    // path index).
+    // The job's one timestamp (whole seconds) for what it generates.
     let mtime = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    // LZ4 packs decoded first, when the job asks: the backport's files are manifest records.
-    // A rebuild takes no LZ4 option and refuses a packed game (`edit_job::fold`).
+    // Sony's metadata over the source's, before anything lists the tree (a later index lists it).
+    let mut source = match req.restore_metadata && !rebuild {
+        true => crate::metadata::overlay(source, req.format == Format::Pkg, ctx)?,
+        false => source,
+    };
+    // Into a folder or `.ffpkg`, a module whose name differs from what `eboot.bin` loads only in case takes eboot's spelling (upstream: Unity titles crashed at start); an edit never renames.
+    if !rebuild && matches!(req.format, Format::Folder | Format::Lz4 | Format::Ffpkg) {
+        let (fixed, fixes) = ps5upload_fpkg::module_case::CaseFixed::wrap(source);
+        source = fixed;
+        if !fixes.is_empty() {
+            ctx.log(format!(
+                "case: {} renamed to the spelling eboot.bin loads: {}",
+                fixes.len(),
+                ps5upload_fpkg::module_case::describe(&fixes)
+            ));
+        }
+    }
+    // A packed game into a `.pkg` is unpacked (issue #73): the job runs as that unpack.
+    let auto = match rebuild {
+        true => None,
+        false => crate::lz4::auto_unpack(req, source.as_mut())?,
+    };
+    if let Some(auto) = &auto {
+        let kind = if auto.zstd_unpack { "zstd" } else { "LZ4" };
+        ctx.log(format!(
+            "{kind}: a .pkg carries no packs: unpacking the game's {kind} packs"
+        ));
+    }
+    let req = auto.as_ref().unwrap_or(req);
+    // LZ4 packs decoded first when asked (backport files are manifest records); a rebuild takes no LZ4 option.
     let (source, packs) = if rebuild {
         (source, crate::lz4::Packs::default())
     } else {
@@ -790,12 +796,9 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     ctx.progress("preflight", 0, 1);
     // A rebuild's output is the source itself; its `.part` goes beside it.
     let in_place = rebuild;
-    // The output may go to a paired device: an image through a `RemoteFile`, a folder file by
-    // file through a `RemoteDir`.
+    //
     let remote_out = !in_place && crate::remote::is_remote(&req.output);
-    // An fpkg (its in-place spool) and LZ4 packs in a folder (each volume's header rewritten last)
-    // go back over what they wrote, which an FTP server must take (`REST` + `STOR` cutting
-    // nothing): probed in the output's folder.
+    // An fpkg's in-place spool and LZ4 volume headers rewrite what they wrote: an FTP output must take `REST` + `STOR`.
     let packs_folder = matches!(req.format, Format::Lz4)
         || (req.format == Format::Folder && (req.lz4 == Some(Lz4Mode::Pack) || req.zstd_pack));
     if remote_out
@@ -844,8 +847,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         (source, Vec::new())
     };
     let (info, mut findings) = preflight::input(source.as_mut());
-    // Additional content holds no game for an image to boot: fpkg or a folder only. An edit
-    // (a rebuild) keeps whatever it is.
+    // Additional content goes only into fpkg or a folder; a rebuild keeps what it is.
     if info.additional_content
         && !rebuild
         && (!matches!(req.format, Format::Pkg | Format::Folder)
@@ -858,18 +860,15 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     if let Some(id) = &info.title_id {
         ctx.log(format!("title id: {id}"));
     }
-    // Before anything sizes or writes the source, so every target (`.pkg` included) and the
-    // verification see the tree without it.
+    // Before anything sizes or writes the source, so every target and verify see it without them.
     let source = leave_out_backport(req, source, &info, &packs, ctx, &mut findings);
-    // Unsigned executables served fake-signed, before the AMPR index sees their sizes. A
-    // rebuild writes the edit as asked.
+    // Unsigned executables fake-signed before the AMPR index sees their sizes (not in a rebuild).
     let source = if rebuild {
         source
     } else {
         sign_executables(source, ctx)
     };
-    // The LZ4 options, before anything sizes or writes the tree (`.pkg` included). A rebuild
-    // keeps the runtime, the journal and logs; `fold` refreshed the index.
+    // The LZ4 options, before anything sizes the tree; a rebuild keeps runtime, journal and logs.
     let (prepared, mut zstd) = if rebuild {
         let prepared = crate::lz4::Prepared {
             tree: source,
@@ -902,8 +901,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     }
     let mut need = preflight::estimate(source.as_ref());
     let mut largest = need;
-    // LZ4 or zstd packs straight into an image: the measure pass gives every pack file's exact
-    // size before anything lays the image out. Skipped when preflight has already failed.
+    // Packs straight into an image: the measure pass sizes every pack file before the layout.
     let image_target = matches!(
         req.format,
         Format::Exfat | Format::Ffpkg | Format::Ffpfs | Format::Ffpfsc
@@ -940,8 +938,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
             }
             largest = source.files().iter().map(|f| f.size).max().unwrap_or(0);
             if let Some(zstd) = zstd.take() {
-                // Loose files, then every packed byte stored raw at worst, with the estimate's
-                // margin.
+                // Loose files, then every packed byte stored raw at worst, with the estimate's margin.
                 let packed = zstd.packed_paths();
                 let loose = source
                     .files()
@@ -962,8 +959,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
                 None
             } else {
                 match pack.take() {
-                    // Every byte the packer may write, loose files and the path index included
-                    // (all chunks stored raw), with the estimate's margin; no volume passes the cap.
+                    // Every byte the packer may write (all chunks raw) with the estimate's margin.
                     Some(pack) => {
                         let bound =
                             ps5_dump_forge_lz4::writer::worst_case_bytes(&pack.files, false);
@@ -1020,10 +1016,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         Format::Pkg => unreachable!("built by `package::run` above"),
     };
     ctx.check()?;
-    // An image is the only thing written and its plan knows its exact size (the estimate
-    // would refuse a destination that holds a tight image); 64 MiB more covers what the
-    // destination's own file system spends on the new file. A `.ffpfsc` is sized as if no
-    // block compressed.
+    // An image's plan knows its exact size: 64 MiB more for the destination's filesystem; a `.ffpfsc` as if no block compressed.
     let output_size = match &plan {
         Some(Plan::Image(image)) => Some(image.size()),
         Some(Plan::Ffpfsc(image, _)) => {
@@ -1098,8 +1091,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         }
     };
     let summary = verify::summary(source.files(), mode);
-    // Packed into an image, the image holds the pack files: they are written and compared as
-    // written, then the logical files are compared through the packs.
+    // Packed into an image: the pack files compared as written, then the logical files through the packs.
     let physical_files = match &measured {
         Some(m) => Some(m.tree(source.as_mut(), 1, ctx.cancel)?.files().to_vec()),
         None => None,
@@ -1107,17 +1099,12 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     let physical_check = physical_files
         .as_deref()
         .map_or(0, |f| verify::summary(f, mode).checked_bytes);
-    // Write reads every source byte once, verify reads back what `mode` samples.
-    // zstd reads each packed file twice (its store-only test, then the write).
+    // Write (and a zstd pack) reads every source byte once, verify reads back what `mode` samples.
     let file_bytes = physical_files
         .as_deref()
         .unwrap_or(source.files())
         .iter()
-        .fold(0u64, |sum, f| sum.saturating_add(f.size))
-        .saturating_add(match &plan {
-            Plan::Zstd(zstd) => zstd.packed_bytes(),
-            _ => 0,
-        });
+        .fold(0u64, |sum, f| sum.saturating_add(f.size));
     ctx.expect_rest(
         file_bytes
             .saturating_add(summary.checked_bytes)
@@ -1125,9 +1112,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     );
 
     let part_path = part_path(&out, ctx.job);
-    // Reads run one range ahead on their own thread; hashing stays here, and `HashingTree`
-    // sees exactly the calls and bytes it would without read-ahead.
-    // The folder writer reads `files()` in order, so its next file is read ahead too.
+    // Reads run one range ahead on their own thread (the folder writer's next file too); hashing stays here.
     let mut ahead = if matches!(plan, Plan::Folder) {
         Prefetch::sequential(source, crate::extract::CHUNK as usize)
     } else {
@@ -1139,10 +1124,8 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     let mut cadence = crate::durable::Cadence::new();
     // Packed into an image: what the image must hold, as written.
     let mut physical: Option<verify::Expected> = None;
-    // The image `.part` stays open from creation to verification, so what is verified is
-    // the file this job wrote, whatever happens to its name meanwhile.
-    // A folder on a peer is written in place (a peer renames no folder), so what was written
-    // before a failure stays there.
+    // The image `.part` stays open until verified, so what is verified is the file this job wrote.
+    // A folder on a peer is written in place: what was written before a failure stays.
     let kept = |e: anyhow::Error| {
         if remote_out
             && matches!(plan, Plan::Folder | Plan::Lz4(_) | Plan::Zstd(_))
@@ -1159,9 +1142,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     let (part, image, bytes, wrapped) = match &plan {
         Plan::Folder if remote_out => {
             let mut dir = crate::remote::RemoteDir::create(&out)?;
-            // ponytail: a peer renames only the files it saw created, so the launch files
-            // aren't staged there: they are read and written last, in a pass of their own (a
-            // solid archive source is decoded again for them).
+            // ponytail: a peer renames only files it saw created, so the launch files go in a last pass (a solid archive decodes again).
             let mut first = Only::new(&mut hashing as &mut dyn SourceTree, |p| {
                 launch_order(p) == 0
             });
@@ -1291,8 +1272,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         }
         Plan::Image(_) | Plan::Ffpfsc(..) => {
             let (part, file, size, wrapped) = match &measured {
-                // The image writer reads the packs as a tree made from the source; the files it
-                // sees are hashed as written, the source's as the packs read them.
+                // The image writer reads the packs made from the source; its files are hashed as written.
                 Some(m) => {
                     let threads = compression_threads(req);
                     let mut packs = m.tree(&mut hashing, threads, ctx.cancel)?;
@@ -1340,8 +1320,7 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
     // Packed, the image's read-back as written comes first.
     ctx.reserve(physical_check);
     let expected = hashing.expected(ctx, mode).map_err(kept)?;
-    // The source is read no more: its handles close before the output may replace it
-    // (Windows refuses to rename over an open file).
+    // The source's handles close before the output may replace it (Windows refuses to rename over an open file).
     drop(ahead);
     // Nor are the packs regenerated: their metadata goes before the reader builds its own.
     let zstd_image = matches!(measured, Some(Measured::Zstd(..)));
@@ -1472,6 +1451,9 @@ pub(crate) fn convert(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobRepo
         files: expected.files.len() as u64,
         checks,
         verify: summary,
+        source_bytes: summary.total_bytes,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
@@ -1488,10 +1470,7 @@ pub(crate) fn compression_threads(req: &ConvertRequest) -> usize {
     }
 }
 
-/// The progress still to come after a measure pass over `tree`, so measuring never fills the
-/// bar: the write reads about every byte again (the packs are at most their source's size, a
-/// little over for RAW-heavy ones), and the check reads back about the same sample twice, as
-/// written and through the packs. The write pass renews this from the plan.
+/// The progress still to come after a measure pass, so measuring never fills the bar: the write reads about every byte again, the check about the same sample twice.
 pub(crate) fn after_measure(tree: &dyn SourceTree, req: &ConvertRequest) -> u64 {
     let bytes = tree
         .files()
@@ -1508,9 +1487,7 @@ pub(crate) fn after_measure(tree: &dyn SourceTree, req: &ConvertRequest) -> u64 
     bytes.saturating_add(check.saturating_mul(2))
 }
 
-/// The measure pass of LZ4 packs into an image: `pack`'s compression over the packed files,
-/// keeping only the metadata (no compressed data), so the image can be laid out from exact
-/// sizes. The write pass reads the packed files a second time.
+/// LZ4's measure pass into an image: `pack`'s compression keeping only metadata, so the image is laid out from exact sizes.
 fn measure_packs(
     tree: &mut dyn SourceTree,
     pack: &crate::lz4::PackPlan,
@@ -1574,8 +1551,7 @@ fn plan_image(
     Image::plan(format, tree.as_ref(), info, cancel)
 }
 
-/// The output being written: a `.part` here, an image's `.part` on a paired device, or a
-/// folder there (written at the output itself).
+/// The output being written: a `.part` here, an image's `.part` on a peer, or a folder there.
 enum Written {
     Local(Part),
     Remote(crate::remote::RemotePart),
@@ -1607,9 +1583,7 @@ fn written_folder(part: &Written, ctx: &Ctx) -> anyhow::Result<Box<dyn SourceTre
     }
     let tree = ScannedFolder::scan(part.path(), ctx.cancel)?;
     // `scan` resolves its root; a `.part` swapped for a link resolves elsewhere.
-    // ponytail: verification reads by path below that root. Someone who can rename entries in
-    // the output folder could swap it mid-read, but could as well swap the published output a
-    // moment later; that writer is outside the threat model.
+    // ponytail: verification reads by path; someone renaming entries in the output folder mid-read could as well swap the published output.
     if tree.root() != part.path() {
         bail!("{} was replaced while verifying", part.path().display());
     }
@@ -1639,9 +1613,7 @@ impl Back {
     }
 }
 
-/// Writes `plan`'s image (alone or in a `.ffpfsc`) from `tree` into a new `.part`, here or on
-/// a peer; returns the `.part`, its image to read back, the image's size and, for a
-/// `.ffpfsc`, the container report.
+/// Writes `plan`'s image (alone or in a `.ffpfsc`) into a new `.part` here or on a peer: the `.part`, its reader, the size and a `.ffpfsc`'s report.
 #[allow(clippy::too_many_arguments)]
 fn write_image(
     plan: &Plan,
@@ -1724,8 +1696,7 @@ fn write_plan<W: Write + Seek>(
     }
 }
 
-/// Every runtime check on the packs `tree` holds (the manifest, its sidecars and every volume
-/// header), then the logical files read back through the packs against `expected`.
+/// Every runtime check on the packs `tree` holds, then the logical files read back through them against `expected`.
 fn pack_checks(
     expected: &verify::Expected,
     tree: Box<dyn SourceTree>,
@@ -1754,8 +1725,7 @@ fn pack_checks(
     Ok(checks)
 }
 
-/// An image's content: compared with `expected`, or, packed (`physical` given), compared as
-/// written with `physical` and then through its packs (`zstd` ones, else LZ4) with `expected`.
+/// An image's content against `expected`, or, packed, as written against `physical` and then through its packs.
 fn content(
     expected: &verify::Expected,
     physical: Option<&verify::Expected>,
@@ -1781,9 +1751,7 @@ fn content(
     Ok(checks)
 }
 
-/// Packs `pack`'s packed files from `tree` (the hashing tree) into the `.part` folder (or the
-/// folder on a peer): the volumes, then the manifest and its sidecars. Returns the bytes the
-/// chunks take.
+/// Packs `pack`'s files from `tree` into the output folder: the volumes, then the manifest and sidecars; returns the chunks' bytes.
 fn write_packs(
     tree: &mut dyn SourceTree,
     pack: &crate::lz4::PackPlan,
@@ -1841,8 +1809,7 @@ fn write_packs(
     Ok(report.stored_bytes)
 }
 
-/// Packs `zstd`'s files from `tree` (the hashing tree) into the `.part` folder (or the folder
-/// on a peer): the volumes, then `ampr_zstd.index`. Returns the bytes the packs take.
+/// Packs `zstd`'s files from `tree` into the output folder: the volumes, then `ampr_zstd.index`; returns the packs' bytes.
 fn write_zstd(
     tree: &mut dyn SourceTree,
     zstd: &crate::zstd_pack::Plan,
@@ -1913,8 +1880,7 @@ fn exfat_geometry(volume: &ExFat) -> anyhow::Result<String> {
     Ok("geometry: raw volume at byte 0, 512 B sectors, 64 KiB clusters".into())
 }
 
-/// The PFS header this crate writes: PS5 (version 2), mode 0x8 (case-insensitive, unsigned,
-/// 32-bit inodes, unencrypted), 64 KiB blocks, and as many blocks as the file holds.
+/// The PFS header this crate writes: version 2, mode 0x8, 64 KiB blocks, as many blocks as the file holds.
 fn pfs_geometry(h: &PfsHeader) -> anyhow::Result<String> {
     let mut bad = Vec::new();
     if h.version != 2 {
@@ -1941,8 +1907,7 @@ fn pfs_geometry(h: &PfsHeader) -> anyhow::Result<String> {
     ))
 }
 
-/// The container holds the one image the job wrote, as written: its name, its length, every
-/// 64 KiB block in the PFSC table, and the stored bytes the writer reported.
+/// The container holds exactly the one image the job wrote: name, length, every block's table entry and stored bytes.
 fn container_check(
     info: &FfpfscInfo,
     name: &str,
@@ -1988,8 +1953,7 @@ pub(crate) fn percent(part: u64, whole: u64) -> u64 {
         .map_or(0, |p| p as u64)
 }
 
-/// An image's own layout facts, read back from `r` (the image's bytes) rather than taken
-/// from the writer's word.
+/// An image's layout facts, read back from its bytes rather than taken from the writer's word.
 fn image_geometry(
     image: &Image,
     mut r: Box<dyn ReadSeek>,
@@ -2009,8 +1973,7 @@ fn image_geometry(
     })
 }
 
-/// One file of a PFS image (the image inside a `.ffpfsc`) as `Read + Seek`, decoded through
-/// the reader, so its own filesystem can be checked.
+/// One file of a PFS image as `Read + Seek`, so its own filesystem can be checked.
 pub(crate) struct Nested {
     pfs: PfsSource,
     path: String,
@@ -2073,8 +2036,7 @@ fn image_checks(back: &Back, size: u64) -> anyhow::Result<Vec<String>> {
     Ok(vec![format!("image size: {len} bytes, 64 KiB aligned")])
 }
 
-/// The `.ffpkg` the writer made (`r`, the image's bytes) has the SMP geometry and the layout
-/// it planned: read from its superblock and root inode, not taken from the writer's word.
+/// The `.ffpkg` has the SMP geometry and the planned layout, read from its superblock and root inode.
 fn ufs2_geometry<R: Read + Seek>(
     r: &mut R,
     layout: &ps5_dump_forge_ufs2::Layout,

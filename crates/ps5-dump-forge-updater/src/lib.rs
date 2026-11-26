@@ -1,11 +1,10 @@
-//! The PS5's ELF loader (elfldr, port 9021) from here: a Dump Forge release's PS5 ELF downloaded
-//! over HTTPS and streamed to it (`install`: the PS5 server's self-update, and the desktop app's
-//! Install on PS5), and any ELF file streamed to it (`send`: the app's Send a payload). elfldr
-//! can't follow GitHub's 302 to its asset host, so it is never handed a URL; a Forge ELF started
-//! with no arguments runs `serve`.
-// ponytail: a raw stream carries no arguments, so a pending developer args file
-// (`/data/dumpforge/args`, ps5/entry.c) runs instead of `serve`; elfldr's `?uri=...&args=serve`
-// would skip it, but that needs a URL elfldr can fetch.
+//! The PS5's ELF loader (elfldr, port 9021): a release's PS5 ELF downloaded over HTTPS and
+//! streamed to it (`install`), or any ELF file (`send`). elfldr can't follow GitHub's 302, so it is
+//! never handed a URL.
+// ponytail: a raw stream carries no arguments, so a pending developer args file (ps5/entry.c)
+// runs instead of `serve`.
+
+pub mod psn;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -13,20 +12,15 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// elfldr's port.
 pub const PORT: u16 = 9021;
-/// The largest ELF taken (a payload is a few MB, Dump Forge's about 16 MB).
 const MAX_ELF: u64 = 64 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// The longest a send may take in all (64 MiB at under 1 MB/s).
 const SEND_TIME: Duration = Duration::from_secs(120);
-/// The longest a download may take in all, redirects included: the PS5 page waits a minute.
+/// Redirects included: the PS5 page waits a minute.
 const DOWNLOAD_TIME: Duration = Duration::from_secs(50);
-/// Where each release's assets are.
 const RELEASES: &str = "https://github.com/quer3q/ps5-dump-forge/releases/download";
 const MAGIC: &[u8; 4] = b"\x7fELF";
 
-/// `X.Y.Z`, each part 1 to 9 digits.
 pub fn plain_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     parts.len() == 3
@@ -35,7 +29,7 @@ pub fn plain_version(v: &str) -> bool {
             .all(|p| (1..=9).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// A connection to elfldr at `addr`; `NotConnected` when nothing answers there.
+/// `NotConnected` when nothing answers.
 fn dial(addr: SocketAddr) -> io::Result<TcpStream> {
     TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|_| {
         io::Error::new(
@@ -45,9 +39,7 @@ fn dial(addr: SocketAddr) -> io::Result<TcpStream> {
     })
 }
 
-/// Streams the ELF file at `path` to elfldr at `addr`, which runs it; the bytes sent. Refused:
-/// a file that isn't an ELF or is over 64 MiB. elfldr gives no answer, so a sent payload that
-/// fails to start isn't seen here.
+/// The bytes sent; elfldr gives no answer, so a payload that fails to start isn't seen.
 pub fn send(addr: SocketAddr, path: &Path) -> io::Result<u64> {
     // Checked before the open: opening a FIFO would wait for a writer.
     let meta = fs::metadata(path)?;
@@ -74,7 +66,6 @@ pub fn send(addr: SocketAddr, path: &Path) -> io::Result<u64> {
     stream(addr, (&magic[..]).chain(file), len, &what)
 }
 
-/// Streams `elf` to elfldr at `addr`, as `send` does a file.
 pub fn send_bytes(addr: SocketAddr, elf: &[u8]) -> io::Result<u64> {
     if elf.len() as u64 > MAX_ELF || !elf.starts_with(MAGIC) {
         return Err(io::Error::new(
@@ -85,11 +76,10 @@ pub fn send_bytes(addr: SocketAddr, elf: &[u8]) -> io::Result<u64> {
     stream(addr, elf, elf.len() as u64, "the ELF")
 }
 
-/// `len` bytes of `elf` to elfldr at `addr`; `what` names it when it ends early.
 fn stream(addr: SocketAddr, mut elf: impl Read, len: u64, what: &str) -> io::Result<u64> {
     let mut stream = dial(addr)?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    // 1 MiB at a time within `SEND_TIME` in all; a file that ends early is an error, not a cut ELF.
+    // A file that ends early is an error, not a cut ELF.
     let deadline = Instant::now() + SEND_TIME;
     let (mut sent, mut buf) = (0u64, vec![0u8; 1 << 20]);
     while sent < len {
@@ -111,9 +101,8 @@ fn stream(addr: SocketAddr, mut elf: impl Read, len: u64, what: &str) -> io::Res
     }
     stream.flush()?;
     stream.shutdown(Shutdown::Write)?;
-    // Whatever elfldr writes back (a payload's output with some loaders) is left unread; a
-    // short wait lets it take the last bytes before the close. Every byte is sent by now: a
-    // peer that already closed makes macOS refuse the timeout (EINVAL), so it only skips the wait.
+    // A short wait lets elfldr take the last bytes before the close; a peer that already closed
+    // makes macOS refuse the timeout (EINVAL), which only skips the wait.
     if stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .is_ok()
@@ -123,25 +112,16 @@ fn stream(addr: SocketAddr, mut elf: impl Read, len: u64, what: &str) -> io::Res
     Ok(sent)
 }
 
-/// A downloaded ELF: in memory, or saved over the spill file when memory couldn't hold it.
 #[derive(Debug)]
-pub enum Elf {
+enum Elf {
     Memory(Vec<u8>),
     File(PathBuf),
 }
 
-/// v`version`'s PS5 ELF from its GitHub release, redirects followed, within 50 s. Refused: a
-/// version that isn't `X.Y.Z` (`InvalidInput`), a reply other than 200, one without a
-/// Content-Length or over 64 MiB, a body cut short or not an ELF. Held in memory when that much
-/// can be reserved; else, with a `spill` file (the PS5's self copy), that file is replaced by it
-/// (under the self copy's lock, so a starting copy's save can't interleave) and named.
-// ponytail: TLS authenticates GitHub; nothing checks a signature or the ELF's version marker
-// (scripts/release-ps5.sh wants exactly one copy of the marker's text in the PS5 ELF).
-pub fn download(version: &str, spill: Option<&Path>) -> io::Result<Elf> {
-    fetch(RELEASES, version, spill, false)
-}
-
-/// `download` from `base`; `force_spill` skips memory (tests).
+/// v`version`'s PS5 ELF from `base`: 200 with a Content-Length of at most 64 MiB, whole, an ELF.
+/// In memory when that much can be reserved, else saved over `spill` (the PS5's self copy, under
+/// its lock); `force_spill` skips memory (tests).
+// ponytail: TLS authenticates GitHub; nothing checks a signature or the ELF's version marker.
 fn fetch(base: &str, version: &str, spill: Option<&Path>, force_spill: bool) -> io::Result<Elf> {
     if !plain_version(version) {
         return Err(io::Error::new(
@@ -150,7 +130,7 @@ fn fetch(base: &str, version: &str, spill: Option<&Path>, force_spill: bool) -> 
         ));
     }
     let failed = |kind: io::ErrorKind, why: &dyn std::fmt::Display| {
-        // `NotConnected` means elfldr doesn't answer (`dial`), never a download's socket.
+        // `NotConnected` is kept for elfldr not answering (`dial`).
         let kind = match kind {
             io::ErrorKind::NotConnected => io::ErrorKind::Other,
             kind => kind,
@@ -161,6 +141,8 @@ fn fetch(base: &str, version: &str, spill: Option<&Path>, force_spill: bool) -> 
     let url = format!("{base}/v{version}/ps5-dump-forge-{version}-ps5.elf");
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIME))
+        // ureq follows an HTTPS to HTTP redirect otherwise (tests serve plain HTTP).
+        .https_only(base.starts_with("https://"))
         .http_status_as_error(false)
         .build()
         .into();
@@ -205,7 +187,7 @@ fn fetch(base: &str, version: &str, spill: Option<&Path>, force_spill: bool) -> 
     }
 }
 
-/// Exactly `len` bytes of `body` handed to `sink`, 64 KiB at a time; the first four bytes.
+/// Exactly `len` bytes of `body` handed to `sink`; returns the first four.
 fn copy_exact(
     body: &mut impl Read,
     len: u64,
@@ -240,9 +222,8 @@ fn copy_exact(
     Ok(head)
 }
 
-/// `target` replaced by exactly `len` bytes of `body` as the self copy saves it: a temporary
-/// file beside it (`.<name>.<pid>.tmp`), synced, renamed over it, the folder synced, under its
-/// lock (`.<name>.lock`, flock). `false`, `target` untouched: the bytes aren't an ELF.
+/// `target` replaced as the self copy saves it (temp + sync + rename + folder sync, under
+/// `.<name>.lock`); `false`, `target` untouched, when the bytes aren't an ELF.
 fn save(body: &mut impl Read, len: u64, target: &Path) -> io::Result<bool> {
     let dir = match target.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
@@ -276,7 +257,6 @@ fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
     options
 }
 
-/// A folder synced (a rename in it made durable); Windows has no folder handle to sync.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
@@ -285,10 +265,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// v`version`'s PS5 ELF (`download`) streamed to elfldr at `addr` (`send_bytes`, or `send` of the
-/// spilled file); the bytes sent. elfldr is probed first (`NotConnected` within 3 s rather than
-/// after a download), then the whole download comes before the send: elfldr drops a connection
-/// that sends nothing for 15 s.
+/// v`version`'s PS5 ELF streamed to elfldr. elfldr is probed first (`NotConnected` within 3 s),
+/// then the whole download comes before the send: elfldr drops a connection idle for 15 s.
 pub fn install(addr: SocketAddr, version: &str, spill: Option<&Path>) -> io::Result<u64> {
     install_from(RELEASES, addr, version, spill)
 }
@@ -302,12 +280,159 @@ fn install_from(
     if !plain_version(version) {
         return fetch(base, version, spill, false).map(|_| 0);
     }
-    // Connect and close, as `GET /api/elfldr` does (elfldr logs an unknown payload, nothing more).
     drop(dial(addr)?);
     match fetch(base, version, spill, false)? {
         Elf::Memory(elf) => send_bytes(addr, &elf),
         Elf::File(path) => send(addr, &path),
     }
+}
+
+const LATEST: &str = "https://api.github.com/repos/quer3q/ps5-dump-forge/releases/latest";
+const MAX_JSON: u64 = 4 << 20;
+const MAX_CLI: u64 = 64 << 20;
+const CLI_TIME: Duration = Duration::from_secs(120);
+
+/// This build's CLI release asset (`{v}` the version); `None` where no release carries one.
+pub fn cli_asset() -> Option<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("ps5-dump-forge-cli-{v}-macos-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("ps5-dump-forge-cli-{v}-macos-x86-64")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("ps5-dump-forge-cli-{v}-windows-x86-64.exe")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("ps5-dump-forge-cli-{v}-windows-arm64.exe")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("ps5-dump-forge-cli-{v}-linux-x86-64")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("ps5-dump-forge-cli-{v}-linux-arm64")
+    } else {
+        None
+    }
+}
+
+pub fn asset_url(version: &str, asset: &str) -> String {
+    format!("{RELEASES}/v{version}/{}", asset.replace("{v}", version))
+}
+
+/// By number; a current prerelease (`-pre4`) is older than its release (update.ts's `isNewer`).
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let core = current.split(['-', '+']).next().unwrap_or("");
+    let parse = |v: &str| -> Option<Vec<u64>> { v.split('.').map(|p| p.parse().ok()).collect() };
+    if !plain_version(latest) || !plain_version(core) {
+        return false;
+    }
+    match (parse(latest), parse(core)) {
+        (Some(l), Some(c)) if l != c => l > c,
+        (Some(_), Some(_)) => core.len() < current.len() && current[core.len()..].starts_with('-'),
+        _ => false,
+    }
+}
+
+/// `listed`: the release has `asset` uploaded and not empty.
+#[derive(Debug, PartialEq)]
+pub struct Latest {
+    pub version: String,
+    pub listed: bool,
+}
+
+pub fn latest(asset: &str) -> io::Result<Latest> {
+    let body = get(LATEST, MAX_JSON).map_err(|e| context("couldn't ask GitHub", e))?;
+    parse_latest(&body, asset)
+}
+
+fn parse_latest(body: &[u8], asset: &str) -> io::Result<Latest> {
+    let bad =
+        |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("GitHub's reply {why}"));
+    let release: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| bad("is not JSON"))?;
+    let version = release["tag_name"]
+        .as_str()
+        .and_then(|t| t.strip_prefix('v'))
+        .filter(|v| plain_version(v))
+        .ok_or_else(|| bad("has no release version (vX.Y.Z)"))?
+        .to_string();
+    let name = asset.replace("{v}", &version);
+    let listed = release["assets"].as_array().is_some_and(|assets| {
+        assets.iter().any(|a| {
+            a["name"].as_str() == Some(&name)
+                && a["state"].as_str() == Some("uploaded")
+                && a["size"].as_u64().is_some_and(|s| s > 0)
+        })
+    });
+    Ok(Latest { version, listed })
+}
+
+/// Checked against the release's SHA256SUMS.
+pub fn download_cli(version: &str, asset: &str) -> io::Result<Vec<u8>> {
+    download_cli_from(RELEASES, version, asset)
+}
+
+fn download_cli_from(base: &str, version: &str, asset: &str) -> io::Result<Vec<u8>> {
+    if !plain_version(version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{version:?} is not a release version (X.Y.Z)"),
+        ));
+    }
+    let name = asset.replace("{v}", version);
+    let why = format!("couldn't download {name}");
+    let sums = get(&format!("{base}/v{version}/SHA256SUMS"), MAX_JSON)
+        .map_err(|e| context(&format!("couldn't download v{version}'s SHA256SUMS"), e))?;
+    let bytes = get(&format!("{base}/v{version}/{name}"), MAX_CLI).map_err(|e| context(&why, e))?;
+    check_sum(&String::from_utf8_lossy(&sums), &name, &bytes)?;
+    Ok(bytes)
+}
+
+fn check_sum(sums: &str, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let listed = sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        (parts.next()?.trim_start_matches('*') == name && parts.next().is_none()).then_some(hash)
+    });
+    let Some(listed) = listed else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SHA256SUMS doesn't list {name}"),
+        ));
+    };
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    if !listed.eq_ignore_ascii_case(&hex) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} doesn't match its SHA256SUMS line (got {hex})"),
+        ));
+    }
+    Ok(())
+}
+
+fn get(url: &str, max: u64) -> io::Result<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(CLI_TIME))
+        .https_only(url.starts_with("https://"))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let other = |e: &dyn std::fmt::Display| io::Error::other(e.to_string());
+    let reply = agent
+        .get(url)
+        .header("Accept", "application/vnd.github+json, */*")
+        .call()
+        .map_err(|e| other(&e))?;
+    if reply.status() != 200 {
+        return Err(other(&format!("the server answered {}", reply.status())));
+    }
+    reply
+        .into_body()
+        .with_config()
+        .limit(max)
+        .read_to_vec()
+        .map_err(|e| other(&e))
+}
+
+fn context(what: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
 #[cfg(test)]
@@ -505,5 +630,58 @@ mod tests {
         let sent = install_from(&base, addr, "1.2.3", None).unwrap();
         assert_eq!(sent, elf_body().len() as u64);
         assert_eq!(got.join().unwrap(), [Vec::new(), elf_body()]);
+    }
+
+    #[test]
+    fn versions_compare_by_number_and_a_prerelease_is_older() {
+        assert!(is_newer("0.5.8", "0.5.7"));
+        assert!(is_newer("0.10.0", "0.9.9"));
+        assert!(is_newer("0.5.7", "0.5.7-pre1"));
+        assert!(!is_newer("0.5.7", "0.5.7"));
+        assert!(!is_newer("0.5.7", "0.5.7+build"));
+        assert!(!is_newer("0.5.6", "0.5.7"));
+        assert!(!is_newer("0.5", "0.5.7"));
+        assert!(!is_newer("0.5.8", "junk"));
+        let body = br#"{"tag_name":"v0.5.8","assets":[
+            {"name":"ps5-dump-forge-cli-0.5.8-x","state":"uploaded","size":9},
+            {"name":"ps5-dump-forge-cli-0.5.8-y","state":"new","size":9}]}"#;
+        let latest = |a| parse_latest(body, a).unwrap().listed;
+        assert!(latest("ps5-dump-forge-cli-{v}-x"));
+        assert!(!latest("ps5-dump-forge-cli-{v}-y"), "not uploaded");
+        assert!(!latest("ps5-dump-forge-cli-{v}-z"));
+    }
+
+    #[test]
+    fn a_cli_is_taken_only_when_its_sha256sums_line_matches() {
+        let cli = b"new cli".to_vec();
+        let hex: String = ring::digest::digest(&ring::digest::SHA256, &cli)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let sums = format!(
+            "{hex}  ps5-dump-forge-cli-1.2.3-x\n{}  ps5-dump-forge-cli-1.2.4-x\n",
+            "0".repeat(64)
+        );
+        let (base, _) = serve(move |path| match path {
+            "/releases/v1.2.3/SHA256SUMS" | "/releases/v1.2.4/SHA256SUMS" => {
+                ok(sums.as_bytes(), sums.len())
+            }
+            p if p.starts_with("/releases/v1.2.") => ok(b"new cli", 7),
+            _ => {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+        });
+        let asset = "ps5-dump-forge-cli-{v}-x";
+        assert_eq!(download_cli_from(&base, "1.2.3", asset).unwrap(), cli);
+        let e = download_cli_from(&base, "1.2.4", asset).unwrap_err();
+        assert!(e.to_string().contains("doesn't match"), "{e}");
+        let e = download_cli_from(&base, "1.2.3", "ps5-dump-forge-cli-{v}-other").unwrap_err();
+        assert!(e.to_string().contains("doesn't list"), "{e}");
+        assert!(
+            download_cli_from(&base, "1.2.5", asset).is_err(),
+            "no SHA256SUMS"
+        );
+        assert!(check_sum(&format!("{hex} *a.exe"), "a.exe", &cli).is_ok());
     }
 }

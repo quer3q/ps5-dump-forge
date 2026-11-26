@@ -1,9 +1,5 @@
-//! The one-lane pack writer: packed files cut into blocks, each kept as raw LZ4 or RAW,
-//! compressed on worker threads and written in strict order into `ampr_assets-NNN.pak` volumes
-//! (dense placement, rolled below 4 GiB for FAT32); then the volume headers rewritten with the
-//! final build ID, the manifest, the CRC sidecar and, when given, the runtime profile.
-//!
-//! Loose files are not written here (core extracts them); their records still go in the manifest.
+//! The pack writer: blocks compressed on workers, written in order into `ampr_assets-NNN.pak`
+//! volumes, then headers, manifest, `.crc` and `.runtime`. Loose files are core's.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -35,7 +31,6 @@ fn bad(msg: impl Into<String>) -> Error {
 /// One manifest record, in final path index order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackFile {
-    /// Relative to the game root.
     pub path: String,
     pub size: u64,
     /// `None`: a loose record (core writes the file itself).
@@ -44,30 +39,23 @@ pub struct PackFile {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PackReport {
-    /// Packed and loose records.
     pub packed: u64,
     pub loose: u64,
     pub volumes: u32,
-    /// Raw bytes of the packed files, and what they take in the volumes (chunks only).
     pub raw_bytes: u64,
     pub stored_bytes: u64,
 }
 
-/// Where `pack` puts its files, all at the output root; core supplies safe creation and
-/// durability. Each file is created once and finished; a volume is reopened once more, after
-/// the build ID is known, to rewrite its 64-byte header, and finished again.
+/// Where `pack` puts its files: created once, a volume reopened once to rewrite its header.
 pub trait PackOutput {
     type W: Write + Seek;
-    /// Creates `name`, which must not exist yet.
     fn create(&mut self, name: &str) -> Result<Self::W>;
-    /// Opens `name`, created and finished by this run, for writing at offset 0.
     fn reopen(&mut self, name: &str) -> Result<Self::W>;
-    /// Every byte of `name` is written: flush and sync it.
     fn finish(&mut self, name: &str, w: Self::W) -> Result<()>;
 }
 
-/// Refinement 3, upstream's thresholds: keep LZ4 only if it saves ≥ 64 B and ≥ 1%, or, when it
-/// does not save a page, ≥ 8 KiB and ≥ 12.5%.
+/// Upstream's thresholds: LZ4 kept if it saves ≥ 64 B and ≥ 1%, or, short of a page, ≥ 8 KiB and ≥
+/// 12.5%.
 fn keep_lz4(raw: usize, compressed: usize) -> bool {
     if compressed >= raw {
         return false;
@@ -80,9 +68,8 @@ fn keep_lz4(raw: usize, compressed: usize) -> bool {
     }
 }
 
-/// Dense placement of `stored` bytes after `cur`: a chunk of a page or more starts on a page;
-/// a smaller one is 64-aligned and moves to the next page only if it would cross one. Returns
-/// the offset and the page flags of the actual placement.
+/// Dense placement: a chunk of a page or more starts on a page; a smaller one is 64-aligned, moved
+/// on only to avoid crossing one.
 fn place(cur: u64, stored: u64) -> (u64, u8) {
     let up = |v: u64, a: u64| v.div_ceil(a) * a;
     let off = if stored >= PAGE {
@@ -105,18 +92,13 @@ fn place(cur: u64, stored: u64) -> (u64, u8) {
     (off, flags)
 }
 
-/// Raw lengths of the blocks of a `size`-byte file.
 fn blocks(size: u64, shift: u8) -> impl Iterator<Item = u64> {
     let b = 1u64 << shift;
     (0..size.div_ceil(b)).map(move |i| b.min(size - i * b))
 }
 
-/// Ruling 6: an upper bound of every byte `pack` writes plus every loose record's file. Each
-/// chunk is charged its raw length in whole pages (a chunk adds at most that many pages to its
-/// volume, whatever it compresses to), volumes are filled by that charge against the cap, each
-/// adds its 64 KiB front region, and the metadata is counted exactly for that volume count.
-/// `files` is the final path-index record set: the `ampr_emu.index` (AMPRIDX3) size for it is
-/// included exactly. The caller adds only files outside it.
+/// An upper bound of every byte `pack` writes plus the loose files: chunks charged whole raw pages,
+/// metadata and `ampr_emu.index` exact.
 pub fn worst_case_bytes(files: &[PackFile], profile: bool) -> u64 {
     worst_case_with_cap(files, profile, VOLUME_CAP)
 }
@@ -159,8 +141,7 @@ fn worst_case_with_cap(files: &[PackFile], profile: bool, cap: u64) -> u64 {
         .saturating_add(cfg)
 }
 
-/// Exact byte size of `ps5upload_fpkg::ampr_index::build` for these paths: header, 24-byte
-/// records, NUL-terminated `/app0/` paths, padding to 16, then a power-of-two slot table.
+/// Exact byte size of `ps5upload_fpkg::ampr_index::build` for these paths.
 fn index_size(files: &[PackFile]) -> u64 {
     let blob: u64 = files
         .iter()
@@ -173,7 +154,6 @@ fn index_size(files: &[PackFile]) -> u64 {
         .saturating_add(slots.saturating_mul(16))
 }
 
-/// One block back from a worker: the CRC of its raw bytes and what is stored.
 pub(crate) struct Encoded {
     pub(crate) raw_len: u64,
     pub(crate) crc: u32,
@@ -181,15 +161,13 @@ pub(crate) struct Encoded {
     pub(crate) data: Vec<u8>,
 }
 
-/// What compresses one block (raw, store, LZ4 level); [`encode`] everywhere but in the tests
-/// that inject another.
+/// What compresses one block; [`encode`] except in tests.
 pub(crate) type Encoder = fn(Vec<u8>, bool, u8) -> Encoded;
 
 type Job = (Vec<u8>, bool, u8, Sender<Encoded>);
 
-/// The one encoding decision, used by `pack`, `measure`, `sample` and the regenerating tree
-/// alike: LZ4 at `level` ([`crate::block`]) unless `store`, kept only when [`keep_lz4`] says
-/// so, else RAW.
+/// The one encoding decision (`pack`, `measure`, `sample`, the tree): LZ4 at `level` kept per
+/// [`keep_lz4`], else RAW.
 pub(crate) fn encode(raw: Vec<u8>, store: bool, level: u8) -> Encoded {
     let (raw_len, crc) = (raw.len() as u64, crc32(&raw));
     if !store
@@ -211,9 +189,13 @@ pub(crate) fn encode(raw: Vec<u8>, store: bool, level: u8) -> Encoded {
     }
 }
 
-/// Auto-loose's sample of `path` (`size` bytes, `block_shift` blocks): the blocks at `indices`
-/// encoded exactly as `pack` would at `level` (LZ4 kept per [`keep_lz4`], else RAW).
-/// `progress` gets the raw bytes sampled so far.
+/// The bytes one block takes in a volume at `level`. For size estimates.
+pub fn stored_len(raw: Vec<u8>, level: u8) -> usize {
+    encode(raw, false, level).data.len()
+}
+
+/// Auto-loose's sample: the blocks at `indices` encoded as `pack` would; `progress` gets raw bytes
+/// sampled.
 #[allow(clippy::too_many_arguments)]
 pub fn sample<S: SourceTree + ?Sized>(
     src: &mut S,
@@ -250,12 +232,10 @@ fn worker(queue: &Mutex<Receiver<Job>>) {
         let Ok((raw, store, level, reply)) = job else {
             return;
         };
-        // The reader may be gone after an error; nothing to do then.
         let _ = reply.send(encode(raw, store, level));
     }
 }
 
-/// An error unless `level` is one [`crate::block::valid_level`] accepts.
 pub fn check_level(level: u8) -> Result<()> {
     if crate::block::valid_level(level) {
         return Ok(());
@@ -285,18 +265,13 @@ fn write_file<O: PackOutput>(out: &mut O, name: &str, bytes: &[u8]) -> Result<()
     out.finish(name, w)
 }
 
-/// Where the sink's volume bytes go: files (`pack`) or nowhere (`measure`). The sink decides
-/// every offset; this only writes what it is told, in order.
+/// Where the sink's volume bytes go: files (`pack`) or nowhere (`measure`).
 trait Volumes {
-    /// A new volume; its first page (header placeholder and front region) is zeros.
     fn open(&mut self, name: &str) -> Result<()>;
-    /// `pad` zero bytes, then `data`.
     fn chunk(&mut self, pad: u64, data: &[u8]) -> Result<()>;
-    /// `pad` zero bytes up to the volume's size, then it is finished.
     fn close(&mut self, name: &str, pad: u64) -> Result<()>;
 }
 
-/// `measure`: placement only.
 struct Nowhere;
 
 impl Volumes for Nowhere {
@@ -311,7 +286,6 @@ impl Volumes for Nowhere {
     }
 }
 
-/// `pack`: the volumes as files of `out`, one open at a time.
 struct Files<'a, O: PackOutput> {
     out: &'a mut O,
     open: Option<BufWriter<O::W>>,
@@ -337,26 +311,22 @@ impl<O: PackOutput> Volumes for Files<'_, O> {
     }
 }
 
-/// The open volume: its name, the end of its last chunk, and how many it holds.
 struct OpenVolume {
     name: String,
     end: u64,
     chunks: u64,
 }
 
-/// The ordered half on the calling thread: placement, chunk records, CRCs, progress. The one
-/// placement implementation: `pack` writes what it decides, `measure` only records it.
+/// The ordered half: placement, chunk records, CRCs, progress; shared by `pack` and `measure`.
 struct Sink<V: Volumes> {
     vols: V,
     cap: u64,
     open: Option<OpenVolume>,
-    /// Name and size of every finished volume, by pack id.
     done: Vec<(String, u64)>,
     chunks: Vec<u8>,
     crcs: Vec<u8>,
     stored: u64,
     raw_done: u64,
-    /// The LZ4 level every block is compressed at.
     level: u8,
 }
 
@@ -375,7 +345,6 @@ impl<V: Volumes> Sink<V> {
         }
     }
 
-    /// Places `e` after the last chunk, in a new volume if the current one would pass the cap.
     fn put(&mut self, e: Encoded, progress: &mut dyn FnMut(u64)) -> Result<()> {
         let s = e.data.len() as u64;
         let (off, flags) = loop {
@@ -416,7 +385,6 @@ impl<V: Volumes> Sink<V> {
         Ok(())
     }
 
-    /// Pads the open volume to a whole page and finishes it.
     fn close(&mut self) -> Result<()> {
         let Some(v) = self.open.take() else {
             return Ok(());
@@ -428,8 +396,8 @@ impl<V: Volumes> Sink<V> {
     }
 }
 
-/// Reads every packed file front to back, block by block, hands the blocks to the workers and
-/// puts the replies in order; at most `limit` blocks are pending.
+/// Reads every packed file block by block to the workers, replies put in order; at most `limit`
+/// pending.
 fn feed<S: SourceTree + ?Sized, V: Volumes>(
     src: &mut S,
     files: &[PackFile],
@@ -471,7 +439,6 @@ fn feed<S: SourceTree + ?Sized, V: Volumes>(
     Ok(())
 }
 
-/// `raw` bytes of `path` at `off`, all of them.
 pub(crate) fn read_block<S: SourceTree + ?Sized>(
     src: &mut S,
     path: &str,
@@ -488,7 +455,6 @@ pub(crate) fn read_block<S: SourceTree + ?Sized>(
     Ok(data)
 }
 
-/// Every packed block of `files` through `threads` workers into `sink`, in order.
 fn compress<S: SourceTree + ?Sized, V: Volumes>(
     src: &mut S,
     files: &[PackFile],
@@ -511,7 +477,6 @@ fn compress<S: SourceTree + ?Sized, V: Volumes>(
             .collect();
         drop(queue);
         let fed = feed(src, files, &work, limit, sink, progress, cancel);
-        // Closes the queue: idle workers see it and exit.
         drop(work);
         // Every worker is joined, so none outlives the scope's borrows.
         let mut panicked = false;
@@ -528,7 +493,6 @@ fn compress<S: SourceTree + ?Sized, V: Volumes>(
     check_cancel(cancel)
 }
 
-/// The logical path of every record and the chunk count, or why the list cannot be packed.
 fn validate(files: &[PackFile]) -> Result<(Vec<String>, u64)> {
     let mut seen = HashSet::with_capacity(files.len());
     let mut logical = Vec::with_capacity(files.len());
@@ -559,26 +523,20 @@ fn validate(files: &[PackFile]) -> Result<(Vec<String>, u64)> {
     Ok((logical, chunk_count))
 }
 
-/// Everything a pack run decides besides the chunk bytes: the volume names and sizes, the
-/// build ID, and the manifest, CRC sidecar and runtime profile exactly as written. `pack`
-/// writes it; `measure` returns it, and [`crate::tree::PackedTree`] serves the packs from it.
-/// It holds no compressed data: the manifest's 12-byte chunk records and the sidecar's 4-byte
-/// CRCs are all it keeps per chunk.
+/// Everything a pack run decides but the chunk bytes (names, sizes, build ID, manifest, sidecar,
+/// profile); 16 B per chunk.
 #[derive(Debug, Clone)]
 pub struct Measured {
     pub build_id: [u8; 16],
-    /// Name and size of every volume, by pack id.
     pub volumes: Vec<(String, u64)>,
     pub manifest: Vec<u8>,
     pub crc: Vec<u8>,
     pub profile: Option<Vec<u8>>,
     pub report: PackReport,
-    /// The LZ4 level the chunks were compressed at; [`crate::tree::PackedTree`] uses it again.
     pub level: u8,
 }
 
 impl Measured {
-    /// Every file `pack` writes, with its exact size: volumes, manifest, sidecar, profile.
     pub fn outputs(&self) -> Vec<(String, u64)> {
         let mut out = self.volumes.clone();
         out.push((MANIFEST.into(), self.manifest.len() as u64));
@@ -589,7 +547,6 @@ impl Measured {
         out
     }
 
-    /// Bytes this keeps in memory (the metadata only).
     pub fn metadata_bytes(&self) -> usize {
         self.manifest.capacity()
             + self.crc.capacity()
@@ -601,7 +558,6 @@ impl Measured {
                 .sum::<usize>()
     }
 
-    /// The 64-byte AMPRDAT3 header of volume `id`, with the final build ID.
     pub fn volume_header(&self, id: usize) -> Result<[u8; DAT_HEADER]> {
         let size = self.volumes[id].1;
         let mut d = [0u8; DAT_HEADER];
@@ -619,8 +575,8 @@ impl Measured {
     }
 }
 
-/// The metadata for what the sink placed: records exactly as on disk, the build ID over them
-/// (ruling 8), then the manifest (checked as the runtime checks it), sidecar and profile.
+/// The metadata for what the sink placed, the build ID over the records, the manifest checked as
+/// the runtime does.
 fn metadata<V: Volumes>(
     files: &[PackFile],
     logical: &[String],
@@ -639,7 +595,6 @@ fn metadata<V: Volumes>(
         level,
         ..
     } = sink;
-    // The string table holds the paths, then the volume names.
     let mut strings = Vec::new();
     let mut add_string = |s: &str| -> Result<(u32, u32)> {
         let at = u32::try_from(strings.len()).map_err(|_| bad("the string table is too large"))?;
@@ -682,7 +637,6 @@ fn metadata<V: Volumes>(
         put_u32(r, 24, PACK_IO_PAGE_LAYOUT)?;
         put_u32(r, 28, PAGE as u32)?;
     }
-    // Ruling 8.
     let mut h = blake3::Hasher::new();
     for part in [
         BUILD_ID_DOMAIN,
@@ -769,10 +723,8 @@ fn metadata<V: Volumes>(
     Ok((vols, measured))
 }
 
-/// Packs `files` (final path index order) from `src` into `out`: volumes, then their headers
-/// rewritten with the build ID, then `ampr_assets.index`, `.crc` and, with `runtime`, `.runtime`.
-/// `mtime` (integer seconds) goes in every record. `threads` workers compress (0 counts as 1)
-/// at LZ4 `level` ([`crate::block::valid_level`]). `progress` gets the raw bytes packed so far.
+/// Packs `files` (final path index order) into `out`: volumes, headers with the build ID,
+/// `ampr_assets.index`, `.crc`, `.runtime`.
 #[allow(clippy::too_many_arguments)]
 pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
     src: &mut S,
@@ -833,9 +785,8 @@ fn pack_with_cap<S: SourceTree + ?Sized, O: PackOutput>(
     Ok(m.report)
 }
 
-/// `pack`'s first half without writing: the same reads, compression, RAW/LZ4 decisions,
-/// placement and rollover, keeping only the metadata ([`Measured`]). With the same `src`
-/// bytes and arguments, [`crate::tree::PackedTree`] then serves exactly what `pack` writes.
+/// `pack` without writing: same reads, compression and placement, keeping only [`Measured`], which
+/// `PackedTree` serves.
 #[allow(clippy::too_many_arguments)]
 pub fn measure<S: SourceTree + ?Sized>(
     src: &mut S,
@@ -872,7 +823,6 @@ pub(crate) fn measure_with_cap<S: SourceTree + ?Sized>(
     Ok(metadata(files, &logical, chunk_count, sink, mtime, runtime)?.1)
 }
 
-/// AMPRCFG1 for `p`; the values were checked by the rules.
 fn profile_bytes(p: &RuntimeProfile, build_id: &[u8; 16]) -> Result<Vec<u8>> {
     let mut b = vec![0u8; CFG_SIZE];
     put_bytes(&mut b, 0, CFG_MAGIC)?;
@@ -902,7 +852,6 @@ pub(crate) mod testkit {
         files: Vec<SourceFile>,
         data: BTreeMap<String, Vec<u8>>,
         pub(crate) dirs: Vec<String>,
-        /// Every `read_range`: path, offset, length asked.
         pub(crate) reads: Vec<(String, u64, usize)>,
     }
 
@@ -955,7 +904,6 @@ pub(crate) mod testkit {
     #[derive(Default)]
     pub(crate) struct MemOut {
         pub(crate) files: BTreeMap<String, Vec<u8>>,
-        /// Every call, in order: `create x`, `reopen x`, `finish x`.
         pub(crate) log: Vec<String>,
     }
 
@@ -991,7 +939,6 @@ pub(crate) mod testkit {
         })
     }
 
-    /// Deterministic incompressible bytes.
     pub(crate) fn noise(len: usize, seed: u64) -> Vec<u8> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..len)
@@ -1004,14 +951,12 @@ pub(crate) mod testkit {
             .collect()
     }
 
-    /// Compressible bytes: short text runs.
     pub(crate) fn text(len: usize, seed: u64) -> Vec<u8> {
         (0..len)
             .map(|i| b"forge packs assets "[(i + seed as usize) % 19])
             .collect()
     }
 
-    /// The source tree, the pack list and the packed output for `entries`.
     pub(crate) fn pack_mem(
         entries: &[(&str, Vec<u8>, Option<PackSpec>)],
         runtime: Option<&RuntimeProfile>,
@@ -1044,7 +989,6 @@ pub(crate) mod testkit {
         Ok((src, files, out, report))
     }
 
-    /// The tree a packed folder would be: loose records' files plus everything `pack` wrote.
     pub(crate) fn deployed(entries: &[(&str, Vec<u8>, Option<PackSpec>)], out: &MemOut) -> Mem {
         let loose = entries.iter().filter(|e| e.2.is_none());
         Mem::new(
@@ -1065,7 +1009,6 @@ mod tests {
         unpack(Box::new(deployed(entries, out))).unwrap()
     }
 
-    /// Every file reads back whole and in ranges that cross block edges.
     fn assert_round_trip(entries: &[(&str, Vec<u8>, Option<PackSpec>)], out: &MemOut) {
         let mut u = open(entries, out);
         let mut want: Vec<(String, u64)> = entries
@@ -1154,8 +1097,7 @@ mod tests {
         }
     }
 
-    /// The writer's output is pinned: these hashes were taken from the one-pass writer before
-    /// `measure` and the regenerating tree shared its code, so folder packs stay byte-identical.
+    /// Pinned output: hashes from the one-pass writer, so folder packs stay byte-identical.
     #[test]
     fn output_is_byte_identical_to_the_pinned_writer() {
         let p = golden_profile();
@@ -1212,7 +1154,6 @@ mod tests {
             &cancel,
         );
         assert!(matches!(r, Err(Error::Cancelled)));
-        // The source is shorter than listed.
         let files = [PackFile {
             path: "a".into(),
             size: 11,

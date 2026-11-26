@@ -1,6 +1,6 @@
 [package]
 name = "ps5-dump-forge-updater"
-description = "A Dump Forge release's PS5 ELF downloaded over HTTPS and streamed to the PS5's ELF loader"
+description = "A Dump Forge release's PS5 ELF downloaded over HTTPS and streamed to the PS5's ELF loader; GETs from Sony's game-update servers"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -9,6 +9,11 @@ rust-version.workspace = true
 [dependencies]
 # HTTPS with rustls (ring, webpki-roots); redirects followed (GitHub's release downloads 302).
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Sony's update servers chain to an RSA/SHA-1 root (`psn.rs`): the same versions ureq links.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The CLI's `update`: GitHub's `releases/latest` JSON.
+serde_json.workspace = true
 
 # `O_NOFOLLOW` on the spill's lock and temporary file, as the server's self copy opens them.
 [target.'cfg(unix)'.dependencies]

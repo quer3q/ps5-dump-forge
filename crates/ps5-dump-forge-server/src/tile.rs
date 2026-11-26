@@ -1,6 +1,5 @@
-//! The PS5 home-screen tile: `/user/app/PDFG00001/sce_sys/{param.json,icon0.png}`, a shortcut
-//! whose `deeplinkUri` opens the web UI in the console's browser. Adapted from ps5-ai-cli's
-//! launcher (`launcher/install.c`, GPL-3.0-or-later); `ps5/launcher.c` registers the title.
+//! The PS5 home-screen tile `/user/app/PDFG00001`, a `deeplinkUri` to the web UI. Adapted from
+//! ps5-ai-cli's `launcher/install.c` (GPL-3.0-or-later); `ps5/launcher.c` registers the title.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -11,36 +10,25 @@ use serde_json::json;
 
 pub(crate) const TITLE_ID: &str = "PDFG00001";
 use crate::notice::ICON;
-/// Marks `/user/app/PDFG00001` as ours: the title folder this payload created, by its
-/// `(st_dev, st_ino)`, and a `registered 0` line once registration succeeded. Only in that
-/// folder are files that differ rewritten (another port, a new icon); any other folder by that
-/// name (deleted and made again by another app) is another title's, never written to. It lives
-/// outside the title folder (as ps5-ai-cli keeps its record), so the system's app registration
-/// never meets a file it doesn't expect there.
+/// The title folder this payload created, by `(st_dev, st_ino)`, plus `registered 0` once that
+/// succeeded; only that folder is ever written to. Outside it, so app registration never meets it.
 /// ponytail: a run cut off between creating the folder and writing this file leaves an empty
 /// PDFG00001 that is then never ours (delete it by hand); and a filesystem that hands a deleted
 /// folder's inode number to another app's new PDFG00001 makes that one look ours.
 #[cfg(target_env = "ps5")]
 pub(crate) const OWNER_FILE: &str = "/data/dumpforge/tile-PDFG00001.owner";
-/// Where earlier versions kept it. `ps5/entry.c` renames that folder to `/data/dumpforge`; when
-/// that failed (or both folders existed) the record is still there, and is taken over while
-/// `OWNER_FILE` is missing, only from a real folder (not the compatibility link to the new one).
+/// Taken over while `OWNER_FILE` is missing, only from a real folder (not entry.c's link).
 #[cfg(target_env = "ps5")]
 const OLD_OWNER_FILE: &str = "/data/ps5-dump-forge/tile-PDFG00001.owner";
 const OWNER_HEADER: &str = "Dump Forge home-screen tile";
-/// The header earlier versions wrote: still ours. Their tile's `titleName` differs, so the first
-/// start rewrites it, the owner file with the new header included.
+/// Earlier versions': still ours.
 const OLD_OWNER_HEADER: &str = "PS5 Dump Forge home-screen tile";
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Outcome {
-    /// Every file is ours, byte for byte, and registered: nothing written or registered.
     Ready,
-    /// Written (all of it when the title folder was missing) or not yet registered, then
-    /// registered: the registration's result (0 is success; anything else is retried on the
-    /// next start).
+    /// The registration's result (not 0: retried on the next start).
     Registered(i32),
-    /// Left alone and not registered: why.
     Left(String),
 }
 
@@ -57,10 +45,8 @@ fn param_json(port: u16) -> Vec<u8> {
     (serde_json::to_string_pretty(&param).unwrap() + "\n").into_bytes()
 }
 
-/// Makes `<apps>/PDFG00001` hold our tile for `port`, then calls `register` (it returns the
-/// registration's result) if anything was written or no registration has succeeded yet.
-/// Symlinks are never followed, and nothing is written into a title folder this payload didn't
-/// create (`owner` records which one that is).
+/// Calls `register` if anything was written or no registration has succeeded yet. Symlinks are
+/// never followed; nothing is written into a title folder this payload didn't create.
 // ponytail: checks, then writes by path: another program on the console swapping a symlink in
 // between the metadata check and the rename could redirect a write. Out of scope by the user's
 // no-protections decision; the upgrade is openat/renameat on held O_DIRECTORY|O_NOFOLLOW
@@ -95,12 +81,12 @@ pub(crate) fn ensure(
         Ok(meta) => {
             let ours = owner_text(&meta, false);
             let mut text = read_owner(owner).unwrap_or_default();
-            if !fs::exists(owner)? && real_dir(old_owner.parent()) {
-                // An earlier version's record, if it names this folder: moved to `owner`.
-                if let Some(old) = read_owner(old_owner).filter(|t| t.starts_with(&ours)) {
-                    record(owner, &meta, old == owner_text(&meta, true))?;
-                    text = old;
-                }
+            if !fs::exists(owner)?
+                && real_dir(old_owner.parent())
+                && let Some(old) = read_owner(old_owner).filter(|t| t.starts_with(&ours))
+            {
+                record(owner, &meta, old == owner_text(&meta, true))?;
+                text = old;
             }
             (text.starts_with(&ours), text == owner_text(&meta, true))
         }
@@ -156,7 +142,7 @@ pub(crate) fn ensure(
     Ok(Outcome::Registered(code))
 }
 
-/// An owner file's text, an earlier version's header read as ours; `None` unless a regular file.
+/// `None` unless a regular file.
 fn read_owner(path: &Path) -> Option<String> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_file() => {
@@ -170,12 +156,10 @@ fn read_owner(path: &Path) -> Option<String> {
     }
 }
 
-/// A folder itself, not a link to one.
 fn real_dir(path: Option<&Path>) -> bool {
     path.is_some_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
 }
 
-/// The owner file's text for the title folder `folder`.
 fn owner_text(folder: &fs::Metadata, registered: bool) -> String {
     let done = if registered { "registered 0\n" } else { "" };
     format!(
@@ -199,7 +183,6 @@ enum State {
     Same,
     Missing,
     Differs,
-    /// A symlink, a folder, ...
     NotFile,
 }
 
@@ -215,11 +198,9 @@ fn state(path: &Path, want: &[u8]) -> io::Result<State> {
     })
 }
 
-/// `dir/name` replaced by `bytes`: a temporary file (`O_EXCL`, so never through a symlink),
-/// synced, renamed over it.
+/// Through an `O_EXCL` temporary file (never through a symlink), synced, renamed over it.
 fn write(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.forge-tmp"));
-    // Our own leftover from a run cut short (a symlink there is removed, not followed).
     let _ = fs::remove_file(&tmp);
     let result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -233,8 +214,7 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// On `serve` start: the tile, in the background, logged to stdout (the serve log). Never
-/// blocks or fails the server.
+/// In the background: never blocks or fails the server.
 #[cfg(target_env = "ps5")]
 pub(crate) fn install(port: u16) {
     unsafe extern "C" {
@@ -242,8 +222,7 @@ pub(crate) fn install(port: u16) {
     }
     let register = || {
         let id = std::ffi::CString::new(TITLE_ID).unwrap();
-        // SAFETY: a NUL-terminated string that outlives the call. ps5/launcher.c logs the
-        // method it used.
+        // SAFETY: a NUL-terminated string that outlives the call.
         unsafe { ps5_register_title(id.as_ptr()) }
     };
     let _ = std::thread::Builder::new()
@@ -297,7 +276,6 @@ mod tests {
                 .ends_with("registered 0\n")
         };
 
-        // Fresh install: every file, then registered, and that recorded.
         assert_eq!(run(8095), Outcome::Registered(0));
         assert_eq!(fs::read(sys.join("param.json")).unwrap(), param_json(8095));
         assert_eq!(fs::read(sys.join("icon0.png")).unwrap(), ICON);
@@ -316,8 +294,7 @@ mod tests {
         let names: Vec<_> = fs::read_dir(&sys).unwrap().flatten().collect();
         assert_eq!(names.len(), 2, "no temporary files left");
 
-        // A failed registration leaves the files in place and is retried on every start
-        // until it succeeds, though the files match.
+        // A failed registration is retried on every start, though the files match.
         code.set(-1);
         assert_eq!(run(8095), Outcome::Registered(-1));
         assert!(!registered());
@@ -342,10 +319,7 @@ mod tests {
         assert_eq!(run(8095), Outcome::Registered(0));
         assert_eq!(calls.get(), 6);
 
-        // Another app's PDFG00001, made after ours was deleted: the owner file names our
-        // folder, not this one, so a differing file is left as it is, nothing is added, and
-        // nothing registered.
-        // (Made while ours still exists, so it can't get our inode number back.)
+        // Another app's PDFG00001 (made while ours exists, so not our inode number): left alone.
         let other = apps.join("other");
         fs::create_dir_all(other.join("sce_sys")).unwrap();
         fs::remove_dir_all(&title).unwrap();

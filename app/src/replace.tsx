@@ -1,6 +1,4 @@
-// The one "N items already exist there: replace them?" question, shared by File Transfer, the
-// phone upload, Edit's Extract and the File explorer's Rename and Move to. It only asks; the
-// caller sends `replace` (core refuses a file onto a folder and the like itself).
+// The one "N items already exist there: replace them?" question; the caller sends `replace`.
 
 import { api, type ConvertRequest } from "./api";
 import { basename, Modal, openOverlay } from "./common";
@@ -8,13 +6,9 @@ import { useMessages } from "./i18n";
 import { Icon } from "./icons";
 import { readable } from "./peers";
 
-/** Names listed in full; the rest are counted. */
 const SHOWN = 10;
 
-/** An extract or a transfer (File Transfer's Start, Edit's Extract, a failed job's Retry) asks
- * once about names already in its output: the request to start, `replace` set only after
- * Replace (a retry asks again, whatever the first run had), or null on Cancel or once `still()`
- * says the moment passed. */
+/** An extract or transfer asks once about names in its output: `replace` set after Replace; null on Cancel or once `still()` fails. */
 export async function askReplace(request: ConvertRequest, still: () => boolean = () => true): Promise<ConvertRequest | null> {
   const plain: ConvertRequest = { ...request, replace: undefined };
   const there = await api.existingTargets(plain);
@@ -24,8 +18,7 @@ export async function askReplace(request: ConvertRequest, still: () => boolean =
   return { ...plain, replace: true };
 }
 
-/** Asks before replacing `names` (as they are in `folder`) for good; true: Replace. Cancel is
- * first and focused; Escape and a click outside cancel. */
+/** Asks before replacing `names` in `folder`; Cancel first and focused, Escape and a click outside cancel. */
 export function confirmReplace(names: string[], folder: string): Promise<boolean> {
   return new Promise((resolve) => {
     let yes = false;

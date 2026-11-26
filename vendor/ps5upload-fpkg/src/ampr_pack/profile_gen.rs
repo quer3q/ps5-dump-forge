@@ -1,3 +1,5 @@
+// Ported from drakmor's ampr_emu tools (https://github.com/drakmor/ampr_emu, GPL-3.0). This
+// Rust port is part of ps5upload, GPL-3.0-or-later.
 //! A profile measured from how a game reads its files: the port of drakmor's
 //! `tools/ampr_pack_profile.py` (ampr_emu, GPL-3.0) that turns `AMPRCMD1` command journals
 //! (what the debug build of ampr_emu writes to `/app0/ampr_commands.bin` while a game runs)

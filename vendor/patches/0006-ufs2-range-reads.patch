@@ -1,8 +1,8 @@
 diff --git a/ps5upload-pkg/src/ufs2.rs b/ps5upload-pkg/src/ufs2.rs
-index 3dd3162..ab3966d 100644
+index 292abcb6793f70c8383ca20d41a83ef4751d0cf9..3a386473222fa34d468f98908467051dcd962125 100644
 --- a/ps5upload-pkg/src/ufs2.rs
 +++ b/ps5upload-pkg/src/ufs2.rs
-@@ -330,8 +330,14 @@ pub struct DirEntry {
+@@ -334,13 +334,23 @@ pub struct DirEntry {
  pub struct Ufs2Image<R: Read + Seek> {
      reader: R,
      pub superblock: Superblock,
@@ -14,10 +14,20 @@ index 3dd3162..ab3966d 100644
  
 +type PtrCache = [(u64, Vec<u8>); NIADDR];
 +
- impl Ufs2Image<File> {
-     /// Open a `.ffpkg` (or any UFS2 image) by path. Cheap — only
-     /// reads the superblock.
-@@ -347,6 +353,7 @@ impl<R: Read + Seek> Ufs2Image<R> {
+ #[cfg(test)]
+ impl<R: Read + Seek> Ufs2Image<R> {
+     /// An image over `reader` with `superblock` as it is, for fixtures that are not whole images.
+     pub(crate) fn from_parts(reader: R, superblock: Superblock) -> Self {
+-        Self { reader, superblock }
++        Self {
++            reader,
++            superblock,
++            ptr_cache: PtrCache::default(),
++        }
+     }
+ }
+ 
+@@ -359,6 +369,7 @@ impl<R: Read + Seek> Ufs2Image<R> {
          Ok(Self {
              reader,
              superblock: sb,
@@ -25,7 +35,7 @@ index 3dd3162..ab3966d 100644
          })
      }
  }
-@@ -614,6 +621,11 @@ impl<R: Read + Seek> Ufs2Image<R> {
+@@ -609,6 +620,11 @@ impl<R: Read + Seek> Ufs2Image<R> {
      /// Reads past the file's end stop at the end, as a short read rather
      /// than an error. Holes read as zeros, exactly as `read_file`
      /// returns them.
@@ -37,7 +47,7 @@ index 3dd3162..ab3966d 100644
      pub fn read_range(
          &mut self,
          inode: &Inode,
-@@ -629,29 +641,47 @@ impl<R: Read + Seek> Ufs2Image<R> {
+@@ -624,29 +640,47 @@ impl<R: Read + Seek> Ufs2Image<R> {
                  cap: usize::MAX as u64,
              })?;
          let bsize = self.superblock.block_size as u64;
@@ -104,7 +114,7 @@ index 3dd3162..ab3966d 100644
          }
          Ok(out)
      }
-@@ -684,12 +714,8 @@ impl<R: Read + Seek> Ufs2Image<R> {
+@@ -679,12 +713,8 @@ impl<R: Read + Seek> Ufs2Image<R> {
                          total_blocks: self.superblock.size_fragments,
                      });
                  }
@@ -119,7 +129,7 @@ index 3dd3162..ab3966d 100644
              }
              return Ok(block);
          }
-@@ -699,6 +725,50 @@ impl<R: Read + Seek> Ufs2Image<R> {
+@@ -694,6 +724,50 @@ impl<R: Read + Seek> Ufs2Image<R> {
          Ok(0)
      }
  
@@ -170,7 +180,7 @@ index 3dd3162..ab3966d 100644
      // 8 args: this is a tight recursive block-walker — `inode_num` is
      // carried purely so a corrupt pointer can be reported as
      // BlockOutOfRange, and the rest (depth, remaining, out, visited)
-@@ -996,6 +1066,7 @@ mod tests {
+@@ -1004,6 +1078,7 @@ mod tests {
              Ufs2Image {
                  reader: Cursor::new(image),
                  superblock: sb,
@@ -178,7 +188,7 @@ index 3dd3162..ab3966d 100644
              },
              inode,
              file,
-@@ -1124,6 +1195,7 @@ mod tests {
+@@ -1167,6 +1242,7 @@ mod tests {
              Ufs2Image {
                  reader: Cursor::new(image),
                  superblock: sb,
@@ -186,7 +196,7 @@ index 3dd3162..ab3966d 100644
              },
              dir,
          )
-@@ -1208,4 +1280,433 @@ mod tests {
+@@ -1251,4 +1327,433 @@ mod tests {
              Err(Ufs2Error::InodeOutOfRange { .. })
          ));
      }

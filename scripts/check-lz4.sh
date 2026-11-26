@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Dev-only cross-check of the LZ4 asset packs against upstream's own Python tools (ampr_emu
-# 0.4.2.1, tools/ampr_pack.py, extracted from the committed vendor/ampr_emu source archive into a
-# temp dir). Forge's writer and reader can share a bug; the upstream parser is an unrelated one.
+# 0.4.2.1, tools/ampr_pack.py, extracted into a temp dir from its source archive, which Forge no
+# longer vendors: AMPR_EMU_SRC=<the tag's archive,
+# https://github.com/drakmor/ampr_emu/archive/refs/tags/0.4.2.1.tar.gz>). Forge's writer and
+# reader can share a bug; the upstream parser is an unrelated one.
 #
 #   scripts/check-lz4.sh <forge_lz4_output_dir> <original_source_dir>
 #       Forge -> upstream: ampr_pack.py inspect, verify, and verify --root <original> on the
@@ -22,7 +24,11 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-archive=$repo/vendor/ampr_emu/ampr_emu-0.4.2.1-src.tar.gz
+archive=${AMPR_EMU_SRC:-}
+[ -f "$archive" ] || [ "${1:-}" = --make-fixture ] || {
+  echo "check-lz4.sh: set AMPR_EMU_SRC to ampr_emu's 0.4.2.1 source archive (not vendored)" >&2
+  exit 2
+}
 tools_dir=ampr_emu-0.4.2.1/tools
 
 make_fixture() {

@@ -1,10 +1,6 @@
-//! Connect's smart Pair by address: what answers at `host` or `host:port`, each confirmed by its
-//! own protocol, never by an open port alone. No port: a Forge (discovery by unicast on UDP 8094,
-//! else a FLINK Hello on 9883), then SMB 445, NFS 2049, FTP 21. A port: an FTP banner, an NFS
-//! NULL call, an SMB2 NEGOTIATE, then a FLINK Hello. Every check runs at once, each within
-//! `WAIT` to connect and `WAIT` for the exchange (then its socket is shut down, so a server that
-//! drips bytes can't hold it), so a probe ends within about 3 s, 4 s for a Forge on a local
-//! address (discovery's 1 s first), plus the name lookup's `WAIT`.
+//! Add a device: what answers at an address, each confirmed by its own protocol, never by an
+//! open port alone. Every check runs at once, each within `WAIT` to connect and `WAIT` for the
+//! exchange (then its socket is shut down, so a server dripping bytes can't hold it).
 // ponytail: one pick when several answer (the order above); the others aren't reported. A name
 // is probed at one address (IPv4 preferred): a device reachable only at another isn't found.
 
@@ -37,7 +33,7 @@ pub struct Probe {
     pub name: Option<String>,
 }
 
-/// The default ports (tests point them at loopback fakes).
+/// Tests point them at loopback fakes.
 pub(crate) struct Ports {
     pub discovery: u16,
     pub flink: u16,
@@ -54,8 +50,7 @@ const PORTS: Ports = Ports {
     ftp: crate::nas::FTP_PORT,
 };
 
-/// What answers at `address` (`host`, `host:port`, `[v6]:port`), or "nothing to connect to at
-/// <address>". A Forge must be on a local network (pairing's rule and text); a NAS needn't.
+/// What answers at `address`; a Forge must be on a local network, a NAS needn't.
 pub fn probe(address: &str, me: &Me) -> io::Result<Probe> {
     probe_on(address, me, &PORTS)
 }
@@ -118,8 +113,7 @@ pub(crate) fn probe_on(address: &str, me: &Me, ports: &Ports) -> io::Result<Prob
             kind: Kind::Forge,
             port: f.0,
             name: Some(f.1),
-            // The address checked, so pairing can't resolve the name to another one; a typed
-            // IP (with its scope) as it is.
+            // The address checked, so pairing can't resolve the name to another one.
             host: if host.contains(':') || host.parse::<IpAddr>().is_ok() {
                 host.clone()
             } else {
@@ -134,7 +128,6 @@ pub(crate) fn probe_on(address: &str, me: &Me, ports: &Ports) -> io::Result<Prob
 }
 
 impl Kind {
-    /// The spelling of `nas::Protocol` (and of `mdns::Nas::service`).
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Forge => "forge",
@@ -145,8 +138,7 @@ impl Kind {
     }
 }
 
-/// Discover's check of a host it found: which of SMB, NFS and FTP answer on their default ports
-/// (all at once, within about `2 * WAIT`), leaving out `skip` (what mDNS announced there).
+/// Which of SMB, NFS and FTP answer on their default ports, leaving out `skip` (mDNS's).
 pub fn serves(ip: IpAddr, skip: &[Kind]) -> Vec<(Kind, u16)> {
     serves_on(ip, skip, &PORTS)
 }
@@ -192,10 +184,8 @@ fn resolve(host: &str) -> Option<SocketAddr> {
     rx.recv_timeout(WAIT).ok().flatten()
 }
 
-/// Connects to `addr` within `WAIT` and runs `exchange` on the connection on a thread of its
-/// own, given up on and shut down `WAIT` later if it is still running: per-read timeouts alone
-/// let a slow server drip bytes, and on Windows a shutdown doesn't end a read that bytes keep
-/// coming to.
+/// Connects within `WAIT` and runs `exchange` on a thread of its own, shut down `WAIT` later if
+/// still running: per-read timeouts alone let a slow server drip bytes.
 // ponytail: there a given-up exchange lives on until its own read limits end it.
 fn bounded<T: Send + 'static>(
     addr: SocketAddr,
@@ -213,7 +203,6 @@ fn bounded<T: Send + 'static>(
     })
 }
 
-/// Whether `kind`'s server answers at `addr`.
 fn confirm(kind: Kind, addr: SocketAddr) -> bool {
     match kind {
         Kind::Smb => bounded(addr, |tcp| ps5_dump_forge_smb::probe(tcp, WAIT)).is_ok(),
@@ -233,9 +222,8 @@ fn ftp_banner(addr: SocketAddr) -> io::Result<String> {
     })
 }
 
-/// A Forge at `base` as (FLINK port, name): a FLINK Hello on the port its discovery reply names
-/// (which must be `port` when one is given), else on `port` or 9883. Off the local network no
-/// Hello is sent (it names this device): the discovery reply alone, for the not-local error.
+/// A Forge as (FLINK port, name): a Hello on the port its discovery reply names, else on `port`
+/// or 9883. Off the local network no Hello is sent (it names this device).
 fn forge(base: SocketAddr, port: u16, me: &Me, ports: &Ports) -> Option<(u16, String)> {
     let ip = base.ip();
     let asked = match ip {

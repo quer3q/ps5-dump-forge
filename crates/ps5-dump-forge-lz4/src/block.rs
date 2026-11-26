@@ -2,11 +2,7 @@
 
 use std::os::raw::{c_char, c_int};
 
-/// Fast: `LZ4_compress_default` (acceleration 1).
 pub const LEVEL_FAST: u8 = 0;
-/// Medium: LZ4 HC level 9.
-pub const LEVEL_MEDIUM: u8 = 9;
-/// Max: LZ4 HC level 12.
 pub const LEVEL_MAX: u8 = 12;
 
 /// 0 (fast) or an HC level, 3..=12.
@@ -14,8 +10,8 @@ pub fn valid_level(level: u8) -> bool {
     level == LEVEL_FAST || (3..=LEVEL_MAX).contains(&level)
 }
 
-/// `raw` as one LZ4 block at `level` (see [`valid_level`]); `None` when the C library fails
-/// (an input over `LZ4_MAX_INPUT_SIZE`, which a block never is).
+/// `raw` as one LZ4 block at `level`; `None` when the C library fails (input over
+/// `LZ4_MAX_INPUT_SIZE`).
 pub fn compress(raw: &[u8], level: u8) -> Option<Vec<u8>> {
     let n = c_int::try_from(raw.len()).ok()?;
     // SAFETY: a pure function of its argument.
@@ -42,8 +38,7 @@ pub fn compress(raw: &[u8], level: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decodes the block `src` into `out`; the decoded length, or `None` when `src` is not a valid
-/// block or decodes to more than `out` holds.
+/// Decodes `src` into `out`: the decoded length, or `None` when invalid or too big for `out`.
 pub fn decompress_into(src: &[u8], out: &mut [u8]) -> Option<usize> {
     let n = c_int::try_from(src.len()).ok()?;
     let cap = c_int::try_from(out.len()).ok()?;
@@ -72,7 +67,7 @@ mod tests {
             })
             .collect();
         let mut sizes = Vec::new();
-        for level in [LEVEL_FAST, 3, LEVEL_MEDIUM, LEVEL_MAX] {
+        for level in [LEVEL_FAST, 3, 9, LEVEL_MAX] {
             assert!(valid_level(level));
             let c = compress(&raw, level).unwrap();
             let mut out = vec![0; raw.len()];

@@ -1,6 +1,4 @@
-// Reading a source, and the one password question for an archive that needs one (built like
-// the delete question). Edit, Convert and Pack read their source through `inspectSource`; the
-// password it returns stays with that source in memory (never stored) and goes with its jobs.
+// Reading a source, and the one archive password question; the password stays in memory with that source.
 
 import { useRef, useState } from "react";
 
@@ -11,13 +9,12 @@ import {
   errorText,
   type Inspection,
 } from "./api";
-import { Modal, openOverlay } from "./common";
-import { useMessages } from "./i18n";
+import { Dots, Modal, openOverlay } from "./common";
+import { gameTitle, msg, useMessages } from "./i18n";
 import { Icon } from "./icons";
 
 export interface Opened {
   ins: Inspection;
-  /** The password that opened it; null when none was needed. */
   password: string | null;
 }
 
@@ -26,23 +23,25 @@ const isPasswordError = (e: unknown) => {
   return text.includes(ARCHIVE_PASSWORD_REQUIRED) || text.includes(ARCHIVE_PASSWORD_WRONG);
 };
 
-/**
- * Inspects `path` (with `password`, one accepted before, on a re-read). An archive that needs a
- * password asks for it and is inspected again with each try until one opens it, unless
- * `current()` says the screen has moved on to another source by then. Rejects with inspect's
- * error; Cancel rejects with core's "needs a password" (`isPasswordRequired`).
- */
+/** Inspects `path`, asking for a password until one opens it (unless `current()` moved on); Cancel rejects with "needs a password". */
 export async function inspectSource(
   path: string,
   password: string | null = null,
   current: () => boolean = () => true,
 ): Promise<Opened> {
+  let opened: Opened;
   try {
-    return { ins: await api.inspect(path, password ?? undefined), password };
+    opened = { ins: await api.inspect(path, password ?? undefined), password };
   } catch (e) {
     if (!isPasswordError(e) || !current()) throw e;
-    return askPassword(path);
+    opened = await askPassword(path);
   }
+  // No title and no title ID: not a game. The screens show it as an error, its findings saying why.
+  const { ins } = opened;
+  if (!ins.title_id && !gameTitle(ins.title_names, ins.title_name)) {
+    throw new Error(ins.findings.length > 0 ? ins.findings.join("\n") : msg().common.unknownTitle);
+  }
+  return opened;
 }
 
 /** The password dialog: resolves once a password opens the archive. */
@@ -86,8 +85,7 @@ function PasswordDialog(props: {
   const unlock = async () => {
     if (!value || checking) return;
     const password = value;
-    // The prompt again while checking, so a second "not correct" is announced anew; focus to
-    // the input, since the disabled Unlock would drop it to the page (Escape, Tab trap lost).
+    // The prompt again while checking (a second "not correct" announced anew); focus to the input, as Unlock is disabled.
     setWrong(false);
     input.current?.focus();
     setChecking(true);
@@ -137,8 +135,22 @@ function PasswordDialog(props: {
           <button type="button" onClick={props.close}>
             {t.cancel}
           </button>
-          <button type="submit" className="primary" disabled={!value || checking}>
-            {checking ? t.checking : t.unlock}
+          {/* Busy, not disabled, while checking: it keeps focus and full opacity; submit ignores it. */}
+          <button
+            type="submit"
+            className="primary"
+            disabled={!value}
+            aria-disabled={checking || undefined}
+            aria-busy={checking || undefined}
+          >
+            {checking ? (
+              <>
+                {t.checking}
+                <Dots />
+              </>
+            ) : (
+              t.unlock
+            )}
           </button>
         </div>
       </form>

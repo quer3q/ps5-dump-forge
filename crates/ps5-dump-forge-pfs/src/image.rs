@@ -1,11 +1,8 @@
-//! The tree as PFS inodes, and the metadata that describes it: header, inode table, super-root,
-//! flat path table, collision resolver and directories. Shared by the `.ffpfs` writer and the
-//! `.ffpfsc` container, which is the same encoder over a one-file tree.
+//! The tree as PFS inodes and its metadata, shared by `.ffpfs` and `.ffpfsc` (a one-file tree).
 //!
-//! Inode order, which is also data order: super-root, `flat_path_table`, the
-//! `collision_resolver` when two paths share a hash, `uroot`, the other directories by
-//! lower-cased path, then the files by lower-cased path. Every node is one contiguous run of
-//! blocks from `db[0]`; an empty file or directory still takes one block.
+//! Inode order = data order: super-root, `flat_path_table`, `collision_resolver` (when two paths
+//! share a hash), `uroot`, directories, then files by lower-cased path. Every node is one
+//! contiguous run from `db[0]`; an empty one still takes a block.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -24,13 +21,11 @@ pub(crate) const MODE_CASE_INSENSITIVE: u16 = 0x8;
 pub(crate) const MODE_SIGNED: u16 = 0x1;
 pub(crate) const MODE_64BIT_INODES: u16 = 0x2;
 pub(crate) const MODE_ENCRYPTED: u16 = 0x4;
-/// The unsigned D32 inode.
 pub(crate) const INODE_LEN: usize = 0xA8;
 /// 390 per 64 KiB block; the 16-byte tail of each table block stays zero.
 pub(crate) const INODES_PER_BLOCK: u64 = BLOCK / INODE_LEN as u64;
 pub(crate) const MODE_DIR: u16 = 0x4000;
 pub(crate) const MODE_FILE: u16 = 0x8000;
-/// Read and execute for owner, group and others.
 pub(crate) const MODE_RX: u16 = 0x001 | 0x004 | 0x008 | 0x020 | 0x040 | 0x100;
 pub(crate) const FLAG_COMPRESSED: u32 = 0x1;
 pub(crate) const FLAG_READONLY: u32 = 0x10;
@@ -46,7 +41,6 @@ pub(crate) const MAX_NAME: usize = 255;
 /// Larger directories are refused, here and by the reader.
 pub(crate) const MAX_DIR_BYTES: u64 = 64 << 20;
 
-/// A file or directory of the image.
 #[derive(Debug, Clone)]
 pub(crate) struct Node {
     pub name: String,
@@ -87,7 +81,6 @@ impl Node {
     }
 }
 
-/// The whole image, fixed before the first byte is written.
 #[derive(Debug, Clone)]
 pub(crate) struct Image {
     /// Node 0 is `uroot`.
@@ -102,7 +95,6 @@ pub(crate) struct Image {
     pub fpt_block: u64,
     pub fpt_blocks: u64,
     pub resolver_blocks: u64,
-    /// Image length in blocks (`ndblock`).
     pub ndblock: u64,
     pub time: i64,
 }
@@ -124,7 +116,6 @@ impl Image {
     }
 }
 
-/// Why `name` cannot be one path component of a PFS image.
 /// ponytail: ASCII only, as MkPFS (the FPT hash upper-cases ASCII, and it is the only layout
 /// known to boot); widen after a console test with UTF-8 names.
 pub(crate) fn name_problem(name: &str) -> Option<&'static str> {
@@ -150,7 +141,7 @@ pub(crate) fn name_problem(name: &str) -> Option<&'static str> {
     None
 }
 
-/// The tree's nodes, names checked: fails with every offending path listed.
+/// The tree's nodes; fails with every offending path listed.
 pub(crate) fn nodes(tree: &dyn SourceTree, cancel: &AtomicBool) -> Result<Vec<Node>> {
     let mut problems = Vec::new();
     let mut nodes = vec![Node::new("", "", true, 0, 0)];
@@ -178,7 +169,7 @@ pub(crate) fn nodes(tree: &dyn SourceTree, cancel: &AtomicBool) -> Result<Vec<No
     Ok(nodes)
 }
 
-/// Adds `path` (a file when `size` is set, else a directory) and its parent directories.
+/// Adds `path` (a file when `size` is set) and its parent directories.
 fn add_path(
     nodes: &mut Vec<Node>,
     index: &mut HashMap<String, usize>,
@@ -221,8 +212,7 @@ fn add_path(
     }
 }
 
-/// Orders a directory's entries as MkPFS lists them (subdirectories, then files, each by
-/// lower-cased name) and reports names that are one name to the case-insensitive image.
+/// Orders entries as MkPFS (subdirectories, then files, by lower-cased name); reports case clashes.
 fn sort_and_check_collisions(nodes: &mut [Node], dir: usize, problems: &mut Vec<String>) {
     let mut kids = std::mem::take(&mut nodes[dir].children);
     kids.sort_by_cached_key(|&k| (!nodes[k].dir, nodes[k].name.to_ascii_lowercase()));
@@ -242,7 +232,6 @@ fn sort_and_check_collisions(nodes: &mut [Node], dir: usize, problems: &mut Vec<
     nodes[dir].children = kids;
 }
 
-/// Fails with every problem listed, if there is any.
 fn refuse(mut problems: Vec<String>, what: &str) -> Result<()> {
     if problems.is_empty() {
         return Ok(());
@@ -271,7 +260,6 @@ pub(crate) fn fpt_hash(path: &str, case_insensitive: bool) -> u32 {
     })
 }
 
-/// One path of the flat path table: the `/`-rooted path, its hash, inode and kind.
 pub(crate) struct PathEntry {
     pub path: String,
     pub hash: u32,
@@ -279,11 +267,9 @@ pub(crate) struct PathEntry {
     pub dir: bool,
 }
 
-/// The flat path table and, when two paths share a hash, the collision resolver (MkPFS
-/// `make_fpt_and_collision_blob`). One `(hash, value)` per hash in hash order; the value is
-/// the inode (`FPT_DIR` on a directory) or, for a shared hash, the offset of its group in the
-/// resolver: the group's paths as directory entries by inode (directories before files, as
-/// MkPFS numbers them), then 0x18 zero bytes. Shared by the writer and the reader's check.
+/// The flat path table and collision resolver (MkPFS `make_fpt_and_collision_blob`): one
+/// `(hash, value)` per hash in order, the value the inode (`FPT_DIR` on a directory) or, for a
+/// shared hash, its group's offset in the resolver (dirents by inode, then 0x18 zero bytes).
 pub(crate) fn path_table(
     mut entries: Vec<PathEntry>,
     problems: &mut Vec<String>,
@@ -318,7 +304,6 @@ pub(crate) fn path_table(
     (fpt, resolver)
 }
 
-/// A directory entry's on-disk length.
 pub(crate) fn dirent_len(name_len: usize) -> u64 {
     (name_len as u64 + 17).next_multiple_of(8)
 }
@@ -335,9 +320,7 @@ pub(crate) fn dirent(ino: u32, kind: i32, name: &str) -> Vec<u8> {
     d
 }
 
-/// Numbers the inodes, sizes the directories, builds the path table and places every run.
-/// D32 limits (32-bit pointers and counts, 16-bit link counts) are checked here and listed
-/// like name problems.
+/// Numbers the inodes, builds the path table and places every run; D32 limits listed as findings.
 pub(crate) fn lay_out(mut nodes: Vec<Node>, time: i64, cancel: &AtomicBool) -> Result<Image> {
     check_cancel(cancel)?;
     let mut problems = Vec::new();
@@ -419,8 +402,7 @@ pub(crate) fn lay_out(mut nodes: Vec<Node>, time: i64, cancel: &AtomicBool) -> R
     let (fpt, resolver) = path_table(entries, &mut problems);
     check_cancel(cancel)?;
 
-    // Blocks: header, inode table, super-root, FPT, resolver (or one reserved block), then
-    // every node's run in inode order.
+    // Blocks: header, inode table, super-root, FPT, resolver (or one reserved), then each node.
     let runs = |bytes: u64| bytes.div_ceil(BLOCK).max(1);
     let inode_blocks = inodes.div_ceil(INODES_PER_BLOCK);
     let fpt_blocks = runs(fpt.len() as u64);
@@ -453,8 +435,7 @@ pub(crate) fn lay_out(mut nodes: Vec<Node>, time: i64, cancel: &AtomicBool) -> R
     })
 }
 
-/// The one-file tree a `.ffpfsc` container is: `uroot` holding `name`, `stored` bytes on disk
-/// for `raw` logical ones.
+/// A `.ffpfsc`'s one-file tree: `name`, `stored` bytes on disk for `raw` logical ones.
 pub(crate) fn single(name: &str, raw: u64, stored: u64, time: i64) -> Result<Image> {
     if let Some(why) = name_problem(name) {
         return Err(err(format!("{name:?} cannot name the image inside: {why}")));
@@ -489,8 +470,7 @@ pub(crate) fn inode(
     for i in 0..4 {
         d[24 + i * 8..32 + i * 8].copy_from_slice(&time.to_le_bytes());
     }
-    // 0x38..0x60: nanoseconds, uid, gid and two reserved words, all zero. Every value
-    // below was range-checked by `lay_out`.
+    // 0x38..0x60 stay zero; every value below was range-checked by `lay_out`.
     d[0x60..0x64].copy_from_slice(&(blocks as u32).to_le_bytes());
     d[0x64..0x68].copy_from_slice(&(db0 as i32).to_le_bytes());
     for i in 1..12 {
@@ -536,13 +516,11 @@ fn node_inode(img: &Image, node: &Node, root: bool) -> [u8; INODE_LEN] {
     }
 }
 
-/// Block 0: the header, with the inode table described by a small inode of its own at 0x50.
 fn header(img: &Image) -> Vec<u8> {
     header_block(img.inodes, img.ndblock, img.inode_blocks, img.time)
 }
 
-/// Block 0 for `inodes` in `inode_blocks` table blocks, `ndblock` blocks in all, stamped
-/// `time`: what the writer makes, so the editor can compare a header with it whole.
+/// Block 0 as the writer makes it, so the editor can compare a header with it whole.
 pub(crate) fn header_block(inodes: u64, ndblock: u64, inode_blocks: u64, time: i64) -> Vec<u8> {
     let mut h = vec![0u8; BLOCK as usize];
     h[0x00..0x08].copy_from_slice(&PFS_VERSION.to_le_bytes());
@@ -564,20 +542,17 @@ pub(crate) fn header_block(inodes: u64, ndblock: u64, inode_blocks: u64, time: i
         h[t + 0x18 + i * 8..t + 0x20 + i * 8].copy_from_slice(&time.to_le_bytes());
     }
     h[t + 0x60..t + 0x64].copy_from_slice(&(inode_blocks as u32).to_le_bytes());
-    // The S64 layout: 12 direct entries of a 32-byte signature and an 8-byte block; the
-    // table starts at block 1.
+    // The inode table's own S64 inode at 0x50: table at block 1.
     h[t + 0x68 + 32..t + 0x68 + 40].copy_from_slice(&1u64.to_le_bytes());
     h[0x368..0x36C].copy_from_slice(&1u32.to_le_bytes()); // unsigned
     h
 }
 
-/// Writes everything before the first file's data: header, inode table, super-root, path
-/// table, resolver, and every directory.
+/// Writes everything before the first file's data.
 pub(crate) fn write_meta<W: Write>(sink: &mut Sink<'_, W>, img: &Image) -> Result<()> {
     sink.expect(0)?;
     sink.write(&header(img))?;
 
-    // The inode table, 390 to a block.
     let special = img.special_inodes();
     let internal = FLAG_INTERNAL | FLAG_READONLY;
     let (file, dir) = (MODE_FILE | MODE_RX, MODE_DIR | MODE_RX);
@@ -664,8 +639,7 @@ pub(crate) fn write_meta<W: Write>(sink: &mut Sink<'_, W>, img: &Image) -> Resul
     Ok(())
 }
 
-/// The output with its position, so every region can assert it starts where the plan put it.
-/// It checks `cancel` every `CHUNK` bytes, so long runs stay cancellable.
+/// The output and its position (each region asserts its planned start); checks `cancel` per `CHUNK`.
 pub(crate) struct Sink<'a, W: Write> {
     pub w: BufWriter<W>,
     pub pos: u64,

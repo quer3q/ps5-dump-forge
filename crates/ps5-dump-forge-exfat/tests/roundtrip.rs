@@ -1,5 +1,4 @@
-//! Folder → `.exfat` → vendored reader, comparing paths, sizes and bytes; plus the
-//! preflight rejections and cancellation.
+//! Folder → `.exfat` → vendored reader round trips, rejections and cancellation.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -116,8 +115,7 @@ fn read_at(f: &mut File, at: u64, len: usize) -> Vec<u8> {
     buf
 }
 
-/// Every path in the image, from the raw directory entries: the root by its FAT chain,
-/// the rest by first cluster and length (the writer sets NoFatChain on them).
+/// Every path in the image, from the raw directory entries.
 fn raw_names(image: &Path) -> Vec<String> {
     let mut f = File::open(image).unwrap();
     let boot = read_at(&mut f, 0, 512);
@@ -197,8 +195,7 @@ fn assert_same(src: &Path, image: &Path) {
         }
         assert_eq!(at, f.size);
     }
-    // KNOWN GAP (reader): the vendored ExFatSource may not report empty directories yet;
-    // compare them only once it does. fsck and the hdiutil mount check cover them meanwhile.
+    // The vendored reader may not report empty directories; fsck and check-exfat.sh cover them.
     if got.empty_dirs().is_empty() {
         eprintln!("NOTE: the exFAT reader reports no empty dirs; empty-dir comparison skipped");
     } else {
@@ -261,8 +258,7 @@ fn mixed_tree_round_trips() {
     assert!(std::fs::read(&image).unwrap() == std::fs::read(&again).unwrap());
 }
 
-/// A tree held in memory, so names a case-insensitive macOS volume cannot hold side by
-/// side (and terabyte sizes) can be planned.
+/// A tree held in memory, for names a case-insensitive volume can't hold and huge sizes.
 struct MemTree {
     files: Vec<SourceFile>,
     empty: Vec<String>,
@@ -308,9 +304,6 @@ impl SourceTree for MemTree {
     }
 }
 
-/// Each folder takes a whole cluster, which the size budgets at 256 B: the room asked for
-/// must still be free.
-
 #[test]
 fn bad_names_are_all_listed() {
     let mut tree = MemTree::new(&[
@@ -329,9 +322,7 @@ fn bad_names_are_all_listed() {
     let e = plan(&tree, &Options::default(), &AtomicBool::new(false))
         .unwrap_err()
         .to_string();
-    // The names are written with `str::escape_debug`, and whether a combining mark after a
-    // letter is escaped depends on the Rust release (newer ones write `\u{301}`): either
-    // spelling names the file.
+    // `escape_debug` of a combining mark depends on the Rust release: either spelling counts.
     assert!(
         e.contains("sce_sys/Cafe\u{301}.png: not in Unicode NFC")
             || e.contains("sce_sys/Cafe\\u{301}.png: not in Unicode NFC"),

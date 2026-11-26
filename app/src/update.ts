@@ -5,8 +5,8 @@
 export const LATEST_URL = "https://api.github.com/repos/quer3q/ps5-dump-forge/releases/latest";
 export const CHECK_TIMEOUT_MS = 10000;
 
-/** What this build updates to: its version and the release file's suffix (after
- * `ps5-dump-forge-<v>-`), from the transport's `updateTarget`. */
+/** What this build updates to: its version and the release file's full name, `{v}` standing
+ * for the version, from the transport's `updateTarget`. */
 export interface Target {
   version: string;
   asset: string;
@@ -32,9 +32,9 @@ export function isNewer(latest: string, current: string): boolean {
   return c[4] !== undefined;
 }
 
-/** The release file for a version: `ps5-dump-forge-<v>-<asset>`. */
+/** The release file for a version: `asset` (a full file name) with `{v}` replaced by it. */
 export function assetName(version: string, asset: string): string {
-  return `ps5-dump-forge-${version}-${asset}`;
+  return asset.split("{v}").join(version); // no replaceAll: ES2020 lib, the PS5 browser
 }
 
 /** The newer version to offer, from a `releases/latest` body; null unless its tag is a plain
@@ -80,7 +80,7 @@ export async function ps5Release(current: string, f: typeof fetch = (i, o) => fe
   for (const url of urls) {
     const r = await ask(url, f);
     const v = tagVersion((r as { tag_name?: unknown } | null)?.tag_name);
-    if (v && carries(r, assetName(v, "ps5.elf"))) return v;
+    if (v && carries(r, assetName(v, "ps5-dump-forge-{v}-ps5.elf"))) return v;
   }
   return null;
 }

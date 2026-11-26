@@ -32,10 +32,8 @@ for src in ps5/shim/freebsd11.c ps5/shim/syscalls.S ps5/entry.c ps5/compat.c ps5
 done
 
 export RUSTC_BOOTSTRAP=1
-# The PS5 kernel fills FreeBSD 11 structs (stat 120 bytes, dirent 264, old statfs); libc and the
-# std built here default to FreeBSD 12's. libc >= 0.2.187 reads this cfg (it ignores the old
-# RUST_LIBC_UNSTABLE_FREEBSD_VERSION env var); rustflags reach std too under -Z build-std.
-# The CLI asserts the struct sizes at compile time, so losing this fails the build.
+# The PS5 kernel fills FreeBSD 11 structs; libc >= 0.2.187 reads only this cfg (not the env var),
+# and under -Z build-std it reaches std too. The CLI asserts the struct sizes.
 export CARGO_TARGET_X86_64_PS5_FREEBSD_RUSTFLAGS='--cfg libc_unstable_freebsd_version="11"'
 export CARGO_TARGET_DIR="$out"
 export CARGO_TARGET_X86_64_PS5_FREEBSD_LINKER=/work/ps5/linker.sh
@@ -46,8 +44,7 @@ export CFLAGS_x86_64_ps5_freebsd='--target=x86_64-sie-ps5 -mno-red-zone -femulat
 # unrar_sys builds UnRAR's C++ the same way; linker.sh links the SDK's libc++ for it.
 export CXX_x86_64_ps5_freebsd="$PS5_PAYLOAD_SDK/bin/prospero-clang++"
 export CXXFLAGS_x86_64_ps5_freebsd="$CFLAGS_x86_64_ps5_freebsd"
-# Cargo doesn't see the C objects or linker.sh; dropping the CLI's linked output makes it relink
-# (about 8 s) so a shim or entry change always lands in the ELF.
+# Cargo doesn't see the C objects or linker.sh: force a relink so a shim or entry change lands.
 build() {
   rm -f "$out"/x86_64-ps5-freebsd/release/deps/ps5_dump_forge-*
   cargo build --release --locked -p ps5-dump-forge-cli \

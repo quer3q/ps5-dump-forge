@@ -2,21 +2,29 @@
 name = "ps5upload-fpkg"
 edition = "2021" # upstream ps5upload is 2021; kept to minimise the vendor diff
 license = "GPL-3.0-or-later"
-version = "7.0.22" # pinned upstream tag v7.0.22
+version = "12.6.30" # pinned upstream tag v12.6.30
 
 [dependencies]
+unicode-normalization = "0.1"
 # Cross-platform OS randomness for the outer PFS seed. Opening /dev/urandom
 # directly meant Windows silently fell back to the clock. Already in the tree.
 getrandom = "0.4"
 aes = "0.9"
+# Forge: upstream turns on flate2's `zlib-rs` here for its own `.ffpfsc` writer, which Forge
+# doesn't use. Features unify, so it would also move Forge's own `.ffpfsc` writer off
+# miniz_oxide; left off.
 flate2 = "1"
+# Forge: no `libdeflater` (upstream's `.ffpfsc` writer's encoder): libdeflate's C doesn't build
+# for the PS5 payload, whose SDK clang lacks the AVX-VNNI and VPCLMULQDQ intrinsics it uses.
 crc32fast = "1"
 # Raw LZ4 blocks for AMPR asset packs (already in the tree through smb2).
-lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] } # Forge's version (upstream 0.13): one copy in the lock
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 # AMPR pack profiles (drakmor's TOML format).
 toml = "1"
 hmac = "0.13"
 sha2 = "0.11"
+# UCP container digests (`sdk_rules::notes`).
+sha1 = "0.11"
 # Big-integer modular exponentiation for the debug license signature (pure Rust, every target).
 num-bigint = "0.5"
 ps5upload-pkg = { path = "../ps5upload-pkg" }
@@ -25,3 +33,7 @@ libc = "0.2"
 serde = { workspace = true }
 sha3 = "0.12"
 thiserror.workspace = true
+
+[dev-dependencies]
+# fself.rs pins its signed output by BLAKE3 in a test.
+blake3.workspace = true

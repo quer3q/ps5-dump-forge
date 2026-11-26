@@ -1,10 +1,6 @@
-//! The package's outer layers, read on demand: the FIH header, the CNT container (only its
-//! header and entry table), and the outer PFS's 64 KiB blocks — decrypted in the native mode,
-//! checked against `imagedigs` in both.
-//!
-//! The vendored `cnt::read` and `outer::open` hold the whole container and the whole outer image
-//! and size their reads by on-disk counts, so this module re-reads the same structures with
-//! every count and offset checked against the file before anything is allocated.
+//! The package's outer layers, read on demand: FIH, the CNT header and entry table, the outer
+//! PFS's 64 KiB blocks (decrypted when native, checked against `imagedigs`). Unlike the vendored
+//! `cnt::read`/`outer::open`, every count and offset is checked before anything is allocated.
 
 use std::io::SeekFrom;
 
@@ -15,16 +11,13 @@ use ps5upload_fpkg::{BLOCK, ReadSeek, Result};
 
 use crate::{CORRUPT, NOT_PS5, RETAIL, err};
 
-/// The FIH header's length; everything we read from it sits inside.
 const FIH_LEN: usize = 0x100;
-/// The CNT header region.
 const CNT_HEADER: usize = 0x1000;
 const CNT_MAGIC: u32 = 0x7F43_4E54;
 const CNT_ENTRY_LEN: u64 = 0x20;
-/// Container entries we accept. Real packages carry a few dozen.
+/// Real packages carry a few dozen.
 const MAX_CNT_ENTRIES: u32 = 4096;
-/// Decrypted outer blocks kept. A Kraken block's stored bytes span at most nine outer blocks and
-/// a sequential read moves forward, so a small ring decodes each block once.
+/// A Kraken block's stored bytes span at most nine outer blocks, so a sequential read decodes each once.
 // ponytail: 16-slot ring (1 MiB), no LRU; widen if random reads ever thrash it
 const OUTER_CACHE: usize = 16;
 const SUPERBLOCK_MAGIC: u64 = 20_130_315;
@@ -43,7 +36,7 @@ fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(b[at..at + 4].try_into().expect("4 bytes"))
 }
 
-/// The package file, read by offset with every read checked against its length first.
+/// The package file; every read is checked against its length first.
 pub(crate) struct Pkg {
     file: Box<dyn ReadSeek>,
     pub len: u64,
@@ -78,14 +71,12 @@ impl Pkg {
     }
 }
 
-/// What the FIH header says about where everything is.
 pub(crate) struct Header {
     pub pfs_offset: u64,
     pub outer_blocks: u64,
     pub sb_index: u64,
     pub game_digest: [u8; 32],
     pub cnt_offset: u64,
-    /// The inner mount's metadata base, in bytes.
     pub meta_base: u64,
     pub format_version: u16,
 }
@@ -107,7 +98,6 @@ pub(crate) fn header(pkg: &mut Pkg) -> Result<Header> {
         _ => return Err(err(NOT_PS5, "no \\x7FFIH magic at offset 0")),
     }
     let fih = ps5upload_fpkg::fih::parse(&head)?;
-    // The vendored reader's own debug/retail test: the signed byte is 0x00 on a debug image.
     if !fih.is_debug() {
         return Err(err(
             RETAIL,
@@ -177,23 +167,20 @@ pub(crate) fn header(pkg: &mut Pkg) -> Result<Header> {
     })
 }
 
-/// One container entry, its payload located in the package.
 #[derive(Clone, Copy)]
 pub(crate) struct Entry {
     pub id: u32,
     pub flags1: u32,
-    /// For a protected entry (`flags1` bit 31) the key index is `flags2 >> 12`.
     pub flags2: u32,
     /// Absolute offset in the package.
     pub at: u64,
     pub size: u64,
-    /// The entry's 32-byte table row as stored: a protected entry's key depends on it.
+    /// The stored table row: a protected entry's key depends on it.
     pub row: [u8; 32],
 }
 
 pub(crate) struct Container {
     pub content_id: String,
-    /// The header's content type (`0x20`/`0x26` a game, `0x21` additional content).
     pub content_type: u32,
     pub entries: Vec<Entry>,
 }
@@ -204,7 +191,7 @@ impl Container {
     }
 }
 
-/// The container's header and entry table; payloads stay on disk until asked for.
+/// The container's header and entry table; payloads stay on disk.
 pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
     let mut head = vec![0u8; CNT_HEADER];
     pkg.read_at(cnt_offset, &mut head)?;
@@ -222,7 +209,6 @@ pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
         ));
     }
     let table = u64::from(be32(&head, 0x18));
-    // Both factors are bounded (4096 × 32), so the table is at most 128 KiB.
     let mut rows = vec![0u8; count as usize * CNT_ENTRY_LEN as usize];
     let table_at = cnt_offset
         .checked_add(table)
@@ -259,7 +245,6 @@ pub(crate) fn container(pkg: &mut Pkg, cnt_offset: u64) -> Result<Container> {
     })
 }
 
-/// The outer superblock's fields this reader uses.
 pub(crate) struct Superblock {
     pub dinode_count: u64,
     pub inode_table_block: u64,
@@ -268,7 +253,7 @@ pub(crate) struct Superblock {
     pub plaintext: bool,
 }
 
-/// Parse and check the outer superblock (the vendored parser is crate-private).
+/// The vendored parser is crate-private.
 pub(crate) fn superblock(sb: &[u8]) -> Result<Superblock> {
     if sb.len() < SIGNED_REGION || le64(sb, 0) != 2 || le64(sb, 8) != SUPERBLOCK_MAGIC {
         return Err(err(CORRUPT, "outer superblock version/magic mismatch"));
@@ -297,12 +282,19 @@ pub(crate) struct Outer {
     pfs_offset: u64,
     pub blocks: u64,
     sb_index: u64,
-    /// Where `imagedigs` (32 bytes per block, byte-reversed) sits in the package.
+    /// `imagedigs`: 32 bytes per block, byte-reversed.
     digests_at: u64,
     xts: Option<Xts>,
     cache: Vec<(u64, Vec<u8>)>,
     next: usize,
+    /// (first block, its window of `imagedigs`).
+    digests: (u64, Vec<u8>),
 }
+
+/// Digests read at once (64 KiB): a far 32-byte read per block breaks a disk's read-ahead (issue #71).
+const DIGEST_WINDOW: u64 = 2048;
+/// Back-to-back outer blocks read in one call (1 MiB).
+const RUN_BLOCKS: usize = 16;
 
 impl Outer {
     pub fn new(pkg: Pkg, h: &Header, digests_at: u64, xts: Option<Xts>) -> Self {
@@ -315,6 +307,7 @@ impl Outer {
             xts,
             cache: Vec::with_capacity(OUTER_CACHE),
             next: 0,
+            digests: (0, Vec::new()),
         }
     }
 
@@ -325,10 +318,8 @@ impl Outer {
 
     // ponytail: one SHA3 per 64 KiB read (and a 32-byte imagedigs read beside it), so a damaged
     // block is an error rather than wrong bytes; drop it for plaintext if throughput ever matters
-    /// Block `index`'s plaintext, `None` when no reading of it matches its digest (the wrong key,
-    /// or a damaged block). The superblock is never transformed; a native block is tried first
-    /// with the sector this builder uses (its index before the superblock, bit 47 set after it)
-    /// and then the other, since Sony's packages sign some blocks before the superblock too.
+    /// Block `index`'s plaintext, `None` when no reading matches its digest (wrong key, damage).
+    /// A native block tries both sector numberings: Sony signs some blocks before the superblock.
     pub fn try_load(&mut self, index: u64) -> Result<Option<Vec<u8>>> {
         if index >= self.blocks {
             return Err(err(
@@ -349,21 +340,30 @@ impl Outer {
         ))
     }
 
-    /// Block `index` as stored, and the digest its plaintext must have.
     fn load_raw(&mut self, index: u64) -> Result<(Vec<u8>, [u8; 32])> {
         let mut raw = vec![0u8; BLOCK as usize];
         self.pkg
             .read_at(self.pfs_offset + index * BLOCK, &mut raw)?;
-        let mut want = [0u8; 32];
-        self.pkg.read_at(self.digests_at + index * 32, &mut want)?;
-        want.reverse();
-        Ok((raw, want))
+        Ok((raw, self.digest(index)?))
     }
 
-    /// [`Outer::block`] for many blocks at once, uncached: read in order, then checked (and
-    /// decrypted) on every core.
+    /// The digest block `index` (below `blocks`) must have.
+    fn digest(&mut self, index: u64) -> Result<[u8; 32]> {
+        let (first, held) = &self.digests;
+        if index < *first || index - first >= held.len() as u64 / 32 {
+            let first = index - index % DIGEST_WINDOW;
+            let mut held = vec![0u8; (DIGEST_WINDOW.min(self.blocks - first) * 32) as usize];
+            self.pkg.read_at(self.digests_at + first * 32, &mut held)?;
+            self.digests = (first, held);
+        }
+        let at = ((index - self.digests.0) * 32) as usize;
+        let mut want: [u8; 32] = self.digests.1[at..at + 32].try_into().expect("32 bytes");
+        want.reverse();
+        Ok(want)
+    }
+
+    /// [`Outer::block`] for many blocks, uncached, checked on every core.
     pub fn blocks(&mut self, indices: &[u64]) -> Result<Vec<Vec<u8>>> {
-        let mut loaded = Vec::with_capacity(indices.len());
         for &index in indices {
             if index >= self.blocks {
                 return Err(err(
@@ -374,8 +374,21 @@ impl Outer {
                     ),
                 ));
             }
-            let (raw, want) = self.load_raw(index)?;
-            loaded.push((index, raw, want));
+        }
+        let mut loaded = Vec::with_capacity(indices.len());
+        let mut k = 0;
+        while k < indices.len() {
+            let mut j = k + 1;
+            while j < indices.len() && j - k < RUN_BLOCKS && indices[j] == indices[j - 1] + 1 {
+                j += 1;
+            }
+            let mut run = vec![0u8; (j - k) * BLOCK as usize];
+            self.pkg
+                .read_at(self.pfs_offset + indices[k] * BLOCK, &mut run)?;
+            for (raw, &index) in run.chunks(BLOCK as usize).zip(&indices[k..j]) {
+                loaded.push((index, raw.to_vec(), self.digest(index)?));
+            }
+            k = j;
         }
         let (xts, sb_index) = (self.xts.as_ref(), self.sb_index);
         crate::par_map(loaded, |(index, raw, want)| {
@@ -390,7 +403,6 @@ impl Outer {
         .collect()
     }
 
-    /// Block `index`'s checked plaintext, from the ring when it is there.
     pub fn block(&mut self, index: u64) -> Result<&[u8]> {
         if let Some(pos) = self.cache.iter().position(|(i, _)| *i == index) {
             return Ok(&self.cache[pos].1);
@@ -414,8 +426,7 @@ impl Outer {
     }
 }
 
-/// Outer block `index`'s plaintext from its stored bytes, `None` when no reading of it matches
-/// `want` (see [`Outer::try_load`]).
+/// See [`Outer::try_load`].
 fn plaintext(
     xts: Option<&Xts>,
     sb_index: u64,
@@ -441,17 +452,15 @@ fn plaintext(
     None
 }
 
-/// One file of the outer PFS (`pfs_image.dat`, `naps_pkg_layout.dat`): its size and the outer
-/// block behind each of its 64 KiB. Four bytes per block — 6.4 MB for a 100 GB image.
+/// A file of the outer PFS: the outer block behind each of its 64 KiB (6.4 MB for a 100 GB image).
 pub(crate) struct OuterFile {
     pub size: u64,
     map: Vec<u32>,
 }
 
 impl OuterFile {
-    /// Map `node`'s blocks: the direct slots, then each indirect level, every table checked
-    /// against the digest its parent records for it. Every table read adds at least one block
-    /// or fails, so the walk is bounded by the file's own block count.
+    /// Map `node`'s blocks, each indirect table checked against its parent's digest. Every table
+    /// read adds a block or fails, so the walk is bounded by the file's block count.
     pub fn map(outer: &mut Outer, node: &Dinode, what: &str) -> Result<Self> {
         let need = node.size.div_ceil(BLOCK);
         if need > outer.blocks {
@@ -499,7 +508,7 @@ impl OuterFile {
         })
     }
 
-    /// The outer blocks behind bytes `range` of this file (clipped to it).
+    /// The outer blocks behind bytes `range` (clipped).
     pub fn outer_blocks(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = u64> + '_ {
         let first = (range.start / BLOCK) as usize;
         let last = if range.is_empty() {
@@ -512,7 +521,6 @@ impl OuterFile {
             .map(|&i| u64::from(i))
     }
 
-    /// Exactly `buf.len()` bytes at `off`.
     pub fn read(&self, outer: &mut Outer, off: u64, buf: &mut [u8]) -> Result<()> {
         if off
             .checked_add(buf.len() as u64)
@@ -529,7 +537,6 @@ impl OuterFile {
         }
         let first = (off / BLOCK) as usize;
         let last = (off + buf.len() as u64).div_ceil(BLOCK) as usize;
-        // A long read checks its blocks on every core; the ring would only hold its tail.
         // ponytail: the edge blocks of a long read may be loaded twice (once more by the next read)
         if last - first > 2 {
             let indices: Vec<u64> = self.map[first..last]
@@ -601,7 +608,6 @@ fn walk_table(
         let at = slot * 36;
         let child = le32(&table, at + 32);
         if child == 0 {
-            // Tables fill from the front; an empty slot means the table ends short of the file.
             return Err(err(
                 CORRUPT,
                 format!("{what}'s indirect table at block {block} ends early"),

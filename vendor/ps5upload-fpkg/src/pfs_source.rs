@@ -46,6 +46,31 @@ const PFSC_HEADER_LEN: usize = 0x30;
 const MAX_INODES: u64 = 8_000_000;
 const MAX_DIR_BYTES: u64 = 256 << 20;
 const MAX_DEPTH: u32 = 64;
+/// Directory entries a walk reads in all. A sound image names each inode once, so this is the
+/// inode bound; a crafted one whose directories point at each other's blocks stops here.
+const MAX_ENTRIES: usize = MAX_INODES as usize;
+/// Bytes of the paths a walk keeps, as the exFAT and UFS2 readers bound theirs.
+const MAX_PATH_BYTES: usize = 256 << 20;
+/// Directory bytes a walk reads in all: 8 million entries are a few hundred MiB of them.
+const MAX_WALK_BYTES: u64 = 2 << 30;
+/// The most reserved for a read ahead of its bytes; the rest grows as blocks really decode.
+const PREALLOC: u64 = 16 << 20;
+
+/// What a walk has been through, so a crafted image cannot make it go round or grow without end.
+#[derive(Default)]
+struct Budget {
+    /// Directory inodes already walked.
+    inodes: std::collections::HashSet<u32>,
+    /// Directory blocks already walked: two inodes naming one block is the same loop with a
+    /// different inode number on it.
+    blocks: std::collections::HashSet<u32>,
+    /// Entries read so far, every directory's, against [`MAX_ENTRIES`].
+    listed: usize,
+    /// Bytes of the paths kept so far, against [`MAX_PATH_BYTES`].
+    path_bytes: usize,
+    /// Directory bytes read so far, against [`MAX_WALK_BYTES`].
+    dir_bytes: u64,
+}
 
 #[derive(Clone)]
 struct Inode {
@@ -209,8 +234,7 @@ impl PfsSource {
             .ok_or_else(|| me.bad("the PFS image has no root directory"))?;
 
         let mut found: Vec<(SourceFile, Entry)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        me.walk(&inodes, uroot, "", 0, &mut seen, &mut found)?;
+        me.walk(&inodes, uroot, "", 0, &mut Budget::default(), &mut found)?;
         if found.is_empty() {
             return Err(me.bad("holds no files"));
         }
@@ -232,7 +256,11 @@ impl PfsSource {
         if at.checked_add(len).is_none_or(|e| e > self.image_len) {
             return Err(self.bad("the PFS image is shorter than what it holds"));
         }
-        let mut out = vec![0u8; len as usize];
+        // A 32-bit build (Android armv7) cannot hold 4 GiB in one buffer: an error, not a
+        // buffer cut short that a later index would run off.
+        let len = usize::try_from(len)
+            .map_err(|_| self.bad("the PFS image holds a piece too large to read here"))?;
+        let mut out = vec![0u8; len];
         self.r.seek(SeekFrom::Start(at))?;
         self.r.read_exact(&mut out)?;
         Ok(out)
@@ -244,7 +272,7 @@ impl PfsSource {
         dir: u32,
         prefix: &str,
         depth: u32,
-        seen: &mut std::collections::HashSet<u32>,
+        budget: &mut Budget,
         out: &mut Vec<(SourceFile, Entry)>,
     ) -> Result<()> {
         if depth > MAX_DEPTH {
@@ -254,15 +282,28 @@ impl PfsSource {
             return Err(self.bad("a directory points outside the inode table"));
         };
         // A directory reached twice is a loop or a hard link; either way it is read once.
-        if inode.mode & INODE_DIR == 0 || !seen.insert(dir) {
+        if inode.mode & INODE_DIR == 0 || !budget.inodes.insert(dir) {
             return Ok(());
         }
         if inode.size > MAX_DIR_BYTES {
             return Err(self.bad("a directory in the PFS image is impossibly large"));
         }
+        if inode.size > 0 && !budget.blocks.insert(inode.first_block) {
+            return Err(self.bad("two directories in the PFS image share one block"));
+        }
+        budget.dir_bytes += inode.size;
+        if budget.dir_bytes > MAX_WALK_BYTES {
+            return Err(self.bad("the PFS image's directories are impossibly large"));
+        }
         let payload = self.bytes(u64::from(inode.first_block) * self.block_size, inode.size)?;
+        let entries = dirents(&payload);
+        drop(payload);
+        budget.listed += entries.len();
+        if budget.listed > MAX_ENTRIES {
+            return Err(self.bad("the PFS image's directories hold more than 8 million entries"));
+        }
         let mut children = 0usize;
-        for d in dirents(&payload) {
+        for d in entries {
             if d.name == "." || d.name == ".." || d.name.is_empty() || d.name.contains('/') {
                 continue;
             }
@@ -273,9 +314,13 @@ impl PfsSource {
                 continue;
             };
             let path = format!("{prefix}{}", d.name);
+            budget.path_bytes += path.len();
+            if budget.path_bytes > MAX_PATH_BYTES {
+                return Err(self.bad("the PFS image's paths are over 256 MiB"));
+            }
             if d.kind == DIRENT_DIR && child.mode & INODE_DIR != 0 {
                 children += 1;
-                self.walk(inodes, d.inode, &format!("{path}/"), depth + 1, seen, out)?;
+                self.walk(inodes, d.inode, &format!("{path}/"), depth + 1, budget, out)?;
             } else if d.kind == DIRENT_FILE && child.mode & INODE_FILE != 0 {
                 children += 1;
                 // Checked now, so a truncated image is refused before a build starts and
@@ -337,9 +382,13 @@ impl PfsSource {
         let table = self.bytes(
             base.checked_add(le64(&head, 0x18))
                 .ok_or_else(|| self.bad("a compressed file's block table is out of range"))?,
-            (blocks + 1) * 8,
+            table_len(blocks)
+                .ok_or_else(|| self.bad("a compressed file's block table is out of range"))?,
         )?;
         let offsets: Vec<u64> = table.chunks(8).map(|c| le64(c, 0)).collect();
+        if offsets.len() as u64 != blocks + 1 {
+            return Err(self.bad("a compressed file's block table is out of range"));
+        }
         let ordered = offsets
             .windows(2)
             .all(|w| w[1] >= w[0] && w[1] - w[0] <= PFSC_BLOCK);
@@ -364,7 +413,8 @@ impl PfsSource {
             return self.bytes(base + start, end - start);
         }
         self.offsets(i)?;
-        let mut out = Vec::with_capacity((end - start) as usize);
+        // The file's size is its own claim; what is reserved for a read of it is not.
+        let mut out = Vec::with_capacity((end - start).min(PREALLOC) as usize);
         for n in start / PFSC_BLOCK..=(end - 1) / PFSC_BLOCK {
             let (from, to) = {
                 let o = self.entries[i].offsets.as_ref().expect("just read");
@@ -401,6 +451,19 @@ impl PfsSource {
         }
         Ok(out)
     }
+}
+
+/// The byte length of a PFSC offset table of `blocks` blocks (one offset more than blocks), or
+/// `None` when it does not fit this build's address space: on a 32-bit build a table of 4 GiB
+/// or more would otherwise be cut short and indexed past its end.
+fn table_len(blocks: u64) -> Option<u64> {
+    table_len_within(blocks, usize::MAX as u64)
+}
+
+/// [`table_len`] for an address space of `max` bytes (what a test of the 32-bit case passes).
+fn table_len_within(blocks: u64, max: u64) -> Option<u64> {
+    let len = blocks.checked_add(1)?.checked_mul(8)?;
+    (len <= max).then_some(len)
 }
 
 /// One file of a PFS image as seekable bytes: the game image nested in it.
@@ -483,11 +546,28 @@ struct Dirent {
 }
 
 /// The entries of a directory's bytes: `inode, type, name length, entry size`, then the name.
-/// Stops at the first entry that does not parse, as the console does.
+/// Stops at the first entry that does not parse, as the console does. Zeros to the end of a
+/// 64 KiB block or of where an entry's header fits mean that block holds no more: a PS4
+/// package's folder moves an entry that would end in a block's last 280 bytes to the next
+/// block (maxton/LibOrbisPkg `PFSBuilder`), so a large folder goes on there.
 fn dirents(blob: &[u8]) -> Vec<Dirent> {
+    const DIR_BLOCK: usize = 0x10000;
     let mut out = Vec::new();
     let mut at = 0usize;
-    while at + 16 <= blob.len() {
+    loop {
+        let in_block = DIR_BLOCK - at % DIR_BLOCK;
+        let head_end = blob.len().min(at + 16.min(in_block));
+        if at < blob.len() && blob[at..head_end].iter().all(|b| *b == 0) {
+            let next = at + in_block;
+            if !at.is_multiple_of(DIR_BLOCK) && next < blob.len() {
+                at = next;
+                continue;
+            }
+            break;
+        }
+        if at + 16 > blob.len() {
+            break;
+        }
         let inode = le32(blob, at);
         let kind = le32(blob, at + 4) as i32;
         let name_len = le32(blob, at + 8) as i32;
@@ -542,5 +622,224 @@ impl SourceTree for PfsSource {
             self.block_size / 1024,
             self.files.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_offset_table_too_large_for_a_32_bit_build_is_refused() {
+        let max32 = u32::MAX as u64;
+        assert_eq!(table_len_within((1 << 29) - 1, max32), None);
+        assert_eq!(table_len_within((1 << 29) - 2, max32), Some((1 << 32) - 8));
+        assert_eq!(table_len_within(u64::MAX, u64::MAX), None);
+        assert_eq!(table_len(3), Some(32));
+    }
+
+    fn entry(out: &mut Vec<u8>, inode: u32, name: &str) {
+        let size = (name.len() + 17).div_ceil(8) * 8;
+        let at = out.len();
+        out.resize(at + size, 0);
+        out[at..at + 4].copy_from_slice(&inode.to_le_bytes());
+        out[at + 4..at + 8].copy_from_slice(&2u32.to_le_bytes());
+        out[at + 8..at + 12].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        out[at + 12..at + 16].copy_from_slice(&(size as u32).to_le_bytes());
+        out[at + 16..at + 16 + name.len()].copy_from_slice(name.as_bytes());
+    }
+
+    /// A folder whose entries go on in its next block after zeros, as a PS4 package lays out a
+    /// large one, reads whole; zeros at the start of a block still end it.
+    #[test]
+    fn a_folder_goes_on_in_its_next_block() {
+        let mut blob = Vec::new();
+        entry(&mut blob, 5, "first");
+        // The last entry ends 8 bytes before the block does: too little for a header.
+        while blob.len() < 0x10000 - 8 - 32 {
+            entry(&mut blob, 6, "x");
+        }
+        entry(&mut blob, 7, "last_in_one");
+        assert_eq!(blob.len(), 0x10000 - 8);
+        blob.resize(0x10000, 0);
+        entry(&mut blob, 8, "in_two");
+        blob.resize(0x20000, 0);
+        let names: Vec<String> = dirents(&blob).into_iter().map(|d| d.name).collect();
+        assert_eq!(names.first().map(String::as_str), Some("first"));
+        assert!(names.iter().any(|n| n == "last_in_one"));
+        assert_eq!(names.last().map(String::as_str), Some("in_two"));
+
+        let mut blob = Vec::new();
+        entry(&mut blob, 5, "only");
+        blob.resize(0x10000, 0);
+        blob.resize(0x20000, 0);
+        entry(&mut blob, 9, "never");
+        assert_eq!(
+            dirents(&blob).len(),
+            1,
+            "zeros from a block's start end the folder"
+        );
+    }
+
+    const BS: usize = 0x1000;
+
+    /// A small PFS image: `inodes` are `(mode, size, first_block)`, `blocks` are placed whole.
+    fn image(inodes: &[(u16, u64, u32)], blocks: &[(usize, Vec<u8>)], total: usize) -> Vec<u8> {
+        let mut img = vec![0u8; total * BS];
+        img[0..8].copy_from_slice(&1u64.to_le_bytes());
+        img[8..16].copy_from_slice(&PFS_MAGIC.to_le_bytes());
+        img[0x20..0x24].copy_from_slice(&(BS as u32).to_le_bytes());
+        img[0x30..0x38].copy_from_slice(&(inodes.len() as u64).to_le_bytes());
+        img[0x40..0x48].copy_from_slice(&1u64.to_le_bytes());
+        for (i, (mode, size, first)) in inodes.iter().enumerate() {
+            let o = BS + i * INODE_LEN;
+            img[o..o + 2].copy_from_slice(&mode.to_le_bytes());
+            img[o + 8..o + 16].copy_from_slice(&size.to_le_bytes());
+            img[o + 0x10..o + 0x18].copy_from_slice(&size.to_le_bytes());
+            img[o + 0x64..o + 0x68].copy_from_slice(&first.to_le_bytes());
+        }
+        for (at, bytes) in blocks {
+            img[at * BS..at * BS + bytes.len()].copy_from_slice(bytes);
+        }
+        img
+    }
+
+    fn dir_block(entries: &[(u32, i32, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (inode, kind, name) in entries {
+            let at = out.len();
+            entry(&mut out, *inode, name);
+            out[at + 4..at + 8].copy_from_slice(&kind.to_le_bytes());
+        }
+        out
+    }
+
+    fn open_image(img: Vec<u8>) -> Result<PfsSource> {
+        PfsSource::from_reader(Box::new(std::io::Cursor::new(img)), "test".into())
+    }
+
+    fn refusal(img: Vec<u8>) -> String {
+        match open_image(img) {
+            Ok(_) => panic!("must not open"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_small_image_walks_and_reads() {
+        let root = dir_block(&[(2, DIRENT_DIR, "data"), (3, DIRENT_FILE, "eboot.bin")]);
+        let data = dir_block(&[(4, DIRENT_FILE, "a.bin")]);
+        let img = image(
+            &[
+                (0, 0, 0),
+                (INODE_DIR, root.len() as u64, 3),
+                (INODE_DIR, data.len() as u64, 4),
+                (INODE_FILE, 5, 5),
+                (INODE_FILE, 3, 6),
+            ],
+            &[
+                (2, dir_block(&[(1, DIRENT_DIR, "uroot")])),
+                (3, root),
+                (4, data),
+                (5, b"eboot".to_vec()),
+                (6, b"abc".to_vec()),
+            ],
+            7,
+        );
+        let mut src = open_image(img).unwrap();
+        let paths: Vec<&str> = src.files().iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["data/a.bin", "eboot.bin"]);
+        assert_eq!(src.read("data/a.bin").unwrap(), b"abc");
+    }
+
+    /// Two directory inodes naming one block: every inode is new to the walk, the block is not.
+    #[test]
+    fn two_directories_sharing_a_block_are_refused() {
+        let root = dir_block(&[(2, DIRENT_DIR, "a"), (3, DIRENT_DIR, "b")]);
+        let shared = dir_block(&[(4, DIRENT_FILE, "f")]);
+        let img = image(
+            &[
+                (0, 0, 0),
+                (INODE_DIR, root.len() as u64, 3),
+                (INODE_DIR, shared.len() as u64, 4),
+                (INODE_DIR, shared.len() as u64, 4),
+                (INODE_FILE, 1, 5),
+            ],
+            &[
+                (2, dir_block(&[(1, DIRENT_DIR, "uroot")])),
+                (3, root),
+                (4, shared),
+            ],
+            6,
+        );
+        assert!(refusal(img).contains("share one block"));
+    }
+
+    #[test]
+    fn the_walk_budgets_end_a_walk() {
+        let root = dir_block(&[(2, DIRENT_FILE, "f")]);
+        let img = image(
+            &[
+                (0, 0, 0),
+                (INODE_DIR, root.len() as u64, 3),
+                (INODE_FILE, 1, 4),
+            ],
+            &[(2, dir_block(&[(1, DIRENT_DIR, "uroot")])), (3, root)],
+            5,
+        );
+        let mut src = open_image(img).unwrap();
+        let inodes = vec![
+            Inode {
+                mode: 0,
+                flags: 0,
+                size: 0,
+                size_compressed: 0,
+                first_block: 0,
+            },
+            Inode {
+                mode: INODE_DIR,
+                flags: 0,
+                size: 24,
+                size_compressed: 24,
+                first_block: 3,
+            },
+            Inode {
+                mode: INODE_FILE,
+                flags: 0,
+                size: 1,
+                size_compressed: 1,
+                first_block: 4,
+            },
+        ];
+        for (budget, what) in [
+            (
+                Budget {
+                    listed: MAX_ENTRIES,
+                    ..Budget::default()
+                },
+                "entries",
+            ),
+            (
+                Budget {
+                    path_bytes: MAX_PATH_BYTES,
+                    ..Budget::default()
+                },
+                "paths",
+            ),
+            (
+                Budget {
+                    dir_bytes: MAX_WALK_BYTES,
+                    ..Budget::default()
+                },
+                "impossibly large",
+            ),
+        ] {
+            let mut budget = budget;
+            let e = src
+                .walk(&inodes, 1, "", 0, &mut budget, &mut Vec::new())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(what), "{e}");
+        }
     }
 }

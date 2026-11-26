@@ -1,15 +1,15 @@
 diff --git a/ps5upload-fpkg/src/si.rs b/ps5upload-fpkg/src/si.rs
-index b2debf8..798df5a 100644
+index 3e3205b32ebe58611d88320870c1756147a895e3..6961c50a27259788dee8402f92d6039718997603 100644
 --- a/ps5upload-fpkg/src/si.rs
 +++ b/ps5upload-fpkg/src/si.rs
-@@ -90,17 +90,46 @@ pub fn chunk_crc_table_controlled(
+@@ -90,13 +90,16 @@ pub fn chunk_crc_table_controlled(
  ) -> Result<Vec<u8>> {
      let blocks = zip_start.div_ceil(BLOCK);
      let mut out = Vec::with_capacity(blocks as usize * 4);
 -    for i in 0..blocks {
 +    let mut start = 0u64;
 +    while start < zip_start {
-         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+         if cancel.is_some_and(crate::workshop::checkpoint) {
              return Err(crate::Error::Cancelled);
          }
 -        let start = i * BLOCK;
@@ -22,6 +22,9 @@ index b2debf8..798df5a 100644
 +        start += len;
      }
      Ok(out)
+ }
+@@ -124,6 +127,32 @@ pub fn chunk_crc_sampled(
+     Ok(true)
  }
  
 +/// The CRC32C of each 64 KiB block of `file[start..start + len]` (the last may be short),
@@ -54,7 +57,7 @@ index b2debf8..798df5a 100644
  mod tests {
      use super::*;
 diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
-index fc1f362..079e90c 100644
+index 2c78f0a1843913c50db5ca5602dbf8452f0b873b..2c3a277e46ec3eec5df05b585f1b34346331140f 100644
 --- a/ps5upload-fpkg/src/stream.rs
 +++ b/ps5upload-fpkg/src/stream.rs
 @@ -10,7 +10,7 @@
@@ -63,10 +66,10 @@ index fc1f362..079e90c 100644
  use std::fs::File;
 -use std::io::{Seek, SeekFrom, Write};
 +use std::io::{Read, Seek, SeekFrom, Write};
- use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::atomic::AtomicBool;
  
  use crate::cnt_write::{self, CntParams};
-@@ -181,6 +181,48 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
+@@ -182,6 +182,48 @@ pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
      }
  }
  
@@ -115,7 +118,7 @@ index fc1f362..079e90c 100644
  fn cancelled() -> crate::Error {
      crate::Error::Cancelled
  }
-@@ -295,32 +337,54 @@ pub fn write_package(
+@@ -296,32 +338,54 @@ pub fn write_package(
      let mut file_digests = FileDigester::new(files.len());
      let mut block = vec![0u8; BLOCK as usize];
      let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(8);
@@ -127,7 +130,7 @@ index fc1f362..079e90c 100644
 +        let threads = compression_threads(request.threads);
 +        let mut batch = Vec::new();
 +        while index < inner_blocks {
-+            if cancel.load(Ordering::Relaxed) {
++            if crate::workshop::checkpoint(cancel) {
 +                return Err(cancelled());
 +            }
 +            let n = (inner_blocks - index).min(WRITE_BATCH);
@@ -153,7 +156,7 @@ index fc1f362..079e90c 100644
 +        }
 +    }
 +    for index in index..inner_blocks {
-         if cancel.load(Ordering::Relaxed) {
+         if crate::workshop::checkpoint(cancel) {
              return Err(cancelled());
          }
 -        if let Some(spool) = spool.as_mut() {
@@ -188,11 +191,11 @@ index fc1f362..079e90c 100644
              // Bytes of the outer image, the same measure the verifier reports.
              (progress.bytes)(((index + 1) * BLOCK).min(outer_size), outer_size);
 diff --git a/ps5upload-fpkg/src/verify.rs b/ps5upload-fpkg/src/verify.rs
-index 580ca03..664bb2d 100644
+index 478670d9f7923179c086a718eb43c389f45dcbf0..83dba6227b73a5969fd5b38d3afc1d73fb16ef54 100644
 --- a/ps5upload-fpkg/src/verify.rs
 +++ b/ps5upload-fpkg/src/verify.rs
-@@ -389,6 +389,54 @@ pub fn verify_streaming_controlled(
-     verify_file_controlled(PkgFile::open(path)?, passcode, progress, cancel)
+@@ -415,6 +415,54 @@ pub fn verify_streaming_controlled(
+     verify_file_controlled(PkgFile::open(path)?, passcode, seed, cancel, progress)
  }
  
 +/// Outer blocks the sweep reads per batch (8 MiB).
@@ -246,16 +249,31 @@ index 580ca03..664bb2d 100644
  /// [`verify_streaming_controlled`] over a package already open, e.g. through the handle it was
  /// just written with, so the bytes checked are that file's whatever its path now names.
  pub fn verify_file_controlled(
-@@ -494,35 +542,16 @@ pub fn verify_file_controlled(
+@@ -521,6 +569,7 @@ pub fn verify_file_controlled(
  
      // The sweep: every data block must reach the digest `imagedigs` carries — by decryption in
      // the native mode, as stored in the plaintext one.
 +    // Read a batch at a time and checked on every core.
      let mut bad = 0u64;
      let mut done = 0u64;
--    for index in 0..count {
-+    while done < count {
-         stop()?;
+     // The game's data comes first; everything past it is the format's own (the layout
+@@ -539,35 +588,23 @@ pub fn verify_file_controlled(
+     let sweep = batches.as_ref().map_or(count, |v| {
+         v.iter().map(|b| span(*b).end - span(*b).start).sum::<u64>() + (count - data)
+     });
+-    let indices: Box<dyn Iterator<Item = u64>> = match batches {
+-        None => Box::new(0..count),
+-        Some(v) => Box::new(v.into_iter().flat_map(span).chain(data..count)),
++    let runs: Vec<std::ops::Range<u64>> = match batches {
++        None => std::iter::once(0..count).collect(),
++        Some(v) => v
++            .into_iter()
++            .map(span)
++            .chain(std::iter::once(data..count))
++            .collect(),
+     };
+-    for index in indices {
+-        stop()?;
 -        // The superblock is not encrypted; it was matched against the game digest above.
 -        if index != sb_index {
 -            let raw = file.read_at(fih.pfs_offset + index * BLOCK, BLOCK as usize)?;
@@ -279,13 +297,15 @@ index 580ca03..664bb2d 100644
 -        }
 -        done += 1;
 -        if done.is_multiple_of(256) {
--            progress(done * BLOCK, count * BLOCK);
--        }
-+        let n = (count - done).min(SWEEP_BATCH);
-+        let raw = file.read_at(fih.pfs_offset + done * BLOCK, (n * BLOCK) as usize)?;
-+        bad += failing_blocks(&raw, done, sb_index, xts.as_ref(), &digests);
-+        done += n;
-+        progress(done * BLOCK, count * BLOCK);
++    for run in runs {
++        let mut at = run.start;
++        while at < run.end {
++            stop()?;
++            let n = (run.end - at).min(SWEEP_BATCH);
++            let raw = file.read_at(fih.pfs_offset + at * BLOCK, (n * BLOCK) as usize)?;
++            bad += failing_blocks(&raw, at, sb_index, xts.as_ref(), &digests);
++            at += n;
++            done += n;
+             progress(done * BLOCK, sweep * BLOCK);
+         }
      }
-     progress(done * BLOCK, count * BLOCK);
-     r.push(

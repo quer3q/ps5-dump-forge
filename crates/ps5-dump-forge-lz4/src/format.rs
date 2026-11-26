@@ -1,6 +1,5 @@
-//! Byte-level pieces of the AMPR pack formats: magics, sizes, flag bits, checked little-endian
-//! access, the two path hashes, the CRC ranges, logical path
-//! rules and the chunk `location`/`descriptor` words. Nothing here maps a struct onto bytes.
+//! Byte-level pieces of the AMPR pack formats: magics, flags, checked LE access, path hashes, CRC
+//! ranges, path rules, chunk words.
 
 use ps5upload_fpkg::{Error, Result};
 
@@ -36,7 +35,6 @@ pub const CFG_CRC_AT: usize = 56;
 pub const CRC_PAYLOAD_CRC_AT: usize = 40;
 pub const CRC_HEADER_CRC_AT: usize = 44;
 
-// File record flags.
 pub const FILE_PACKED: u32 = 1;
 pub const FILE_STORE_ONLY: u32 = 2;
 pub const FILE_STREAMING: u32 = 4;
@@ -44,14 +42,12 @@ pub const FILE_HOT: u32 = 8;
 pub const FILE_RANDOM: u32 = 16;
 pub const FILE_FLAGS_KNOWN: u32 = 0x1f;
 
-// Chunk descriptor flags.
 pub const CHUNK_SHARED: u8 = 1;
 pub const CHUNK_STREAMING: u8 = 2;
 pub const CHUNK_PAGE_CONTAINED: u8 = 4;
 pub const CHUNK_PAGE_ALIGNED: u8 = 8;
 pub const CHUNK_FLAGS_KNOWN: u8 = 0x0f;
 
-// Pack record flags.
 pub const PACK_STRIPED: u32 = 1;
 pub const PACK_IO_PAGE_LAYOUT: u32 = 2;
 
@@ -226,7 +222,8 @@ fn check_path_bytes(rel: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks a complete logical path (`/app0/<relative>`) and returns the relative part, spelling kept.
+/// Checks a complete logical path (`/app0/<relative>`) and returns the relative part, spelling
+/// kept.
 pub fn logical_to_rel(path: &str) -> Result<&str> {
     let b = path.as_bytes();
     if b.len() < APP0.len()

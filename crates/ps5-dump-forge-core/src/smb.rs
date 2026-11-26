@@ -1,10 +1,6 @@
-//! NAS shares (`smb://host[:port]/<share>/<path>`): a game source and an output, read and
-//! written through the [`crate::remote::Remote`] calls a paired Forge's files use, over
-//! `ps5-dump-forge-smb`. A path's first part is the share; `smb://host` alone lists the server's
-//! disk shares. Credentials come from [`set_credentials`] (the Connect service's saved NAS
-//! devices); a host with none logs in as guest. A game on a share is still never changed in
-//! place: edits, delete and move refuse an `smb://` path
-//! ([`crate::net::refuse`]).
+//! SMB shares (`smb://host[:port]/<share>/<path>`) as a [`crate::remote::Remote`], over
+//! `ps5-dump-forge-smb`; `smb://host` lists the disk shares. Logins from [`set_credentials`],
+//! else guest.
 
 use std::collections::HashMap;
 use std::io;
@@ -16,7 +12,7 @@ use ps5_dump_forge_smb::{File, Session};
 
 use crate::remote::{FlinkPath, Remote, RemoteEntry, RemoteStat};
 
-/// One saved NAS's login. An empty `user` is a guest login.
+/// One saved NAS's login; an empty `user` is a guest login.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SmbCredential {
     pub host: String,
@@ -41,8 +37,7 @@ fn credentials() -> &'static Mutex<Vec<SmbCredential>> {
     C.get_or_init(Mutex::default)
 }
 
-/// Replaces the known logins (hosts compared ASCII case-insensitively) and drops every cached
-/// session, so the next use logs in with what was saved.
+/// Replaces the logins (hosts ASCII case-folded) and drops every cached session.
 pub fn set_credentials(creds: Vec<SmbCredential>) {
     *lock(credentials()) = creds;
     let smb = remote_inner();
@@ -55,7 +50,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The SMB client as a [`Remote`].
 pub(crate) fn remote() -> Arc<dyn Remote> {
     remote_inner().clone()
 }
@@ -65,18 +59,15 @@ fn remote_inner() -> &'static Arc<Smb> {
     R.get_or_init(|| Arc::new(Smb::default()))
 }
 
-/// One logged-in session per server, shared by listings, reads and uploads (requests take
-/// turns on its one connection).
-// ponytail: one request at a time per server (no pipelining, no second connection for
-// uploads); a read opens the file each time (create + read + close: an output being written
-// is read back with its size now, not a cached handle's).
+/// One session per server, shared by listings, reads and uploads.
+// ponytail: one request at a time per server; a read opens the file each time (an output
+// being written is read back at its size now).
 #[derive(Default)]
 struct Smb {
     sessions: Mutex<HashMap<String, Session>>,
     uploads: Mutex<HashMap<u64, Upload>>,
     next: AtomicU64,
-    /// Bumped (under `sessions`) whenever the logins change: a login that began before is
-    /// used once but not cached.
+    /// Bumped under `sessions` on a login change: a login begun before it is used once, not cached.
     logins: AtomicU64,
 }
 
@@ -115,12 +106,10 @@ fn retry(e: &io::Error) -> bool {
     )
 }
 
-/// `at`'s share and the path within it (`""` for the share's root).
 fn split(at: &FlinkPath) -> (&str, &str) {
     at.path.split_once('/').unwrap_or((&at.path, ""))
 }
 
-/// `at`'s share and path when it is inside a share (not the server itself).
 fn in_share(at: &FlinkPath) -> io::Result<(&str, &str)> {
     if at.path.is_empty() {
         return Err(invalid(at, "name a share"));
@@ -128,8 +117,7 @@ fn in_share(at: &FlinkPath) -> io::Result<(&str, &str)> {
     Ok(split(at))
 }
 
-/// `at`'s share and path when it is below a share's root (what can be made, renamed or
-/// removed).
+/// `at`'s share and path when below a share's root (what can be made, renamed or removed).
 fn below_share(at: &FlinkPath) -> io::Result<(&str, &str)> {
     match split(at) {
         (_, "") => Err(invalid(at, "a server or share itself can't be changed")),
@@ -153,7 +141,7 @@ fn mtime(secs: i64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
-/// A folder with no size or time: the server, as its shares' parent.
+/// The server, as its shares' parent.
 const FOLDER: RemoteStat = RemoteStat {
     dir: true,
     size: 0,
@@ -162,12 +150,10 @@ const FOLDER: RemoteStat = RemoteStat {
 };
 
 impl Smb {
-    /// `f` on the server's session (made when there is none); a connection-level failure on a
-    /// cached session logs in once more and tries again.
-    // ponytail: a request whose reply was lost is sent again: a create, mkdir or rename that
-    // the server did then answers AlreadyExists or NotFound (a created `.part` stays behind).
+    /// `f` on the server's session; a connection-level failure on a cached one logs in once more.
+    // ponytail: a request whose reply was lost is sent again (a create may then answer AlreadyExists).
     fn with<T>(&self, at: &FlinkPath, f: impl Fn(&Session) -> io::Result<T>) -> io::Result<T> {
-        // Bound first: a guard in the `if let` would live through the login's own lock.
+        // Bound first: a guard in the `if let` would live through the login.
         let cached = lock(&self.sessions).get(&at.key_id).cloned();
         if let Some(session) = cached {
             match f(&session) {
@@ -231,6 +217,7 @@ impl Remote for Smb {
                 dir: e.dir,
                 size: if e.dir { 0 } else { e.size },
                 mtime: mtime(e.mtime),
+                link: e.link,
                 name: e.name,
                 ..Default::default()
             })
@@ -241,7 +228,7 @@ impl Remote for Smb {
         let (share, rest) = in_share(path)?;
         self.with(path, |s| {
             let file = s.open(share, rest)?;
-            // Grown as the bytes come, 16 MiB at a time: a server may list any size.
+            // Grown as bytes come, 16 MiB at a time: a server may list any size.
             let mut buf = Vec::new();
             while buf.len() < len {
                 let have = buf.len();
@@ -285,7 +272,7 @@ impl Remote for Smb {
     }
 
     fn close(&self, handle: u64) -> io::Result<()> {
-        // The handle is closed when its last user (a write in flight) lets go of it.
+        // Closed when its last user (a write in flight) lets go of it.
         let upload = lock(&self.uploads).remove(&handle);
         match upload {
             Some(_) => Ok(()),
@@ -308,13 +295,36 @@ impl Remote for Smb {
         self.with(path, |s| s.remove(share, rest))
     }
 
+    fn rmdir(&self, path: &FlinkPath) -> io::Result<()> {
+        let (share, rest) = below_share(path)?;
+        self.with(path, |s| s.rmdir(share, rest))
+    }
+
+    fn delete_path(&self, path: &FlinkPath) -> Result<(), crate::DeleteError> {
+        below_share(path).map_err(|_| crate::delete::nas_root(path))?;
+        crate::delete::nas_delete(self, path)
+    }
+
+    fn move_path(
+        &self,
+        from: &FlinkPath,
+        to: &FlinkPath,
+        replace: bool,
+    ) -> Result<(), crate::DeleteError> {
+        let (share, _) = below_share(from).map_err(|_| crate::delete::nas_root(from))?;
+        let (to_share, _) = below_share(to).map_err(|_| crate::delete::nas_root(to))?;
+        if from.key_id != to.key_id || !share.eq_ignore_ascii_case(to_share) {
+            return Err(crate::delete::nas_other_share(from, to));
+        }
+        crate::delete::nas_move(self, from, to, replace)
+    }
+
     fn free_space(&self, dir: &FlinkPath) -> io::Result<u64> {
         let (share, rest) = in_share(dir)?;
         self.with(dir, |s| s.free_space(share, rest))
     }
 }
 
-/// `from`'s share and both paths below it, when `to` is on the same share of the same server.
 fn same_share<'a>(
     from: &'a FlinkPath,
     to: &'a FlinkPath,
@@ -359,8 +369,8 @@ mod tests {
             password: "secret".into(),
         };
         assert!(!format!("{cred:?}").contains("secret"));
-        // Nothing is made, renamed or removed at the server or a share itself, and nothing
-        // moves between shares; none of these reach the network.
+        // Nothing is made, renamed or removed at the server or a share, nothing moves
+        // between shares; none of these reach the network.
         let at = |s: &str| FlinkPath::parse(Path::new(s)).unwrap();
         let smb = Smb::default();
         let kind = |r: io::Result<()>| r.unwrap_err().kind();
@@ -392,8 +402,7 @@ mod tests {
         assert_eq!(kind(smb.write_at(7, 0, b"x")), io::ErrorKind::InvalidInput);
     }
 
-    /// The adapter against a real server: `FORGE_SMB_TEST=smb://host[:port]/share` (guest),
-    /// the share holding a writable `out` folder (tests/scripts/nas.sh).
+    /// Against a real server: `FORGE_SMB_TEST=smb://host[:port]/share` (guest, writable `out`).
     #[test]
     fn a_share_is_read_and_written() {
         let Ok(url) = std::env::var("FORGE_SMB_TEST") else {
@@ -427,7 +436,6 @@ mod tests {
         smb.write_at(h, 1 << 20, &bytes[1 << 20..]).unwrap();
         smb.write_at(h, 0, &bytes[..1 << 20]).unwrap();
         smb.sync(h).unwrap();
-        // Read back while still open, with its size now.
         assert_eq!(smb.read_at(&tmp, 0, bytes.len() + 9).unwrap(), bytes);
         smb.close(h).unwrap();
 
@@ -449,10 +457,6 @@ mod tests {
         smb.remove(&file).unwrap();
         assert_eq!(smb.stat(&file).unwrap_err().kind(), io::ErrorKind::NotFound);
         assert!(smb.list(&dir).unwrap().is_empty());
-        // `remove` takes files only; the empty folder goes through the share's folder here.
-        if let Ok(local) = std::env::var("FORGE_SMB_TEST_SHARE_DIR") {
-            let rel = &dir.path[share.path.len() + 1..];
-            std::fs::remove_dir(Path::new(&local).join(rel)).unwrap();
-        }
+        smb.rmdir(&dir).unwrap();
     }
 }

@@ -1,5 +1,4 @@
-// A tab's job list under its cards: one row per job of that tab's type, newest first (Convert,
-// Edit, Pack and Connect each list their own).
+// The Queue's job list: one row per job, newest first.
 
 import { memo, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 
@@ -15,19 +14,18 @@ import {
   type VerifyReport,
 } from "./api";
 import { basename, CardHead, FormatPill, isNetwork, kindLabel, PathLine, usePeerPath } from "./common";
-import { msg, useMessages } from "./i18n";
+import { msg, num, useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
-import { DEFAULT_ZSTD_LEVEL, jobType, packJob, type Action, type Job } from "./jobs";
-import { LEVEL_OF, type PackLevel } from "./Pack";
+import { canRetry as retryable, DEFAULT_ZSTD_LEVEL, isCancelled, jobType, packJob, stageFraction, stageWeight, type Action, type Job } from "./jobs";
+import { LEVEL_OF, type PackLevel } from "./build/formats";
 import { readable } from "./peers";
 import { askReplace } from "./replace";
 import { refreshConnect, useSavedNames } from "./useConnectState";
 
 type T = Messages["jobs"];
 
-/** A tab's job list, below its cards, full width, growing with its rows (the page scrolls);
- * `id` names its heading (one list per tab). */
+/** `id` names its heading. */
 export function JobsCard(props: { jobs: Job[]; dispatch: (a: Action) => void; id: string }) {
   const t = useMessages().jobs;
   const pending = props.jobs.filter((j) => j.request && !j.result).length;
@@ -53,9 +51,7 @@ export function JobsCard(props: { jobs: Job[]; dispatch: (a: Action) => void; id
   );
 }
 
-/** A job that deleted its source (`delete_source`): core's check line `source deleted: <path>`
- * (`deleted`, `text` the path), `source kept: <reason>` or `source partly deleted: <what is
- * gone>; <error>` (`partly`); null without one. Matched by its backend English prefix. */
+/** Core's `source deleted: <path>`, `source kept: <reason>` or `source partly deleted: ...` line, by its English prefix. */
 export function sourceLine(checks: string[]): { deleted: boolean; partly: boolean; text: string } | null {
   for (const c of checks) {
     if (c.startsWith(SOURCE_DELETED)) return { deleted: true, partly: false, text: c.slice(SOURCE_DELETED.length) };
@@ -68,9 +64,7 @@ const SOURCE_DELETED = "source deleted: ";
 const SOURCE_KEPT = "source kept: ";
 const SOURCE_PARTLY = "source partly deleted: ";
 
-/** What a stage's byte rate measures: verify reads the output back, compress and measure
- * (packing without writing, to size the packs) count the uncompressed bytes they took in, the
- * rest write. */
+/** Verify reads the output back, compress and measure count the bytes they took in, the rest write. */
 function rateLabel(t: T, stage: string): string {
   if (stage === "verify") return t.rate.read;
   if (stage === "compress" || stage === "measure") return t.rate.compress;
@@ -78,8 +72,7 @@ function rateLabel(t: T, stage: string): string {
   return t.rate.write;
 }
 
-/** A finished job's button names the platform's file manager; only Finder gets its face. The
- * http build has none on the console: it shows the path, selected, to copy. */
+/** Only Finder gets its face; the http build shows the path, selected, to copy. */
 const IS_MAC = !web && navigator.userAgent.includes("Mac");
 const REVEAL_ICON: IconName = IS_MAC ? "finder" : web ? "file" : "folder";
 function revealLabel(t: T): string {
@@ -88,14 +81,14 @@ function revealLabel(t: T): string {
   return navigator.userAgent.includes("Windows") ? t.showExplorer : t.showFolder;
 }
 
-/** An Edit tab job: an extract, or its changes applied to the source (in place, or rebuilt beside it). */
 function editTag(t: T, r: ConvertRequest | undefined): string | null {
   if (r?.extract?.length) return t.extract;
+  if (r?.recover_metadata && !r.edits?.length) return msg().metadata.tag;
   if (!r?.edits?.length) return null;
   return r.edit_rebuild && r.format !== "folder" ? t.editRebuild : t.edit;
 }
 
-/** A Pack tab job's tag: LZ4 or zstd, pack with its level (Fast, Medium, Max, else "level N") or unpack. */
+/** Pack with its level (Fast, Medium, Max, else "level N") or unpack. */
 function packTag(t: T, p: { kind: "lz4" | "zstd"; id: "pack" | "unpack" }, r: ConvertRequest): string {
   if (p.id === "unpack") return p.kind === "lz4" ? t.packTag.lz4Unpack : t.packTag.zstdUnpack;
   const n = p.kind === "lz4" ? (r.lz4_level ?? 0) : (r.zstd_level ?? DEFAULT_ZSTD_LEVEL);
@@ -105,31 +98,26 @@ function packTag(t: T, p: { kind: "lz4" | "zstd"; id: "pack" | "unpack" }, r: Co
   return r.pack_profile ? t.packTag.withRules(tag) : tag;
 }
 
-/** The target as its pill shows it: a pack into a folder writes an LZ4 packed folder. */
 function targetKind(r: ConvertRequest): string {
   return r.lz4 === "pack" && r.format === "folder" ? "lz4" : r.format;
 }
 
-/** A job's title: its output's name; a peer's share root (`flink://<key_id>`) by the device's
- * name, not its key id; before its request arrives, "Job N". */
+/** Its output's name; a peer's share root by the device's name; "Job N" before its request arrives. */
 export function jobName(job: Job, shown: (path: string) => string, fallback: (id: number) => string): string {
-  // An install has no output: the package names it.
   if (job.request?.install) return basename(job.request.install);
   const out = job.request?.output;
   if (out === undefined) return fallback(job.id);
   return /^flink:\/\/[^/\\]+[/\\]*$/i.test(out) ? shown(out).replace(/: \/$/, "") : basename(out);
 }
 
-/** Memoized: a progress event re-renders only its own job's row (`jobsReducer` keeps the other
- * jobs' objects; `dispatch` is stable). */
+/** Memoized: a progress event re-renders only its own row (`jobsReducer` keeps the others' objects). */
 const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatch: (a: Action) => void }) {
   const { job, fresh, dispatch } = props;
   const t = useMessages().jobs;
   const installTag = useMessages().install.tag;
   const [cancelling, setCancelling] = useState(false);
-  /** Retry is starting the job again (asking about names already there first). */
   const [retrying, setRetrying] = useState(false);
-  /** The row is still listed (a Dismiss unmounts it). */
+  /** Still listed (a Dismiss unmounts it). */
   const mounted = useRef(true);
   useEffect(() => {
     // Set here too: Strict Mode's development check unmounts and mounts once.
@@ -140,9 +128,8 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
   }, []);
   // A running job's Cancel asks once ("Stop job?") for a few seconds; a second click stops it.
   const [confirming, setConfirming] = useState(false);
-  /** Show in Finder's, Cancel's or Retry's failure. */
   const [actionError, setActionError] = useState<string | null>(null);
-  /** http build: the output path, shown and selected (no clipboard API over plain HTTP). */
+  /** http build: shown and selected (no clipboard API over plain HTTP). */
   const [pathShown, setPathShown] = useState(false);
   const pathBox = useRef<HTMLParagraphElement>(null);
   const shown = usePeerPath();
@@ -154,7 +141,6 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
   }, [pathShown]);
   const name = jobName(job, shown, t.job);
   const result = job.result;
-  // A paired peer's job using this device's files: read only, only Cancel (asks that peer).
   const remote = job.remote;
   const stopping = cancelling || !!remote?.cancelling;
   const cancel = async () => {
@@ -168,7 +154,7 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
     setActionError(null);
     try {
       if (remote) {
-        // False: the peer's list is gone (it ended or went silent); the row goes on the next poll.
+        // False: the peer's list is gone; the row goes on the next poll.
         if (!(await connect.cancelJob(remote.keyId, job.id))) setCancelling(false);
         await refreshConnect();
       } else await api.cancelJob(job.id);
@@ -201,24 +187,14 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
   };
 
   // An edit's "cancelled; …" says what stays changed.
-  const cancelled = !!result && "Err" in result && (result.Err === "cancelled" || result.Err.startsWith("cancelled; "));
-  // A failure here (not a cancel, not a peer's job) can start again; an edit's retry is the Edit
-  // tab's Apply, which keeps the changes after a failure.
-  const request = job.request;
-  const canRetry = !remote && !!request && !request.edits?.length && !!result && "Err" in result && !cancelled;
+  const cancelled = isCancelled(job);
+  const canRetry = retryable(job);
   const retry = async () => {
-    if (retrying || !request) return;
+    if (retrying) return;
     setRetrying(true);
     setActionError(null);
     try {
-      // A failed copy leaves files behind: an extract or a transfer asks about them again. A row
-      // dismissed while that check runs starts nothing.
-      const still = () => mounted.current;
-      const next = request.transfer?.length || request.extract?.length ? await askReplace(request, still) : request;
-      if (next && still()) {
-        const id = await api.startJob(next);
-        dispatch({ type: "started", id, request: next });
-      }
+      await retryJob(job, dispatch, () => mounted.current);
     } catch (e) {
       setActionError(errorText(e));
     } finally {
@@ -235,35 +211,27 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
   else if (job.stage === undefined) [status, tone] = [t.queued, ""];
   else [status, tone] = [(t.stages as Record<string, string | undefined>)[job.stage] ?? job.stage, "blue"];
   const running = !result && job.stage !== undefined;
-  // One clock per running row, each second: how long the stage has run.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!running) return;
     const tick = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(tick);
   }, [running]);
-  // A sheen crosses the bar while the job runs (the whole track while the fill is too thin to
-  // see it): many stages move it little or in steps (checking, planning, a large file), and a
-  // sheen that came and went with each step flickered.
   const alive = running && !stopping;
-  const stepMs = Math.max(0, now - job.stageAt);
-  const step = running && stepMs >= STEP_MS ? clock(stepMs) : null;
+  const step = running ? clock(Math.max(0, now - job.stageAt)) : null;
+  const frac = running ? stageFraction(job, now) : 0;
   const pack = packJob(job.request);
   const edit = editTag(t, job.request);
-  // A transfer (Connect's copy job): its first source shown as "from", no target format.
   const transfer = job.request?.transfer?.length ? job.request.transfer : null;
-  // A package install: the package shown as "from", no target format.
   const install = job.request?.install ?? null;
-  // Delete the source: core's one line on what became of it.
   const sourceNote = result && "Ok" in result ? sourceLine(result.Ok.checks) : null;
-  // Every step the job will run, once core said; gone when the job ends (its result says it).
-  const steps = !result && job.stages?.length ? <Steps job={job} /> : null;
-  // Packing straight into an image: its write pass packs too.
+  const failedHere = !!result && "Err" in result && !cancelled;
+  const crumbs = job.stages?.length && (running || failedHere) ? <Crumbs job={job} /> : null;
+  const report = result && "Ok" in result ? result.Ok : null;
   if (running && job.stage === "write" && pack?.kind === "lz4" && pack.id === "pack" && targetKind(job.request!) !== "lz4")
     status = t.packingWriting;
 
-  // A job just started here scrolls the page to itself; restored ones (a reload) leave the
-  // page where it is.
+  // A job just started here scrolls the page to itself; restored ones (a reload) don't.
   const ref = useRef<HTMLElement>(null);
   useEffect(() => {
     if (fresh) ref.current?.scrollIntoView({ block: "nearest" });
@@ -300,6 +268,7 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
           {job.request && <PathLine path={install ?? (transfer ? transfer[0] : job.request.source)} prefix={t.from} />}
         </div>
         {/* An output on a peer (`flink://`) or a NAS has no local folder for the file manager to show. */}
+        {report && <CopyDetails job={job} report={report} />}
         {!remote && result && "Ok" in result && (web || !isNetwork(job.request?.output)) && (
           <button className="small" onClick={reveal}>
             <Icon name={REVEAL_ICON} />
@@ -339,42 +308,28 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
           {confirming ? t.stopHint : ""}
         </span>
       </header>
-      {running && (
-        <div className="bar" style={{ "--p": job.shown } as CSSProperties}>
-          <progress value={job.shown} max={1} aria-label={`${name}: ${status}`} />
-          {alive && <span className={job.shown < 0.02 ? "sheen track" : "sheen"} aria-hidden="true" />}
-        </div>
-      )}
-      {running && steps}
+      {running && <SegmentBar job={job} frac={frac} alive={alive} label={`${name}: ${status}`} />}
+      {crumbs}
       <p className="job-status">
         <span className={`tag status ${tone}`}>
           {status}
         </span>
-        {running && (job.total > 0 || step) && (
+        {running && (
           <span className="meta">
-            {job.total > 0 && (
+            <strong>{Math.floor(100 * frac)}%</strong>
+            {job.speed !== undefined && (
               <>
-                <strong>{Math.floor(100 * job.shown)}%</strong>
-                {job.speed !== undefined && (
-                  <>
-                    {` · ${rateLabel(t, job.stage ?? "")} `}
-                    <bdi>{prettyBytes(job.speed)}/s</bdi>
-                  </>
-                )}
-                {job.etaMs !== undefined && ` · ${t.left(prettyDuration(job.etaMs))}`}
+                {` · ${rateLabel(t, job.stage ?? "")} `}
+                <bdi>{prettyBytes(job.speed)}/s</bdi>
               </>
             )}
-            {step && `${job.total > 0 ? " · " : ""}${t.inStep(step)}`}
+            {job.etaMs !== undefined && ` · ${t.left(prettyDuration(job.etaMs))}`}
+            {step && ` · ${t.inStep(step)}`}
           </span>
         )}
-        {result && "Ok" in result && (
-          <span>
-            {t.result(prettyBytes(result.Ok.bytes), result.Ok.files)}{" "}
-            <span className="path">{shown(result.Ok.output)}</span>
-          </span>
-        )}
+        {report && <ResultLine job={job} report={report} />}
       </p>
-      {!running && steps}
+      {report && <ResultMore job={job} report={report} />}
       {pathShown && result && "Ok" in result && (
         <p className="out-box path-shown" ref={pathBox} tabIndex={-1} role="region" aria-label={`${name}: ${t.outputPath}`}>
           {result.Ok.output}
@@ -435,6 +390,7 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
           extract={!!job.request?.extract?.length}
           transfer={!!transfer}
           install={!!install}
+          metadata={!!job.request?.recover_metadata && !job.request.edits?.length}
         />
       )}
       {job.log.length > 0 && <Log lines={job.log} name={name} />}
@@ -442,10 +398,199 @@ const JobCard = memo(function JobCard(props: { job: Job; fresh: boolean; dispatc
   );
 });
 
-/** The job's steps in order, neighbours with one label merged (preflight and check are one
- * "Checking"): done before the current one, the rest not started. A stage the messages don't
- * name shows its id, like the status tag. */
-function Steps({ job }: { job: Job }) {
+/** A failed copy leaves files behind: an extract or a transfer asks about names there first; false when nothing started. */
+/** Jobs already retried (rows stay, D4), by object. ponytail: a list rebuilt after the poller lost the server is new objects, so a retried row is eligible again; key by instance + id if that bites. */
+export const retriedJobs = new WeakSet<Job>();
+
+export async function retryJob(job: Job, dispatch: (a: Action) => void, still: () => boolean = () => true): Promise<boolean> {
+  const request = job.request;
+  if (!request || !retryable(job)) return false;
+  const next = request.transfer?.length || request.extract?.length ? await askReplace(request, still) : request;
+  if (!next || !still()) return false;
+  const id = await api.startJob(next);
+  retriedJobs.add(job);
+  dispatch({ type: "started", id, request: next });
+  return true;
+}
+
+type Fact = "file" | "type" | "size" | "files" | "time";
+
+function kindOfPath(path: string): string {
+  const m = /\.(exfat|ffpkg|ffpfs|ffpfsc|pkg)$/i.exec(path);
+  return m ? m[1].toLowerCase() : "folder";
+}
+
+function outputType(r: ConvertRequest | undefined, output: string): string {
+  const R = msg().result;
+  if (!r) return R.kinds[kindOfPath(output)] ?? kindOfPath(output);
+  if (r.install) return R.installed;
+  if (r.transfer?.length) return R.transferred;
+  if (r.extract?.length) return R.extracted;
+  if (r.edits?.length) {
+    const k = kindOfPath(output);
+    const what = R.kinds[k] ?? k;
+    return r.edit_rebuild && k !== "folder" ? R.rebuilt(what) : R.edited(what);
+  }
+  const p = packJob(r);
+  const kind = targetKind(r);
+  if (p?.id === "pack") {
+    if (kind === "folder" || kind === "lz4") return p.kind === "zstd" ? R.zstdFolder : R.lz4Folder;
+    return R.withPacks(R.kinds[kind] ?? kind, p.kind === "zstd" ? "ZSTD" : "LZ4");
+  }
+  return R.kinds[kind] ?? kindLabel(kind);
+}
+
+/** As label + text (the card and the copied summary alike). */
+function resultFacts(job: Job, report: JobReport, shown: (p: string) => string): [Fact, string][] {
+  const R = msg().result;
+  const facts: [Fact, string][] = [
+    ["file", shown(report.output)],
+    ["type", outputType(job.request, report.output)],
+  ];
+  const after = report.bytes;
+  const before = report.source_bytes || report.verify?.total_bytes;
+  // A ratio only when they differ (packs, compression, image metadata), never for a copy.
+  const copy = !!job.request?.transfer?.length || !!job.request?.extract?.length;
+  if (before && after && !copy && Math.abs(after - before) / before >= 0.01)
+    facts.push(["size", `${prettyBytes(before)} -> ${prettyBytes(after)} (${R.ofSource((100 * after) / before)})`]);
+  else facts.push(["size", prettyBytes(after)]);
+  if (report.files > 0) facts.push(["files", num(report.files)]);
+  // Core's times (a reloaded page shows them too), else this page's for an older server.
+  const took =
+    report.started_at_ms && report.ended_at_ms
+      ? report.ended_at_ms - report.started_at_ms
+      : job.startedAt !== undefined && job.endedAt !== undefined
+        ? job.endedAt - job.startedAt
+        : 0;
+  if (took > 0) facts.push(["time", prettyDuration(took)]);
+  return facts;
+}
+
+function verifiedWord(report: JobReport): string {
+  const R = msg().result;
+  if (report.verify) return report.verify.mode === "full" ? R.verifiedFull : R.verifiedFast;
+  return report.checks.length > 0 ? R.verified : R.notVerified;
+}
+
+/** The async API on a secure page, else a selected textarea and `execCommand` (old WebKit, plain HTTP). */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  const focused = document.activeElement as HTMLElement | null;
+  area.select();
+  area.setSelectionRange(0, text.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  area.remove();
+  focused?.focus();
+  return ok;
+}
+
+function ResultLine({ report }: { job: Job; report: JobReport }) {
+  const R = useMessages().result;
+  const shown = usePeerPath();
+  const size = prettyBytes(report.bytes) + (report.files > 0 ? `, ${R.filesN(report.files)}` : "");
+  return (
+    <span className="result-line">
+      <bdi>{size}</bdi>
+      <span className="arrow" aria-hidden="true">
+        →
+      </span>
+      <span className="visually-hidden">{R.to}</span>
+      <bdi className="path">{shown(report.output)}</bdi>
+    </span>
+  );
+}
+
+function ResultMore({ job, report }: { job: Job; report: JobReport }) {
+  const R = useMessages().result;
+  const shown = usePeerPath();
+  const names = useSavedNames();
+  const parts = useMemo(
+    () => resultFacts(job, report, shown).filter(([k, v]) => k !== "file" && k !== "files" && (k !== "size" || v.includes("->"))),
+    [job, report, shown, names, R],
+  );
+  return (
+    <p className="result-more muted">
+      {parts.map(([k, v], i) => (
+        <span key={k}>
+          {i > 0 && " · "}
+          <bdi>{k === "time" ? R.took(v) : v}</bdi>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+function CopyDetails({ job, report }: { job: Job; report: JobReport }) {
+  const t = useMessages().jobs;
+  const R = useMessages().result;
+  const shown = usePeerPath();
+  const [copied, setCopied] = useState<"" | "ok" | "fail">("");
+  useEffect(() => {
+    if (!copied) return;
+    const id = setTimeout(() => setCopied(""), 2500);
+    return () => clearTimeout(id);
+  }, [copied]);
+  const copy = async () => {
+    const verified = verifiedWord(report);
+    const lines = [jobName(job, shown, t.job), ...resultFacts(job, report, shown).map(([k, v]) => `${R[k]}: ${v}`)];
+    lines.push(report.verify?.mode === "fast" ? `${verified}: ${coverage(t, report.verify)}` : verified);
+    if (report.checks.length) lines.push(R.checks, ...report.checks.map((c) => `- ${readable(c)}`));
+    setCopied((await copyText(lines.join("\n"))) ? "ok" : "fail");
+  };
+  const label = copied === "ok" ? R.copied : copied === "fail" ? R.copyFailed : R.copy;
+  return (
+    <>
+      <button type="button" className="small" onClick={copy}>
+        <Icon name={copied === "ok" ? "check" : "file"} />
+        {label}
+      </button>
+      <span className="visually-hidden" role="status">
+        {copied ? label : ""}
+      </span>
+    </>
+  );
+}
+
+/** One segment per stage, as wide as its weight; one progressbar for assistive tech at the job's whole fraction. */
+function SegmentBar({ job, frac, alive, label }: { job: Job; frac: number; alive: boolean; label: string }) {
+  const stages = job.stages?.length ? job.stages : [job.stage ?? ""];
+  const at = job.stages?.length ? (job.step ?? -1) : 0;
+  const pct = Math.floor(100 * job.shown);
+  return (
+    <div className="segbar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label={label}>
+      {stages.map((id, i) => {
+        const state = i < at ? "done" : i === at ? "now" : "later";
+        return (
+          <span
+            key={i}
+            className={`segbar-seg ${state}${state === "now" && alive ? " alive" : ""}`}
+            style={{ flexGrow: stageWeight(id), ...(state === "now" ? { "--p": frac } : {}) } as CSSProperties}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/** Neighbours with one label merged; a failed job's step crossed in red; an unnamed stage shows its id. */
+function Crumbs({ job }: { job: Job }) {
   const t = useMessages().jobs;
   const labels = t.steps as Record<string, string | undefined>;
   const steps: { label: string; last: number }[] = [];
@@ -455,30 +600,28 @@ function Steps({ job }: { job: Job }) {
     if (prev?.label === label) prev.last = i;
     else steps.push({ label, last: i });
   });
+  const failed = !!job.result && "Err" in job.result;
   const step = job.step;
   const at = step === undefined ? -1 : steps.findIndex((s) => step <= s.last);
   return (
     // `role="list"`: WebKit drops the list role of an `ol` styled without markers.
-    <ol className="steps" role="list" aria-label={t.stepsLabel}>
+    <ol className="stage-crumbs" role="list" aria-label={t.stepsLabel}>
       {steps.map((s, i) => {
-        const state = at < 0 || i > at ? "later" : i < at ? "done" : "now";
+        const state = at < 0 || i > at ? "later" : i < at ? "done" : failed ? "fail" : "now";
         return (
           <li key={i} className={state} aria-current={state === "now" ? "step" : undefined}>
-            {i > 0 && (
+            {state === "done" && <Icon name="check" />}
+            {state === "fail" && <Icon name="x" />}
+            <span aria-hidden={state === "now" ? undefined : "true"}>{s.label}</span>
+            {state !== "now" && (
+              <span className="visually-hidden">
+                {state === "done" ? t.stepDone(s.label) : state === "fail" ? t.stepFailed(s.label) : t.stepLater(s.label)}
+              </span>
+            )}
+            {i < steps.length - 1 && (
               <span className="sep" aria-hidden="true">
                 ›
               </span>
-            )}
-            {state === "done" && <Icon name="check" />}
-            {state === "now" ? (
-              s.label
-            ) : (
-              <>
-                <span aria-hidden="true">{s.label}</span>
-                <span className="visually-hidden">
-                  {state === "done" ? t.stepDone(s.label) : t.stepLater(s.label)}
-                </span>
-              </>
             )}
           </li>
         );
@@ -487,24 +630,18 @@ function Steps({ job }: { job: Job }) {
   );
 }
 
-/** The verified fold's title: the mode (when the report has one) and the checks passed. */
 function verifiedTitle(t: T, r: JobReport): string {
   const n = r.checks.filter((c) => !sourceLine([c])).length;
   if (!r.verify) return t.verifiedPlain(n);
   return r.verify.mode === "full" ? t.verifiedFull(n) : t.verifiedFast(n);
 }
 
-/** Fast verification's coverage: "checked 2.1 GiB of 80.9 GiB in 41 samples". */
 function coverage(t: T, v: VerifyReport): string {
   return t.coverage(prettyBytes(v.checked_bytes), prettyBytes(v.total_bytes), v.samples);
 }
 
-/** How long "Stop job?" waits for the second click. */
 const CONFIRM_MS = 4000;
-/** A stage running this long shows its time on the meta line. */
-const STEP_MS = 10_000;
 
-/** A stage's running time as a clock: "0:42", "12:05", "1:02:09". */
 function clock(ms: number): string {
   const s = Math.floor(ms / 1000);
   const ss = String(s % 60).padStart(2, "0");
@@ -513,51 +650,136 @@ function clock(ms: number): string {
   return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${ss}`;
 }
 
-/** A failed job's error: a plain title, then core's text verbatim (without its "preflight failed:"). */
-function FailureText(props: { err: string; format?: string; edit?: boolean; extract?: boolean; transfer?: boolean; install?: boolean }) {
-  const { format, edit, extract, transfer, install } = props;
+/** A plain title, then core's text verbatim (without its "preflight failed:"). */
+function FailureText(props: { err: string; format?: string; edit?: boolean; extract?: boolean; transfer?: boolean; install?: boolean; metadata?: boolean }) {
+  const { format, edit, extract, transfer, install, metadata } = props;
   const t = useMessages().jobs;
+  const cantMetadata = useMessages().metadata.cant;
   const cantInstall = useMessages().install.cantInstall;
-  // A paired device's `flink://` address by its name (again once a name arrives or changes).
   const names = useSavedNames();
   const err = useMemo(() => readable(props.err), [props.err, names]);
   const pre = /^preflight failed:\n?/.exec(err);
   return (
     <div className="error-box">
-      <strong className="error-title">{install ? cantInstall : transfer ? t.cantTransfer : extract ? t.cantExtract : edit ? t.cantEdit : format ? t.cantBuildAs(kindLabel(format)) : t.cantBuild}</strong>
+      <strong className="error-title">{install ? cantInstall : metadata ? cantMetadata : transfer ? t.cantTransfer : extract ? t.cantExtract : edit ? t.cantEdit : format ? t.cantBuildAs(kindLabel(format)) : t.cantBuild}</strong>
       <span className="backend">{pre ? err.slice(pre[0].length) : err}</span>
     </div>
   );
 }
 
-/** Collapsed until asked for: the job's row stays short in the list. */
+function lineClass(line: string): string | undefined {
+  if (/\b(error|errors|fail|failed|failure|refused|panic)\b|can't/i.test(line)) return "bad";
+  if (/\bwarn(ing)?\b/i.test(line)) return "warn";
+  if (/\b(verified|ok|done|passed)\b/i.test(line)) return "good";
+  return undefined;
+}
+
+function logFileName(name: string): string {
+  const base = name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_").trim() || "job";
+  return `${base}.log`;
+}
+
+/** Collapsed until asked for; Clear hides lines up to the last one shown (this view only). */
 function Log({ lines, name }: { lines: string[]; name: string }) {
   const t = useMessages().jobs;
+  const L = useMessages().log;
   const names = useSavedNames();
-  // Up to 500 lines joined and rewritten once per change, not on every render.
-  const text = useMemo(() => readable(lines.join("\n")), [lines, names]);
+  const all = useMemo(() => lines.map((l) => readable(l)), [lines, names]);
+  // ponytail: a later line with the same text as Clear's last one hides what came before it.
+  const [clearedAt, setClearedAt] = useState<string | null>(null);
+  const shown = useMemo(() => {
+    if (clearedAt === null) return all;
+    const k = all.lastIndexOf(clearedAt);
+    return k < 0 ? all : all.slice(k + 1);
+  }, [all, clearedAt]);
+  const [filter, setFilter] = useState("");
+  const q = filter.trim().toLowerCase();
+  const visible = useMemo(() => (q ? shown.filter((l) => l.toLowerCase().includes(q)) : shown), [shown, q]);
+  const [follow, setFollow] = useState(true);
   const [el, setEl] = useState<HTMLPreElement | null>(null);
-  // Follow the tail as lines arrive, unless the reader scrolled up from it.
-  const atEnd = useRef(true);
   useEffect(() => {
-    if (el && atEnd.current) el.scrollTop = el.scrollHeight;
-  }, [el, lines]);
+    if (el && follow) el.scrollTop = el.scrollHeight;
+  }, [el, visible, follow]);
+  const [said, setSaid] = useState("");
+  useEffect(() => {
+    if (!said) return;
+    const id = setTimeout(() => setSaid(""), 2500);
+    return () => clearTimeout(id);
+  }, [said]);
+  const copy = async () => setSaid((await copyText(visible.join("\n"))) ? L.copied : L.copyFailed);
+  const save = () => {
+    // The Tauri webview doesn't download a link: copy there instead.
+    if (!web) return void copy();
+    const url = URL.createObjectURL(new Blob([visible.join("\n") + "\n"], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = logFileName(name);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const clear = () => {
+    setClearedAt(all.length ? all[all.length - 1] : null);
+    setSaid(L.cleared);
+  };
   return (
     <details className="fold">
       <summary>{t.log(lines.length)}</summary>
+      <div className="log-bar">
+        <span className="log-count">{q ? L.lines(visible.length, shown.length) : L.lines(shown.length)}</span>
+        <input
+          type="search"
+          className="log-filter"
+          value={filter}
+          placeholder={L.filter}
+          aria-label={`${name}: ${L.filter}`}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <label className="log-follow">
+          <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />
+          {L.follow}
+        </label>
+        <button type="button" className="small" onClick={copy} disabled={visible.length === 0}>
+          <Icon name="file" />
+          {L.copy}
+        </button>
+        <button type="button" className="small" onClick={save} disabled={visible.length === 0} title={web ? undefined : L.copy}>
+          <Icon name="download" />
+          {L.save}
+        </button>
+        <button type="button" className="small" onClick={clear} disabled={shown.length === 0}>
+          <Icon name="x" />
+          {L.clear}
+        </button>
+        <span className="visually-hidden" role="status">
+          {said}
+        </span>
+        {said && (
+          <span className="log-said" aria-hidden="true">
+            {said}
+          </span>
+        )}
+      </div>
       <pre
-        className="log"
+        className="log log-panel"
         ref={setEl}
         tabIndex={0}
-        // A `pre` can't carry a name; a region can (one per row: the job's name first).
+        // A `pre` can't carry a name; a region can.
         role="region"
         aria-label={`${name}: ${t.logLabel}`}
         onScroll={(e) => {
           const p = e.currentTarget;
-          atEnd.current = p.scrollHeight - p.scrollTop - p.clientHeight < 24;
+          const atEnd = p.scrollHeight - p.scrollTop - p.clientHeight < 24;
+          if (!atEnd && follow) setFollow(false);
         }}
       >
-        {text}
+        {visible.map((l, k) => (
+          <span key={k} className={lineClass(l)}>
+            {l}
+            {"\n"}
+          </span>
+        ))}
       </pre>
     </details>
   );

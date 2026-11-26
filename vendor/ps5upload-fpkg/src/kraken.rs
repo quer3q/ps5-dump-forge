@@ -1052,17 +1052,22 @@ pub enum Half {
     /// A Kraken LZ chunk body with delta literals (literal mode 0): each literal is stored less
     /// the byte at the last match distance.
     LzDelta(Vec<u8>),
+    /// One bare entropy-coded array holding the whole half, no LZ: what Sony's encoder writes
+    /// where matches do not pay (all-zero data is `27 ff fc 00 03 00 40 00`, a one-symbol
+    /// Huffman array of 128 KiB). The layout record marks it neither raw nor LZ; it is read,
+    /// never written by this crate.
+    Entropy(Vec<u8>),
 }
 
 impl Half {
     pub fn bytes(&self) -> &[u8] {
         match self {
-            Half::Raw(b) | Half::Lz(b) | Half::LzDelta(b) => b,
+            Half::Raw(b) | Half::Lz(b) | Half::LzDelta(b) | Half::Entropy(b) => b,
         }
     }
 
     pub fn is_lz(&self) -> bool {
-        !matches!(self, Half::Raw(_))
+        matches!(self, Half::Lz(_) | Half::LzDelta(_))
     }
 
     pub fn is_delta(&self) -> bool {
@@ -1206,6 +1211,13 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
     let end = at + len;
     let mut p = 0usize;
     let mut dst = at;
+    // The reference decoder (ooz `Kraken_ReadLzTable`) wants 13 bytes for every LZ chunk, the
+    // eight seed bytes of the block's first half included. Asking for 13 more AFTER the seed
+    // refused valid small first halves that level 7 writes (#477: "chunk too short" on a good
+    // package). A half shorter than this that is not LZ at all is a `Half::Entropy` (#493).
+    if src.len() < 13 {
+        return format_err("kraken: chunk too short");
+    }
     if at == 0 {
         // The seed is the half's first eight bytes: a half shorter than that cannot be LZ, and
         // a damaged descriptor saying it is must not make the copy below overrun the block.
@@ -1216,17 +1228,21 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
         p = SEED;
         dst = SEED;
     }
-    if src.len() < p + 13 {
-        return format_err("kraken: chunk too short");
-    }
-    let flag = src[p];
+    // The excess flag, and its second byte only when the count needs one, must be inside the
+    // chunk (the 13-byte minimum already guarantees both; these keep the reads checked).
+    let flag = *src
+        .get(p)
+        .ok_or_else(|| crate::Error::Format("kraken: chunk too short".into()))?;
     if flag & 0xC0 != 0x80 {
         return format_err("kraken: expected the excess framing");
     }
     p += 1;
     let mut excess = (flag & 0x3F) as usize;
     if excess > 0x1F {
-        excess += src[p] as usize * 0x20;
+        let hi = *src
+            .get(p)
+            .ok_or_else(|| crate::Error::Format("kraken: chunk too short".into()))?;
+        excess += hi as usize * 0x20;
         p += 1;
     }
     if excess > src.len() - p {
@@ -1243,6 +1259,11 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
     // `0x80` marks the scaled offset code (what this encoder once wrote); anything else is the
     // start of the offsets array in the traditional code.
     let scaled = src[p] == 0x80;
+    if src[p] > 0x80 {
+        // ooz: scaling `src[p] - 127` with a second array of low bits; no encoder we read
+        // writes it, and reading it as the traditional code would misread the block.
+        return format_err("kraken: unsupported offset scaling");
+    }
     if scaled {
         p += 1;
     }
@@ -1359,37 +1380,56 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
     Ok(())
 }
 
-/// A non-LZ half can be a bare entropy array rather than a raw copy.
-pub(crate) fn decode_entropy_half(src: &[u8], len: usize) -> Result<Vec<u8>> {
-    let (out, used) = get_array(src, 0, src.len(), len)?;
-    if used != src.len() || out.len() != len {
-        return format_err("kraken: entropy half has the wrong length or trailing bytes");
-    }
-    Ok(out)
-}
-
 /// Decode a block of `len` logical bytes from its halves.
 pub fn decode_block(halves: &[Half], len: usize) -> Result<Vec<u8>> {
-    let parts: Vec<_> = halves
-        .iter()
-        .map(|h| (h.bytes(), h.is_lz(), h.is_delta()))
-        .collect();
+    let parts: Vec<Part> = halves.iter().map(Half::part).collect();
     decode_parts(&parts, len)
 }
 
-/// [`decode_block`] over borrowed halves, each `(bytes, LZ, delta literals)`.
-pub(crate) fn decode_parts(halves: &[(&[u8], bool, bool)], len: usize) -> Result<Vec<u8>> {
+/// A [`Half`]'s bytes, borrowed, for [`decode_parts`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Part<'a> {
+    Raw(&'a [u8]),
+    Lz(&'a [u8]),
+    LzDelta(&'a [u8]),
+    Entropy(&'a [u8]),
+}
+
+impl Half {
+    fn part(&self) -> Part<'_> {
+        match self {
+            Half::Raw(b) => Part::Raw(b),
+            Half::Lz(b) => Part::Lz(b),
+            Half::LzDelta(b) => Part::LzDelta(b),
+            Half::Entropy(b) => Part::Entropy(b),
+        }
+    }
+}
+
+/// [`decode_block`] over borrowed halves.
+pub(crate) fn decode_parts(halves: &[Part], len: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; len];
     let mut at = 0usize;
-    for &(b, lz, delta) in halves {
+    for &h in halves {
         let hl = (len - at).min(HALF);
-        if lz {
-            decode_half(b, &mut out, at, hl, delta)?;
-        } else {
-            if b.len() != hl {
-                return format_err("kraken: raw half has the wrong length");
+        match h {
+            Part::Raw(b) => {
+                if b.len() != hl {
+                    return format_err("kraken: raw half has the wrong length");
+                }
+                out[at..at + hl].copy_from_slice(b);
             }
-            out[at..at + hl].copy_from_slice(b);
+            Part::Lz(b) => decode_half(b, &mut out, at, hl, false)?,
+            Part::LzDelta(b) => decode_half(b, &mut out, at, hl, true)?,
+            Part::Entropy(b) => {
+                // ooz `Kraken_DecodeQuantum`'s entropy-only chunk: one array that must be
+                // exactly the half's stored bytes and decode to exactly its logical length.
+                let (bytes, used) = get_array(b, 0, b.len(), hl)?;
+                if used != b.len() || bytes.len() != hl {
+                    return format_err("kraken: entropy half does not fill the half");
+                }
+                out[at..at + hl].copy_from_slice(&bytes);
+            }
         }
         at += hl;
     }
@@ -1606,5 +1646,100 @@ mod tests {
         }
         let r = decode_block(&halves, BLOCK);
         assert!(r.is_err() || r.unwrap() != data);
+    }
+
+    /// Sony's all-zero half: a bare one-symbol Huffman array, 8 bytes for 128 KiB (#493). ooz
+    /// (`Kraken_DecodeBytes`, its one-symbol return fixed) decodes these bytes the same way.
+    const SONY_ZERO_HALF: [u8; 8] = [0x27, 0xff, 0xfc, 0x00, 0x03, 0x00, 0x40, 0x00];
+
+    #[test]
+    fn sony_entropy_only_zero_halves_decode() {
+        let zero = || Half::Entropy(SONY_ZERO_HALF.to_vec());
+        assert_eq!(
+            decode_block(&[zero(), zero()], BLOCK).unwrap(),
+            vec![0u8; BLOCK]
+        );
+        // After an LZ even half, an entropy odd half needs no history.
+        let mut data = noise(HALF, 7);
+        data.extend(vec![0u8; HALF]);
+        let mut halves = encode_block(&data[..HALF]);
+        halves.push(zero());
+        assert_eq!(decode_block(&halves, BLOCK).unwrap(), data);
+    }
+
+    #[test]
+    fn a_damaged_entropy_half_is_refused_without_panicking() {
+        let zero = SONY_ZERO_HALF.to_vec();
+        // Trailing byte, missing byte, wrong logical size, empty, unknown array type.
+        let mut long = zero.clone();
+        long.push(0);
+        for bad in [
+            long,
+            zero[..7].to_vec(),
+            Vec::new(),
+            vec![0x17, 0, 0, 0, 0, 0],
+        ] {
+            assert!(decode_block(&[Half::Entropy(bad)], HALF).is_err());
+        }
+        assert!(decode_block(&[Half::Entropy(zero.clone())], HALF - 16).is_err());
+        // Random damage never panics.
+        let mut arr = Vec::new();
+        put_array(
+            &mut arr,
+            &noise(HALF, 3).iter().map(|b| b & 0x0F).collect::<Vec<_>>(),
+        );
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..2000 {
+            let mut bad = if seed & 1 == 0 {
+                arr.clone()
+            } else {
+                zero.clone()
+            };
+            for _ in 0..1 + seed % 3 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let at = (seed % bad.len() as u64) as usize;
+                bad[at] = (seed >> 32) as u8;
+            }
+            let _ = decode_block(&[Half::Entropy(bad)], HALF);
+        }
+    }
+
+    /// The smallest LZ chunk ooz accepts is 13 bytes, on either half: four literals and no
+    /// commands after an odd half's excess flag.
+    #[test]
+    fn a_thirteen_byte_odd_lz_half_decodes() {
+        let odd = vec![
+            0x80, // excess framing, no excess bytes
+            0x80, 0x03, b'x', b'y', b'z', // literals
+            0x80, 0x00, // commands
+            0x00, 0x00,
+            0x00, // offsets (a first byte with bit 7 set would mean scaled offsets)
+            0x80, 0x00, // lengths
+        ];
+        assert_eq!(odd.len(), 13);
+        let halves = [Half::Raw(vec![1u8; HALF]), Half::Lz(odd.clone())];
+        let back = decode_block(&halves, HALF + 3).unwrap();
+        assert_eq!(&back[HALF..], b"xyz");
+        // One byte short is under the minimum, a refusal and not a misread.
+        let short = [Half::Raw(vec![1u8; HALF]), Half::Lz(odd[..12].to_vec())];
+        assert!(decode_block(&short, HALF + 3).is_err());
+        // Offsets scaled by more than 1 (ooz: a second, low-bits array) are refused, not read
+        // as a traditional array.
+        let mut scaled = odd.clone();
+        scaled[8] = 0x81;
+        let halves = [Half::Raw(vec![1u8; HALF]), Half::Lz(scaled)];
+        assert!(decode_block(&halves, HALF + 3).is_err());
+    }
+
+    /// An excess count that needs a second byte the chunk does not have, or more excess bytes
+    /// than the chunk holds, is an error.
+    #[test]
+    fn a_bad_excess_count_is_refused() {
+        let mut odd = vec![0xBF, 0xFF];
+        odd.extend([0x80, 0x00].repeat(5));
+        let halves = [Half::Raw(vec![1u8; HALF]), Half::Lz(odd)];
+        assert!(decode_block(&halves, HALF + 4).is_err());
     }
 }

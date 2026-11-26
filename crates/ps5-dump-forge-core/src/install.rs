@@ -1,10 +1,7 @@
-//! Install (a request with [`ConvertRequest::install`]): a `.pkg` on this device or another
-//! one handed to the PS5's installer. Sony's installer accepts the package by URL and then
-//! pulls it over HTTP Range requests (several connections, keep-alive, HEAD too, sometimes a
-//! `.crc` sidecar), so the job serves the package on a 127.0.0.1 port of its own until every
-//! byte has been served at least once. Nothing is written here.
-// ponytail: done means every byte was fetched once; whether the PS5 then finishes the install
-// (its own checks, its own download queue) is not seen.
+//! Install ([`ConvertRequest::install`]): a `.pkg` here or on another device handed to the
+//! PS5's installer, which takes a URL and pulls the package over HTTP Range requests, so the
+//! job serves it on a 127.0.0.1 port of its own until every byte was served once.
+// ponytail: done means every byte was fetched once; whether the PS5 finishes is not seen.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
@@ -22,20 +19,17 @@ use crate::jobs::Ctx;
 use crate::remote::is_remote;
 use crate::{ConvertRequest, JobReport, VerifyMode, VerifySummary};
 
-/// The stages an install reports, in order.
 pub(crate) const STAGES: [&str; 2] = ["preflight", "install"];
 
 /// No request and no byte served for this long: the PS5 gave up on the download.
 const STALL: Duration = Duration::from_secs(5 * 60);
 
-/// Once every byte is served, this long with no request ends the job (a response still on its
-/// way, a range asked for again).
+/// Once every byte is served, this long with no request ends the job.
 const SETTLE: Duration = Duration::from_secs(2);
 
 /// Sony's MetaInfo holds the URL in 128 bytes.
 const URL_MAX: usize = 127;
 
-/// The bytes a response body is sent in.
 const SEND_CHUNK: usize = 1 << 20;
 
 /// At most this many connections served at once (ps5upload's loopback takes 16); more get 503.
@@ -51,17 +45,13 @@ const RECHECK: Duration = Duration::from_secs(5);
 /// The longest request head read.
 const HEAD_MAX: usize = 8 << 10;
 
-/// The `Last-Modified` every response carries: fixed and in the past (ps5upload found a fresh
-/// one refused on some firmware).
+/// Every response's `Last-Modified`: fixed and past (ps5upload saw a fresh one refused).
 const LAST_MODIFIED: &str = "Wed, 01 Jan 2025 00:00:00 GMT";
 
-/// The cancel error: the PS5 may keep the download listed.
 const CANCELLED: &str = "cancelled; if the PS5 still lists the download, delete it there";
 
-/// The installer: `(url, name)` accepted, or Sony's error code.
 pub(crate) type Installer<'a> = &'a dyn Fn(&str, &str) -> Result<(), u32>;
 
-/// What Sony's error code means for the user, where it is known.
 fn hint(code: u32) -> Option<&'static str> {
     Some(match code {
         0x80A3_0004 | 0x80A3_000A => "install the base game first",
@@ -77,7 +67,6 @@ fn hint(code: u32) -> Option<&'static str> {
     })
 }
 
-/// The job's error for Sony's refusal `code`.
 fn refused(code: u32) -> String {
     match hint(code) {
         Some(h) => format!("the PS5 refused the package: 0x{code:08X} ({h})"),
@@ -85,7 +74,6 @@ fn refused(code: u32) -> String {
     }
 }
 
-/// The PS5's installer (`ps5/installer.c`).
 #[cfg(target_env = "ps5")]
 fn ps5_install(url: &str, name: &str) -> Result<(), u32> {
     use std::ffi::{CString, c_char};
@@ -101,7 +89,7 @@ fn ps5_install(url: &str, name: &str) -> Result<(), u32> {
     if rc == 0 { Ok(()) } else { Err(code) }
 }
 
-/// The install job, with this platform's installer (none off the PS5: a preflight finding).
+/// The install job (no installer off the PS5: a preflight finding).
 pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     #[cfg(target_env = "ps5")]
     return run_with(req, ctx, Some(&ps5_install), STALL);
@@ -109,7 +97,6 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     run_with(req, ctx, None, STALL)
 }
 
-/// What the request itself can't be, before the package is read.
 fn request_findings(req: &ConvertRequest) -> Vec<String> {
     let mut findings = Vec::new();
     if !req.edits.is_empty()
@@ -131,8 +118,7 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     findings
 }
 
-/// The package (or its sidecar) opened for reading, and its length: a regular file here (never a
-/// link), or a file on another device read through [`crate::remote`].
+/// The package (or sidecar) opened, and its length: a regular file here, or a remote one.
 fn open(path: &Path) -> anyhow::Result<(Box<dyn ReadSeek>, u64, SourceStamp)> {
     let shown = || path.display().to_string();
     if is_remote(path) {
@@ -155,30 +141,26 @@ fn open(path: &Path) -> anyhow::Result<(Box<dyn ReadSeek>, u64, SourceStamp)> {
     Ok((Box::new(file), meta.len(), stamp))
 }
 
-/// The package being served.
 struct Package {
     path: PathBuf,
     total: u64,
     stamp: SourceStamp,
-    /// The last part of the URL: the file's own name when it is plain ASCII, else the content
-    /// ID's (`<content id>.pkg`), else `package.pkg`.
+    /// The URL's last part: the file's name when plain ASCII, else `<content id>.pkg`, else `package.pkg`.
     url_name: String,
     /// The name hint Sony gets: the file's name without `.pkg`.
     name: String,
-    /// `<package>.crc` beside it, served when asked for and there.
+    /// `<package>.crc` beside it, served when there.
     sidecar: PathBuf,
-    /// The header's content ID (offset 0x40, 36 ASCII bytes), when it reads as one.
+    /// The header's content ID (0x40, 36 ASCII bytes), when it reads as one.
     content_id: Option<String>,
 }
 
-/// A name that goes into the URL as it is.
 fn url_safe(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && (name.bytes()).all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// The package at `path`, or why it can't be installed (a finding).
 fn probe(path: &Path) -> Result<Package, String> {
     if path.as_os_str().is_empty() {
         return Err("install: no package given".to_string());
@@ -274,27 +256,22 @@ impl Coverage {
     }
 }
 
-/// What the server's threads and the job share.
 struct Shared {
     coverage: Coverage,
     /// The last request or body chunk: the stall clock.
     last: Instant,
-    /// Connections being served.
     conns: usize,
-    /// Requests answered, for the first few logged.
     requests: u64,
-    /// Lines for the job's log, taken by the job thread (the server's can't log).
+    /// Lines for the job's log (the server threads can't log).
     logs: Vec<String>,
     /// A package change found by a server thread; delivered as the job's error.
     failed: Option<String>,
-    /// Lines logged so far.
     logged: usize,
 }
 
-/// Requests logged as they come; later only refusals are.
+/// Requests logged as they come; later only refusals.
 const LOG_FIRST: u64 = 8;
 
-/// At most this many log lines from the server.
 const LOG_MAX: usize = 50;
 
 impl Shared {
@@ -338,7 +315,6 @@ fn http_date(secs: u64) -> String {
     )
 }
 
-/// One request's head, as far as serving needs it.
 struct Head {
     method: String,
     target: String,
@@ -379,11 +355,9 @@ fn parse_head(head: &[u8]) -> Option<Head> {
 /// What a `Range` header asks of `total` bytes.
 #[derive(Debug, PartialEq)]
 enum Range {
-    /// No usable range (none, malformed, several): the whole file.
+    /// None, malformed or several: the whole file.
     Whole,
-    /// Bytes `start..=end`.
     Part(u64, u64),
-    /// Nothing of the file: 416.
     Unsatisfiable,
 }
 
@@ -421,7 +395,6 @@ fn parse_range(value: &str, total: u64) -> Range {
     Range::Part(start, end.min(total - 1))
 }
 
-/// A response head.
 fn response(status: &str, len: u64, extra: &str, keep: bool) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -435,10 +408,9 @@ fn response(status: &str, len: u64, extra: &str, keep: bool) -> String {
     )
 }
 
-/// A kept-alive connection with no request for this long is closed.
 const CONN_IDLE: Duration = Duration::from_secs(60);
 
-/// Accepts connections on `listener` (non-blocking) until `stop`, each served on its own thread.
+/// Accepts connections until `stop`, each on its own thread.
 fn serve(
     listener: &TcpListener,
     pkg: &Package,
@@ -477,8 +449,7 @@ fn serve(
     });
 }
 
-/// Answers the requests of one connection, one after another, until it closes, idles, fails
-/// or the job stops serving.
+/// Answers one connection's requests until it closes, idles, fails or serving stops.
 fn connection(
     mut conn: TcpStream,
     pkg: &Package,
@@ -526,7 +497,6 @@ fn connection(
     }
 }
 
-/// A 404, logged.
 fn not_found(
     conn: &mut TcpStream,
     state: &Mutex<Shared>,
@@ -613,7 +583,7 @@ fn answer(
     Ok(h.keep)
 }
 
-/// Opens the same package seen at preflight, including its identity and modification time.
+/// Opens the package seen at preflight (same identity and mtime).
 fn open_checked(pkg: &Package) -> anyhow::Result<Box<dyn ReadSeek>> {
     if !pkg.stamp.unchanged() {
         anyhow::bail!(changed(pkg));
@@ -632,9 +602,8 @@ fn changed(pkg: &Package) -> String {
     )
 }
 
-/// A connection's package reader: opened and checked at its first body, then kept for the
-/// connection's later requests (each open and stamp is a round trip or more on another
-/// device), its stamp checked again once [`RECHECK`] has passed.
+/// A connection's package reader, kept across its requests (an open is a round trip on
+/// another device), its stamp checked again after [`RECHECK`].
 #[derive(Default)]
 struct Reader {
     open: Option<(Box<dyn ReadSeek>, Instant)>,
@@ -657,7 +626,6 @@ impl Reader {
     }
 }
 
-/// Sends bytes `start..end` of the package, marking each chunk sent as covered.
 fn body(
     conn: &mut TcpStream,
     reader: &mut Reader,
@@ -694,8 +662,7 @@ fn body(
     Ok(())
 }
 
-/// The package's `.crc` sidecar, whole, when there is one beside it (else 404); the connection
-/// is closed after it.
+/// The package's `.crc` sidecar, whole (else 404); the connection closes after it.
 fn sidecar(
     conn: &mut TcpStream,
     pkg: &Package,
@@ -719,8 +686,7 @@ fn sidecar(
     Ok(false)
 }
 
-/// The install job with `installer` (none: this device can't install, a preflight finding),
-/// failing once the PS5 fetches nothing for `stall`.
+/// The install job with `installer`, failing once the PS5 fetches nothing for `stall`.
 pub(crate) fn run_with(
     req: &ConvertRequest,
     ctx: &Ctx,
@@ -793,11 +759,13 @@ pub(crate) fn run_with(
             samples: 0,
             seed: 0,
         },
+        source_bytes: pkg.total,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
-/// Hands `url` to the installer, then waits until every byte was served and requests settle,
-/// the PS5 stalls, or the job is cancelled.
+/// Hands `url` to the installer, then waits for every byte served and settled, a stall or a cancel.
 fn deliver(
     ctx: &Ctx,
     pkg: &Package,
@@ -860,7 +828,6 @@ mod tests {
 
     const ID: &[u8; 36] = b"UP0000-PPSA00000_00-0000000000000000";
 
-    /// A package-looking file of `len` bytes (a CNT header, a content ID, varied bytes).
     fn package(path: &Path, len: usize) -> Vec<u8> {
         let mut data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
         data[..4].copy_from_slice(b"\x7FCNT");
@@ -886,7 +853,6 @@ mod tests {
         run_with(req, &ctx, Some(installer), Duration::from_secs(5)).map_err(|e| format!("{e:#}"))
     }
 
-    /// One request on a kept-alive connection: status and body.
     fn ask(conn: &mut TcpStream, method: &str, path: &str, range: Option<&str>) -> (u16, Vec<u8>) {
         let range = range.map(|r| format!("Range: {r}\r\n")).unwrap_or_default();
         let req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{range}\r\n");
@@ -907,7 +873,6 @@ mod tests {
         (status, body)
     }
 
-    /// The host and path of `url`.
     fn split(url: &str) -> (String, String) {
         let rest = url.strip_prefix("http://").unwrap();
         let (host, path) = rest.split_once('/').unwrap();

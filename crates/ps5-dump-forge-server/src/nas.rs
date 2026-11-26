@@ -1,7 +1,5 @@
-//! Connect's saved NAS devices (`nas.json` beside `peers.json`, 0600): one entry per host +
-//! port, an SMB share, an FTP server or an NFS server (each a source and an output), saved
-//! from Discover (mDNS) or added by address, with optional credentials (none for NFS: it has
-//! no login). The password is never logged and never in a reply (`NasDevice::has_password`).
+//! Connect's saved NAS devices (`nas.json`, 0600): one entry per host + port. The password is
+//! never logged and never in a reply (`NasDevice::has_password`).
 //! ponytail: the password is plaintext at rest (the file is 0600, like the node secret).
 
 use std::collections::HashSet;
@@ -15,15 +13,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 pub const NAS_FILE: &str = "nas.json";
-/// SMB.
+/// SMB's.
 pub const DEFAULT_PORT: u16 = 445;
-/// FTP.
 pub const FTP_PORT: u16 = 21;
-/// NFS.
 pub const NFS_PORT: u16 = 2049;
 
-/// How a saved NAS is reached: `smb://` (the default, as every entry before FTP), `ftp://` or
-/// `nfs://`. Spelled as mDNS's `Nas::service` for SMB and NFS, so Discover's Save can pass it on.
+/// SMB the default (entries saved before FTP have none); spelled as mDNS's `Nas::service`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
@@ -42,7 +37,6 @@ impl Protocol {
         }
     }
 
-    /// As a search names it (`mdns::Nas::service`).
     fn service(self) -> &'static str {
         match self {
             Self::Smb => "smb",
@@ -55,7 +49,7 @@ impl Protocol {
 /// A saved NAS as stored (with its password: never serialized anywhere but `nas.json`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedNas {
-    /// Stable across address changes: `nas-` + 8 random hex digits.
+    /// `nas-` + 8 random hex digits, stable across address changes.
     pub id: String,
     pub name: String,
     pub host: String,
@@ -98,9 +92,8 @@ pub struct NasDevice {
     pub last_online: u64,
 }
 
-/// What a save asks for. `user`/`password` `None` keep the saved ones (Discover's Save sends
-/// none); `Some("")` clears them. NFS has no login: a save as NFS drops both (an entry
-/// switched to NFS loses its old ones). `id`: the saved entry an edit changes (its address too).
+/// `user`/`password` `None` keep the saved ones, `Some("")` clears them; a save as NFS drops
+/// both. `id`: the entry an edit changes (its address too).
 #[derive(Clone, Default, Deserialize)]
 pub struct NasSave {
     #[serde(default)]
@@ -124,8 +117,7 @@ pub struct NasList {
     pub nas: Vec<SavedNas>,
 }
 
-/// `host`, `host:port` or `[v6]:port` → (host, port); the port defaults to `default` (445 for
-/// SMB, 21 for FTP, 2049 for NFS).
+/// `host`, `host:port` or `[v6]:port` → (host, port), the port `default` when none is typed.
 pub fn parse_host(text: &str, port: Option<u16>, default: u16) -> io::Result<(String, u16)> {
     let t = text.trim();
     let bad = || {
@@ -154,9 +146,7 @@ pub fn parse_host(text: &str, port: Option<u16>, default: u16) -> io::Result<(St
 }
 
 impl NasList {
-    /// Hands every saved login to core: SMB ones to its `smb://` registry, FTP ones to its
-    /// `ftp://` one, replacing the last set. NFS has none to hand: core's `nfs://` reaches any
-    /// server by its address alone (AUTH_SYS).
+    /// Hands every saved SMB and FTP login to core, replacing the last set (NFS has none).
     pub fn publish(&self) {
         let ftp = |n: &&SavedNas| n.protocol == Protocol::Ftp;
         let authority = |n: &SavedNas| match n.port {
@@ -209,15 +199,13 @@ impl NasList {
         crate::connect::write_atomic(&dir.join(NAS_FILE), &json)
     }
 
-    /// Adds the NAS at `req`'s host + port, or updates that one entry in place (its name, and
-    /// the credentials the request names); returns its id. Never a duplicate.
+    /// Adds the NAS at `req`'s host + port, or updates that one entry in place; returns its id.
     pub fn upsert(&mut self, req: &NasSave) -> io::Result<String> {
         let edited = req
             .id
             .as_ref()
             .and_then(|id| self.nas.iter().position(|n| &n.id == id));
-        // Naming none keeps the protocol of the entry it edits or saves again (an SMB default
-        // address finds it), else SMB.
+        // None keeps the protocol of the entry it edits or saves again, else SMB.
         let protocol = req
             .protocol
             .or_else(|| edited.map(|e| self.nas[e].protocol))
@@ -279,9 +267,8 @@ impl NasList {
         Ok(n.id.clone())
     }
 
-    /// Saved NAS devices that moved to a new IP: an offline entry saved by IP address takes the
-    /// address and port of the one host a search found with its protocol and a similar name
-    /// (the same letters and digits, any case), when no entry is saved there yet. The ids moved.
+    /// An offline entry saved by IP takes the address of the one host a search found with its
+    /// protocol and a similar name (same letters and digits, any case); returns the ids moved.
     /// ponytail: a name is trusted as announced, so another device that takes an offline
     /// entry's name gets its saved login.
     pub fn migrate(&mut self, found: &[crate::mdns::Nas], online: &HashSet<String>) -> Vec<String> {
@@ -329,9 +316,8 @@ fn rand4() -> [u8; 4] {
     b
 }
 
-/// Online = a TCP connect to its port within `timeout`, the name looked up within `timeout`
-/// too and every address (at most 8) tried at once, so one NAS never holds up a probe round
-/// for longer than twice `timeout`.
+/// A TCP connect within `timeout`, the lookup bounded too and every address (at most 8) tried
+/// at once, so one NAS never holds up a probe round for longer than twice `timeout`.
 // ponytail: a lookup past its bound is left running on its own thread (std has no timeout for
 // it); while it runs, that host + port reads offline and no second lookup of it starts.
 pub fn reachable(host: &str, port: u16, timeout: Duration) -> bool {
@@ -409,8 +395,7 @@ mod tests {
             found("Box", "smb", "10.0.0.60", 445),
             found("Named", "smb", "10.0.0.70", 445),
         ];
-        // Online entries stay; offline: the SMB one moves (its login kept), the FTP one finds
-        // no FTP host by its name, the one saved by name is left to its name.
+        // Offline: the SMB one moves (login kept), the FTP one and the named one stay.
         assert!(l.migrate(&finds, &HashSet::from([smb.clone()])).is_empty());
         assert_eq!(l.migrate(&finds, &HashSet::new()), vec![smb.clone()]);
         let n = &l.nas[0];

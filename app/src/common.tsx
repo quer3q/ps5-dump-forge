@@ -1,4 +1,3 @@
-// Pieces shared by the screens.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
@@ -21,6 +20,8 @@ import { nasName, nasPath } from "./peers";
 import { useCoverGlow } from "./glow";
 import { Icon, type IconName } from "./icons";
 import { useSavedNames } from "./useConnectState";
+import { getPrefs } from "./prefs";
+import "./source-card.css";
 
 // Format names stay as they are in every language; only "Folder" is translated (kindLabel).
 const KIND_LABEL: Record<Format | ArchiveKind, string> = {
@@ -29,33 +30,29 @@ const KIND_LABEL: Record<Format | ArchiveKind, string> = {
   ffpkg: "ffpkg",
   ffpfs: "ffpfs",
   ffpfsc: "ffpfsc",
-  pkg: "fpkg", // the debug FPKG's display name; its file still ends in .pkg
+  pkg: "FPKG", // the debug FPKG's display name; its file still ends in .pkg
   lz4: "LZ4", // an LZ4 packed folder
   zip: "zip", // archives: a source only
   "7z": "7z",
   rar: "rar",
 };
 
-/** What a source can be, in picker order; also the target picker's formats. The LZ4 packed
- * folder is not among them: the Pack tab's LZ4 Pack picks it. */
+/** Source kinds in picker order (the LZ4 packed folder is Build's). */
 export const KINDS: Kind[] = ["folder", "exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
 
-/** Archives holding one game: sources only, never a target. */
 export const ARCHIVE_KINDS: ArchiveKind[] = ["zip", "7z", "rar"];
 
-/** An inspected source's kind is an archive's. */
 export function isArchive(kind: string | undefined): boolean {
   return ARCHIVE_KINDS.includes(kind as ArchiveKind);
 }
 
-/** A format's display name, read at call time (a component calling it re-renders on a switch
- * through its own `useMessages`). */
+/** Read at call time (a component re-renders on a switch through its own `useMessages`). */
 export function kindLabel(kind: string): string {
   if (kind === "folder") return msg().common.folder;
+  if (kind === "zstd") return "ZSTD";
   return KIND_LABEL[kind as Format | ArchiveKind] ?? kind;
 }
 
-/** A format as a small tinted tag (hues: `.fmt-*` in styles.css). */
 export function FormatPill({ kind }: { kind: string }) {
   useLang(); // re-render on a language switch: kindLabel reads the current one
   const known = kind in KIND_LABEL || kind === "zstd";
@@ -64,13 +61,10 @@ export function FormatPill({ kind }: { kind: string }) {
   return <span className={known ? `tag fmt fmt-${hue}` : "tag"}>{kindLabel(kind)}</span>;
 }
 
-/** The image formats' names (no dot) as words in running text: not an extension (`.exfat`) nor
- * part of a longer name (`fpkg-enable`). The character before is matched, not looked behind:
- * the PS5's WebKit has no lookbehind. */
+/** Format names as words, not `.exfat` nor `fpkg-enable`; the char before is matched since the PS5's WebKit has no lookbehind. */
 const FORMAT_NAME = /(^|[^.\w-])(ffpfsc|ffpfs|ffpkg|exfat|fpkg)(?![\w-])/g;
 
-/** Running text with every format name in bold, so it reads as a name. Only for copy: a path
- * or file name (`game.ffpkg`) keeps its dot and stays plain. */
+/** Copy only: a path or file name keeps its dot and stays plain. */
 export function Prose({ text }: { text: string }) {
   const parts: ReactNode[] = [];
   let at = 0;
@@ -83,7 +77,6 @@ export function Prose({ text }: { text: string }) {
   return <>{parts}</>;
 }
 
-/** A dialog's head: an icon and its title. */
 export function Head({ id, icon, title }: { id: string; icon: IconName; title: string }) {
   return (
     <div className="modal-head">
@@ -97,14 +90,10 @@ export function Head({ id, icon, title }: { id: string; icon: IconName; title: s
   );
 }
 
-/** A card's title row: icon + title, actions on the right. */
 export function CardHead(props: {
-  /** Left out where the title stands alone (How to connect). */
   icon?: IconName;
   title: string;
   id?: string;
-  /** The heading can take focus from code (tabIndex -1), e.g. when the control that had it
-   * goes away. */
   focusable?: boolean;
   children?: ReactNode;
 }) {
@@ -123,7 +112,6 @@ export function CardHead(props: {
   );
 }
 
-/** Element ids of a tab and its panel. */
 export function tabId(prefix: string, id: string): string {
   return `${prefix}-tab-${id}`;
 }
@@ -131,29 +119,17 @@ export function panelId(prefix: string, id: string): string {
   return `${prefix}-panel-${id}`;
 }
 
-/**
- * A segmented row of tabs (WAI-ARIA tabs: one tab stop, arrow keys / Home / End move and
- * select). The caller renders each panel with `id={panelId(..)}`, `role="tabpanel"`,
- * `aria-labelledby={tabId(..)}` and `hidden` when not selected.
- */
+/** WAI-ARIA tabs; the caller renders each panel with `panelId`/`tabId` and `hidden`. */
 export function TabList<T extends string>(props: {
   label: string;
   prefix: string;
-  /** `className`: extra classes on that tab's button (none use it now). `sep`: a divider
-   * before it (drawn only; the keys still move through every tab). */
-  tabs: { id: T; label: ReactNode; className?: string; sep?: boolean }[];
+  tabs: { id: T; label: ReactNode }[];
   value: T;
   onChange: (id: T) => void;
   className?: string;
-  /** Controls on either side of the tab bar, outside it (the PS5's L2 / R2 badges). */
-  start?: ReactNode;
-  end?: ReactNode;
 }) {
   const ids = props.tabs.map((t) => t.id);
-  const framed = props.start !== undefined || props.end !== undefined;
-  // A bar that scrolls inside itself (the header under 900px) keeps the chosen tab whole in
-  // view, whatever chose it (the header's Connect state too). By hand, not scrollIntoView:
-  // older WebKit takes its options as "align to top" and would scroll the page.
+  // A bar that scrolls keeps the chosen tab in view; by hand, since older WebKit's scrollIntoView would scroll the page.
   useEffect(() => {
     const tab = document.getElementById(tabId(props.prefix, props.value));
     const bar = tab?.parentElement;
@@ -165,7 +141,6 @@ export function TabList<T extends string>(props: {
   }, [props.prefix, props.value]);
   const onKey = (e: KeyboardEvent) => {
     const i = ids.indexOf(props.value);
-    // Right-to-left, the next tab is to the left.
     const rtl = document.documentElement.dir === "rtl";
     const next =
       e.key === (rtl ? "ArrowLeft" : "ArrowRight") ? ids[(i + 1) % ids.length]
@@ -178,7 +153,7 @@ export function TabList<T extends string>(props: {
     props.onChange(next);
     document.getElementById(tabId(props.prefix, next))?.focus();
   };
-  const list = (
+  return (
     <div
       className={`seg ${props.className ?? ""}`}
       role="tablist"
@@ -187,7 +162,7 @@ export function TabList<T extends string>(props: {
     >
       {props.tabs.map((t) => {
         const on = t.id === props.value;
-        const tab = (
+        return (
           <button
             key={t.id}
             type="button"
@@ -196,68 +171,36 @@ export function TabList<T extends string>(props: {
             aria-selected={on}
             aria-controls={panelId(props.prefix, t.id)}
             tabIndex={on ? 0 : -1}
-            className={`seg-opt${on ? " on" : ""}${t.className ? ` ${t.className}` : ""}`}
+            className={`seg-opt${on ? " on" : ""}`}
             onClick={() => props.onChange(t.id)}
           >
             {t.label}
           </button>
         );
-        return t.sep ? [<span key={`${t.id}-sep`} className="tab-sep" aria-hidden="true" />, tab] : tab;
       })}
     </div>
   );
-  return framed ? (
-    <div className="seg-wrap">
-      {props.start}
-      {list}
-      {props.end}
-    </div>
-  ) : (
-    list
-  );
 }
 
-/**
- * One-of-N format choice as a segmented group, each format in its own hue. Native radios
- * underneath (visually hidden), so Tab / arrow keys and radio semantics come from the
- * browser.
- */
+/** Native radios underneath (visually hidden), so keys and semantics come from the browser. */
 export function FormatPicker<F extends Format>(props: {
   name: string;
-  /** The group's name: `label`, or the id of a visible label (`labelledBy`). */
-  label?: string;
-  labelledBy?: string;
+  label: string;
   value: F;
   onChange: (f: F) => void;
-  disabled?: (f: F) => boolean;
-  /** Why a disabled format is refused: read out with its label, and its tooltip. */
-  reason?: (f: F) => string | undefined;
-  /** Default: every source kind (the LZ4 packed folder is chosen elsewhere). */
-  formats?: F[];
-  /** A format shown as Folder (label and colour): the Pack tab's LZ4 packed folder. */
-  asFolder?: F;
+  formats: F[];
   className?: string;
 }) {
   useLang(); // re-render on a language switch: kindLabel reads the current one
-  const formats = props.formats ?? (KINDS as F[]);
   return (
-    <div
-      className={`seg formats ${props.className ?? ""}`}
-      role="radiogroup"
-      aria-label={props.labelledBy ? undefined : props.label}
-      aria-labelledby={props.labelledBy}
-    >
-      {formats.map((f) => {
-        const disabled = props.disabled?.(f) ?? false;
-        const shown = f === props.asFolder ? "folder" : f;
-        const why = disabled ? props.reason?.(f) : undefined;
+    <div className={`seg formats ${props.className ?? ""}`} role="radiogroup" aria-label={props.label}>
+      {props.formats.map((f) => {
         return (
           // `on` from state, not `input:checked + …`: WebKit misses that restyle when React
           // sets `checked` by code (a new source switching the format).
           <label
             key={f}
-            className={`seg-choice fmt-${shown}${props.value === f ? " on" : ""}`}
-            title={why}
+            className={`seg-choice fmt-${f}${props.value === f ? " on" : ""}`}
           >
             <input
               type="radio"
@@ -265,12 +208,10 @@ export function FormatPicker<F extends Format>(props: {
               name={props.name}
               value={f}
               checked={props.value === f}
-              disabled={disabled}
               onChange={() => props.onChange(f)}
             />
             <span className="seg-opt">
-              {kindLabel(shown)}
-              {why &&<span className="visually-hidden">, {why}</span>}
+              {kindLabel(f)}
             </span>
           </label>
         );
@@ -281,9 +222,7 @@ export function FormatPicker<F extends Format>(props: {
 
 export const IMAGE_EXTENSIONS = ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"];
 
-/** What the Image/Archive picker offers besides images: an archive, or the first part of a
- * multi-part one (`.part1.rar` ends in .rar, `.7z.001`/`.zip.001`, a split zip's `.zip`; `.z01`
- * too, so core can name the part to choose instead). */
+/** Also a multi-part archive's first part (`.7z.001`, `.zip.001`; `.z01` so core can name the part to choose). */
 export const ARCHIVE_EXTENSIONS = ["zip", "7z", "rar", "001", "z01"];
 
 /** A Mac (or iPad) keyboard: its key marked delete sends Backspace, so the explorers' tips name fn+Delete. */
@@ -291,13 +230,9 @@ export const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.
 
 export { basename, dirname, joinPath, SEPARATORS } from "./paths";
 
-/**
- * A path on one line that never hides its last part: the folder part ellipsizes, the name
- * stays. The full path is the tooltip.
- */
+/** The folder part ellipsizes, the name stays; the full path is the tooltip. */
 export function PathLine({ path: raw, prefix }: { path: string; prefix?: string }) {
   const path = usePeerPath()(raw);
-  // A device's root ("<device>: /") has no name of its own: shown whole.
   const name = basename(path) || path;
   const dir = name === path ? "" : path.slice(0, trimSep(path).length - name.length);
   return (
@@ -311,11 +246,8 @@ export function PathLine({ path: raw, prefix }: { path: string; prefix?: string 
   );
 }
 
-/** Shows a paired Forge's `flink://<key_id>/<rel>` path, or a saved NAS's `smb://`, `ftp://` or
- * `nfs://` one, as "<device name>: /<rel>" while that device is known (saved); anything else, or
- * an unknown device, as it is. */
+/** `flink://` or a saved NAS's path as "<device name>: /<rel>" while that device is saved. */
 export function usePeerPath(): (path: string) => string {
-  // Names only: a poll that changes nothing else re-renders nothing here.
   const { devices, nas } = useSavedNames();
   return useCallback(
     (path: string) => {
@@ -326,9 +258,7 @@ export function usePeerPath(): (path: string) => string {
   );
 }
 
-/** The device a path is on when it isn't this one: a paired Forge (`flink://`) or a NAS
- * (`smb://`, `ftp://`, `nfs://`: its saved name, else its address), by name; `null` for this
- * device's paths. */
+/** By name; `null` for this device's paths. */
 export function useDeviceName(): (path: string) => string | null {
   const { devices, nas } = useSavedNames();
   return useCallback(
@@ -349,14 +279,12 @@ function peerOf(path: string, devices: { key_id: string; name: string }[] | unde
   return d && m ? { name: d.name, rest: m[2] || "/" } : null;
 }
 
-// ---- Dialogs over the whole app (the LZ4 help, the delete question) ----
+// ---- Dialogs over the whole app ----
 
 const overlays = new Set<() => void>();
-/** Each overlay's host and where focus goes back to when it closes. */
 const returns = new Map<HTMLElement, { to: HTMLElement | null; closed: boolean }>();
 
-/** Another device's pairing request is up (Connect's prompt, above every dialog): a dialog that
- * opens, loads or closes under it leaves focus in the prompt, so Enter and Escape answer it. */
+/** Another device's pairing request is up: a dialog under it leaves focus in the prompt. */
 export function pairPromptUp(): boolean {
   return document.querySelector(".pair-layer") !== null;
 }
@@ -366,14 +294,10 @@ export function closeOverlays(): void {
   for (const close of [...overlays]) close();
 }
 
-/**
- * A dialog in its own React root, like the http Picker: the app behind it (header, every
- * screen) is inert. `onClosed` runs once it closes; focus goes back to what had it.
- */
+/** A dialog in its own React root; the app behind it is inert; focus goes back to what had it. */
 export function openOverlay(render: (close: () => void) => ReactNode, onClosed?: () => void): void {
   let opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  // Opened from a dialog closing now (Connect's details → File Transfer or Edit): this one gives
-  // focus back to that one's opener, which no longer does it (its button is gone by then).
+  // Opened from a dialog closing now: give focus back to that one's opener (its button is gone by then).
   for (const [h, r] of returns)
     if (r.closed && opener && h.contains(opener)) {
       opener = r.to;
@@ -382,7 +306,6 @@ export function openOverlay(render: (close: () => void) => ReactNode, onClosed?:
   const app = document.getElementById("root");
   app?.setAttribute("inert", "");
   app?.setAttribute("aria-hidden", "true");
-  // The dialogs already open (File Transfer under its picker) are behind this one too.
   const under = [...returns].filter(([h, r]) => !r.closed && !h.hasAttribute("inert")).map(([h]) => h);
   for (const h of under) {
     h.setAttribute("inert", "");
@@ -419,15 +342,11 @@ export function openOverlay(render: (close: () => void) => ReactNode, onClosed?:
   root.render(render(close));
 }
 
-/** What Tab stops at inside a dialog: not a button taken out of the Tab order (a TabList's or
- * ViewSwitch's unselected options). Picker's trap uses it too. */
+/** Not a button taken out of the Tab order (a TabList's or ViewSwitch's unselected options). */
 export const FOCUSABLE =
   'button:not(:disabled):not([tabindex="-1"]), a[href], input:not(:disabled), [tabindex]:not([tabindex="-1"])';
 
-/** An overlay's backdrop and box: Escape and a click outside close it, Tab stays inside (old
- * WebKit has no `inert`). Give the first control `autoFocus`. Without `close` (Stopping, has
- * stopped) it takes no keys or clicks at all: Escape stays the browser's (the PS5's Circle
- * leaves the page). */
+/** Escape and a click outside close it; Tab stays inside (old WebKit has no `inert`). Without `close` it takes no keys at all (the PS5's Circle leaves the page). */
 export function Modal(props: {
   close?: () => void;
   className: string;
@@ -486,22 +405,18 @@ export function Modal(props: {
   );
 }
 
-// ---- Deleted sources ----
 
 const deletedSubs = new Set<(path: string) => void>();
 
-/** Calls `f` with every path Edit or the Storage tab deletes, renames or moves away; returns the unsubscribe. */
 export function onDeleted(f: (path: string) => void): () => void {
   deletedSubs.add(f);
   return () => void deletedSubs.delete(f);
 }
 
-/** A game the Storage tab handed to Edit or Convert; a new `id` is a new request, even for the same
- * path (the screen reads it again). */
+/** A new `id` is a new request, even for the same path. */
 export interface SourceSelection {
   id: number;
   path: string;
-  /** An archive's comes from the Storage tab's File explorer (by extension). */
   kind: Kind | ArchiveKind;
 }
 
@@ -509,21 +424,17 @@ export function notifyDeleted(path: string): void {
   for (const f of deletedSubs) f(path);
 }
 
-/** `path` is `dir` or inside it, by spelling (the server compared the real paths). */
+/** By spelling (the server compared the real paths). */
 export function isWithin(path: string, dir: string): boolean {
   const p = trimSep(path);
   const d = trimSep(dir);
   return p === d || (p.startsWith(d) && SEPARATORS.test(p[d.length] ?? ""));
 }
 
-/** The picker for a game folder, or an image or archive file; `onPick` unless cancelled
- * (`isImage`: a file, so not a plain folder). */
-/** Pick (by user request, one button): Forge's own picker, where a file click picks an image or
- * archive and "Choose this folder" the folder shown; what was picked is told by its extension. */
+/** A file click picks an image or archive (`isImage`), "Choose this folder" the folder shown. */
 export async function pickSource(onPick: (path: string, isImage: boolean) => void): Promise<void> {
   const t = msg().common;
-  // The http build lists the saved NAS devices as roots; a saved NAS online is a tab (a game
-  // folder or image there, read only: no .pkg or archive, core reads those from a local path only).
+  // A saved NAS or peer is a tab: no .pkg or archive there, core reads those from a local path only.
   const p = await pick({
     directory: false,
     folderToo: true,
@@ -543,69 +454,56 @@ const isImagePath = (p: string): boolean => {
   return !!ext && (IMAGE_EXTENSIONS.includes(ext) || ARCHIVE_EXTENSIONS.includes(ext) || /^(part\d+\.rar|r\d\d|\d{3})$/.test(ext));
 };
 
-/** The images a NAS share can serve as a source (common's IMAGE_EXTENSIONS without .pkg). */
 const NAS_IMAGES = ["exfat", "ffpkg", "ffpfs", "ffpfsc"];
 
-/** A source on a saved NAS (`smb://host/share/...`, an FTP server's `ftp://host/...` or an NFS
- * server's `nfs://host/<export>/...`): read only, like an archive (a NAS takes outputs, but its
- * games aren't edited in place). */
+/** Read only, like an archive. */
 export const isNas = (path: string | null | undefined): boolean => !!path && /^(smb|ftp|nfs):\/\//i.test(path);
-/** A source on a paired Forge (`flink://key/...`): read only here, as core says. */
 export const isPeer = (path: string | null | undefined): boolean => !!path && /^flink:\/\//i.test(path);
-/** A source on another device (a NAS or a paired Forge). */
 export const isNetwork = (path: string | null | undefined): boolean => isNas(path) || isPeer(path);
 
-/** "Pick": a game folder, or an image or archive file, in one picker. */
 function PickButtons(props: { onPick: (path: string, isImage: boolean) => void; big?: boolean; disabled?: boolean }) {
   const t = useMessages().common;
   return (
-    <button className={props.big ? "primary" : "small"} onClick={() => void pickSource(props.onPick)} disabled={props.disabled}>
+    <button className={props.big ? "primary" : "small primary"} onClick={() => void pickSource(props.onPick)} disabled={props.disabled}>
       <Icon name="disc" />
       {t.pickButton}
     </button>
   );
 }
 
-/** Core's "needs a password" error, as the UI says it. */
 export function isPasswordRequired(error: string | null): boolean {
   return error !== null && error.includes(ARCHIVE_PASSWORD_REQUIRED);
 }
 
-/**
- * The Source card: an empty state with the pickers until a source is chosen, then the game
- * it holds (or why it can't be read). `full` adds what only Edit shows; `compact` (Edit) keeps the
- * card to the cover, title, kind, title ID, version and findings, with `children` (Edit's folds)
- * at its foot.
- */
+/** The game card (Build's, Edit's stacked): cover, title, chips, the ID/firmware/size tiles, findings; `children` at its foot. */
 export function SourceCard(props: {
   path: string | null;
   onPick: (path: string, isImage: boolean) => void;
   busy: boolean;
   error: string | null;
   ins: Inspection | null;
-  full?: boolean;
-  /** Edit's small card: the facts beyond title ID and version go into `children`'s folds. */
-  compact?: boolean;
-  /** At the card's foot once a source is chosen (Edit's folds). */
   children?: ReactNode;
-  /** Keeps element ids apart per screen; default "i" with `full`, else "c". */
+  /** Keeps element ids apart per screen; default "c". */
   prefix?: string;
-  /** Stands in for the default empty state (the Pack tab's). */
-  empty?: ReactNode;
-  /** More buttons in the title row once a source is chosen (Edit's Delete). */
   actions?: ReactNode;
-  /** An archive that needs a password was left locked (Cancel): ask again. */
+  /** An archive left locked (Cancel): ask again. */
   onUnlock?: () => void;
-  /** The source can't change now (Edit, while changes are applied): the pick buttons are off. */
+  /** Edit, while changes are applied: the pick buttons are off. */
   locked?: boolean;
+  /** false: no findings list (Build lists them in its Summary). */
+  findings?: boolean;
+  /** Build's card, the cover above the text (Edit's narrow column). */
+  stacked?: boolean;
 }) {
   const t = useMessages().common;
   const { path, ins } = props;
-  const headId = `${props.prefix ?? (props.full ? "i" : "c")}-source`;
+  const headId = `${props.prefix ?? "c"}-source`;
   const glow = useCoverGlow(!path ? null : ins ? ins.cover : props.busy ? undefined : null);
+  const wide = !!ins;
+  // Couldn't be read (not a password to ask for): an error state with Pick, as the empty one.
+  const failed = !!path && !ins && !props.busy && !!props.error && !isPasswordRequired(props.error);
 
-  // The first pick unmounts the empty state's buttons, which had focus: hand it to the
-  // card's heading instead of letting it fall to the page.
+  // The first pick unmounts the focused empty-state buttons: hand focus to the title.
   const hadPath = useRef(path !== null);
   useEffect(() => {
     const a = document.activeElement;
@@ -617,17 +515,34 @@ export function SourceCard(props: {
 
   return (
     <section
-      className={`card hero${props.full ? " full" : ""}${props.compact ? " compact-src" : ""}${glow.ready ? " lit" : ""}`}
+      className={`card hero${wide ? " src-2b" : ""}${wide && props.stacked ? " stack" : ""}${glow.ready ? " lit" : ""}`}
       style={glow.style}
-      aria-labelledby={headId}
+      aria-label={t.source}
+      id={headId}
+      tabIndex={-1}
     >
-      <CardHead icon="disc" title={t.source} id={headId} focusable>
-        {path && <PickButtons onPick={props.onPick} disabled={props.locked} />}
-        {/* Last, like the Library's: a destructive button away from the pickers. */}
-        {path && props.actions}
-      </CardHead>
-      {!path && props.empty ? (
-        props.empty
+      {/* No title (the section is labelled): Pick, and Edit's Delete, at the head's end. */}
+      {path && !failed && (
+        <header className="card-head src-head">
+          <div className="head-actions">
+            <PickButtons onPick={props.onPick} disabled={props.locked} />
+            {/* Last, like the File explorer's: a destructive button away from the pickers. */}
+            {props.actions}
+          </div>
+        </header>
+      )}
+      {failed ? (
+        <div className="empty" role="alert">
+          <span className="empty-icon bad">
+            <Icon name="alert" />
+          </span>
+          <p className="empty-title">{t.unreadable}</p>
+          {path && <PathLine path={path} />}
+          <p className="bad backend">{props.error}</p>
+          <div className="row center">
+            <PickButtons onPick={props.onPick} big disabled={props.locked} />
+          </div>
+        </div>
       ) : !path ? (
         <div className="empty">
           <span className="empty-icon">
@@ -645,7 +560,7 @@ export function SourceCard(props: {
         </div>
       ) : (
         <>
-          <GameHead path={path} ins={ins} busy={props.busy} full={props.full} />
+          <GameHead path={path} ins={ins} busy={props.busy} titleId={`${headId}-title`} />
           {isPasswordRequired(props.error) ? (
             <div className="row locked">
               <p className="bad">{t.needsPassword}</p>
@@ -659,8 +574,9 @@ export function SourceCard(props: {
           ) : (
             props.error && <p className="bad backend">{props.error}</p>
           )}
-          {ins && (props.compact ? <CompactSummary ins={ins} /> : <InspectSummary ins={ins} full={props.full} />)}
-          {ins && !ins.patch && !!ins.unsigned?.length && (
+          {ins && <InspectSummary ins={ins} ampr={false} findings={props.findings} />}
+          {/* Build says it in its summary instead. */}
+          {ins && props.findings !== false && !ins.patch && !!ins.unsigned?.length && (
             <p className="note-line warn interrupted-note">
               <Icon name="warn" />
               <span>{t.unsigned(ins.unsigned.length)}</span>
@@ -684,11 +600,14 @@ export function Dots() {
   );
 }
 
-/** Cover, title, kind tags and the source's path. */
-function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; full?: boolean }) {
+function GameHead(props: {
+  path: string;
+  ins: Inspection | null;
+  busy: boolean;
+  titleId: string;
+}) {
   const t = useMessages().common;
   const { ins } = props;
-  // A game on another device (a paired Forge or a NAS) names it; this device's games don't.
   const device = useDeviceName()(props.path);
   const title = ins
     ? (gameTitle(ins.title_names, ins.title_name) ?? ins.title_id ?? t.unknownTitle)
@@ -696,7 +615,7 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
       ? <>{t.reading}<Dots /></>
       : t.unreadable;
   return (
-    <div className={props.full ? "game full" : "game"}>
+    <div className="game">
       {ins?.cover ? (
         <img className="cover" src={ins.cover} alt="" />
       ) : (
@@ -706,8 +625,12 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
       )}
       <div className="game-text">
         <div className="title-row">
-          <h3 className={ins ? "title" : "title pending"}>{title}</h3>
+          <h3 className={ins ? "title" : "title pending"} id={props.titleId} tabIndex={-1}>
+            {title}
+          </h3>
           {ins && <FormatPill kind={ins.kind} />}
+          {/* Packed: its pack kind right after the kind (a packed game is still a folder or image). */}
+          {(ins?.zstd_packed || ins?.lz4?.packed) && <span className="tag green">{ins.zstd_packed ? "ZSTD" : "LZ4"}</span>}
           {device && (
             <span className="tag green" title={device}>
               {device}
@@ -719,18 +642,31 @@ function GameHead(props: { path: string; ins: Inspection | null; busy: boolean; 
           {ins?.additional_content && <span className="tag violet">{t.additionalContent}</span>}
           {ins?.patch && <span className="tag orange">{t.patch}</span>}
         </div>
+        {ins && <SourceChips ins={ins} />}
         <PathLine path={props.path} />
       </div>
     </div>
   );
 }
 
-/** The game's facts as inset tiles. */
-function Facts({ ins, full, rest }: { ins: Inspection; full: boolean; rest?: boolean }) {
+function SourceChips({ ins }: { ins: Inspection }) {
+  const t = useMessages().common;
+  const c = useMessages().sourceChips;
+  const fw = ins.backport_firmware ?? ins.firmware;
+  const eboot = ins.files.some((f) => f.path === "eboot.bin");
+  return (
+    <ul className="src-chips" aria-label={t.source}>
+      {ins.sdk && <li className="tag">{c.sdk(ins.sdk)}</li>}
+      {fw && <li className="tag">{c.firmware(fw)}</li>}
+      {eboot && <li className="tag mono">eboot.bin</li>}
+    </ul>
+  );
+}
+
+function Facts({ ins, full, rest, ampr }: { ins: Inspection; full: boolean; rest?: boolean; ampr: boolean }) {
   const t = useMessages().common;
   const bp = ins.backport.length > 0;
   const emus = emulatorNames(ins);
-  // With a fakelib/ (backport or emulators) the game runs as low as its executables allow.
   const fromExe = ins.backport_firmware !== null;
   const minFw = ins.backport_firmware ?? ins.firmware;
   const fwNote: string[] = [];
@@ -766,7 +702,7 @@ function Facts({ ins, full, rest }: { ins: Inspection; full: boolean; rest?: boo
         </dd>
       </div>
       {full && ins.archive && <ArchiveTile facts={ins.archive} />}
-      {(ins.zstd_packed || (ins.lz4 && lz4Shown(ins.lz4))) && <AmprTile ins={ins} />}
+      {ampr && (ins.zstd_packed || (ins.lz4 && lz4Shown(ins.lz4))) && <AmprTile ins={ins} />}
       {full && (
         <div className="tile wide">
           <dt>{t.contentId}</dt>
@@ -783,7 +719,6 @@ function Facts({ ins, full, rest }: { ins: Inspection; full: boolean; rest?: boo
   );
 }
 
-/** An archive source, in Edit: its parts and how it is packed, and where the game sits. */
 function ArchiveTile({ facts }: { facts: NonNullable<Inspection["archive"]> }) {
   const t = useMessages().common;
   const notes = [facts.root ? t.archiveRoot(facts.root) : t.archiveAtRoot];
@@ -801,17 +736,13 @@ function ArchiveTile({ facts }: { facts: NonNullable<Inspection["archive"]> }) {
   );
 }
 
-/** An AMPR game's runtime and packs (LZ4 or zstd), as the CLI's `inspect` line says them: the
- * runtime with its version as the title, the state as the value, the details under it. Packed
- * gets the green neon straps, damaged packs the warning colour, Unpacked a greyed look. */
+/** An AMPR game's runtime (with its version as the title) and packs, as the CLI's `inspect` says them. */
 function AmprTile({ ins }: { ins: Inspection }) {
   const t = useMessages().common;
   const facts = ins.lz4;
   const zstd = ins.zstd_packed;
   const damaged = !zstd && !!facts && facts.manifest_error !== null;
-  // No runtime (none in fakelib/, or no facts at all): the title says it all, no notes (by user
-  // decision). A zstd-packed game's note otherwise: its packs are kept (an older ampr-emu-ng is
-  // replaced; Convert says so).
+  // No runtime: the title says it all, no notes.
   const noRuntime = !facts || facts.runtime === "none";
   const notes: string[] = zstd && !noRuntime ? [t.zstdKept] : [];
   let detail: ReactNode = null;
@@ -823,16 +754,15 @@ function AmprTile({ ins }: { ins: Inspection }) {
       // Core's English, isolated for RTL.
       detail = <bdi>{facts.manifest_error}</bdi>;
     }
-    // No runtime: the title says it all, so no notes (by user decision).
     if (facts.runtime !== "none") {
       if (!facts.imports_ampr) notes.push(t.noAmpr);
       const runtime = facts.imports_ampr ? runtimeAction(facts) : null;
       if (runtime) notes.push(runtime);
-      const index = facts.index;
+      const index = getPrefs().replaceAmprEmu ? facts.index : (facts.keep_index ?? facts.index);
       if (index && index !== "ok") notes.push(t.index[index]);
     }
   }
-  const packed = zstd ? "zstd" : facts?.packed ? "LZ4" : null;
+  const packed = zstd ? "ZSTD" : facts?.packed ? "LZ4" : null;
   const state = packed ? t.packed(packed) : damaged ? t.damaged : t.unpacked;
   const look = packed ? " neon packed" : damaged ? " damaged" : " unpacked";
   return (
@@ -851,8 +781,6 @@ function AmprTile({ ins }: { ins: Inspection }) {
   );
 }
 
-/** The game's runtime with the version it names itself with: "ampr-emu-ng 0.4.1",
- * "ampr_emu 0.4.2.1", "ampr_emu" (no version readable), the old trace runtime, "No runtime". */
 function runtimeName(f: Lz4Facts): string {
   const t = msg().common;
   const v = f.runtime_version ? ` ${f.runtime_version}` : "";
@@ -862,21 +790,16 @@ function runtimeName(f: Lz4Facts): string {
   return t.noRuntime;
 }
 
-/** What a conversion does to an AMPR game's runtime, as the CLI's `inspect` says it: installs
- * or replaces with the bundled ampr_emu, or keeps the game's own (said only when it is another
- * build: Forge's release runtime is the bundled one; the tile's title names it). Null when
- * there is nothing to say. */
+/** Said only for an ampr_emu build the switch keeps; null when there is nothing to say. */
 function runtimeAction(f: Lz4Facts): string | null {
   const t = msg().common;
-  const shipped = f.shipped_runtime_version;
-  if (!shipped || !f.runtime_action) return null;
-  if (f.runtime_action !== "keep") return t.runtimeAction(f.runtime_action, shipped);
-  return f.runtime === "other" && f.runtime_version ? t.runtimeAction("keep", f.runtime_version) : null;
+  const replace = getPrefs().replaceAmprEmu;
+  const action = replace ? f.runtime_action : (f.keep_runtime_action ?? f.runtime_action);
+  if (!action) return null;
+  if (action === "keep") return !replace && f.runtime_action === "replace" ? t.runtimeAction("keep") : null;
+  return t.runtimeAction(action);
 }
 
-/** The LZ4 (AMPR) tile shows for a game with its own ampr_emu, any LZ4 artifact (packs, a
- * damaged manifest), an ampr_emu.index a conversion rewrites, or an AMPR game a conversion
- * gives the bundled ampr_emu. */
 function lz4Shown(f: Lz4Facts): boolean {
   const index = f.index;
   return (
@@ -888,18 +811,15 @@ function lz4Shown(f: Lz4Facts): boolean {
   );
 }
 
-/** Which fakelib folder a backport ships, and how many backport libraries it has. */
 function backportLib(ins: Inspection): string {
   const exclusive = ins.backport.some((p) => /^fakelib2\//i.test(p));
   return msg().common.backportLibs(exclusive, ins.backport.length);
 }
 
-/** The emulators in fakelib/, each named once ("AMPR", "DLC", "PlayGo", "Other"). */
 export function emulatorNames(ins: Inspection): string[] {
   return [...new Set(ins.emulators.map((e) => e.name))];
 }
 
-/** Preflight findings, each with a status icon; nothing at all when there are none. */
 export function Findings({ lines }: { lines: string[] }) {
   const t = useMessages().common;
   if (lines.length === 0) return null;
@@ -918,10 +838,7 @@ export function Findings({ lines }: { lines: string[] }) {
   );
 }
 
-/**
- * What a finding from core means for a build: `block` fails every target, `warn` may fail
- * (`formats`: the targets it fails), `info` is only news.
- */
+/** `block` fails every target, `warn` may fail (`formats`: the targets it fails), `info` is only news. */
 // ponytail: core reports findings as plain text, so this matches its wording (preflight.rs
 // `input`, inspect.rs). Ceiling: core should tag each finding with a severity and formats.
 export function classify(line: string): { kind: "block" | "warn" | "info"; formats?: Format[] } {
@@ -938,12 +855,10 @@ export function classify(line: string): { kind: "block" | "warn" | "info"; forma
   return { kind: "warn" };
 }
 
-/** The DLC embedded in the dump, collapsed until asked for. */
 function DlcList({ dlcs }: { dlcs: Inspection["dlcs"] }) {
   const t = useMessages().common;
   if (dlcs.length === 0) return null;
   const notes = dlcs.map(dlcNote);
-  // One shared explanation goes on top once instead of under every row.
   const shared = notes.every((n) => n === notes[0]) ? notes[0] : null;
   return (
     <details className="fold">
@@ -967,7 +882,6 @@ function DlcList({ dlcs }: { dlcs: Inspection["dlcs"] }) {
   );
 }
 
-/** Where a DLC's content comes from, as one phrase. */
 function dlcNote(d: Inspection["dlcs"][number]): string {
   const t = msg().common;
   if (d.folder) return t.dlcIn(d.folder, prettyBytes(d.bytes));
@@ -976,7 +890,6 @@ function dlcNote(d: Inspection["dlcs"][number]): string {
   return t.dlcMerged;
 }
 
-/** The title ID and version tiles. */
 function IdTiles({ ins }: { ins: Inspection }) {
   const t = useMessages().common;
   return (
@@ -993,26 +906,24 @@ function IdTiles({ ins }: { ins: Inspection }) {
   );
 }
 
-/** Edit's compact card: title ID and version, then the findings. */
-function CompactSummary({ ins }: { ins: Inspection }) {
-  return (
-    <div className="summary">
-      <dl className="tiles">
-        <IdTiles ins={ins} />
-      </dl>
-      <Findings lines={ins.findings} />
-    </div>
-  );
-}
-
-/** The game's facts, its embedded DLC (and backport and emulator files, `full`), then the
- * findings. `rest`: Edit's facts fold, without what its compact card already shows (title ID,
- * version, findings). */
-export function InspectSummary({ ins, full = false, rest = false }: { ins: Inspection; full?: boolean; rest?: boolean }) {
+/** `rest`: Edit's facts fold, without the ID tiles its card already shows. */
+export function InspectSummary({
+  ins,
+  full = false,
+  rest = false,
+  ampr = true,
+  findings = true,
+}: {
+  ins: Inspection;
+  full?: boolean;
+  rest?: boolean;
+  ampr?: boolean;
+  findings?: boolean;
+}) {
   const t = useMessages().common;
   return (
     <div className="summary">
-      <Facts ins={ins} full={full} rest={rest} />
+      <Facts ins={ins} full={full} rest={rest} ampr={ampr} />
       {(ins.dlcs.length > 0 ||
         (full && (ins.backport.length > 0 || ins.emulators.length > 0))) && (
         <div className="folds">
@@ -1048,24 +959,20 @@ export function InspectSummary({ ins, full = false, rest = false }: { ins: Inspe
           )}
         </div>
       )}
-      {!rest && <Findings lines={ins.findings} />}
+      {!rest && findings && <Findings lines={ins.findings} />}
     </div>
   );
 }
 
-/** A button that opens a short menu of choices. Esc or a click outside closes it; focus goes
- * back to the button before the choice runs, so a cancelled dialog leaves it there. The menu
- * opens upwards, or towards the other side, where its scrolling container would clip it. */
+/** Focus goes back to the button before the choice runs; the menu opens where its scrolling container won't clip it. */
 export function ChooseMenu<K extends string>(props: {
   id?: string;
   label: ReactNode;
-  /** The menu's accessible name. */
   menuLabel: string;
   /** `disabled`: shown and focusable, but not chosen (`aria-disabled`); `busy`: its work runs. */
   items: { id: K; icon: IconName; label: ReactNode; disabled?: boolean; busy?: boolean }[];
   onChoose: (what: K) => void;
   className?: string;
-  /** An icon-only button: no trailing chevron, this as its aria-label and tip. */
   buttonLabel?: string;
   tabIndex?: number;
   disabled?: boolean;
@@ -1078,7 +985,6 @@ export function ChooseMenu<K extends string>(props: {
   useLayoutEffect(() => {
     const m = menu.current;
     if (!open || !m) return setFlip("");
-    // The nearest ancestor that clips (scrolls), else the window.
     let bound = { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
     for (let el = m.parentElement; el && el !== document.body; el = el.parentElement) {
       const st = getComputedStyle(el);
@@ -1167,15 +1073,12 @@ export function ChooseMenu<K extends string>(props: {
   );
 }
 
-/** http build: the page's url as a QR code for a phone, drawn by the server (`GET /api/qr`), in a
- * `className` block with its `caption` under it. Nothing, caption included, in the app (no address)
- * or when it doesn't load. */
+/** http build: the page's url as a QR code drawn by the server (`GET /api/qr`); nothing in the app or when it doesn't load. */
 export function AddressQr(props: { size: number; connect?: boolean; className?: string; caption?: ReactNode }) {
   const t = useMessages().common;
   const [failed, setFailed] = useState(false);
   const address = serverAddress();
   if (!address || failed) return null;
-  // `connect`: the address of the Connect tab (`#connect`), for a phone.
   return (
     <div className={props.className}>
       <img
@@ -1191,15 +1094,12 @@ export function AddressQr(props: { size: number; connect?: boolean; className?: 
   );
 }
 
-/** A small pill radiogroup (not tabs: the screen tabs are the header's): the Storage view switch,
- * Connect's device filter. One tab stop; the arrow keys, Home and End move and choose. Each option
- * is `.view-<id>`, its selected colour. */
+/** A small pill radiogroup (Storage's view switch, Connect's filter): one tab stop, arrows, Home and End; each option `.view-<id>`. */
 export function ViewSwitch<T extends string>(props: {
   label: string;
   value: T;
   onChange: (v: T) => void;
   options: { id: T; icon?: IconName; label: ReactNode }[];
-  /** More classes on the group (File Transfer's device switches: `devices`). */
   className?: string;
   /** Off (aria-disabled, so it keeps focus): no click or key changes the choice. */
   disabled?: boolean;
@@ -1209,7 +1109,6 @@ export function ViewSwitch<T extends string>(props: {
   const onKey = (e: KeyboardEvent) => {
     if (props.disabled) return;
     const i = ids.indexOf(props.value);
-    // Right-to-left, the next option is to the left.
     const rtl = document.documentElement.dir === "rtl";
     const fwd = e.key === "ArrowDown" || e.key === (rtl ? "ArrowLeft" : "ArrowRight");
     const back = e.key === "ArrowUp" || e.key === (rtl ? "ArrowRight" : "ArrowLeft");
@@ -1230,7 +1129,7 @@ export function ViewSwitch<T extends string>(props: {
             role="radio"
             aria-checked={on}
             aria-disabled={props.disabled || undefined}
-            // With no option chosen (File Transfer: a side's device offline) the first is the Tab stop.
+            // With no option chosen (the chosen device went offline) the first is the Tab stop.
             tabIndex={on || (i === 0 && !ids.includes(props.value)) ? 0 : -1}
             className={`seg-opt view-${o.id}${on ? " on" : ""}`}
             onClick={() => !props.disabled && props.onChange(o.id)}
@@ -1241,5 +1140,24 @@ export function ViewSwitch<T extends string>(props: {
         );
       })}
     </div>
+  );
+}
+
+/** Decimal GB as the console's Settings shows it: whole numbers, one decimal under 10 GB. */
+const gb = (bytes: number) => {
+  // The precision follows the rounded value: 9.96 GB is "10 GB", not "10.0 GB".
+  const tenths = Math.round(bytes / 1e8) / 10;
+  return `${tenths < 10 ? num(tenths, 1) : num(Math.round(bytes / 1e9))} GB`;
+};
+
+export function FreeSpace({ storage }: { storage: { free: number; total: number } | null | undefined }) {
+  const t = useMessages().library;
+  if (!storage) return null;
+  return (
+    <span className="library-storage" title={t.storageTip}>
+      <Icon name="drive" />
+      <span>{t.free(gb(storage.free), gb(storage.total))}</span>
+      <span className="visually-hidden">{t.storageTip}</span>
+    </span>
   );
 }

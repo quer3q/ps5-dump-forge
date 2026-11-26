@@ -1,5 +1,5 @@
 // The Connect tab's "How it works": in the desktop app first a highlighted Install on PS5 box, then
-// a few short paragraphs, no headings (pairing and the check number, a NAS, File Transfer, Speed test, phones
+// a few short paragraphs, no headings (pairing and the check number, a NAS, the Transfer screen, Speed test, phones
 // in the web build, what the network can see), in a modal over the inert app (common.tsx
 // `openOverlay`). Text only.
 

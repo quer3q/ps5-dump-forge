@@ -1,26 +1,13 @@
-//! In-place image edits with an undo journal: the engine every format editor's writes go through.
-//!
-//! A format editor (`edit::plan` in the exFAT, UFS2 and PFS crates) turns [`Op`]s into [`Write`]s
-//! and reads the image only. [`apply`] then writes them crash-safely:
-//!
-//! 1. the old bytes of every `live` region (their union: live writes may overlap, each byte's
-//!    original kept once) go to `<image file name>.forge-undo` beside the image (exclusive
-//!    create), which is synced with its folder;
-//! 2. the free-space writes, then an image sync;
-//! 3. the live writes (metadata, in-place replacements) in the order given, then an image sync.
-//!
-//! [`Applied::commit`] deletes the journal; [`Applied::rollback`] restores the old bytes and
-//! deletes it. A journal left by a crash is handled by [`recover`], which every open of an image
-//! for editing calls first: a complete journal is restored then deleted, an incomplete one (the
-//! crash came before any live write) only deleted. Free space keeps whatever the free-space
-//! writes put there: nothing references it once the live regions are restored.
+//! In-place image edits with an undo journal. A format editor's `edit::plan` turns [`Op`]s into
+//! [`Write`]s; [`apply`] journals the old bytes of every `live` region (their union, synced with
+//! its folder), writes free space and syncs, then the live writes in order and syncs.
+//! [`recover`] settles a journal a crash left; free space may keep the new, unreferenced bytes.
 //!
 //! Journal layout, little-endian: `FORGEUNDO1`, the image length (u64), the journal's own length
 //! (u64), the entry count (u32); per entry its offset (u64), length (u64) and old bytes; then the
 //! trailer: `FORGEEND` and a CRC-32 of everything before the CRC. A journal that doesn't end with
-//! the trailer and is shorter than its header declares (or than a header) was cut short before it
-//! was synced (so before any live write) and is deleted; any other that fails a check (its CRC,
-//! its declared length either way, an entry) is damage: an error, the journal kept.
+//! the trailer and is shorter than its header declares (or than a header) was cut short before its
+//! sync (before any live write) and is deleted; any other failed check is damage, kept.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write as _};
@@ -39,29 +26,40 @@ const PIECE: usize = 8 << 20;
 /// into `Mkdir` + `Put`s; folder deletes/renames stay one op).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// Delete a file, or a folder with everything in it.
-    Delete { path: String },
+    /// A file, or a folder with everything in it.
+    Delete {
+        path: String,
+    },
     /// Move or rename a file or folder; `to` does not exist.
-    Rename { from: String, to: String },
-    /// A new empty folder (its parents exist or come first).
-    Mkdir { path: String },
-    /// Add or replace a file of `len` bytes whose content `Data` names.
-    Put { path: String, len: u64, data: Data },
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Its parents exist or come first.
+    Mkdir {
+        path: String,
+    },
+    Put {
+        path: String,
+        len: u64,
+        data: Data,
+    },
 }
 
 /// The bytes of a [`Write`] or a [`Op::Put`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Data {
-    /// These bytes.
     Bytes(Vec<u8>),
-    /// This many zero bytes.
     Zero(u64),
-    /// `len` bytes at `offset` of the caller's source `id`, read through `apply`'s `read_source`.
-    Source { id: u32, offset: u64, len: u64 },
+    /// Read through `apply`'s `read_source`.
+    Source {
+        id: u32,
+        offset: u64,
+        len: u64,
+    },
 }
 
 impl Data {
-    /// The number of bytes.
     pub fn len(&self) -> u64 {
         match self {
             Data::Bytes(b) => b.len() as u64,
@@ -70,7 +68,6 @@ impl Data {
         }
     }
 
-    /// No bytes at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -88,9 +85,8 @@ pub struct Write {
 /// The caller's source of [`Data::Source`] bytes: fill the whole buffer from `offset` of `id`.
 pub type ReadSource<'a> = &'a mut dyn FnMut(u32, u64, &mut [u8]) -> io::Result<()>;
 
-/// How the engine makes its writes durable: `file` syncs the image or the journal, `dir` the
-/// folder holding the journal (after it is created or deleted). Core passes its own on the PS5
-/// (retrying syncs, where a retried sync fails the job); [`Syncs::STD`] elsewhere.
+/// How writes are made durable: `file` the image or journal, `dir` the journal's folder. Core
+/// passes its retrying syncs on the PS5; [`Syncs::STD`] elsewhere.
 #[derive(Debug, Clone, Copy)]
 pub struct Syncs {
     pub file: fn(&File) -> io::Result<()>,
@@ -98,24 +94,20 @@ pub struct Syncs {
 }
 
 impl Syncs {
-    /// `File::sync_all`, and the folder opened and synced (unix; a no-op elsewhere).
     pub const STD: Syncs = Syncs {
         file: File::sync_all,
         dir: std_sync_dir,
     };
 }
 
-/// What [`Applied::commit`]'s error message starts with when the edit is in the image and only
-/// syncing the journal's removal failed.
-pub const APPLIED: &str = "applied; ";
+/// [`Applied::commit`]'s error prefix when the edit is in the image and only the folder sync failed.
+const APPLIED: &str = "applied; ";
 
-/// An applied edit whose journal is still on disk: [`commit`](Self::commit) it once the image
-/// checks out, else [`rollback`](Self::rollback). Dropped without either, the journal stays for
-/// [`recover`].
+/// An applied edit whose journal is still on disk; dropped without commit or rollback, the
+/// journal stays for [`recover`].
 #[derive(Debug)]
 pub struct Applied {
-    /// The image edited, kept open: a rollback restores this file even if its path now names
-    /// another one (replaced while the edit was checked).
+    /// Kept open: a rollback restores this file even if its path now names another one.
     image: File,
     journal: PathBuf,
 }
@@ -130,11 +122,10 @@ pub fn journal_path(image: &Path) -> PathBuf {
 /// What [`recover`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
-    /// No journal: nothing to do.
     Clean,
-    /// A complete journal: the old bytes were restored, then it was deleted.
+    /// A complete journal: restored, then deleted.
     Restored,
-    /// An incomplete journal (a crash while writing it, before any live write): deleted.
+    /// Cut short before any live write: deleted.
     Discarded,
 }
 
@@ -151,14 +142,9 @@ enum Step {
     All,
 }
 
-/// Writes `writes` into `image` (opened read-write, at `image_path`) crash-safely, as the crate
-/// docs describe. Live writes may overlap each other (applied in order, so the last wins); a
-/// free-space write must not overlap any other. All lie inside the image's current length (an
-/// image never grows); zero-length writes are skipped. `read_source` serves [`Data::Source`];
-/// copies stream in pieces of at most 8 MiB, `cancel` checked between them. A cancel or failure
-/// before the live writes deletes the journal (the filesystem is untouched); one during them
-/// rolls back; so does one seen after the last piece. An existing journal is refused:
-/// [`recover`] first. `sync` makes each step durable.
+/// Writes `writes` crash-safely. Live writes may overlap (the last wins); a free write overlaps
+/// nothing; none past the image's end. A cancel or failure before the live writes deletes the
+/// journal; one during or right after them rolls back. An existing journal is refused.
 pub fn apply(
     image: &mut File,
     image_path: &Path,
@@ -193,7 +179,6 @@ fn apply_until(
         .map_err(|e| ctx(e, "read the image's length"))?
         .len();
     check(writes, image_len)?;
-    // The handle a rollback restores through, taken before anything is written.
     let kept = image
         .try_clone()
         .map_err(|e| ctx(e, "keep the image open"))?;
@@ -248,11 +233,8 @@ fn apply_until(
 }
 
 impl Applied {
-    /// Keeps the edit: deletes the journal, then syncs its folder. A failed delete leaves the
-    /// journal (the next [`recover`] would undo the edit). A failed folder sync comes after the
-    /// delete: the edit is in the image, and the error's message starts with [`APPLIED`]. Should
-    /// the deleted journal reappear after a crash, the next open restores the original image,
-    /// which is safe.
+    /// Deletes the journal, then syncs its folder. A failed delete leaves the journal (the next
+    /// [`recover`] undoes the edit); a failed folder sync's error starts with `APPLIED`.
     pub fn commit(self, sync: Syncs) -> io::Result<()> {
         std::fs::remove_file(&self.journal)
             .map_err(|e| ctx(e, &format!("delete {}", self.journal.display())))?;
@@ -268,15 +250,14 @@ impl Applied {
         })
     }
 
-    /// Undoes the edit: the journal's old bytes go back into the image, then it is deleted.
+    /// The journal's old bytes back into the image, then the journal deleted.
     pub fn rollback(mut self, sync: Syncs) -> io::Result<()> {
         restore(Some(&mut self.image), None, &self.journal, sync).map(drop)
     }
 }
 
-/// Settles a journal a crash left beside `image_path` (see [`Recovery`]). Call it before every
-/// open of an image for editing. A damaged journal, or one that doesn't fit the image, is an
-/// error and stays.
+/// Settles a journal a crash left; call before every open for editing. A damaged one, or one
+/// that doesn't fit the image, is an error and stays.
 pub fn recover(image_path: &Path, sync: Syncs) -> io::Result<Recovery> {
     let journal = journal_path(image_path);
     match std::fs::symlink_metadata(&journal) {
@@ -287,8 +268,7 @@ pub fn recover(image_path: &Path, sync: Syncs) -> io::Result<Recovery> {
     restore(None, Some(image_path), &journal, sync)
 }
 
-/// Refuses writes past the image's end and a free write overlapping any other write (live
-/// writes may overlap each other: they apply in order).
+/// Refuses writes past the image's end and a free write overlapping any other.
 fn check(writes: &[Write], image_len: u64) -> io::Result<()> {
     let mut spans = Vec::with_capacity(writes.len());
     for w in writes.iter().filter(|w| !w.data.is_empty()) {
@@ -326,8 +306,7 @@ fn check(writes: &[Write], image_len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// The union of the live writes' ranges, sorted and merged: what the journal keeps, each
-/// byte's original value once.
+/// The union of the live writes' ranges, sorted and merged: what the journal keeps.
 fn journal_spans(writes: &[Write]) -> Vec<(u64, u64)> {
     let mut spans: Vec<(u64, u64)> = live(writes)
         .map(|w| (w.offset, w.offset + w.data.len()))
@@ -348,7 +327,6 @@ fn live(writes: &[Write]) -> impl Iterator<Item = &Write> {
     writes.iter().filter(|w| w.live && !w.data.is_empty())
 }
 
-/// A writer that keeps the CRC-32 of what went through it.
 struct Hashed {
     out: BufWriter<File>,
     crc: crc32fast::Hasher,
@@ -464,8 +442,7 @@ fn put_all(
     check_cancel(cancel)
 }
 
-/// Puts a journal's old bytes back into `image` and deletes it, or only deletes an incomplete
-/// one. The whole journal is checked before the image is touched.
+/// The whole journal is checked before the image is touched.
 fn restore(
     image: Option<&mut File>,
     image_path: Option<&Path>,
@@ -491,9 +468,8 @@ fn restore(
         return Err(bad("not an undo journal"));
     }
     let header = Header::parse(&head);
-    // Cut short only when it neither ends with the trailer nor reaches the length its header
-    // declares (or holds no whole header): it was never synced, so nothing live was written.
-    // Anything else that fails a check is damage, and kept.
+    // Cut short (never synced, so nothing live written) only without the trailer and short of
+    // its declared length; anything else failing a check is damage, kept.
     let short = header.as_ref().is_none_or(|h| len < h.len);
     if short && !has_end(&mut file, len).map_err(rd)? {
         remove_journal(journal, sync)?;
@@ -581,7 +557,6 @@ fn restore(
     Ok(Recovery::Restored)
 }
 
-/// A journal header's fields after its magic.
 struct Header {
     image_len: u64,
     len: u64,
@@ -589,7 +564,6 @@ struct Header {
 }
 
 impl Header {
-    /// The fields of `head`, or `None` when it is shorter than a header.
     fn parse(head: &[u8]) -> Option<Header> {
         let at = |i: usize| Some(u64::from_le_bytes(head.get(i..i + 8)?.try_into().ok()?));
         Some(Header {
@@ -600,7 +574,6 @@ impl Header {
     }
 }
 
-/// Whether the `FORGEEND` marker sits where the trailer starts.
 fn has_end(file: &mut File, len: u64) -> io::Result<bool> {
     if len < TRAILER_LEN {
         return Ok(false);
@@ -611,7 +584,6 @@ fn has_end(file: &mut File, len: u64) -> io::Result<bool> {
     Ok(&end == END)
 }
 
-/// Whether the last 4 bytes hold the CRC-32 of everything before them.
 fn crc_ok(file: &mut File, len: u64) -> io::Result<bool> {
     file.seek(SeekFrom::Start(0))?;
     let mut crc = crc32fast::Hasher::new();
@@ -647,7 +619,7 @@ fn discard(journal: &Path, sync: Syncs) {
     let _ = remove_journal(journal, sync);
 }
 
-/// Syncs the folder holding `path`, so a created or deleted journal survives a crash.
+/// So a created or deleted journal survives a crash.
 fn sync_dir(path: &Path, sync: Syncs) -> io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -704,7 +676,6 @@ mod tests {
     const LEN: u64 = 20 << 20;
     const BIG: u64 = 9 << 20;
 
-    /// A folder under the system temp dir, removed on drop.
     struct Tmp(PathBuf);
 
     impl Drop for Tmp {
@@ -1023,8 +994,7 @@ mod tests {
         assert_eq!(recover(&path, Syncs::STD).unwrap(), Recovery::Discarded);
     }
 
-    /// A journal for `image_len` with `count` entries and `body` as its entry table, whose
-    /// declared length and trailer CRC are right.
+    /// A journal whose declared length and trailer CRC are right around `body`.
     fn journal_bytes(image_len: u64, count: u32, body: &[u8]) -> Vec<u8> {
         let len = HEADER_LEN + body.len() as u64 + TRAILER_LEN;
         let mut b = MAGIC.to_vec();

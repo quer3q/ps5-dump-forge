@@ -1,7 +1,4 @@
-// Checks src/explorer.ts with a plain `node scripts/check-explorer.mjs` (type stripping): the
-// tree from an inspection's files and empty folders, folders-first natural order, a folder's
-// lookup, the filter's walk (paths from the current folder, folders first), the keyboard focus target
-// after a folder shows (none in an empty one: the grid takes it).
+// Checks src/explorer.ts with a plain `node scripts/check-explorer.mjs` (type stripping).
 
 import assert from "node:assert/strict";
 
@@ -34,15 +31,13 @@ assert.deepEqual(names(x.search(root, "", ".dat")), ["data/file2.dat", "data/fil
 assert.deepEqual(names(x.search(root, "", "  ")), []);
 assert.equal(x.search(root, "", "e").length, 10); // all but data, data/Sub
 
-// Across folders: folders first, then files, each by path (not the walk's depth-first order);
-// a folder matches through its path too (b/hit-dir/z).
+// Across folders: folders first, then files, each by path; a folder matches through its path too.
 {
   const t = x.buildTree([{ path: "a/hit.bin", size: 1 }, { path: "c/hit2.bin", size: 1 }], ["b/hit-dir", "b/hit-dir/z/hit-deep"]);
   assert.deepEqual(names(x.search(t, "", "hit")), ["b/hit-dir", "b/hit-dir/z", "b/hit-dir/z/hit-deep", "a/hit.bin", "c/hit2.bin"]);
 }
 
-// Keyboard focus after a folder shows: the asked-for row, else the first; none in an empty
-// folder, so the grid itself takes focus (and Backspace / Alt+Up still go up).
+// Focus after a folder shows: the asked-for row, else the first; none in an empty folder.
 {
   const empty = x.listDir(x.findDir(root, "empty/inner"), "empty/inner");
   assert.equal(x.focusIndex(empty, ""), null);
@@ -90,8 +85,7 @@ const file = (size) => ({ kind: "file", size });
   const f = folded([ren("data/a.bin", "data/c.bin"), del("eboot.bin"), mk("x/y"), ren("data", "stuff")]);
   ok(f);
   assert.deepEqual(listing(f.tree), { files: ["sce_sys/param.json", "stuff/c.bin", "stuff/sub/b.bin"], empty: ["empty", "x/y"] });
-  // Marks: the moved folder is Renamed (its contents moved with it, no badge), the renamed file
-  // inside too; new folders are New; untouched entries have none.
+  // Marks: the moved folder is Renamed (contents unbadged), the file inside too; new folders New.
   assert.equal(node(f.tree, "stuff").mark, "renamed");
   assert.equal(node(f.tree, "stuff").from, "data");
   assert.equal(node(f.tree, "stuff/sub").mark, undefined);
@@ -151,8 +145,7 @@ const file = (size) => ({ kind: "file", size });
   assert.equal(node(h.tree, "eboot.bin").mark, "new");
 }
 
-// A folder onto a folder merges, as core's fold does (contents known: a browser drop, junk already
-// left out). Core keeps no test of its own for it: this is the check.
+// A folder onto a folder merges, as core's fold does; core has no test of its own for it.
 {
   const host = { kind: "dir", files: [{ path: "a.bin", size: 8 }, { path: "new.bin", size: 3 }, { path: "deep/c.bin", size: 1 }], emptyDirs: ["e"] };
   const f = folded([add("data", host), add("copy", host)]);
@@ -260,8 +253,7 @@ const plan = (changes, dir, items) => x.planAdds(base, ["empty"], changes, dir, 
 const item = (name, what) => ({ name, what, src: name });
 const dirOf = (files, emptyDirs = []) => ({ kind: "dir", files: files.map((p) => ({ path: p, size: 9 })), emptyDirs });
 const ops = (cs) => cs.map((c) => (c.op === "add" ? `add ${c.to}${c.only ? " only " + c.what.files.map((f) => f.path).join(",") : ""}` : `${c.op} ${c.path}`));
-// A host folder (its listing from host_tree) folds like core's folder add: its files are
-// browsable, renamable and deletable, replaced ones badged with the new size.
+// A host folder (host_tree's listing) folds like core's folder add, replaced files badged with the new size.
 {
   const host = dirOf(["a.bin", "new.bin"]);
   const p = plan([], "", [item("data", host)]);
@@ -283,8 +275,7 @@ const ops = (cs) => cs.map((c) => (c.op === "add" ? `add ${c.to}${c.only ? " onl
   assert.equal(node(f.tree, "data/a.bin").mark, undefined);
   assert.equal(node(f.tree, "data/new.bin").mark, "new");
 }
-// A truncated host folder (host_tree cut short): a merge onto a folder there is always asked
-// about, Replace merges the whole folder, Skip leaves the whole item out (never an `only` add).
+// A truncated host folder: a merge onto a folder there is always asked; Skip leaves the whole item out.
 {
   const host = { ...dirOf(["new.bin"]), truncated: true }; // only an unlisted file may clash
   let p = plan([], "", [item("data", host)]);
@@ -342,8 +333,7 @@ const ops = (cs) => cs.map((c) => (c.op === "add" ? `add ${c.to}${c.only ? " onl
   const p = plan(pend, "", [item("eboot.bin", file(5)), item("n.bin", file(6))]);
   assert.deepEqual(p.clashes, ["n.bin"]);
 }
-// A name with a backslash (a macOS or Linux file name, as paths.basename keeps it) is queued and
-// refused, never turned into another name.
+// A name with a backslash is queued and refused, never turned into another name.
 {
   const paths = await import("../src/paths.ts");
   const name = paths.basename("/tmp/assets\\part.bin");
@@ -376,9 +366,7 @@ const ops = (cs) => cs.map((c) => (c.op === "add" ? `add ${c.to}${c.only ? " onl
   assert.deepEqual(s.changes, []);
 }
 
-// Core's edits: a whole host folder is one add; a folder that goes in file by file (a browser's,
-// or one of which some was skipped) is one add per file and a new folder per empty one; an empty
-// one is a new folder unless one is there already. Sources are read one at a time, in order.
+// Core's edits: a host folder is one add; a per-file folder one add per file and a mkdir per empty one.
 {
   const seen = [];
   const from = async (src, rel, to) => {
@@ -413,8 +401,7 @@ const ops = (cs) => cs.map((c) => (c.op === "add" ? `add ${c.to}${c.only ? " onl
   assert.deepEqual(seen, ["eboot.bin", "data/Host", "data/Skip/k.bin", "Up/a/b.bin", "Up/c.bin"]);
 }
 
-// Before Apply: uploads are left out when nothing else depends on them; a change on an
-// uploaded path, a folder above it or anything inside it means nothing is checked before Apply.
+// Before Apply: uploads left out unless a change depends on them (on, above or inside an uploaded path).
 {
   const later = (src) => src === "up";
   const up = (to, what = file(1)) => ({ ...add(to, what), src: "up" });
@@ -436,8 +423,7 @@ const ops = (cs) => cs.map((c) => (c.op === "add" ? `add ${c.to}${c.only ? " onl
   assert.equal(x.checkable([up("n.bin"), ren("eboot.bin", "n.bin/z")], later).changes, null);
 }
 
-// Staging: every upload in its own namespace. The review's sequence: a file `assets`, deleted,
-// then a folder holding `assets/x.bin`: no staged path is another's or inside another.
+// Staging: a file `assets`, deleted, then a folder holding `assets/x.bin`: no staged path nests in another.
 {
   const at = x.stagingNames("t");
   const staged = [];

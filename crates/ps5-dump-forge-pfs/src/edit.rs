@@ -1,10 +1,6 @@
-//! In-place editing of a Forge-built PFS image (`.ffpfs`): the read side. [`Volume::open`]
-//! checks the header is the one layout the writer (and MkPFS) makes, reads every inode, walks
-//! the super-root and every directory, and cross-checks the flat path table and collision
-//! resolver against the walked tree, so a later edit starts from a consistent image.
-//!
-//! The inodes and the tree (names and paths) are held in memory whole, within
-//! [`MEMORY_LIMIT`]; [`Volume::list`] and [`Volume::lookup`] read nothing more.
+//! In-place editing of a Forge-built `.ffpfs`. [`Volume::open`] checks the writer's one layout,
+//! every inode, the tree and the path tables, so an edit starts from a consistent image; inodes and
+//! tree are held whole within [`MEMORY_LIMIT`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -22,10 +18,8 @@ use crate::image::{
     path_table,
 };
 
-/// The inodes, the tree and the transient buffers of [`Volume::open`], at most.
 // ponytail: 128 MiB holds roughly a million entries with short paths; past it, rebuild.
 pub const MEMORY_LIMIT: u64 = 128 << 20;
-/// As the reader: deeper trees are refused.
 const MAX_DEPTH: u32 = 32;
 
 fn other_tool(why: impl std::fmt::Display) -> Vec<String> {
@@ -62,7 +56,6 @@ fn le64(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// Why [`Volume::open`] stopped: an I/O error, or findings.
 #[derive(Debug)]
 enum Fail {
     Io(io::Error),
@@ -81,7 +74,7 @@ impl From<Vec<String>> for Fail {
     }
 }
 
-/// Bytes charged against the limit; every allocation from image data is charged first.
+/// Every allocation from image data is charged against the limit first.
 #[derive(Debug)]
 struct Budget {
     used: u64,
@@ -101,8 +94,7 @@ impl Budget {
         self.used = self.used.saturating_sub(bytes);
     }
 
-    /// Room for `more` elements in `v`, its growth charged (by capacity) before it happens;
-    /// capacity at least doubles, so pushes stay amortized.
+    /// Room for `more` in `v`, its growth charged by capacity first (doubling, so amortized).
     fn reserve<T>(&mut self, v: &mut Vec<T>, more: usize) -> Result<(), Vec<String>> {
         let free = v.capacity() - v.len();
         if free < more {
@@ -113,34 +105,31 @@ impl Budget {
         Ok(())
     }
 
-    /// Room for one more element in `v`.
     fn grow<T>(&mut self, v: &mut Vec<T>) -> Result<(), Vec<String>> {
         self.reserve(v, 1)
     }
 }
 
-/// What an entry is: Forge writes files and folders only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     File,
     Dir,
 }
 
-/// One D32 inode as the writer lays it out: one contiguous run of `blocks` from `block`.
+/// One D32 inode: one contiguous run of `blocks` from `block`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inode {
     pub mode: u16,
     pub nlink: u16,
     pub flags: u32,
-    /// Bytes (a directory's whole run; the writer stores one size, never compressed).
+    /// A directory's is its whole run.
     pub size: u64,
     pub block: u64,
     pub blocks: u64,
 }
 
-/// Inode `ino`'s bytes: `None` for an unused (all-zero) slot. `fill` is what `db[1..12]` hold:
-/// -1 for a run, 0 for the super-root. The run must end inside the image's `ndblock` blocks,
-/// so every later read of it is in bounds.
+/// Inode `ino`'s bytes, `None` for an all-zero slot; `fill` is `db[1..12]` (-1 a run, 0 the
+/// super-root). The run must end inside `ndblock`, so every later read is in bounds.
 fn parse_inode(ino: u32, d: &[u8], fill: i32, ndblock: u64) -> Result<Option<Inode>, Vec<String>> {
     if d.iter().all(|&b| b == 0) {
         return Ok(None);
@@ -172,18 +161,16 @@ fn parse_inode(ino: u32, d: &[u8], fill: i32, ndblock: u64) -> Result<Option<Ino
     }))
 }
 
-/// One directory entry of the tree, with what its inode says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub name: String,
-    /// The game path: `/`-separated, no leading `/`.
+    /// No leading `/`.
     pub path: String,
     pub ino: u32,
     pub kind: Kind,
-    /// A file's length; a directory's entry bytes in use (`.` and `..` included).
+    /// A file's length; a directory's entry bytes in use.
     pub size: u64,
-    /// The directory holding the entry, the entry's absolute byte offset in the image and its
-    /// on-disk length.
+    /// The holding directory, the entry's absolute offset and its on-disk length.
     pub parent: u32,
     pub offset: u64,
     pub reclen: u32,
@@ -197,11 +184,9 @@ impl Node {
     }
 }
 
-/// A Forge-built `.ffpfs`, read and checked.
 #[derive(Debug)]
 pub struct Volume {
     inode_blocks: u64,
-    /// The one timestamp the writer stamps (header and every inode).
     time: i64,
     ndblock: u64,
     /// Indexed by inode number; `None` is an unused slot.
@@ -219,10 +204,7 @@ pub struct Volume {
     adopted: BTreeMap<u32, Vec<usize>>,
 }
 
-/// The header's `(inodes, inode_blocks, ndblock)`, if block 0 (`h`, the whole block) is the
-/// one the writer makes: version 2, case-insensitive, unsigned, 32-bit inodes, unencrypted,
-/// 64 KiB blocks, the inode table at block 1 described by the header's own inode, an image as
-/// long as the header says, and every other byte as the writer leaves it.
+/// The header's `(inodes, inode_blocks, ndblock)` if block 0 is exactly the writer's.
 fn check_header(h: &[u8], file_len: u64) -> Result<(u64, u64, u64, i64), Vec<String>> {
     let get = |at| le64(h, at).ok_or_else(|| other_tool("header missing"));
     if get(8)? != PFS_MAGIC {
@@ -260,9 +242,7 @@ fn check_header(h: &[u8], file_len: u64) -> Result<(u64, u64, u64, i64), Vec<Str
             "{inodes} inodes in {inode_blocks} table blocks"
         )));
     }
-    // Everything else, the inode table's own descriptor at 0x50 included (flags, pointers,
-    // the S64 signatures), is what the writer puts there: the block compared whole, the one
-    // timestamp it stamps taken from the descriptor.
+    // The rest (the table's descriptor at 0x50 included) compared whole, its timestamp taken.
     let time = get(0x50 + 0x18)? as i64;
     if h != header_block(inodes, ndblock, inode_blocks, time) {
         return Err(other_tool("header fields"));
@@ -270,7 +250,6 @@ fn check_header(h: &[u8], file_len: u64) -> Result<(u64, u64, u64, i64), Vec<Str
     Ok((inodes, inode_blocks, ndblock, time))
 }
 
-/// The inode table, one block at a time, the vector charged before it is allocated.
 fn read_inodes(
     image: &mut File,
     count: u64,
@@ -299,7 +278,6 @@ fn read_inodes(
     Ok(out)
 }
 
-/// One entry as read from a directory's run.
 struct Raw {
     ino: u32,
     kind: i32,
@@ -309,16 +287,13 @@ struct Raw {
     reclen: u32,
 }
 
-/// What [`read_dir`] returns: the entries, the bytes in use, and what they were charged.
 struct Listing {
     raw: Vec<Raw>,
     used: u64,
     charged: u64,
 }
 
-/// The entries of directory run `d` (`what` names it for findings): every one as the writer
-/// encodes it (its length exactly the padded `16 + name + 1`, a UTF-8 name), up to the first
-/// all-zero header, and nothing but zeros after it.
+/// The entries of directory run `d`, each exactly as the writer encodes it, then only zeros.
 fn read_dir(image: &mut File, d: &Inode, what: &str, budget: &mut Budget) -> Result<Listing, Fail> {
     if d.size > MAX_DIR_BYTES {
         return Err(other_tool(format!("{what}: over 64 MiB of entries")).into());
@@ -390,8 +365,7 @@ const DIR_MODE: u16 = MODE_DIR | MODE_RX;
 const FILE_MODE: u16 = MODE_FILE | MODE_RX;
 const INTERNAL: u32 = FLAG_INTERNAL | FLAG_READONLY;
 
-/// Inode `ino`, which an entry names as `kind` with `flags` (`what` names it): in range, used,
-/// of the writer's mode and flags; a directory's size its whole run, a file's link count 1.
+/// Inode `ino` as an entry names it: used, of the writer's mode and flags, a file's nlink 1.
 fn expect(
     inodes: &[Option<Inode>],
     ino: u32,
@@ -440,8 +414,7 @@ fn slashed(path: &str) -> String {
     joined(&["/", path])
 }
 
-/// `parts` concatenated into a string of exactly their length (no `format!`, whose capacity
-/// may overshoot), so the budget's charge for a path is what it holds.
+/// `parts` concatenated at exactly their length, so a path's charge is what it holds.
 fn joined(parts: &[&str]) -> String {
     let mut s = String::with_capacity(parts.iter().map(|p| p.len()).sum());
     for p in parts {
@@ -451,10 +424,8 @@ fn joined(parts: &[&str]) -> String {
 }
 
 impl Volume {
-    /// Reads and checks the header, the inode table, the super-root, every directory, the
-    /// flat path table and the collision resolver. `Ok(Err(findings))` when the image can't be
-    /// edited in place: another tool's layout, a damaged or inconsistent structure, or
-    /// metadata past [`MEMORY_LIMIT`].
+    /// `Ok(Err(findings))` when the image can't be edited in place (another layout, damage,
+    /// metadata past [`MEMORY_LIMIT`]).
     pub fn open(image: &mut File) -> io::Result<Result<Volume, Vec<String>>> {
         Self::open_within(image, MEMORY_LIMIT)
     }
@@ -473,7 +444,6 @@ impl Volume {
             return Err(other_tool("header missing").into());
         }
         let mut budget = Budget { used: 0, limit };
-        // The block read and the one it is compared with.
         budget.charge(2 * BLOCK)?;
         let mut h = vec![0u8; BLOCK as usize];
         read_at(image, 0, &mut h)?;
@@ -515,9 +485,7 @@ impl Volume {
 }
 
 impl Volume {
-    /// The super-root (inode 0, one block) lists exactly what the writer puts there:
-    /// `flat_path_table` (inode 1), `collision_resolver` (inode 2) when there is one, then
-    /// `uroot` (the next inode).
+    /// The super-root lists exactly `flat_path_table` (1), `collision_resolver` (2) if any, `uroot`.
     fn super_root(&mut self, image: &mut File, budget: &mut Budget) -> Result<(), Fail> {
         let what = "the super-root";
         let sr = expect(&self.inodes, 0, Kind::Dir, INTERNAL, what)?;
@@ -555,7 +523,6 @@ impl Volume {
         Ok(())
     }
 
-    /// Every inode no entry names is an unused (all-zero) slot.
     fn check_unused(&self, seen: &[bool]) -> Result<(), Fail> {
         let stray = self
             .inodes
@@ -568,8 +535,7 @@ impl Volume {
         }
     }
 
-    /// Every inode's run lies past the header and the inode table, inside the image, and no
-    /// two runs share a block.
+    /// Every run lies past the inode table, inside the image, and no two share a block.
     fn check_runs(&self, budget: &mut Budget) -> Result<(), Fail> {
         let used = self.inodes.iter().flatten().count();
         let bytes = (used as u64 + 1) * size_of::<(u64, u64)>() as u64;
@@ -594,10 +560,8 @@ impl Volume {
 }
 
 impl Volume {
-    /// Walks `uroot`'s tree, every directory's entries pushed to `nodes` together (in disk
-    /// order) and their range kept on the directory. Each directory starts with its `.` and
-    /// `..`, names the writer accepts, no name twice (ASCII case folded, as mode 0x8 looks
-    /// names up), its link count `2 + subdirectories` (`uroot`: 3 +); each inode is named once.
+    /// Walks `uroot`'s tree, each directory's entries pushed together (disk order), checked as the
+    /// writer makes them (case-folded unique names, link counts, each inode named once).
     /// Returns the path-table entries the tree encodes to.
     fn walk(
         &mut self,
@@ -643,8 +607,6 @@ impl Volume {
                 if let Some(why) = name_problem(&r.name) {
                     return Err(other_tool(format!("{what}: {:?}: {why}", r.name)).into());
                 }
-                // The node's name and path, and the path entry's `/`-rooted path, before
-                // they are made.
                 let child_len = path.len() + usize::from(!path.is_empty()) + r.name.len();
                 budget.charge((r.name.len() + 2 * child_len + 1) as u64)?;
                 let child = if path.is_empty() {
@@ -653,7 +615,6 @@ impl Volume {
                     joined(&[&path, "/", &r.name])
                 };
                 let cwhat = slashed(&child);
-                // Anything past the exact length an allocator rounded up to, charged too.
                 let over = (child.capacity() + cwhat.capacity()).saturating_sub(2 * child_len + 1);
                 budget.charge(over as u64)?;
                 match seen.get_mut(r.ino as usize) {
@@ -716,7 +677,6 @@ impl Volume {
 }
 
 impl Volume {
-    /// No two entries of `range` (one directory) share a name, ASCII case folded.
     fn check_unique(
         &self,
         range: &Range<usize>,
@@ -739,12 +699,8 @@ impl Volume {
         Ok(())
     }
 
-    /// The flat path table and collision resolver are byte for byte what the writer encodes
-    /// for the walked tree (the console looks files up through them). A resolver is there
-    /// when two paths share a hash; one that lists nothing (size 0) is kept by an edit that
-    /// removed the last shared hash, so inode numbers never move. Each is read only at the
-    /// expected length. What `path_table` allocates (sort scratch, the table, the resolver's
-    /// growth) and both reads are charged first.
+    /// The path tables are byte for byte what the writer encodes; an empty resolver is kept by
+    /// an edit that removed the last shared hash, so inode numbers never move. All charged first.
     fn check_path_table(
         &self,
         image: &mut File,
@@ -805,8 +761,7 @@ impl Volume {
 }
 
 impl Volume {
-    /// The entries of the directory at game path `dir` (`""` is the root), `.` and `..` left
-    /// out, in disk order.
+    /// The entries of `dir` (`""` the root), without `.` and `..`, in disk order.
     pub fn list(&self, dir: &str) -> io::Result<&[Node]> {
         let range = if dir.is_empty() {
             self.root.clone()
@@ -827,14 +782,12 @@ impl Volume {
             .ok_or_else(|| io::Error::other("internal error: a directory's entries"))
     }
 
-    /// The node at game path `path` (`/`-separated), or `None` when it does not exist (or a
-    /// parent is a file). Names compare with ASCII case folded, as the image's mode 0x8 (and
-    /// the console) looks them up; [`Volume::open`] refused a folder with two such names.
+    /// The node at `path`, names ASCII case folded as mode 0x8 looks them up.
     pub fn lookup(&self, path: &str) -> io::Result<Option<&Node>> {
         Ok(self.locate(path)?.and_then(|i| self.nodes.get(i)))
     }
 
-    /// [`Self::lookup`]'s node as an index into `nodes`; a node a plan deleted is skipped.
+    /// As an index into `nodes`; a node a plan deleted is skipped.
     fn locate(&self, path: &str) -> io::Result<Option<usize>> {
         if path.split('/').any(str::is_empty) {
             return Err(io::Error::new(
@@ -865,8 +818,7 @@ impl Volume {
         Ok(found)
     }
 
-    /// The live entries of folder `dir` (`range`: its entries in `nodes`) as indices: those
-    /// of its range still in it, in disk order, then those a plan moved in.
+    /// The live entries of folder `dir`: its range's still in it, then those a plan moved in.
     fn kids(&self, dir: u32, range: Range<usize>) -> impl Iterator<Item = usize> + '_ {
         let moved = self.adopted.get(&dir).map_or(&[][..], Vec::as_slice);
         range.chain(moved.iter().copied()).filter(move |&i| {
@@ -876,33 +828,27 @@ impl Volume {
         })
     }
 
-    /// Inode `ino` is in use (a plan clears the inodes it deletes).
     fn live(&self, ino: u32) -> bool {
         matches!(self.inodes.get(ino as usize), Some(Some(_)))
     }
 
-    /// Inode `ino`, `None` past the table or for an unused slot.
     pub fn inode(&self, ino: u32) -> Option<&Inode> {
         self.inodes.get(ino as usize)?.as_ref()
     }
 
-    /// Every entry of the tree, directories' entries together, in walk order.
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
     }
 
-    /// Bytes the volume holds once open (inodes and tree), as charged to the budget.
     pub fn held(&self) -> u64 {
         self.held
     }
 }
 
-/// The finding for what a `.ffpfs` can't take in place: a new file, a bigger one, a folder.
 pub const NO_ROOM: &str =
     "a .ffpfs keeps every file in one run: convert it to .exfat or .ffpkg to add files";
 
-/// The finding for renames whose paths share a path-table hash the image has no room to
-/// resolve: a resolver past its run, or a first one without a free inode or blocks.
+/// Renames whose shared hashes the image has no room to resolve.
 pub const SHARED_HASH: &str = "the renamed paths share a path-table hash this .ffpfs has no room \
     to resolve: rebuild it instead";
 
@@ -910,27 +856,20 @@ fn internal() -> String {
     "internal error: the PFS edit plan lost track of a node".to_string()
 }
 
-/// Byte offset of inode `ino`'s slot in the image.
 fn inode_offset(ino: u32) -> u64 {
     let ino = u64::from(ino);
     (1 + ino / INODES_PER_BLOCK) * BLOCK + (ino % INODES_PER_BLOCK) * INODE_LEN as u64
 }
 
-/// Plans the writes that apply `ops` to the image, in order (each op sees the ones before
-/// it), reading it only. Every write is `live`: a Put overwrites an existing file's run in
-/// place; a Delete rewrites its folder's entries, clears the inodes and shrinks the path
-/// tables, and the blocks it leaves are just unreferenced (PFS keeps no free-space map); a
-/// Rename rewrites the entries of the folders it touches (within their runs), a moved
-/// folder's `..` and link counts, and rebuilds the path tables. An
-/// op that does not apply is a finding; so is an image Forge can't edit in place
-/// ([`Volume::open`]'s findings). The image never grows. The open and the plan together,
-/// the returned writes included, stay within [`MEMORY_LIMIT`] (else the "too big" finding).
+/// Plans the writes that apply `ops` in order, reading only; every write is `live`. A Put
+/// overwrites a file's run, a Delete rewrites its folder and clears inodes (blocks just become
+/// unreferenced), a Rename rewrites folders within their runs. The image never grows; open and
+/// plan stay within [`MEMORY_LIMIT`].
 pub fn plan(image: &mut File, ops: &[Op]) -> Result<Vec<Write>, Vec<String>> {
     plan_within(image, ops, MEMORY_LIMIT)
 }
 
-/// [`plan`] within `limit` bytes: the open's budget carried on, every allocation of the plan
-/// (copied data, sets, folder buffers, the rebuilt path tables, the writes) charged first.
+/// [`plan`] within `limit` bytes, every allocation of the open and the plan charged first.
 fn plan_within(image: &mut File, ops: &[Op], limit: u64) -> Result<Vec<Write>, Vec<String>> {
     match Volume::open_within(image, limit) {
         Ok(Ok(v)) => {
@@ -950,15 +889,13 @@ const SET_ENTRY: u64 = 32;
 /// An inode slot's three small writes' buffers (2, 16 and 4 bytes), with allocator rounding.
 const INODE_HEAP: u64 = 64;
 
-/// An op's outcome: `Err` stops the plan (the budget, or an internal error); `Ok(Err)` is
-/// the op's finding.
+/// `Err` stops the plan; `Ok(Err)` is the op's finding.
 type Step = Result<Result<(), String>, Vec<String>>;
 
 fn lost() -> Vec<String> {
     vec![internal()]
 }
 
-/// `ino` added to `set`, its entry charged first.
 fn mark(set: &mut BTreeSet<u32>, ino: u32, budget: &mut Budget) -> Result<(), Vec<String>> {
     if !set.contains(&ino) {
         budget.charge(SET_ENTRY)?;
@@ -967,18 +904,14 @@ fn mark(set: &mut BTreeSet<u32>, ino: u32, budget: &mut Budget) -> Result<(), Ve
     Ok(())
 }
 
-/// What a plan changed so far, written out by [`Volume::writes`].
 #[derive(Default)]
 struct Changes {
-    /// File data, in op order.
     data: Vec<Write>,
-    /// Inodes whose slot is rewritten (cleared when gone).
+    /// Rewritten (cleared when gone).
     inodes: BTreeSet<u32>,
-    /// Folders whose entries are rewritten.
     dirs: BTreeSet<u32>,
-    /// Folders moved to another parent: their `..` entry is rewritten.
+    /// Their `..` entry is rewritten.
     moved: BTreeSet<u32>,
-    /// Something was deleted: the path tables are rebuilt.
     tables: bool,
 }
 
@@ -1005,7 +938,6 @@ impl Volume {
         self.writes(c, budget)
     }
 
-    /// The live node at `path`, as an index into `nodes`; `Err` is a bad path's finding.
     fn find(&self, path: &str) -> Result<Option<usize>, String> {
         self.locate(path).map_err(|_| format!("{path:?}: bad path"))
     }
@@ -1017,9 +949,7 @@ impl Volume {
             .ok_or_else(lost)
     }
 
-    /// Deletes the file or folder at `path`: its inode cleared, and for a folder every inode
-    /// under it (their entries are left: nothing references them), its folder's entries and
-    /// a folder's parent link count marked for rewriting, the path tables for rebuilding.
+    /// Deletes `path`: its inodes cleared (entries under it left, unreferenced), its folder marked.
     fn delete(&mut self, c: &mut Changes, budget: &mut Budget, path: &str) -> Step {
         let at = match self.find(path) {
             Ok(Some(at)) => at,
@@ -1055,11 +985,8 @@ impl Volume {
         Ok(Ok(()))
     }
 
-    /// Renames or moves the file or folder at `from` to `to` (names ASCII case folded, as the
-    /// image looks them up; a change of case alone is a rename). Every folder it touches is
-    /// rewritten in the writer's entry order ([`Volume::writes`]); the target folder's run
-    /// (a directory never grows) must hold the new name, else the "no room" finding. A moved folder's `..` and both parents' link counts follow, as the writer sets
-    /// them; every path under it changes, for the path tables rebuilt at the end.
+    /// Renames or moves `from` to `to` (a case change alone is a rename). The target folder's run
+    /// must hold the new name (a directory never grows); a moved folder's `..` and link counts follow.
     fn rename(&mut self, c: &mut Changes, budget: &mut Budget, from: &str, to: &str) -> Step {
         if let Some(Err(f)) = [from, to]
             .into_iter()
@@ -1098,7 +1025,6 @@ impl Volume {
             }
         };
         let moved = dir != old_parent;
-        // The folder's live entries, `.` and `..` included, against its run.
         let used = dirent_len(1)
             + dirent_len(2)
             + self
@@ -1140,10 +1066,7 @@ impl Volume {
         Ok(Ok(()))
     }
 
-    /// Node `at` named and placed at `new_path` in folder `dir` (`own`: `at` is in `dir`'s
-    /// range of `nodes`), every path under it changed, both folders' entries and the path
-    /// tables marked; a folder moved to another parent gets its `..` marked and both link
-    /// counts changed.
+    /// Node `at` placed at `new_path` in `dir` (`own`: in `dir`'s range), paths under it changed.
     fn moved_to(
         &mut self,
         c: &mut Changes,
@@ -1155,7 +1078,6 @@ impl Volume {
     ) -> Result<(), Vec<String>> {
         let cut = new_path.rfind('/').map_or(0, |i| i + 1);
         let name = new_path.get(cut..).ok_or_else(lost)?;
-        // The node's own copies of its name and path; the old ones go.
         budget.charge((name.len() + new_path.len()) as u64)?;
         let name = joined(&[name]);
         let node = self.nodes.get_mut(at).ok_or_else(lost)?;
@@ -1206,10 +1128,8 @@ impl Volume {
         Ok(())
     }
 
-    /// Replaces the file at `path` with `len` bytes of `data`, in the run it holds: refused
-    /// ([`NO_ROOM`]) for a new path or one longer than the run. The tail of its new last
-    /// block is zeroed; blocks past it are left unreferenced. `Data::Bytes` is copied into
-    /// the plan's write, charged first.
+    /// Replaces the file at `path` within its run ([`NO_ROOM`] for a new path or a longer one); the
+    /// new last block's tail is zeroed.
     fn put(
         &mut self,
         c: &mut Changes,
@@ -1268,10 +1188,8 @@ fn live(offset: u64, data: Data) -> Write {
 }
 
 impl Volume {
-    /// The writes for `c`: file data in op order, then each changed folder's entries (`.`
-    /// and `..` kept, the live ones packed after them in the writer's order: folders, then
-    /// files, each by lower-cased name; zeros up to the old end), a moved folder's `..`, the
-    /// path tables, then each changed inode slot.
+    /// The writes for `c`: file data, changed folders (in the writer's order, zeros to the old
+    /// end), moved folders' `..`, the path tables, then the inode slots.
     fn writes(mut self, c: Changes, budget: &mut Budget) -> Result<Vec<Write>, Vec<String>> {
         let mut out = c.data;
         budget.charge(c.dirs.len() as u64 * SET_ENTRY)?;
@@ -1296,8 +1214,6 @@ impl Volume {
                     .ok_or_else(lost)?;
                 (n.children.clone(), n.size)
             };
-            // The entries now, against the folder's run (renames checked it), then zeros up
-            // to the old end.
             let old = used.checked_sub(dots).ok_or_else(lost)?;
             let new: u64 = self
                 .kids(d, kids.clone())
@@ -1313,7 +1229,6 @@ impl Volume {
             }
             budget.grow(&mut out)?;
             budget.charge(len)?;
-            // In the writer's order: folders, then files, each by lower-cased name.
             let count = self.kids(d, kids.clone()).count();
             let order_bytes = (count * size_of::<usize>()) as u64;
             budget.charge(order_bytes)?;
@@ -1333,7 +1248,6 @@ impl Volume {
             bytes.resize(len as usize, 0);
             out.push(live(dir.block * BLOCK + dots, Data::Bytes(bytes)));
         }
-        // A moved folder's `..`: its new parent's inode, the entry's first field.
         budget.reserve(&mut out, c.moved.len())?;
         budget.charge(c.moved.len() as u64 * INODE_HEAP)?;
         for &m in &c.moved {
@@ -1371,14 +1285,9 @@ impl Volume {
         Ok(out)
     }
 
-    /// The flat path table and collision resolver of the live tree, re-hashed and re-sorted
-    /// as the writer builds them, written over the old ones, zeros up to their old length.
-    /// The FPT never grows (one entry per live node); the resolver may, within its run, else
-    /// the [`SHARED_HASH`] finding; the first collision makes one ([`Self::make_resolver`]). A
-    /// resolver left with no collision stays, empty (size 0, one block): uroot keeps its
-    /// inode number and [`Volume::open`] accepts it. Charged before building: the entries,
-    /// their paths, the sort's scratch, the FPT at its old length and the resolver twice at
-    /// its exact length; what the tables hold stays charged.
+    /// The path tables of the live tree, rebuilt as the writer builds them over the old ones. The
+    /// resolver may grow within its run (else [`SHARED_HASH`]); one left with no collision stays
+    /// empty, so uroot keeps its inode number.
     fn tables(
         &mut self,
         out: &mut Vec<Write>,
@@ -1406,8 +1315,7 @@ impl Volume {
                 dir: node.is_dir(),
             });
         }
-        // The resolver's exact length from the hash groups, checked against its run (a
-        // rename can make or lengthen a group) and charged twice (it grows by pushes).
+        // Charged twice: the resolver grows by pushes.
         entries.sort_unstable_by_key(|e| (e.hash, e.ino));
         let (mut resolver_len, mut i) = (0u64, 0);
         while let Some(h) = entries.get(i).map(|e| e.hash) {
@@ -1450,7 +1358,6 @@ impl Volume {
             mark(inodes, ino, budget)?;
             let i = self.inode_mut(ino)?;
             let (new, old) = (table.len() as u64, i.size);
-            // A table grows only within its run (a rename can lengthen the resolver).
             if new.div_ceil(BLOCK).max(1) > i.blocks {
                 return Err(vec![SHARED_HASH.to_string()]);
             }
@@ -1468,12 +1375,8 @@ impl Volume {
 }
 
 impl Volume {
-    /// The first collision's resolver, made as the writer makes it (an internal file of
-    /// `len` bytes, zeros to the end of its last block) in the lowest freed inode past uroot,
-    /// else a spare slot of the inode table's last block (the header's count raised), and in
-    /// the first unreferenced blocks that hold it (the writer reserves one after the FPT);
-    /// the super-root lists it between the FPT and uroot, which keeps inode 2. Without an
-    /// inode or blocks for it, the [`SHARED_HASH`] finding. Its bytes come from the caller.
+    /// The first collision's resolver: the lowest freed inode past uroot (else a spare table
+    /// slot) and the first unreferenced blocks; else the [`SHARED_HASH`] finding.
     fn make_resolver(
         &mut self,
         out: &mut Vec<Write>,
@@ -1496,7 +1399,6 @@ impl Volume {
             }
             None => return Err(refuse()),
         };
-        // Every run in use (the header and inode table first), for the first gap of `need`.
         let used = self.inodes.iter().flatten().count();
         let runs_bytes = (used as u64 + 1) * 16;
         budget.charge(runs_bytes)?;

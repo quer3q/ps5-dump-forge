@@ -1,9 +1,5 @@
-//! Byte images of the superblock, cylinder group headers and inodes.
-//!
-//! Field offsets are those of FreeBSD `struct fs`, `struct cg` (sys/ufs/ffs/fs.h) and
-//! `struct ufs2_dinode` (sys/ufs/ufs/dinode.h), checked against a compiled copy of fs.h
-//! (sizeof(struct fs) = 1376, sizeof(struct cg) = 168). Values follow newfs for
-//! `-O 2 -b 65536 -f 65536 -m 0 -S 4096` without soft updates.
+//! Byte images of the superblock, cylinder group headers and inodes: FreeBSD `struct fs`
+//! (1376 B), `struct cg` (168 B) and `struct ufs2_dinode`, values as newfs writes them.
 
 use crate::geom::{BSIZE, CBLKNO, CG_HDR, CONTIGSUMSIZE, Geom, IBLKNO, INOPB, NINDIR, SBLKNO};
 
@@ -11,7 +7,6 @@ pub const FS_UFS2_MAGIC: u32 = 0x1954_0119;
 pub const CG_MAGIC: u32 = 0x0009_0255;
 pub const SBLOCK_UFS2: u64 = 65536;
 pub const SBLOCKSIZE: usize = 8192;
-/// `fs_volname[MAXVOLLEN]`.
 pub const VOLNAME_AT: usize = 680;
 pub const VOLNAME_LEN: usize = 32;
 /// `fs_old_flags`: flags live in `fs_flags` (FS_FLAGS_UPDATED).
@@ -39,10 +34,8 @@ fn put64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// The superblock (`fs_sbsize` = 8192 bytes). `actual` is `fs_sblockactualloc`: the byte
-/// offset this copy is written at (newfs stamps each backup with its own location).
-/// `fs_id` is `fs_id[1]`, `volname` the `fs_volname` field. The in-place editor builds one
-/// too, to check an image's geometry fields against the writer's own.
+/// The superblock (8192 bytes). `actual` is `fs_sblockactualloc`, this copy's byte offset.
+/// The in-place editor builds one too, to check an image's geometry against the writer's.
 pub fn superblock(
     g: &Geom,
     total: &Csum,
@@ -95,8 +88,7 @@ pub fn superblock(
     put64(&mut b, 1096, g.dblkno); // fs_csaddr = cgdmin(0)
     put32(&mut b, 1196, 16384); // fs_avgfilesize (AVFILESIZ)
     put32(&mut b, 1200, 64); // fs_avgfpdir (AFPDIR)
-    // fs_ckhash, fs_metackhash, fs_flags = 0: no soft updates, no check hashes. fsck only
-    // offers to add hashes interactively; nothing requires them.
+    // fs_ckhash, fs_metackhash, fs_flags = 0: no soft updates, no check hashes.
     s32(&mut b, 1316, CONTIGSUMSIZE as i64); // fs_contigsumsize
     s32(&mut b, 1320, 120); // fs_maxsymlinklen = (NDADDR + NIADDR) * 8
     put64(&mut b, 1328, maxfilesize()); // fs_maxfilesize
@@ -116,8 +108,7 @@ fn maxfilesize() -> u64 {
     m
 }
 
-/// `struct fsrecovery`, the last 20 bytes before the UFS2 superblock: lets fsck find the
-/// backup superblocks if the primary is lost.
+/// `struct fsrecovery`, the 20 bytes before the superblock: how fsck finds the backups.
 pub fn fsrecovery(g: &Geom) -> [u8; 20] {
     let mut b = [0u8; 20];
     put32(&mut b, 0, FS_UFS2_MAGIC);
@@ -128,9 +119,8 @@ pub fn fsrecovery(g: &Geom) -> [u8; 20] {
     b
 }
 
-/// The cylinder group header plus its maps, one block. `used_inodes` is how many inodes of
-/// the group are allocated (they are always the group's first ones); `used_blocks` how many
-/// of its allocatable data blocks are taken (always the first ones, see `Geom::locate`).
+/// The cylinder group header plus its maps, one block. The `used_inodes` and `used_blocks`
+/// taken are always the group's first ones.
 pub fn cylinder_group(g: &Geom, c: u64, used_inodes: u64, used_blocks: u64, cs: &Csum) -> Vec<u8> {
     let mut b = vec![0u8; BSIZE as usize];
     let ndblk = g.cg_blocks(c);
@@ -154,9 +144,7 @@ pub fn cylinder_group(g: &Geom, c: u64, used_inodes: u64, used_blocks: u64, cs: 
     put32(&mut b, 108, clusteroff as u32);
     put32(&mut b, 112, ndblk as u32); // cg_nclusterblks (frag = 1)
     put32(&mut b, 116, g.ipg as u32); // cg_niblk
-    // cg_initediblk: inodes known to be initialised. Ours are all zeroed or written, but
-    // like newfs we claim only what is in use, rounded to an inode block, at least two
-    // blocks; the kernel zeroes further blocks itself as it allocates into them.
+    // cg_initediblk: like newfs, only what is in use, rounded to an inode block, at least two.
     let inited = used_inodes
         .next_multiple_of(INOPB)
         .max(2 * INOPB)
@@ -171,8 +159,7 @@ pub fn cylinder_group(g: &Geom, c: u64, used_inodes: u64, used_blocks: u64, cs: 
     for i in 0..used_inodes {
         set(iusedoff, i);
     }
-    // Free blocks: in groups after the first, the blocks in front of the backup
-    // superblock; then everything past the allocated data.
+    // Free: the blocks in front of a backup superblock, then everything past the data.
     let first_free = g.cg_data_start(c) - c * g.fpg + used_blocks;
     let free_ranges = [(0, if c > 0 { SBLKNO } else { 0 }), (first_free, ndblk)];
     let mut sum = [0u32; CONTIGSUMSIZE as usize + 1];
@@ -209,7 +196,6 @@ impl Dinode {
     pub fn write(&self, b: &mut [u8]) {
         b[0..2].copy_from_slice(&self.mode.to_le_bytes());
         b[2..4].copy_from_slice(&self.nlink.to_le_bytes());
-        // uid, gid, blksize: 0.
         put64(b, 16, self.size);
         put64(b, 24, self.blocks);
         for at in [32, 40, 48, 56] {

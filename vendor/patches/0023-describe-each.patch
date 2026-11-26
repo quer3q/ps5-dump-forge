@@ -1,0 +1,102 @@
+diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
+index 089d047768b9a2bc429caa75c1ab315d1c23a31d..75d9631a5680941d32befc5b07094d544c8f6050 100644
+--- a/ps5upload-fpkg/src/kraken_image.rs
++++ b/ps5upload-fpkg/src/kraken_image.rs
+@@ -831,6 +831,22 @@ fn deshuffle(data: &mut [u8], pattern: u8) -> Result<()> {
+ /// truncated or corrupt one is a [`crate::Error::Format`], never a panic. Each block it returns
+ /// is at most 256 KiB long.
+ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
++    let mut out = Vec::new();
++    describe_each(blob, |b| {
++        out.push(b);
++        Ok(())
++    })?;
++    Ok(out)
++}
++
++/// [`describe`], handing each block to `each` in mount order as the walk finds it instead of
++/// collecting them, so a caller keeping its own compact form never holds both lists. The
++/// same checks run; an error from `each` stops the walk and is returned. A failed walk may
++/// have handed some blocks over already.
++pub fn describe_each(
++    blob: &[u8],
++    mut each: impl FnMut(DescribedBlock) -> Result<()>,
++) -> Result<()> {
+     let word = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap());
+     if blob.len() < 16 {
+         return format_err("descriptor too short");
+@@ -925,12 +941,12 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+     };
+     // Zero blocks for the sparse extents starting at `logical`, each of at most 256 KiB and
+     // none crossing a boundary.
+-    let fill = |logical: &mut u64, out: &mut Vec<DescribedBlock>| {
++    let fill = |logical: &mut u64, each: &mut dyn FnMut(DescribedBlock) -> Result<()>| {
+         while let Ok(i) = sparse.binary_search_by_key(logical, |s| s.0) {
+             let end = sparse[i].1;
+             while *logical < end {
+                 let len = (end - *logical).min(UBLOCK);
+-                out.push(DescribedBlock {
++                each(DescribedBlock {
+                     logical: *logical,
+                     len,
+                     stored_at: 0,
+@@ -940,10 +956,11 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+                     odd_lz: false,
+                     mode_bits: 0,
+                     shuffle: 0,
+-                });
++                })?;
+                 *logical += len;
+             }
+         }
++        Ok::<(), crate::Error>(())
+     };
+     // The three bytes before the records read `00 00 04` in every plain build measured (Sony's,
+     // LibProsperoPkg's at 128 and 256 KiB blocks, ours). Other builders carry other values
+@@ -956,7 +973,6 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+         x[..9].copy_from_slice(&blob[rec_at + i * 9..rec_at + i * 9 + 9]);
+         u128::from_le_bytes(x)
+     };
+-    let mut out = Vec::new();
+     let (mut cursor, mut logical) = (0u64, 0u64);
+     let mut next_is_anchor = true; // index 0 is the start anchor
+                                    // The previous record's bits 68–71: the low nibble of this record's key (see `layout`).
+@@ -978,7 +994,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+             }
+             continue;
+         }
+-        fill(&mut logical, &mut out);
++        fill(&mut logical, &mut each)?;
+         if strict && i > 0 && nibble != logical & 0xF {
+             return format_err(format!(
+                 "record {i}: the exact start's low nibble disagrees (the console would read the \
+@@ -1065,7 +1081,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+                 ))
+             })?,
+         };
+-        out.push(DescribedBlock {
++        each(DescribedBlock {
+             logical,
+             len,
+             stored_at: cursor,
+@@ -1075,17 +1091,17 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+             odd_lz: f(36, 1) == 1,
+             mode_bits: f(32, 5) as u8,
+             shuffle,
+-        });
++        })?;
+         cursor = end;
+         logical += len;
+     }
+-    fill(&mut logical, &mut out);
++    fill(&mut logical, &mut each)?;
+     if logical != mount {
+         return format_err(format!(
+             "blocks tile to {logical:#x}, the mount is {mount:#x}"
+         ));
+     }
+-    Ok(out)
++    Ok(())
+ }
+ 
+ /// Decode block `b` of a stored image. `b` comes from [`describe`]; one built by hand is

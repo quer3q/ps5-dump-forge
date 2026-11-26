@@ -16,11 +16,15 @@ impl Reader {
     /// Open the pack set whose manifest is `index_name` in `tree` (a folder, an image), with its
     /// `.crc` sidecar when the tree has one.
     pub fn open(tree: &mut dyn SourceTree, index_name: &str) -> Result<Self> {
-        let manifest = Manifest::parse(&tree.read(index_name)?)?;
+        let manifest = Manifest::parse(&crate::source::read_small(
+            tree,
+            index_name,
+            crate::source::MAX_INDEX_BYTES,
+        )?)?;
         let crc_name = format!("{index_name}.crc");
         let crcs = if tree.files().iter().any(|f| f.path == crc_name) {
             Some(parse_crc_sidecar(
-                &tree.read(&crc_name)?,
+                &crate::source::read_small(tree, &crc_name, crate::source::MAX_INDEX_BYTES)?,
                 &manifest.build_id,
                 manifest.chunks.len(),
             )?)
@@ -67,6 +71,47 @@ impl Reader {
         })
     }
 
+    /// One decoded chunk of record `i` (`local`: its place in the file), reading volumes from
+    /// `tree` (named relative to the manifest's folder `dir`), CRC-checked when it can be.
+    pub fn read_chunk(
+        &self,
+        i: usize,
+        local: u32,
+        tree: &mut dyn SourceTree,
+        dir: &str,
+    ) -> Result<Vec<u8>> {
+        let f = &self.manifest.files[i];
+        let index = f.first_chunk as usize + local as usize;
+        let c = &self.manifest.chunks[index];
+        let raw_size = Manifest::raw_size(f, local) as usize;
+        let (begin, end) = self.payload[usize::from(c.pack_id)];
+        if c.offset < begin || c.offset + u64::from(c.stored_size) > end {
+            return format_err("a chunk lies outside its volume's payload");
+        }
+        let name = join(dir, self.manifest.pack_name(usize::from(c.pack_id))?);
+        let stored = tree.read_range(&name, c.offset, c.stored_size as usize)?;
+        if stored.len() != c.stored_size as usize {
+            return format_err(format!("{name} is truncated"));
+        }
+        let raw = match c.codec {
+            CODEC_RAW => stored,
+            CODEC_LZ4 => lz4::decompress(&stored, raw_size)?,
+            other => return format_err(format!("unknown chunk codec {other}")),
+        };
+        if raw.len() != raw_size {
+            return format_err("a chunk decoded to the wrong size");
+        }
+        if let Some(crcs) = &self.crcs {
+            if crc32(&raw) != crcs[index] {
+                return format_err(format!(
+                    "chunk {index} of {} fails its CRC",
+                    self.manifest.path(i)?
+                ));
+            }
+        }
+        Ok(raw)
+    }
+
     /// The decoded bytes of record `i`, reading volumes from `tree` (named relative to the
     /// manifest's folder `dir`). A loose record is an error: its bytes are not in the packs.
     pub fn read_file(&self, i: usize, tree: &mut dyn SourceTree, dir: &str) -> Result<Vec<u8>> {
@@ -74,37 +119,10 @@ impl Reader {
         if !f.packed() {
             return format_err(format!("{} is loose", self.manifest.path(i)?));
         }
-        let mut out = Vec::with_capacity(f.logical_size as usize);
+        // The size is the manifest's claim; what is reserved for it is not.
+        let mut out = Vec::with_capacity((f.logical_size as usize).min(16 << 20));
         for local in 0..f.chunk_count {
-            let index = f.first_chunk as usize + local as usize;
-            let c = &self.manifest.chunks[index];
-            let raw_size = Manifest::raw_size(f, local) as usize;
-            let (begin, end) = self.payload[usize::from(c.pack_id)];
-            if c.offset < begin || c.offset + u64::from(c.stored_size) > end {
-                return format_err("a chunk lies outside its volume's payload");
-            }
-            let name = join(dir, self.manifest.pack_name(usize::from(c.pack_id))?);
-            let stored = tree.read_range(&name, c.offset, c.stored_size as usize)?;
-            if stored.len() != c.stored_size as usize {
-                return format_err(format!("{name} is truncated"));
-            }
-            let raw = match c.codec {
-                CODEC_RAW => stored,
-                CODEC_LZ4 => lz4::decompress(&stored, raw_size)?,
-                other => return format_err(format!("unknown chunk codec {other}")),
-            };
-            if raw.len() != raw_size {
-                return format_err("a chunk decoded to the wrong size");
-            }
-            if let Some(crcs) = &self.crcs {
-                if crc32(&raw) != crcs[index] {
-                    return format_err(format!(
-                        "chunk {index} of {} fails its CRC",
-                        self.manifest.path(i)?
-                    ));
-                }
-            }
-            out.extend_from_slice(&raw);
+            out.extend_from_slice(&self.read_chunk(i, local, tree, dir)?);
         }
         if out.len() as u64 != f.logical_size {
             return format_err("a packed file decoded to the wrong size");

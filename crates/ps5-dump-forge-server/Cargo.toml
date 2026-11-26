@@ -18,6 +18,8 @@ qrcode = { version = "0.14", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 ps5-dump-forge-core.workspace = true
+# `GET /api/session`'s `bundled_ng_version` (`runtime::NG_VERSION`).
+ps5-dump-forge-lz4.workspace = true
 ps5-dump-forge-flink.workspace = true
 # Connect's probe (`probe.rs`): an NFS NULL call, an SMB2 NEGOTIATE.
 ps5-dump-forge-nfs.workspace = true

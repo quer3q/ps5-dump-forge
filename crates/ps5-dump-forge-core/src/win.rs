@@ -1,5 +1,4 @@
-//! The kernel32 calls the core needs on Windows and std does not expose (stably): file
-//! identity and link counts of an open handle, free space and the file system's name.
+//! kernel32 calls std doesn't expose: file identity, link count, free space, file system name.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -29,7 +28,6 @@ struct FileIdInfo {
     id: [u8; 16],
 }
 
-/// `FileIdInfo` in `FILE_INFO_BY_HANDLE_CLASS`.
 const FILE_ID_INFO: i32 = 18;
 
 #[link(name = "kernel32")]
@@ -69,9 +67,8 @@ fn by_handle(file: &File) -> io::Result<ByHandleFileInformation> {
     Ok(info)
 }
 
-/// (volume serial, file id) of an open handle. The 128-bit id where the file system has one
-/// (ReFS's 64-bit index is not unique); else the 64-bit index. An id of 0 (some SMB servers
-/// and drivers report it for every file) is an error, never a match.
+/// (volume serial, file id): the 128-bit id where there is one (ReFS's 64-bit index isn't
+/// unique), else the index. An id of 0 (some SMB servers and drivers) is an error, never a match.
 pub(crate) fn file_id(file: &File) -> io::Result<(u64, u128)> {
     let (serial, id) = raw_file_id(file)?;
     if id == 0 {
@@ -83,10 +80,8 @@ pub(crate) fn file_id(file: &File) -> io::Result<(u64, u128)> {
     Ok((serial, id))
 }
 
-/// `file_id`, but an id of 0 is returned as is. For source stamps, which also compare length
-/// and modification time, and for a volume root (`finalize::path_id`: a FAT/exFAT root reports
-/// 0, and only a root can then match it); never for other identities that decide what to
-/// publish or delete.
+/// `file_id` with 0 allowed: only for source stamps (length and mtime compared too) and a
+/// FAT/exFAT volume root; never for identities that decide what to publish or delete.
 pub(crate) fn raw_file_id(file: &File) -> io::Result<(u64, u128)> {
     let mut info = FileIdInfo::default();
     // SAFETY: an open handle; `info` is the FILE_ID_INFO the class asks for, with its size.
@@ -106,7 +101,6 @@ pub(crate) fn raw_file_id(file: &File) -> io::Result<(u64, u128)> {
     Ok((u64::from(info.volume_serial), u128::from(index)))
 }
 
-/// How many names the open file has.
 pub(crate) fn link_count(file: &File) -> io::Result<u64> {
     by_handle(file).map(|info| u64::from(info.links))
 }
@@ -115,7 +109,7 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// Bytes free to this user (quotas included) in `dir`.
+/// Bytes free to this user (quotas included).
 pub(crate) fn free_bytes(dir: &Path) -> io::Result<u64> {
     // A UNC directory needs its trailing backslash; any other takes one too.
     let mut dir = wide(dir);
@@ -140,19 +134,16 @@ pub(crate) fn free_bytes(dir: &Path) -> io::Result<u64> {
     Ok(free)
 }
 
-/// The name of the file system holding `dir` (`NTFS`, `FAT32`, `exFAT`, ...), read from its
-/// volume root (a drive, a mounted folder or a UNC share).
+/// `NTFS`, `FAT32`, `exFAT`, ... of `dir`'s volume root.
 pub(crate) fn fs_name(dir: &Path) -> io::Result<String> {
     let dir = wide(dir);
-    // The volume root is a prefix of the path, plus a trailing backslash.
     let mut root = vec![0u16; dir.len().max(260) + 1];
     // SAFETY: a NUL-terminated wide string and a buffer of the length passed.
     if unsafe { GetVolumePathNameW(dir.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let mut name = [0u16; 261];
-    // SAFETY: `root` is NUL-terminated by the call above; `name` is a buffer of the length
-    // passed; everything else is optional (null).
+    // SAFETY: `root` is NUL-terminated; `name` has the length passed; the rest are null.
     let ok = unsafe {
         GetVolumeInformationW(
             root.as_ptr(),

@@ -1,17 +1,10 @@
 //! Patch packages (`\x7FLIH`): a delta of a whole package, served as that package.
 //!
-//! Layout (measured on one debug patch, PPSA23566 01.006; no public spec): a 64 KiB header,
-//! little-endian, with the file's length at `0x18` and three `{offset, size}` pairs: the
-//! patched package's `\x7FFIH` header block (`0x20`), its `\x7FCNT` container (`0x30`) and a
-//! stored zip of PlayGo and relocation tables (`0x40`). Between the header block and the
-//! container sit the outer blocks the patch changed, 64 KiB each, in image order with gaps.
-//! The FIH and the container describe the whole patched package (its `imagedigs` lists every
-//! outer block), so each stored block is placed by matching its SHA3 against `imagedigs`; every
-//! other block is the base game's, which this file does not hold.
-//!
-//! [`View`] is the package the header describes, as bytes: the FIH block at 0, the outer image
-//! at the FIH's `pfs_offset`, the container at its `cnt_offset`. A read of a block the patch
-//! does not carry fails with [`crate::IN_BASE`].
+//! Layout (measured on PPSA23566 01.006; no public spec): a 64 KiB little-endian header, the file's
+//! length at `0x18`, `{offset, size}` pairs for the patched package's FIH block (`0x20`), its CNT
+//! (`0x30`) and a stored zip of PlayGo/relocation tables (`0x40`). Between FIH and CNT sit the
+//! changed outer blocks, each placed by its SHA3 in `imagedigs`; any other block is the base game's
+//! ([`crate::IN_BASE`]).
 // ponytail: blocks placed by digest, so every open reads and hashes the whole patch once,
 // uncancellable (472 MB: 0.2 s here; a 30 GB one takes minutes over USB); decoding the zip's
 // relocation tables would place them without reading them
@@ -31,27 +24,24 @@ const CNT_HEADER: usize = 0x1000;
 const CNT_ENTRY_LEN: usize = 0x20;
 const MAX_CNT_ENTRIES: usize = 4096;
 const IMAGE_DIGESTS: u32 = 0x040A;
-/// `imagedigs` read per pass while blocks are placed.
 const DIGEST_CHUNK: usize = 1 << 20;
 /// Stored blocks read and hashed at once (16 MiB).
 const HASH_BATCH: usize = 256;
 
-/// What the patch holds.
 pub(crate) struct Facts {
     /// The outer blocks it carries (a block of zeros it stores once may stand for many).
     pub present: HashSet<u64>,
     pub outer_blocks: u64,
 }
 
-/// The patched package, as bytes.
+/// The patched package, as bytes: FIH at 0, the outer image at `pfs_offset`, CNT at `cnt_offset`.
 pub(crate) struct View {
     pkg: Pkg,
-    /// The FIH block's offset in the patch.
+    /// Offsets in the patch: `fih_at`, `cnt_at`.
     fih_at: u64,
     pfs_offset: u64,
     pfs_size: u64,
     cnt_offset: u64,
-    /// The container's offset and size in the patch.
     cnt_at: u64,
     cnt_size: u64,
     /// Outer block index → its offset in the patch.
@@ -64,8 +54,7 @@ pub(crate) fn is_lih(head: &[u8]) -> bool {
     head.starts_with(MAGIC)
 }
 
-/// Where the patch file holds the patched package's container, from its header alone (no
-/// block placed): its entries' offsets are relative to it, so it reads as at that offset.
+/// The patched package's container offset in the patch, from its header alone.
 pub(crate) fn container_at(pkg: &mut Pkg) -> Result<u64> {
     if pkg.len < BLOCK {
         return Err(err(CORRUPT, "the patch header is truncated"));
@@ -155,8 +144,7 @@ impl View {
             ));
         }
 
-        // Each stored block's digest, then one pass over `imagedigs` places them. A digest that
-        // `imagedigs` lists more than once (a block of zeros) serves every one of its blocks.
+        // A digest `imagedigs` lists more than once (a block of zeros) serves each of its blocks.
         // ponytail: two maps of ~50 B per stored block (40 MB for a 50 GB patch)
         let offsets: Vec<u64> = data.step_by(BLOCK as usize).collect();
         let mut stored: HashMap<[u8; 32], u64> = HashMap::new();
@@ -222,7 +210,7 @@ impl View {
         self.len
     }
 
-    /// Where in the patch the view's byte `pos` is, and how many bytes from there are contiguous.
+    /// `pos` in the patch, and how many bytes from there are contiguous.
     fn locate(&self, pos: u64) -> io::Result<(u64, u64)> {
         if pos < BLOCK {
             return Ok((self.fih_at + pos, BLOCK - pos));
@@ -276,7 +264,7 @@ impl Seek for View {
     }
 }
 
-/// The container's `imagedigs` entry: its offset in the patch and its size.
+/// `imagedigs`: its offset in the patch and its size.
 fn image_digests(pkg: &mut Pkg, cnt_at: u64, cnt_size: u64) -> Result<(u64, u64)> {
     let mut head = vec![0u8; CNT_HEADER];
     pkg.read_at(cnt_at, &mut head)?;

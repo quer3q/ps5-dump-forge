@@ -11,6 +11,58 @@ use ps5upload_fpkg::inner::MetaCodec;
 use ps5upload_fpkg::source;
 use ps5upload_fpkg::{cnt, cnt_write, fih, inner, naps, outer, plan, PkgFile};
 
+/// A folder of a test's own under the temp directory, and a path in it (the folder itself, or a
+/// file there). The folder goes when the value does, however the test ends: these hold built
+/// packages and unpacked images, and left behind on every run they add up.
+struct Scratch {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn dir(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fpkg-mounts-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self {
+            path: root.clone(),
+            root,
+        }
+    }
+
+    /// The same folder, standing for the file `name` in it.
+    fn file(tag: &str, name: &str) -> Self {
+        let mut me = Self::dir(tag);
+        me.path = me.root.join(name);
+        me
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 fn mount_dir() -> Option<PathBuf> {
@@ -361,12 +413,9 @@ fn a_build_from_an_exfat_mount_verifies_and_round_trips() {
 }
 
 /// A `.ffpfsc` of an image.
-fn wrapped(image: &Path, name: &str) -> PathBuf {
+fn wrapped(image: &Path, name: &str) -> Scratch {
     use ps5upload_fpkg::ffpfsc::{wrap, Control, WrapOptions};
-    let dir = std::env::temp_dir().join(format!("fpkg-ffpfsc-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.join(format!("{name}.ffpfsc"));
+    let out = Scratch::file("ffpfsc", &format!("{name}.ffpfsc"));
     wrap(
         image,
         &out,
@@ -383,7 +432,7 @@ fn wrapped(image: &Path, name: &str) -> PathBuf {
 fn the_pfsc_reader_reads_the_inner_image_at_any_offset() {
     use std::io::{Read, Seek, SeekFrom};
     // The fixture compresses; noise is stored as it is (no block shrinks enough).
-    let noise = std::env::temp_dir().join(format!("fpkg-noise-{}.bin", std::process::id()));
+    let noise = Scratch::file("noise", "noise.bin");
     let mut x = 0x2545_f491_4f6c_dd1du64;
     let bytes: Vec<u8> = (0..0x10000 * 3 + 777)
         .map(|_| {
@@ -394,7 +443,7 @@ fn the_pfsc_reader_reads_the_inner_image_at_any_offset() {
         })
         .collect();
     std::fs::write(&noise, &bytes).unwrap();
-    for (source, compress) in [(fixture(), true), (noise.clone(), false)] {
+    for (source, compress) in [(fixture(), true), (noise.to_path_buf(), false)] {
         let raw = std::fs::read(&source).unwrap();
         let img = wrapped(&source, &format!("reader-{compress}"));
         let r0 = ps5upload_fpkg::ffpfsc::verify(&img, None).unwrap();

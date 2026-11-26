@@ -1,10 +1,6 @@
 //! A game's unsigned PS5 executables (plain ELF, `e_type` `0xFE10`/`0xFE18`) served as
 //! fake-signed SELFs: the console's loader refuses a plain ELF, so such a game never starts.
-//! Byte for byte what ampr-emu-ng's `tools/make_fself.py --ptype fake` writes (its
-//! defaults: paid `0x3100000000000002`, ptype 1, versions 0, no auth info): a header, an
-//! entry pair per copied segment (zero digests, then the segment's bytes), the ELF and
-//! program headers, ex-info with the ELF's SHA-256, a zero NPDRM block, zero meta blocks,
-//! footer and signature, then the segments, then any `PT_SCE_VERSION` bytes.
+//! Byte for byte ampr-emu-ng's `tools/make_fself.py --ptype fake` (paid `0x3100000000000002`, ptype 1): header, entry pairs per segment, ELF and program headers, ex-info (ELF SHA-256), zero NPDRM, meta, footer, signature, the segments, `PT_SCE_VERSION`.
 
 use std::collections::HashMap;
 
@@ -33,8 +29,7 @@ const HEAD: u64 = 0x4000;
 const PAID: u64 = 0x3100_0000_0000_0002;
 const PTYPE_FAKE: u64 = 1;
 
-/// The executables (by extension) that are unsigned PS5 ELFs, in `files()` order;
-/// `fakelib/` and `fakelib2/` included, the loader loads them too.
+/// The executables (by extension) that are unsigned PS5 ELFs, in `files()` order (`fakelib*/` included).
 /// ponytail: at most `MAX_EXECUTABLES` are found (a game has a few dozen).
 pub(crate) fn unsigned(tree: &mut dyn SourceTree) -> Vec<String> {
     let paths: Vec<String> = tree
@@ -59,8 +54,7 @@ pub(crate) fn unsigned(tree: &mut dyn SourceTree) -> Vec<String> {
 }
 
 /// `sdk::is_executable`, a `.bin` only when named `eboot*`.
-/// ponytail: games hold thousands of data `.bin` files (a solid archive would be decoded to
-/// the last one just to look); an executable `.bin` under another name isn't seen.
+/// ponytail: data `.bin` files aren't opened (a solid archive would decode to the last one); an executable `.bin` under another name isn't seen.
 pub(crate) fn executable(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     let bin = name
@@ -82,8 +76,7 @@ fn align16(x: u64) -> Option<u64> {
     Some(x.checked_add(15)? & !15)
 }
 
-/// One executable's SELF: `head` holds bytes `0..head.len()` (headers, meta, signature),
-/// `copies` the ELF ranges placed after it, zeros everywhere else.
+/// One executable's SELF: `head` holds bytes `0..head.len()`, `copies` the ELF ranges after it, zeros elsewhere.
 struct Plan {
     elf_size: u64,
     size: u64,
@@ -98,8 +91,7 @@ struct Plan {
 /// The SELF of the ELF at `path` (`elf_size` bytes), from its headers only.
 fn plan(tree: &mut dyn SourceTree, path: &str, elf_size: u64) -> Result<Plan, String> {
     let err = |e: ps5upload_fpkg::Error| e.to_string();
-    // The header and (where it fits, as usual) the program headers in one read: a second read
-    // right after it would make a remote source fetch a whole read-ahead window.
+    // Header and program headers in one read: a second read would make a remote source fetch a read-ahead window.
     let first = tree
         .read_range(path, 0, elf_size.min(HEAD) as usize)
         .map_err(err)?;
@@ -236,14 +228,12 @@ fn plan(tree: &mut dyn SourceTree, path: &str, elf_size: u64) -> Result<Plan, St
     })
 }
 
-/// A tree whose unsigned PS5 executables read as fake-signed SELFs, at their SELF sizes;
-/// one that can't be planned, and every other file, read as they are.
+/// A tree whose unsigned PS5 executables read as fake-signed SELFs at their SELF sizes; every other file as it is.
 pub(crate) struct Signed {
     inner: Box<dyn SourceTree>,
     files: Vec<SourceFile>,
     plans: HashMap<String, Plan>,
-    /// `ampr_emu.index` with the signed files' records at their SELF sizes, when it lists any:
-    /// the runtime answers `/app0` lookups from it, and a packed game keeps it as it is.
+    /// `ampr_emu.index` with the signed files at their SELF sizes, when it lists any (the runtime answers `/app0` lookups from it).
     index: Option<Vec<u8>>,
     /// How many of its records were resized.
     pub(crate) resized: usize,
@@ -252,9 +242,7 @@ pub(crate) struct Signed {
 /// A path index this big is not read (as `lz4::index_state`'s cap).
 const MAX_INDEX: u64 = 64 << 20;
 
-/// `ampr_emu.index` with each record of a signed file that lists its ELF size set to its SELF
-/// size (records hold a plain u64 size at +8, no checksum), and the count; `None` when it
-/// doesn't read or lists none of them.
+/// `ampr_emu.index` with each signed file's record at its SELF size (a plain u64 at +8, no checksum) and the count; `None` when it lists none.
 fn resized_index(
     inner: &mut dyn SourceTree,
     plans: &HashMap<String, Plan>,
@@ -287,8 +275,7 @@ fn resized_index(
 }
 
 impl Signed {
-    /// The tree, the paths it signs (in `files()` order), and `(path, why)` for each
-    /// unsigned executable it serves unchanged.
+    /// The tree, the paths it signs, and `(path, why)` for each unsigned executable served unchanged.
     pub(crate) fn new(
         mut inner: Box<dyn SourceTree>,
     ) -> (Self, Vec<String>, Vec<(String, String)>) {
@@ -352,8 +339,7 @@ fn exact(
 }
 
 /// SHA-256 of the whole ELF, for the ex-info.
-/// ponytail: the ELF is read twice, once for this digest that sits in front of its
-/// segments; byte identity with make_fself kept.
+/// ponytail: the ELF is read twice, for this digest in front of its segments.
 fn digest(tree: &mut dyn SourceTree, path: &str, size: u64) -> ps5upload_fpkg::Result<[u8; 32]> {
     let mut hash = Sha256::new();
     let mut at = 0;

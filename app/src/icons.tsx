@@ -5,7 +5,6 @@ const PATHS = {
   folder: "M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5z",
   disc: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 14.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z",
   drive: "M3 13.5 5.6 6.2A1.8 1.8 0 0 1 7.3 5h9.4a1.8 1.8 0 0 1 1.7 1.2L21 13.5v4a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5zM3 13.5h18M16.5 16.2v.3",
-  target: "M4 7.5 12 3l8 4.5v9L12 21l-8-4.5zM4 7.5l8 4.5 8-4.5M12 12v9",
   /** A package (the Package installer): the box with its tape. */
   package: "M4 7.5 12 3l8 4.5v9L12 21l-8-4.5zM4 7.5l8 4.5 8-4.5M12 12v9M8 5.25l8 4.5",
   bolt: "M13 3 5 13.5h6L10 21l8-10.5h-6z",
@@ -47,14 +46,20 @@ const PATHS = {
   // A folder with an arrow going in: Move to another folder.
   move: "M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2h7.5A2.5 2.5 0 0 1 21 9.5v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 16.5zM8 13h7M12.5 10.5 15 13l-2.5 2.5",
   plus: "M12 5v14M5 12h14",
-  // An arrow pointing on (mirrored in RTL by its CSS): File Transfer, from what to where.
+  // An arrow pointing on (mirrored in RTL by its CSS): from what to where.
   arrow: "M5 12h14M13 6l6 6-6 6",
-  // Lines running on with arrows: streamed, nothing staged (About's features).
-  stream: "M4 7h11M4 12h16M4 17h11M15 4l3 3-3 3M15 14l3 3-3 3",
-  // A memory card, its contacts on top: USB sticks and SD cards.
-  sdcard: "M7 3h9l3 3v13.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 19.5v-15A1.5 1.5 0 0 1 6.5 3zM9 3v4M12 3v4M15 3v4",
   heart: "M12 20s-7.5-4.6-7.5-10A4.5 4.5 0 0 1 12 7.4 4.5 4.5 0 0 1 19.5 10c0 5.4-7.5 10-7.5 10z",
-  "file-plus": "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5M12 11.5v5M9.5 14h5",
+  // Two sliders: Settings (kraken-mount's).
+  settings: "M4 7h10M18 7h2M4 17h4M12 17h8M16 9.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4zM10 19.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4z",
+  // Two linked rings: Connect.
+  link: "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1",
+  // Double chevron: collapse the rail.
+  collapse: "M11 17l-5-5 5-5M18 17l-5-5 5-5",
+  // A ribbon bookmark (filled by CSS while pressed: a bookmarked folder).
+  bookmark: "M7 4h10a1 1 0 0 1 1 1v16l-6-4-6 4V5a1 1 0 0 1 1-1z",
+  // Arrows up and down side by side: Transfer, files both ways.
+  transfer: "M8 19V5M4 9l4-4 4 4M16 5v14M12 15l4 4 4-4",
+  "file-plus":"M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5M12 11.5v5M9.5 14h5",
 } as const;
 
 export type IconName = keyof typeof PATHS;

@@ -6,8 +6,23 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// The most a reader reserves up front for a buffer whose length comes from an image's own
+/// records (it still grows to the real size): a damaged image cannot make us reserve gigabytes.
+pub const PREALLOC_CAP: usize = 8 << 20;
+
+/// How much to reserve up front for a `len` read from an image's records: `len`, at most
+/// [`PREALLOC_CAP`].
+pub fn prealloc(len: usize) -> usize {
+    if len <= PREALLOC_CAP {
+        len
+    } else {
+        PREALLOC_CAP
+    }
+}
+
 pub mod ampr_index;
 pub mod ampr_pack;
+pub mod browse;
 pub mod build;
 pub mod cnt;
 pub mod cnt_write;
@@ -15,14 +30,20 @@ pub mod crypto;
 pub mod exfat;
 pub mod exfat_write;
 pub mod ffpfsc;
+pub mod ffpfsc_block;
+pub mod ffpfsc_compat;
 pub mod fih;
 pub mod fih_write;
+pub mod finish;
 pub mod flt;
+pub mod fself;
 pub mod inner;
 pub mod keys;
 pub mod kraken;
 pub mod kraken_image;
 pub mod license;
+pub mod lih;
+pub mod module_case;
 pub mod naps;
 pub mod outer;
 pub mod outer_write;
@@ -30,10 +51,17 @@ pub mod pfs_source;
 pub mod pfsc;
 pub mod pfsc_reader;
 pub mod pfsimage;
+pub mod pkg_source;
 pub mod plan;
 pub mod playgo;
+pub mod protected;
+pub mod ps4_merge;
+pub mod ps4_param;
+pub mod ps4_pkg;
+pub mod ps4_pkg_write;
 pub mod remote_source;
 pub mod rsa;
+pub mod sample;
 pub mod sdk_rules;
 pub mod self_repair;
 pub mod si;
@@ -42,6 +70,7 @@ pub mod source;
 pub mod stream;
 pub mod ufs2_source;
 pub mod verify;
+pub mod workshop;
 pub mod xts;
 
 /// Every PFS and finalized-image block is 64 KiB.
@@ -157,6 +186,11 @@ impl PkgFile {
     /// Any seekable bytes of known length.
     pub fn from_reader(file: Box<dyn ReadSeek>, len: u64) -> Self {
         Self { file, len }
+    }
+
+    /// The reader this was made from, back.
+    pub fn into_reader(self) -> Box<dyn ReadSeek> {
+        self.file
     }
 
     pub fn len(&self) -> u64 {

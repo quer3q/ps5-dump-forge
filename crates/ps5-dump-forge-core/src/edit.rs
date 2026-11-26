@@ -1,6 +1,5 @@
-//! An in-place edit's tree: the source with its [`Edit`]s folded over it, served as one
-//! `SourceTree`. Nothing is copied: a base file is read from the base at its original path, an
-//! added one from this computer or a paired device (`flink://`), checked unchanged on every read.
+//! The source with its [`Edit`]s folded over it, as one `SourceTree`; nothing is copied, and an
+//! added file (here or `flink://`) is checked unchanged on every read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -18,33 +17,25 @@ use crate::finalize::{FileId, followed_id, handle_id, path_id};
 use crate::remote::{FlinkPath, RemoteReader, RemoteTree};
 use crate::scan::{JunkFiltered, ScannedFolder, Stamp, ancestors, open_nofollow};
 
-/// Where an edited file's bytes come from.
 #[derive(Debug, Clone)]
 enum Origin {
-    /// The base tree's file at this path.
     Base(String),
-    /// A file an `Add` copies, as it was when the edit was resolved.
     Host(HostFile),
 }
 
-/// A file's size and where its bytes come from.
 type Entry = (u64, Origin);
 
-/// A file an `Add` copies (on this computer, or a `flink://` path on a paired device), as it
-/// was when the edit was resolved; a format editor's [`Data::Source`] `id` is its index in
-/// [`Edited::hosts`].
+/// A file an `Add` copies, as it was when resolved; [`Data::Source`] `id` indexes [`Edited::hosts`].
 #[derive(Debug, Clone)]
 pub(crate) struct HostFile {
     pub path: PathBuf,
     pub size: u64,
     pub stamp: Stamp,
-    /// Which file the path named (so a file renamed over it later is caught); `None` on a
-    /// peer, which has no identity to give: its size and mtime are checked.
+    /// So a file renamed over it later is caught; `None` on a peer (size and mtime checked).
     pub id: Option<FileId>,
 }
 
 impl HostFile {
-    /// Opens the file for reading; [`Opened::same`] then says whether it is still this one.
     pub(crate) fn open(&self) -> io::Result<Opened> {
         if self.id.is_some() {
             return open_nofollow(&self.path).map(Opened::Local);
@@ -63,8 +54,7 @@ pub(crate) enum Opened {
 }
 
 impl Opened {
-    /// Whether this is still `host` as the edit was resolved with it: the path names the
-    /// handle's file (local), and its size and modification time are unchanged.
+    /// The path still names the handle's file (local), size and mtime unchanged.
     pub(crate) fn same(&self, host: &HostFile) -> io::Result<bool> {
         match self {
             Opened::Local(file) => {
@@ -98,8 +88,7 @@ impl Seek for Opened {
     }
 }
 
-/// The tree while the edits fold over it: every file by game path, and every directory (each
-/// file's and each directory's parents included); and the editor's ops so far.
+/// The tree while the edits fold over it (every parent directory included), and the ops so far.
 #[derive(Default)]
 struct State {
     files: BTreeMap<String, Entry>,
@@ -108,15 +97,13 @@ struct State {
     hosts: Vec<HostFile>,
 }
 
-/// The base tree with the edits applied.
 pub(crate) struct Edited {
     base: Box<dyn SourceTree>,
     files: Vec<SourceFile>,
     origins: Vec<Origin>,
     empty_dirs: Vec<String>,
     edits: usize,
-    /// The edits as a format editor's ops, in order (a folder `Add` expanded into `Mkdir`s and
-    /// `Put`s), and the host files their `Data::Source` ids name.
+    /// A folder `Add` expanded into `Mkdir`s and `Put`s.
     ops: Vec<Op>,
     hosts: Vec<HostFile>,
     /// The last host file read, kept open: writers read one file in many chunks.
@@ -124,9 +111,7 @@ pub(crate) struct Edited {
 }
 
 impl Edited {
-    /// Folds `edits` over `base` in order. `source` is the source folder (`None` for an image):
-    /// an `Add` from inside it is refused. The inner `Err` lists every offender; the outer one
-    /// is a cancel.
+    /// `source`: the source folder (`None` for an image), an `Add` from inside it refused.
     pub(crate) fn new(
         base: Box<dyn SourceTree>,
         edits: &[Edit],
@@ -183,12 +168,10 @@ impl Edited {
 }
 
 impl Edited {
-    /// The edits as a format editor's ops, in order.
     pub(crate) fn ops(&self) -> &[Op] {
         &self.ops
     }
 
-    /// The host files the ops' `Data::Source` ids name (by index).
     pub(crate) fn hosts(&self) -> &[HostFile] {
         &self.hosts
     }
@@ -211,8 +194,7 @@ impl Edited {
                 format!("{} ({path}): {e}", host.path.display()),
             ))
         };
-        // A peer checks its stamp when opened; each fetch checks it again. A local path and
-        // handle must still name the stamped file on every read.
+        // A peer checks its stamp on open and each fetch; a local one on every read.
         let opening = self.open.as_ref().is_none_or(|(at, _)| *at != i);
         if opening {
             self.open = None;
@@ -280,7 +262,6 @@ impl SourceTree for Edited {
     }
 }
 
-/// One edit, as a finding names it.
 fn label(edit: &Edit) -> String {
     match edit {
         Edit::Add { from, to } => format!("add {} as {to}", from.display()),
@@ -298,7 +279,6 @@ fn valid(path: &str) -> bool {
             .all(|c| !c.is_empty() && c != "." && c != "..")
 }
 
-/// `rel` under game folder `dir`.
 fn join(dir: &str, rel: &str) -> String {
     format!("{dir}/{rel}")
 }
@@ -525,8 +505,7 @@ impl State {
         Ok(self.add_folder(to, folder.files(), folder.empty_dirs(), hosts, why))
     }
 
-    /// [`Self::add`] of a `flink://` path: a file or folder on a paired device, as it lists
-    /// it (links refused, junk left out as a conversion leaves it out).
+    /// [`Self::add`] of a `flink://` path, by the peer's listing (links refused, junk left out).
     fn add_peer(
         &mut self,
         from: &Path,
@@ -600,8 +579,8 @@ impl State {
         Ok(self.add_folder(to, folder.files(), folder.empty_dirs(), hosts, Vec::new()))
     }
 
-    /// Adds a folder's `files` (`hosts` holds each one's origin, in order) and `empty_dirs`
-    /// at `to`, unless `why` (what was found already) or the tree refuses them.
+    /// Adds a folder's `files` (origins in `hosts`) and `empty_dirs` at `to`, unless `why` or
+    /// the tree refuses them.
     fn add_folder(
         &mut self,
         to: &str,
@@ -640,7 +619,6 @@ impl State {
         Vec::new()
     }
 
-    /// Adds `host` at `path`, and its `Put`.
     fn put(&mut self, path: &str, host: HostFile) {
         let size = host.size;
         let source = u32::try_from(self.hosts.len()).expect("fewer than 2^32 host files");

@@ -1,12 +1,5 @@
-// The http build's launcher: the home-screen tile opens http://127.0.0.1:8095/ in the PS5
-// browser, which shows this page from AppCache even when nothing listens (after a restart).
-// Before the app loads, the page asks `GET /api/session`; if nothing answers, it asks elfldr
-// (port 9021) to start the copy the payload saved of itself, then waits for the server.
-// Only at page load and only on the console itself (a loopback host, port 8095): a PC on the LAN, the
-// app's Stop and its poller never start anything. Type imports only and every dependency
-// injected, so a plain `node` can drive it (scripts/check-launcher.mjs).
+// The http build's launcher: at page load on the console's own browser (loopback, port 8095) only, a silent session makes it ask elfldr (9021) to start the saved copy, then wait for the server. Every dependency injected (scripts/check-launcher.mjs).
 
-/** What the launcher needs from the page; `browserDeps()` is the real one. */
 export interface Deps {
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
@@ -14,16 +7,13 @@ export interface Deps {
   nonce(): string;
 }
 
-/** Why a launch failed; the page words it (main-http.tsx). */
 export type Failure = "loader" | "missing" | "timeout" | "stopping";
 
 /** `up`: the session answered healthy (an AppCache update check is worth it). */
 export type Outcome = { ok: true; up: boolean } | { ok: false; failure: Failure };
 
 export const ELFLDR = "http://127.0.0.1:9021";
-/** Where the payload saves itself, where earlier versions did (the payload renames that folder
- * on start and links the old name to the new one; a real folder there means the rename failed),
- * then the USB drives, in this order. */
+/** The self copy, the old folder's (a real folder there means the rename failed), then USB drives, in order. */
 export const COPIES = [
   "/data/dumpforge/ps5-dump-forge.elf",
   "/data/ps5-dump-forge/ps5-dump-forge.elf",
@@ -39,12 +29,10 @@ export const STOP_WAIT_MS = 120000;
 
 const fail = (failure: Failure): Outcome => ({ ok: false, failure });
 
-/** The tile's page: only the console's own browser may start the payload. */
 export function isLoopback(hostname: string): boolean {
   return hostname === "127.0.0.1" || hostname === "localhost";
 }
 
-/** The port elfldr's `args=serve` start listens on. */
 export const DEFAULT_PORT = "8095";
 
 export function browserDeps(): Deps {
@@ -56,8 +44,7 @@ export function browserDeps(): Deps {
   };
 }
 
-/** A fetch plus reading its body as text, all within `ms`. Rejects on a network failure or
- * the deadline; `headers` says whether a response arrived before it. */
+/** Rejects on a network failure or the deadline; `headers`: a response arrived before it. */
 async function fetchText(
   d: Deps,
   url: string,
@@ -91,8 +78,6 @@ async function fetchText(
 
 export type SessionState = "up" | "stopping" | "down" | "other";
 
-/** `GET /api/session`: ours and running, ours and quitting, nothing answering, or something
- * else answering. */
 export async function session(d: Deps): Promise<SessionState> {
   const r = await fetchText(d, "/api/session", { cache: "no-store" }, SESSION_TIMEOUT_MS);
   if (!("status" in r)) return "down";
@@ -105,7 +90,6 @@ export async function session(d: Deps): Promise<SessionState> {
   }
 }
 
-/** Polls the session every second until `want` holds, up to `ms`. */
 async function waitFor(d: Deps, want: (s: SessionState) => boolean, ms = START_WAIT_MS): Promise<boolean> {
   const end = d.now() + ms;
   for (;;) {
@@ -131,8 +115,7 @@ async function requestStart(d: Deps): Promise<Outcome> {
   return fail("missing");
 }
 
-/** The whole page-load check. `onStarting` runs once nothing answered, before elfldr is
- * asked (the page shows "Starting Dump Forge…"). */
+/** `onStarting` runs once nothing answered, before elfldr is asked. */
 export async function launch(d: Deps, onStarting: () => void): Promise<Outcome> {
   let s = await session(d);
   // Anything that answers but isn't ours running is the app's business (its offline notice).
@@ -149,9 +132,7 @@ export async function launch(d: Deps, onStarting: () => void): Promise<Outcome> 
 
 let inFlight: Promise<Outcome> | null = null;
 
-/** At most one launch per page at a time; Retry starts a new one once it settled. A host
- * that isn't loopback (a PC on the LAN), or a port other than 8095 (`serve --port`, which a
- * relaunch with `args=serve` would never reach), never launches: it gets the app as it is. */
+/** At most one launch at a time; a non-loopback host or a port other than 8095 never launches. */
 export function launchOnce(hostname: string, port: string, d: Deps, onStarting: () => void): Promise<Outcome> {
   if (!isLoopback(hostname) || port !== DEFAULT_PORT) return Promise.resolve({ ok: true, up: false });
   if (!inFlight) inFlight = launch(d, onStarting).finally(() => (inFlight = null));

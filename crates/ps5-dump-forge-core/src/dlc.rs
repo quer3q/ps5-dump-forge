@@ -1,13 +1,4 @@
-//! DLC embedded in a game dump. There is no one layout for it, so three traces are read:
-//! the DLC emulator's list (`dlc_emu.ini` at the root, one `[PSAC]` section per content id,
-//! answered by its `fakelib/libSceAppContent.sprx`),
-//! a DLC's own metadata (`sce_sys/param.json` or `sce_sys/param.sfo`) anywhere but the
-//! game's own `param.json` (a DLC copied into the game root leaves its `param.sfo` there),
-//! and folders named by a DLC's content id (`EP1003-PPSA09017_00-FALLOUT4DLC00003`, `-ac`
-//! as the console mounts them). Both are merged by content id. Metadata counts as a DLC's
-//! when a `param.sfo` says so (CATEGORY `ac`, additional content), else only when its
-//! content id differs from a known game id: a game's own generated `param.sfo` (CATEGORY
-//! `gd`, `gp`, ...) never does.
+//! DLC embedded in a game dump, from three traces merged by content id: `dlc_emu.ini`'s `[PSAC]` sections, a DLC's own `sce_sys/param.*` anywhere but the game's own (a `param.sfo` of CATEGORY `ac`, else a content id not the game's), and content-id folders.
 
 use std::collections::BTreeMap;
 
@@ -19,18 +10,15 @@ use crate::preflight::MAX_PARAM_JSON;
 /// One DLC found in a dump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Dlc {
-    /// `EP1003-PPSA09017_00-FALLOUT4DLC00003`.
     pub content_id: String,
-    /// Its last 16 characters, the label that tells a game's DLCs apart.
+    /// The content id's last 16 characters, which tell a game's DLCs apart.
     pub label: String,
-    /// From its metadata, when it has some.
     pub name: Option<String>,
     /// The folder it sits in, when it has its own (else its files are merged in the game's).
     pub folder: Option<String>,
     /// Bytes under `folder`.
     pub bytes: u64,
-    /// Listed in the DLC emulator's `dlc_emu.ini`: its `download_status` there
-    /// (`NO_EXTRA_DATA`: an entitlement only, no data of its own).
+    /// Its `dlc_emu.ini` `download_status` (`NO_EXTRA_DATA`: an entitlement only).
     pub emulated: Option<String>,
 }
 
@@ -124,13 +112,7 @@ pub(crate) fn find(tree: &mut dyn SourceTree, game: Option<&str>) -> Vec<Dlc> {
     dlcs
 }
 
-/// (content id, download status) of every `[PSAC]` section of a `dlc_emu.ini`:
-///
-/// ```text
-/// [PSAC]
-/// content_id=EP9000-PPSA13197_00-SAMPLEGAMEDLC001
-/// download_status=NO_EXTRA_DATA
-/// ```
+/// (content id, download status) of every `[PSAC]` section of a `dlc_emu.ini`.
 fn emulated(text: &str) -> Vec<(String, String)> {
     text.split('[')
         .skip(1)
@@ -152,8 +134,7 @@ fn emulated(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `name` as a content id (`XX0000-XXXX00000_00-` and a 16-character label), `-ac` as the
-/// console mounts DLC allowed.
+/// `name` as a content id (`XX0000-XXXX00000_00-` + a 16-character label), `-ac` allowed.
 fn content_id_of(name: &str) -> Option<String> {
     let id = name.strip_suffix("-ac").unwrap_or(name);
     let b = id.as_bytes();

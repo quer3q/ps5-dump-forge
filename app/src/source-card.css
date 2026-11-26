@@ -1,0 +1,52 @@
+/* The Source card's head holds no title (the section is labelled "Source"): only its actions,
+   at the end. The game title takes the focus the old heading took. */
+.card.hero > .src-head { justify-content: flex-end; }
+.card.hero .title[tabindex]:focus { outline-color: var(--accent-soft); outline-offset: 4px; border-radius: 6px; }
+
+/* Build's card once a game is read (the 2b layout): a 200px cover, everything else on its right,
+   Pick on the title's line at its end; compact tiles. .game becomes display:contents, so the cover
+   and .game-text are items of the card's own grid. */
+.card.hero.src-2b {
+  --cv: 200px;
+  display: grid; grid-template-columns: var(--cv) minmax(0, 1fr); column-gap: 24px; align-content: start;
+}
+.card.hero.src-2b > * { grid-column: 2; }
+.card.hero.src-2b > .game { display: contents; }
+.card.hero.src-2b > .game > .cover {
+  grid-column: 1; grid-row: 1 / span 30; align-self: start;
+  width: var(--cv); height: var(--cv); border-radius: var(--radius-lg);
+}
+.card.hero.src-2b > .game > .cover .icon { width: 30%; height: 30%; }
+.card.hero.src-2b .game-text { grid-row: 1; grid-column: 2; align-self: start; }
+.card.hero.src-2b > .src-head {
+  grid-row: 1; grid-column: 2; justify-self: end; align-self: start; margin: 0; min-height: 0; position: relative; z-index: 1;
+}
+.card.hero.src-2b .title-row { padding-inline-end: 96px; min-height: 30px; }
+.card.hero.src-2b .summary { margin-top: 12px; }
+/* The tiles: each as wide as its content, wrapping; a wide one takes the row. */
+.card.hero.src-2b .tiles { display: flex; flex-wrap: wrap; gap: 6px; }
+.card.hero.src-2b .tile { flex: 0 1 auto; max-width: 100%; }
+.card.hero.src-2b .tile.wide { flex-basis: 100%; }
+.card.hero.src-2b .tile { padding: 7px 10px; border-radius: var(--radius); }
+.card.hero.src-2b .tile dt { font-size: 11px; margin-bottom: 2px; }
+.card.hero.src-2b .tile .value { font-size: 14px; }
+.card.hero.src-2b .tile dd .tag { min-height: 18px; padding: 0 7px; font-size: 11px; }
+
+/* Narrow screens: a smaller cover beside the text; under 600px (and always on Edit's stacked card, in its
+   narrow column) the cover sits above it, Pick at the end of the cover's row, so the title has the full width. */
+@media (max-width: 879px) { .card.hero.src-2b { --cv: 128px; column-gap: 16px; } }
+@media (max-width: 599px) {
+  .card.hero.src-2b { --cv: 88px; grid-template-columns: minmax(0, 1fr); }
+  .card.hero.src-2b > *, .card.hero.src-2b > .src-head, .card.hero.src-2b > .game > .cover,
+  .card.hero.src-2b .game-text { grid-column: 1; }
+  .card.hero.src-2b > .game > .cover { grid-row: 1; }
+  .card.hero.src-2b .game-text { grid-row: 2; margin-top: 12px; }
+  .card.hero.src-2b .title-row { padding-inline-end: 0; }
+}
+/* Edit's card: the under-600px layout at every width, a 120px cover. */
+.card.hero.src-2b.stack { --cv: 120px; grid-template-columns: minmax(0, 1fr); }
+.card.hero.src-2b.stack > *, .card.hero.src-2b.stack > .src-head, .card.hero.src-2b.stack > .game > .cover,
+.card.hero.src-2b.stack .game-text { grid-column: 1; }
+.card.hero.src-2b.stack > .game > .cover { grid-row: 1; }
+.card.hero.src-2b.stack .game-text { grid-row: 2; margin-top: 12px; }
+.card.hero.src-2b.stack .title-row { padding-inline-end: 0; }

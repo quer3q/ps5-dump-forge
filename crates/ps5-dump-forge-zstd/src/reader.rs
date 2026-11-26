@@ -38,8 +38,7 @@ fn exact<T: SourceTree + ?Sized>(
     Ok(bytes)
 }
 
-/// True when the source has a zstd pack index at its root. A damaged index is left
-/// for `unpack` to report rather than being mistaken for a loose game.
+/// True when the source has a zstd pack index at its root (a damaged one is `unpack`'s to report).
 pub fn detect<T: SourceTree + ?Sized>(tree: &T) -> bool {
     tree.files().iter().any(|file| file.path == INDEX)
 }
@@ -51,18 +50,14 @@ pub struct Unpacked<T: SourceTree + ?Sized> {
     files: Vec<SourceFile>,
     empty_dirs: Vec<String>,
     packed: HashMap<String, usize>,
-    /// Packed files also on disk with identical bytes (the plain copy kept).
     identical: Vec<String>,
-    /// Packed files also on disk with other contents (the packed copy served).
     differing: Vec<String>,
     hidden: HashSet<String>,
 }
 
-/// Validate the whole index and each volume header and advertised physical size. A packed
-/// path also on disk (ASCII case-folded) is never refused, as LZ4's reader: one identical copy
-/// (same name, same size, at most 16 MiB, same bytes, no other record folding to it) keeps the
-/// plain file; otherwise the packed copy is served under the index's name and every physical file folding to it leaves
-/// the tree.
+/// Validates the index and every volume header and size. A packed path also on disk (folded): one
+/// identical copy (≤ 16 MiB) keeps the plain file, otherwise the packed copy is served and folding
+/// files leave.
 pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> {
     let mut sizes = HashMap::with_capacity(inner.files().len());
     for file in inner.files() {
@@ -111,8 +106,7 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
     for paths in physical.values_mut() {
         paths.sort();
     }
-    // Records by folded path: two that fold to one (a case-sensitive source) both keep their
-    // packed copy, so neither can give its listing to the one file on disk.
+    // Records folding to one path (a case-sensitive source) both keep their packed copy.
     let mut folds: HashMap<String, usize> = HashMap::new();
     for file in &index.files {
         *folds.entry(file.path.to_ascii_lowercase()).or_default() += 1;
@@ -194,9 +188,8 @@ pub(crate) fn decode_chunk(frame: &[u8], codec: Codec, expected: usize) -> Resul
         }
         return Ok(frame.to_vec());
     }
-    // A chunk must be exactly one ordinary frame, with declared content size,
-    // no dictionary, a checksum and a window of at most one chunk (the runtime's
-    // limit). zstd's one-shot decode verifies the checksum.
+    // A chunk is one ordinary frame: content size, no dictionary, a checksum, window ≤ one chunk
+    // (the runtime's limit).
     if frame.len() < 6
         || frame[..4] != [0x28, 0xb5, 0x2f, 0xfd]
         || frame[4] & 0x04 == 0
@@ -242,13 +235,11 @@ impl<T: SourceTree + ?Sized> Unpacked<T> {
         &self.index
     }
 
-    /// Packed files also on disk with identical bytes; their plain copies are kept.
     pub fn identical_paths(&self) -> &[String] {
         &self.identical
     }
 
-    /// Packed files also on disk with another name's case, size or bytes (or over 16 MiB);
-    /// the packed copy is served and the physical files are left out.
+    /// Packed files also on disk with other contents (or over 16 MiB): the packed copy served.
     pub fn differing_paths(&self) -> &[String] {
         &self.differing
     }

@@ -454,7 +454,7 @@ fn the_check_and_plan_files_are_counted() {
 /// An LZ4-packed folder's own index also lists the files inside its packs, and ampr_emu checks
 /// each record it opens against the pack manifest: the package carries it byte for byte. The
 /// same folder without packs gets one generated anew; a packed one whose index is missing or
-/// unreadable is refused, and readiness says so.
+/// unreadable is refused.
 #[test]
 fn a_packed_sources_own_index_is_packaged_as_is() {
     use ps5upload_fpkg::ampr_index::{self, Entry};
@@ -497,7 +497,10 @@ fn a_packed_sources_own_index_is_packaged_as_is() {
         (Origin::Source, own.len() as u64)
     );
     assert!(prepared.generated_bytes("ampr_emu.index").is_none());
-    assert!(prepared.log().iter().any(|l| l.contains("as it is")));
+    assert!(prepared
+        .log()
+        .iter()
+        .any(|l| l.contains("it has to match the packs")));
     let out = TempDir::new("packed-index-out");
     let report = build::build(
         &BuildRequest {
@@ -518,18 +521,6 @@ fn a_packed_sources_own_index_is_packaged_as_is() {
         &mount[f.offset as usize..(f.offset + f.size) as usize],
         &own[..]
     );
-    let mut tree = FolderSource::open(src.path()).unwrap();
-    let readiness = ps5upload_fpkg::source::readiness(&mut tree);
-    let check = |r: &ps5upload_fpkg::source::Readiness| {
-        let c = r
-            .checks
-            .iter()
-            .find(|c| c.name.starts_with("ampr_emu.index"))
-            .unwrap();
-        (c.ok, c.detail.clone())
-    };
-    let (ok, detail) = check(&readiness);
-    assert!(ok && detail.contains("as it is"), "{detail}");
 
     // Not packed: generated anew from what the package holds.
     std::fs::write(src.path().join("ampr_assets.index"), b"NOTAPACK").unwrap();
@@ -550,12 +541,6 @@ fn a_packed_sources_own_index_is_packaged_as_is() {
         assert!(
             err.to_string().contains("no readable ampr_emu.index"),
             "{err}"
-        );
-        let mut tree = FolderSource::open(src.path()).unwrap();
-        let (ok, detail) = check(&ps5upload_fpkg::source::readiness(&mut tree));
-        assert!(
-            !ok && detail.contains("no readable ampr_emu.index"),
-            "{detail}"
         );
     }
 }
@@ -581,7 +566,10 @@ fn a_zstd_packed_sources_own_index_is_packaged_as_is() {
     let own = ampr_index::build_entries(&records).unwrap();
     std::fs::write(src.path().join("ampr_emu.index"), &own).unwrap();
     let mut tree = FolderSource::open(src.path()).unwrap();
-    assert!(ps5upload_fpkg::source::lz4_packed(&mut tree).unwrap());
+    assert_eq!(
+        ps5upload_fpkg::source::packed_kind(&mut tree).unwrap(),
+        Some("zstd")
+    );
     let prepared = build::prepare(
         &mut tree,
         &request(src.path()),
@@ -602,7 +590,10 @@ fn a_zstd_packed_sources_own_index_is_packaged_as_is() {
     // Not the zstd pack magic: generated anew.
     std::fs::write(src.path().join("ampr_zstd.index"), [0u8; 128]).unwrap();
     let mut tree = FolderSource::open(src.path()).unwrap();
-    assert!(!ps5upload_fpkg::source::lz4_packed(&mut tree).unwrap());
+    assert_eq!(
+        ps5upload_fpkg::source::packed_kind(&mut tree).unwrap(),
+        None
+    );
 }
 
 /// A listed `ampr_assets.index` whose first bytes cannot be read is an error, not "not packed":
@@ -624,17 +615,6 @@ fn an_unreadable_pack_manifest_fails_the_build() {
     .err()
     .unwrap();
     assert!(matches!(err, ps5upload_fpkg::Error::Io(_)), "{err}");
-    let readiness = ps5upload_fpkg::source::readiness(&mut tree);
-    let check = readiness
-        .checks
-        .iter()
-        .find(|c| c.name.starts_with("ampr_emu.index"))
-        .unwrap();
-    assert!(
-        !check.ok && check.detail.contains("cannot be read"),
-        "{}",
-        check.detail
-    );
 }
 
 /// A thread cap changes how long compression takes, never what it produces.
@@ -746,46 +726,6 @@ fn the_written_handle_is_what_gets_verified() {
     assert!(report.verify.ok(), "{}", report.verify);
     assert_eq!(report.path, path);
     assert_eq!(report.size, std::fs::metadata(&moved).unwrap().len());
-}
-
-#[test]
-fn a_sampled_self_check_runs_through_write_package() {
-    let src = TempDir::new("sampled-src");
-    let out = TempDir::new("sampled-out");
-    write_tree(src.path());
-    let mut tree = FolderSource::open(src.path()).unwrap();
-    let prepared = build::prepare(
-        &mut tree,
-        &request(src.path()),
-        &mut BuildControl::default(),
-    )
-    .unwrap();
-    let path = out.path().join("sampled.part");
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .unwrap();
-    let report = build::write_package(
-        &prepared,
-        &mut tree,
-        &mut file,
-        &path,
-        &mut |_| {},
-        &mut BuildControl {
-            sample: Some(7),
-            ..BuildControl::default()
-        },
-    )
-    .unwrap();
-    assert!(report.verify.ok(), "{}", report.verify);
-    let text = report.verify.to_string();
-    assert!(
-        text.contains("(a sample of") && text.contains("seed 7)"),
-        "{text}"
-    );
-    assert!(text.contains("batches sampled"), "{text}");
 }
 
 /// An output that is not a file (Forge writes onto another device): clones share one buffer,

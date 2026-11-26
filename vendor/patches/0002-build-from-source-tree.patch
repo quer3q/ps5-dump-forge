@@ -1,5 +1,5 @@
 diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
-index 3589f12..bbd3b02 100644
+index 977725c0df4b1077ffb4a25d92374a7fab9119d8..da41c6f91ca5e2e93417209b3d1867dfff6043f2 100644
 --- a/ps5upload-fpkg/src/build.rs
 +++ b/ps5upload-fpkg/src/build.rs
 @@ -4,6 +4,10 @@
@@ -13,7 +13,7 @@ index 3589f12..bbd3b02 100644
  
  use std::path::{Path, PathBuf};
  
-@@ -278,18 +282,227 @@ enum Mode {
+@@ -316,27 +320,227 @@ enum Mode {
      InMemory,
  }
  
@@ -217,14 +217,23 @@ index 3589f12..bbd3b02 100644
      control: &mut BuildControl,
 -    mode: Mode,
 -) -> Result<BuildReport> {
+-    enter(control, Stage::Check);
+-    let opened = source::open(&request.source)?;
+-    let opened = match &request.reader {
+-        Some(reader) => (reader.0)(opened).map_err(crate::Error::Format)?,
+-        None => opened,
 +) -> Result<Prepared> {
 +    let mut log: Vec<String> = Vec::new();
 +    let mut progress = |line: &str| {
 +        log.push(line.to_string());
 +        progress(line);
-+    };
-     enter(control, Stage::Check);
--    let mut tree = source::open(&request.source)?;
+     };
+-    // An unsigned executable would install and then never start: it goes in fake-signed.
+-    let (mut tree, signing) = crate::fself::wrap(opened);
+-    if let Some(line) = signing.describe() {
+-        progress(&line);
+-    }
++    enter(control, Stage::Check);
      let mut files: Vec<SourceFile> = tree.files().to_vec();
      if files.is_empty() {
          return format_err(format!("{} has no files", tree.describe()));
@@ -245,7 +254,7 @@ index 3589f12..bbd3b02 100644
      // Leftovers of an earlier build stay out of this one (see `sdk_rules`).
      let before = files.len();
      files.retain(|f| match sdk_rules::excluded(&f.path) {
-@@ -305,17 +518,17 @@ fn build_mode(
+@@ -352,19 +556,18 @@ fn build_mode(
              before - files.len()
          ));
      }
@@ -255,8 +264,11 @@ index 3589f12..bbd3b02 100644
          .warnings()
          .map(|c| format!("{}: {}", c.name, c.detail))
          .collect();
--    let param_json = tree.read("sce_sys/param.json").unwrap_or_default();
-+    let source_param = tree.read(PARAM_JSON).unwrap_or_default();
+-    let param_json =
+-        source::read_small(tree.as_mut(), "sce_sys/param.json", source::MAX_PARAM_BYTES)
+-            .unwrap_or_default();
++    let source_param =
++        source::read_small(tree, PARAM_JSON, source::MAX_PARAM_BYTES).unwrap_or_default();
      // A "free" or "upgradable" DRM value makes the console show a lock and refuse to start
      // the title, so the package carries "standard". The user's file is untouched: the
      // rewritten bytes are served in its place, and the file list's size for it is adjusted
@@ -266,7 +278,7 @@ index 3589f12..bbd3b02 100644
      let param_json = source::launch_rewrite(&param_json).unwrap_or(param_json);
      let content_id = match &request.content_id {
          Some(id) => id.clone(),
-@@ -372,7 +585,7 @@ fn build_mode(
+@@ -464,7 +667,7 @@ fn build_mode(
      // The declared size class, from everything but `param.json` itself.
      let unpacked: u64 = files
          .iter()
@@ -275,7 +287,7 @@ index 3589f12..bbd3b02 100644
          .map(|f| f.size)
          .sum();
      let param_json = match sdk_rules::size_class_rewrite(&param_json, unpacked, files.len() as u64)
-@@ -404,7 +617,7 @@ fn build_mode(
+@@ -496,7 +699,7 @@ fn build_mode(
          }
          _ => param_json,
      };
@@ -284,7 +296,25 @@ index 3589f12..bbd3b02 100644
          entry.size = param_json.len() as u64;
      }
      if !files.iter().any(|f| f.path == "eboot.bin") {
-@@ -442,9 +655,19 @@ fn build_mode(
+@@ -505,7 +708,7 @@ fn build_mode(
+     let content_version = source::content_version_word(&param_json).unwrap_or(0);
+     // The container's payloads, read once: the streaming arm hands them to the writer,
+     // and reading them here keeps the source free for the range reader below.
+-    let mut small = |path: &str| source::read_small(tree.as_mut(), path, source::MAX_ARTWORK_BYTES);
++    let mut small = |path: &str| source::read_small(&mut *tree, path, source::MAX_ARTWORK_BYTES);
+     let icon_png = small("sce_sys/icon0.png").unwrap_or_default();
+     let icon_dds = small("sce_sys/icon0.dds").unwrap_or_default();
+     // Only files still in the package: an excluded one must not reappear in the container.
+@@ -524,7 +727,7 @@ fn build_mode(
+     // language list and default are the game's). Packages used to declare all 31 languages,
+     // Japanese first, with en-US as the default, whatever the game shipped with.
+     let own_scenario = source::read_small(
+-        tree.as_mut(),
++        tree,
+         "sce_sys/playgo-scenario.json",
+         source::MAX_PARAM_BYTES,
+     )
+@@ -553,9 +756,19 @@ fn build_mode(
      if !icon_dds.is_empty() {
          carried.insert("sce_sys/icon0.dds");
      }
@@ -307,26 +337,46 @@ index 3589f12..bbd3b02 100644
      let time = request.time.unwrap_or_else(now);
      // A libSceAmpr title looks its files up through `ampr_emu.index` at the image root (see
      // `ampr_index`), and `ampr_emu` trusts its sizes. It is always generated from exactly the
-@@ -455,7 +678,7 @@ fn build_mode(
+@@ -568,18 +781,16 @@ fn build_mode(
      let dump_index = files
          .iter()
          .any(|f| f.path.eq_ignore_ascii_case(AMPR_INDEX));
--    if dump_index || source::imports_ampr(tree.as_mut(), "eboot.bin") {
-+    if dump_index || source::imports_ampr(tree, "eboot.bin") {
+-    if let Some(packs) = source::packed_kind(tree.as_mut())? {
++    if let Some(packs) = source::packed_kind(tree)? {
+         let at = files
+             .iter()
+             .find(|f| f.path.eq_ignore_ascii_case(AMPR_INDEX))
+             .map(|f| f.path.clone());
+         let readable = match at {
+-            Some(path) => crate::ampr_index::parse(&source::read_small(
+-                tree.as_mut(),
+-                &path,
+-                source::MAX_INDEX_BYTES,
+-            )?)
+-            .is_some(),
++            Some(path) => {
++                crate::ampr_index::parse(&source::read_small(tree, &path, source::MAX_INDEX_BYTES)?)
++                    .is_some()
++            }
+             None => false,
+         };
+         if !readable {
+@@ -592,7 +803,7 @@ fn build_mode(
+         progress(&format!(
+             "keeping the {packs}-packed game's {AMPR_INDEX}: it has to match the packs"
+         ));
+-    } else if dump_index || source::imports_ampr(tree.as_mut(), "eboot.bin") {
++    } else if dump_index || source::imports_ampr(tree, "eboot.bin") {
          files.retain(|f| !f.path.eq_ignore_ascii_case(AMPR_INDEX));
          let mut listed: Vec<(String, u64)> =
              files.iter().map(|f| (f.path.clone(), f.size)).collect();
-@@ -504,17 +727,163 @@ fn build_mode(
+@@ -641,13 +852,172 @@ fn build_mode(
              (outer_write::max_inner_blocks() * BLOCK) as f64 / (1u64 << 30) as f64,
          ));
      }
 -    let sizes: std::collections::HashMap<&str, u64> =
 -        files.iter().map(|f| (f.path.as_str(), f.size)).collect();
--    let cancelled = || {
--        control
--            .cancel
--            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
--    };
+-    let cancelled = || crate::workshop::checkpoint_opt(control.cancel);
 +    // The keystone the plan adds when the source has none is generated too; its bytes are the
 +    // ones the inner writer derives from the passcode.
 +    if plan
@@ -478,7 +528,16 @@ index 3589f12..bbd3b02 100644
 +    control: &mut BuildControl,
 +    mode: Mode,
 +) -> Result<BuildReport> {
-+    let mut tree = source::open(&request.source)?;
++    let opened = source::open(&request.source)?;
++    let opened = match &request.reader {
++        Some(reader) => (reader.0)(opened).map_err(crate::Error::Format)?,
++        None => opened,
++    };
++    // An unsigned executable would install and then never start: it goes in fake-signed.
++    let (mut tree, signing) = crate::fself::wrap(opened);
++    if let Some(line) = signing.describe() {
++        progress(&line);
++    }
 +    let prepared = prepare_with(tree.as_mut(), request, progress, control)?;
  
      // Refuse before the first write rather than fill the disk and fail halfway: a game
@@ -488,7 +547,7 @@ index 3589f12..bbd3b02 100644
      if let Some(free) = free_bytes(&request.output_dir) {
          if let Some(message) = shortfall(free, planned + planned / 100) {
              return format_err(format!("{}: {message}", request.output_dir.display()));
-@@ -523,7 +892,7 @@ fn build_mode(
+@@ -656,7 +1026,7 @@ fn build_mode(
      let stem = request
          .file_name
          .clone()
@@ -497,7 +556,7 @@ index 3589f12..bbd3b02 100644
      std::fs::create_dir_all(&request.output_dir)?;
      let final_path = request.output_dir.join(format!("{stem}.pkg"));
      let partial = request.output_dir.join(format!("{stem}.pkg.partial"));
-@@ -534,41 +903,96 @@ fn build_mode(
+@@ -667,41 +1037,109 @@ fn build_mode(
              partial.display()
          ));
      }
@@ -529,8 +588,12 @@ index 3589f12..bbd3b02 100644
 +            final_path.display()
 +        ));
 +    }
-+    std::fs::rename(&partial, &final_path)?;
++    // Written and verified: from here the `.partial` is never removed. A rename that still
++    // fails after its retries leaves it for the user to rename.
 +    leftover.keep();
++    if let Err(e) = crate::finish::rename(&partial, &final_path) {
++        return format_err(crate::finish::kept_message(&partial, &final_path, &e));
++    }
 +    let size = std::fs::metadata(&final_path)?.len();
 +    debug_assert_eq!(size, written);
 +    progress("done");
@@ -551,7 +614,13 @@ index 3589f12..bbd3b02 100644
 +    control: &mut BuildControl,
 +) -> Result<crate::verify::Report> {
 +    enter(control, Stage::Verify);
-+    progress("verifying");
++    match control.sample {
++        Some(seed) => progress(&format!(
++            "verifying (fast: sampled blocks, seed {seed}, policy {})",
++            crate::sample::POLICY
++        )),
++        None => progress("verifying"),
++    }
 +    // The streaming verifier reads the package block by block, so the self-check of a
 +    // 155 GB package does not need 155 GB of memory.
 +    let mut verify_bytes = |done: u64, total: u64| {
@@ -559,7 +628,14 @@ index 3589f12..bbd3b02 100644
 +            f(done, total);
 +        }
 +    };
-+    let report = verify::verify_streaming(path, &prepared.request.passcode, &mut verify_bytes)?;
++    // Stop ends the read-back as it does the write (a 155 GB package takes minutes to check).
++    let report = verify::verify_streaming_controlled(
++        path,
++        &prepared.request.passcode,
++        control.sample,
++        control.cancel,
++        &mut verify_bytes,
++    )?;
 +    if !report.ok() {
 +        return format_err(format!("the built package failed verification:\n{report}"));
 +    }
@@ -582,11 +658,7 @@ index 3589f12..bbd3b02 100644
 +    let param_json = &prepared.param_json;
 +    let content_version = prepared.content_version;
 +    let (time, seed) = (prepared.time, prepared.seed);
-+    let cancelled = || {
-+        control
-+            .cancel
-+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-+    };
++    let cancelled = || crate::workshop::checkpoint_opt(control.cancel);
  
      let written = match mode {
          Mode::Streaming => {
@@ -623,7 +695,7 @@ index 3589f12..bbd3b02 100644
              };
              let mut bytes = |done: u64, total: u64| {
                  if let Some(f) = control.bytes.as_deref_mut() {
-@@ -588,20 +1012,20 @@ fn build_mode(
+@@ -721,20 +1159,20 @@ fn build_mode(
              let idle = std::sync::atomic::AtomicBool::new(false);
              let cancel = control.cancel.unwrap_or(&idle);
              let stream_request = stream::StreamRequest {
@@ -650,7 +722,7 @@ index 3589f12..bbd3b02 100644
                  level: request.level,
                  metadata_codec: request.metadata_codec,
              };
-@@ -610,18 +1034,19 @@ fn build_mode(
+@@ -743,18 +1181,19 @@ fn build_mode(
                  Some(stream::KrakenSpool::File(spool)) => Some(spool.clone()),
                  _ => None,
              });
@@ -675,7 +747,7 @@ index 3589f12..bbd3b02 100644
                          Some((repair, original)) => {
                              let mut read = |o: u64, l: usize| tree.read_range(path, o, l);
                              repair.read(*original, 0, size as usize, &mut read)
-@@ -637,7 +1062,7 @@ fn build_mode(
+@@ -770,7 +1209,7 @@ fn build_mode(
              enter(control, Stage::Write);
              progress("writing the inner image");
              let inner = inner::write_with(
@@ -684,7 +756,7 @@ index 3589f12..bbd3b02 100644
                  &request.passcode,
                  &mut read,
                  crate::stream::image_time(request.image_mode, time),
-@@ -660,7 +1085,7 @@ fn build_mode(
+@@ -793,7 +1232,7 @@ fn build_mode(
                  &naps,
                  seed,
                  request.image_mode,
@@ -693,7 +765,7 @@ index 3589f12..bbd3b02 100644
                  &request.passcode,
                  crate::stream::image_time(request.image_mode, time),
              )?;
-@@ -687,17 +1112,17 @@ fn build_mode(
+@@ -820,17 +1259,17 @@ fn build_mode(
              progress("writing the container");
              let outer_size = outer.image.len() as u64;
              let playgo = crate::playgo::build(
@@ -717,7 +789,7 @@ index 3589f12..bbd3b02 100644
                  playgo_chunk: &playgo.chunk_dat,
                  playgo_hash_table: &playgo.hash_table,
                  playgo_ficm: &playgo.ficm,
-@@ -708,10 +1133,10 @@ fn build_mode(
+@@ -841,10 +1280,10 @@ fn build_mode(
                  cnt_offset,
                  seed,
                  passcode: &request.passcode,
@@ -730,7 +802,7 @@ index 3589f12..bbd3b02 100644
                  inner_size,
              })?;
  
-@@ -739,9 +1164,9 @@ fn build_mode(
+@@ -872,9 +1311,9 @@ fn build_mode(
              let sb_at = outer.superblock_block as usize * BLOCK as usize;
              let manifest = pfsimage::build(&pfsimage::ManifestParams {
                  facts: &cnt.facts,
@@ -743,7 +815,7 @@ index 3589f12..bbd3b02 100644
                  content_version,
                  cnt_offset,
                  si_offset: cnt_offset + cnt.facts.container_size,
-@@ -753,7 +1178,7 @@ fn build_mode(
+@@ -886,7 +1325,7 @@ fn build_mode(
                  playgo: &playgo,
                  outer: &outer_layout,
                  naps_len: naps.len() as u64,
@@ -752,7 +824,7 @@ index 3589f12..bbd3b02 100644
              });
              let members = vec![
                  ("common/etc/naps_meta_18.dat".to_string(), meta_18),
-@@ -772,12 +1197,8 @@ fn build_mode(
+@@ -905,12 +1344,8 @@ fn build_mode(
  
              progress("writing the package");
              {
@@ -767,13 +839,19 @@ index 3589f12..bbd3b02 100644
                  out.write_all(&fih)?;
                  out.write_all(&outer.image)?;
                  out.write_all(&cnt.bytes)?;
-@@ -787,38 +1208,7 @@ fn build_mode(
+@@ -920,55 +1355,7 @@ fn build_mode(
              cnt_offset + cnt.bytes.len() as u64 + si.len() as u64
          }
      };
 -
 -    enter(control, Stage::Verify);
--    progress("verifying");
+-    match control.sample {
+-        Some(seed) => progress(&format!(
+-            "verifying (fast: sampled blocks, seed {seed}, policy {})",
+-            crate::sample::POLICY
+-        )),
+-        None => progress("verifying"),
+-    }
 -    // The streaming verifier reads the package block by block, so the self-check of a
 -    // 155 GB package does not need 155 GB of memory.
 -    let mut verify_bytes = |done: u64, total: u64| {
@@ -781,7 +859,14 @@ index 3589f12..bbd3b02 100644
 -            f(done, total);
 -        }
 -    };
--    let report = verify::verify_streaming(&partial, &request.passcode, &mut verify_bytes)?;
+-    // Stop ends the read-back as it does the write (a 155 GB package takes minutes to check).
+-    let report = verify::verify_streaming_controlled(
+-        &partial,
+-        &request.passcode,
+-        control.sample,
+-        control.cancel,
+-        &mut verify_bytes,
+-    )?;
 -    if !report.ok() {
 -        return format_err(format!("the built package failed verification:\n{report}"));
 -    }
@@ -791,8 +876,12 @@ index 3589f12..bbd3b02 100644
 -            final_path.display()
 -        ));
 -    }
--    std::fs::rename(&partial, &final_path)?;
+-    // Written and verified: from here the `.partial` is never removed. A rename that still
+-    // fails after its retries leaves it for the user to rename.
 -    leftover.keep();
+-    if let Err(e) = crate::finish::rename(&partial, &final_path) {
+-        return format_err(crate::finish::kept_message(&partial, &final_path, &e));
+-    }
 -    let size = std::fs::metadata(&final_path)?.len();
 -    debug_assert_eq!(size, written);
 -    progress("done");
@@ -808,10 +897,22 @@ index 3589f12..bbd3b02 100644
  
  /// The package's size before it is written: the header block, the outer image the layout
 diff --git a/ps5upload-fpkg/src/source.rs b/ps5upload-fpkg/src/source.rs
-index 9add45f..b505f3c 100644
+index b20bf7ebd5c73a713c3d3a1cac521f697c53976d..cb3ea8d173b4626e8ea1c420c17967b4919332dd 100644
 --- a/ps5upload-fpkg/src/source.rs
 +++ b/ps5upload-fpkg/src/source.rs
-@@ -1315,6 +1315,8 @@ mod tests {
+@@ -17,8 +17,9 @@ pub const MAX_PARAM_BYTES: u64 = 4 << 20;
+ /// `snd0.at9`, …) or a runtime module may be to be read whole. Real ones are a few MiB.
+ pub const MAX_ARTWORK_BYTES: u64 = 256 << 20;
+ /// The most an asset index or pack manifest may be to be read whole. A quarter of a million
+-/// files make one of a few tens of MiB.
+-pub const MAX_INDEX_BYTES: u64 = 512 << 20;
++/// files make one of a few tens of MiB. (Forge: 256 MiB, not upstream's 512, the bound for whole
++/// reads `build::prepare` keeps: a job stays within 512 MiB, parsing included.)
++pub const MAX_INDEX_BYTES: u64 = 256 << 20;
+ 
+ /// The whole of a file that is known to be small, refused when the tree lists it as larger than
+ /// `cap`. A tree's sizes are the image's own claims: a crafted image that lists a terabyte
+@@ -1924,6 +1925,8 @@ mod tests {
          send::<crate::exfat::ExFatSource>();
          send::<crate::ufs2_source::Ufs2Source>();
          send::<Box<dyn SourceTree>>();
@@ -822,7 +923,7 @@ index 9add45f..b505f3c 100644
          std::fs::create_dir_all(&dir).unwrap();
 diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
 new file mode 100644
-index 0000000..f6cc99e
+index 0000000000000000000000000000000000000000..f6cc99e99ecf91e040bae29c264ce30f942b9bc9
 --- /dev/null
 +++ b/ps5upload-fpkg/tests/prepared.rs
 @@ -0,0 +1,460 @@

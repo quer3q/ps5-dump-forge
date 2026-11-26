@@ -1,8 +1,6 @@
-//! Where a file's blocks go. Each file (or directory) owns one contiguous run of data
-//! blocks, the "slots", filled in the order FreeBSD's `ffs_balloc` allocates them: the 12
-//! direct blocks, then each indirect block right before the blocks it maps (pre-order).
-//! So one start index per file fixes every pointer, and the writer can produce any
-//! indirect block from arithmetic alone.
+//! Where a file's blocks go: one contiguous run of "slots" in `ffs_balloc` order (12 direct
+//! blocks, then each indirect block right before the blocks it maps), so one start index per
+//! file fixes every pointer.
 
 use crate::geom::NINDIR;
 
@@ -37,7 +35,6 @@ fn tree_slots(level: u32, k: u64) -> u64 {
         }
 }
 
-/// Most data blocks an inode can address.
 pub fn max_blocks() -> u64 {
     NDADDR + span(1) + span(2) + span(3)
 }
@@ -63,7 +60,6 @@ pub fn total_slots(n: u64) -> Option<u64> {
 }
 
 /// Slot of each top-level indirect block (`di_ib[0..3]`) of a file of `n` data blocks.
-/// A tree exists only when every earlier one is full, hence the closed form.
 pub fn indirect_roots(n: u64) -> [Option<u64>; NIADDR] {
     let mut out = [None; NIADDR];
     let mut slot = NDADDR;
@@ -140,8 +136,7 @@ fn tree(level: u32, k: u64, slot: &mut u64, lbn: &mut u64, out: &mut Vec<Seg>) {
     }
 }
 
-/// Slots of the children of the indirect block at `slot` (level, mapping k blocks): child
-/// i starts right after its earlier siblings, which are all full trees.
+/// Slots of the children of the indirect block at `slot` (earlier siblings are full trees).
 pub fn children(slot: u64, level: u32, k: u64) -> impl Iterator<Item = u64> {
     let per = span(level - 1);
     let step = full_slots(level - 1);
@@ -152,8 +147,7 @@ pub fn children(slot: u64, level: u32, k: u64) -> impl Iterator<Item = u64> {
 mod tests {
     use super::*;
 
-    /// Each indirect block's children are exactly the next-level indirects / data runs
-    /// that the walk emits under it.
+    /// Each indirect block's children are exactly what the walk emits under it.
     #[test]
     fn children_point_at_the_walk() {
         let n = NDADDR + span(1) + 3 * NINDIR + 5;

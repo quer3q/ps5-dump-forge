@@ -1,0 +1,123 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index bf536de506b14a5cf9f90bd817799f4d69a61045..fbe5c4b43d8879a50969fe5eb783881ff44135ea 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -83,6 +83,11 @@ pub struct BuildRequest {
+     /// clears it, so nothing in the environment reaches that build. [`Self::level`]
+     /// `Stored` stores the blocks raw either way.
+     pub env_overrides: bool,
++    /// The caller's answer to [`source::imports_ampr`]`(tree, "eboot.bin")` for this source,
++    /// e.g. [`source::Readiness::imports_ampr`] from a [`source::readiness`] it already ran.
++    /// The scan reads up to 16 MiB of the module plus its dynamic segment, which is slow from a
++    /// source that decodes as it reads (an archive). `None` (every constructor) scans, once.
++    pub imports_ampr: Option<bool>,
+ }
+ 
+ /// The game as the build reads it, made from the source as it was opened, or why it can't be.
+@@ -127,6 +132,7 @@ impl BuildRequest {
+             reader: None,
+             threads: None,
+             env_overrides: true,
++            imports_ampr: None,
+         }
+     }
+ 
+@@ -158,6 +164,7 @@ impl BuildRequest {
+             reader: None,
+             threads: None,
+             env_overrides: false,
++            imports_ampr: None,
+         }
+     }
+ }
+@@ -640,7 +647,7 @@ fn prepare_with(
+             before - files.len()
+         ));
+     }
+-    let readiness = source::readiness(tree);
++    let readiness = source::readiness_with(tree, request.imports_ampr);
+     check_cancel(control)?;
+     let warnings: Vec<String> = readiness
+         .warnings()
+@@ -917,7 +924,7 @@ fn prepare_with(
+         progress(&format!(
+             "keeping the {packs}-packed game's {AMPR_INDEX}: it has to match the packs"
+         ));
+-    } else if dump_index || source::imports_ampr(tree, "eboot.bin") {
++    } else if dump_index || readiness.imports_ampr {
+         files.retain(|f| !f.path.eq_ignore_ascii_case(AMPR_INDEX));
+         let mut listed: Vec<(String, u64)> =
+             files.iter().map(|f| (f.path.clone(), f.size)).collect();
+diff --git a/ps5upload-fpkg/src/source.rs b/ps5upload-fpkg/src/source.rs
+index cb3ea8d173b4626e8ea1c420c17967b4919332dd..35e024ccaf3ae0e5b359d2c2f0598bbe6806f7b3 100644
+--- a/ps5upload-fpkg/src/source.rs
++++ b/ps5upload-fpkg/src/source.rs
+@@ -488,6 +488,9 @@ pub struct Check {
+ #[derive(Debug, Default)]
+ pub struct Readiness {
+     pub checks: Vec<Check>,
++    /// What [`imports_ampr`] said of `eboot.bin`, so a caller can hand it on as
++    /// [`crate::build::BuildRequest::imports_ampr`] instead of scanning again.
++    pub imports_ampr: bool,
+ }
+ 
+ impl Readiness {
+@@ -1105,6 +1108,12 @@ fn ampr_index_check(tree: &mut dyn SourceTree) -> (bool, String) {
+ /// Report readiness for a source tree. Never blocks: the caller decides which findings
+ /// matter for the build it is about to run.
+ pub fn readiness(tree: &mut dyn SourceTree) -> Readiness {
++    readiness_with(tree, None)
++}
++
++/// [`readiness`], taking [`imports_ampr`]'s answer for `eboot.bin` when the caller already has
++/// it (`Some`) instead of scanning the module again.
++pub fn readiness_with(tree: &mut dyn SourceTree, imports_ampr: Option<bool>) -> Readiness {
+     let mut r = Readiness::default();
+     let files = tree.files().to_vec();
+     let has = |path: &str| files.iter().any(|f| f.path == path);
+@@ -1167,8 +1176,9 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Readiness {
+     // like a broken package rather than a missing dependency. Say so before the build.
+     // Spider-Man 2 built without `ampr_emu.index` exited at startup ("returned from main",
+     // CE-108255-1); the same build with the index at the folder root played (FW 5.10).
++    r.imports_ampr = imports_ampr.unwrap_or_else(|| self::imports_ampr(tree, "eboot.bin"));
+     // A game in packs is read through its index whatever its eboot imports.
+-    if imports_ampr(tree, "eboot.bin") || packed_kind(tree).ok().flatten().is_some() {
++    if r.imports_ampr || packed_kind(tree).ok().flatten().is_some() {
+         let (ok, detail) = ampr_index_check(tree);
+         r.push("ampr_emu.index for a libSceAmpr title", ok, detail);
+     }
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index 9d1bb91747224a2e383637a2a8766e8f2ffe2b2b..bc0f5baf22fe2ce408c3fe0aa2f295a39b07ec53 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -493,6 +493,30 @@ fn a_dumps_own_ampr_index_is_generated_anew() {
+     assert!(prepared.log().iter().any(|l| l.contains("regenerating")));
+ }
+ 
++/// A caller that already scanned `eboot.bin` (`readiness`) passes the answer on, and `prepare`
++/// takes it instead of scanning again: told "no", an AMPR module gets no generated index.
++#[test]
++fn a_known_ampr_answer_is_taken_instead_of_a_scan() {
++    let src = TempDir::new("ampr-known");
++    write_tree(src.path());
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    assert!(ps5upload_fpkg::source::readiness(&mut tree).imports_ampr);
++    let has_index = |imports_ampr: Option<bool>, tree: &mut FolderSource| {
++        let request = BuildRequest {
++            imports_ampr,
++            ..request(src.path())
++        };
++        let prepared = build::prepare(tree, &request, &mut BuildControl::default()).unwrap();
++        prepared
++            .manifest()
++            .iter()
++            .any(|e| e.path == "ampr_emu.index")
++    };
++    assert!(has_index(None, &mut tree));
++    assert!(has_index(Some(true), &mut tree));
++    assert!(!has_index(Some(false), &mut tree));
++}
++
+ /// An LZ4-packed folder's own index also lists the files inside its packs, and ampr_emu checks
+ /// each record it opens against the pack manifest: the package carries it byte for byte. The
+ /// same folder without packs gets one generated anew; a packed one whose index is missing or

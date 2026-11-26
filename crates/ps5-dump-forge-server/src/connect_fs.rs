@@ -1,44 +1,21 @@
-//! The peer side of reading in place (core's `remote::Remote`): what this device answers when a
-//! paired device stats, lists or reads its files. Paths are relative to the share root, as the
-//! transfer RPCs' are; the folder they sit in is resolved inside the root, the entry itself is
-//! never followed: a link is reported as one, and special files (FIFOs, sockets, devices) and
-//! names that aren't UTF-8 are listed marked (`special`, `bad_name`) and refused.
+//! The peer side of a paired device's file access (core's `remote::Remote` on the other side).
+//! Paths are relative to the share root; the folder they sit in is resolved inside the root,
+//! the entry itself never followed; special files and non-UTF-8 names are listed marked
+//! (`special`, `bad_name`) and refused.
 //!
-//! Control RPCs: `stat {path}` → [`FsStat`], `fs_list {path}` → `{entries: [FsEntry]}` (an error
-//! past `MAX_FS_LISTED`, never a cut list), `read_open {path}` → `{handle, size, mtime_ns}` (a
-//! regular file), `read_close {handle}`. A handle belongs to the control session that opened it
-//! and is closed with it. Reads go on a data lane joined under that session: `Request read
-//! {handle, offset, len}` (`len` ≤ `CHUNK`), answered by one `Data` (head: job = handle, file 0,
-//! the offset, BLAKE3 of the bytes; fewer bytes only where the file ends). Requests may be
-//! pipelined; answers come in order. A failure is the lane's `Error {"transfer_failed: <why>"}`
-//! and ends the lane.
+//! Reads: `stat`, `fs_list` (an error past `MAX_FS_LISTED`, never a cut list), `read_open` →
+//! `{handle, size, mtime_ns}`, `read_close`; a handle belongs to the control session that
+//! opened it. A lane `read {handle|path, offset, len}` is answered by one `Data` (BLAKE3; fewer
+//! bytes only where the file ends); a failure is the lane's `Error` and ends it.
 //!
-//! Writes (`Writes`): `mkdir {path}` → `{created}` (one level; an existing folder is fine),
-//! `create {path}` → `{handle}` (exclusive, no link followed, 0777 on the PS5), `sync {handle}`,
-//! `close {handle}`, `reopen {path}` → `{handle, size}` (a file the session created and closed,
-//! not yet renamed, open for writing again; an open one stays as it is; an older peer answers
-//! `unknown method`), `rename {from, to, replace?}` (never over another, unless `replace`: then
-//! over a regular file only, never a folder or link; then both folders synced),
-//! `remove {path}`, `free {path}` → `{free}` bytes. Only a file the session created is renamed
-//! or removed; one it never renamed is kept `KEPT_FOR` once the session ends (removed at once
-//! when the service stops), then removed. `reattach {path}` → `{handle, size, open}` moves such
-//! a file (kept, or still held by another session of the same pairing) to the calling session,
-//! so a writer whose session was lost resumes it; an older peer answers `unknown method`. A
-//! path the `Busy` hook names (this device's unfinished jobs) is refused. Bytes go on a lane:
-//! `Request write {handle, offset, len}` + its `Data` (BLAKE3), each answered `DataOk`;
-//! pipelining ok.
+//! Writes: `mkdir`, `create` (exclusive, no link followed), `sync`, `close`, `reopen`,
+//! `rename {from, to, replace?}`, `remove`, `free`, `reattach`; only a file the session created
+//! is written, renamed or removed; one never renamed is kept `KEPT_FOR` after the session ends,
+//! then removed. A lane `write {handle, offset, len}` + `Data` is answered `DataOk`.
 //!
-//! Speed test (`speed_test`): the `speed` RPC → `{max}` (an older peer: `unknown method`), then
-//! lanes of `speed_up {offset, len}` + `Data` (dropped, answered `DataOk`) and `speed_down
-//! {offset, len}` (answered by a `Data` of zeros; `len` 1..=`CHUNK`, any other method refused);
-//! nothing on disk, at most `SPEED_PEER_LANES` lanes and `SPEED_BUDGET` bytes per device at once.
-//! A cancel (`Connect::speed_test_cancel`, by run id; `SpeedCancel`) shuts the test's own
-//! control conn (dial, handshake, `speed` RPC) and every lane's socket and stops each before
-//! its next chunk: `cancelled`.
-//!
-//! While a lane's read, write or put works the disk, the peer sends a `Ping` on the lane every
-//! `PING_EVERY` (`pinging`), which the reader skips: a disk stall past `DEAD_AFTER` doesn't end
-//! the lane. An older peer sends none.
+//! Speed test: the `speed` RPC, then lanes of `speed_up`/`speed_down`, nothing on disk.
+//! While a lane works the disk it sends a `Ping` every `PING_EVERY`, so a stall past
+//! `DEAD_AFTER` doesn't end it.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -60,15 +37,12 @@ use serde_json::Value;
 
 use crate::connect::{Inner, Rpc, join_checked};
 
-/// Open read handles on this device, every peer and session together.
 const MAX_READS: usize = 64;
-/// ... and per control session, so one peer can't hold them all.
+/// Per control session, so one peer can't hold them all.
 const MAX_READS_PER_SESSION: usize = MAX_READS / 2;
-/// A lane's read of a handle its session no longer holds (closed, or the session ended).
 const NO_OPEN_FILE: &str = "no open file";
-/// A listing past this many entries is refused (the reply must fit one RPC body).
+/// A listing past these is refused (the reply must fit one RPC body).
 const MAX_FS_LISTED: usize = 100_000;
-/// ... or past this many bytes of entries as JSON (room left for the `Response` around them).
 const MAX_LIST_JSON: usize = MAX_RPC_BODY as usize - (64 << 10);
 
 /// A file, folder or link as `lstat` sees it. A link's `dir`/`size` are false/0 (not followed).
@@ -76,7 +50,7 @@ const MAX_LIST_JSON: usize = MAX_RPC_BODY as usize - (64 << 10);
 pub struct FsStat {
     pub dir: bool,
     pub size: u64,
-    /// Nanoseconds since the Unix epoch; `None` before it or where the filesystem keeps none.
+    /// Nanoseconds since the Unix epoch.
     pub mtime_ns: Option<u64>,
     pub link: bool,
 }
@@ -87,10 +61,9 @@ pub struct FsEntry {
     pub name: String,
     #[serde(flatten)]
     pub stat: FsStat,
-    /// A FIFO, socket or device (listed as a file of size 0, never read).
+    /// A FIFO, socket or device (size 0, never read).
     #[serde(default, skip_serializing_if = "is_false")]
     pub special: bool,
-    /// A name that isn't UTF-8 here (a path can't name it).
     #[serde(default, skip_serializing_if = "is_false")]
     pub bad_name: bool,
 }
@@ -130,9 +103,7 @@ fn describe(m: &fs::Metadata) -> Option<FsStat> {
     })
 }
 
-/// What paired peers may reach on this device: the share root (canonical), and on the PS5 (by
-/// user request) within it only `/data` and the drives plugged in (`Roots::reach`), so a
-/// peer lists `/` as `data` (and `mnt` while a drive is mounted) and is refused anything else.
+/// The share root (canonical), and on the PS5 within it only `/data` and the drives plugged in.
 pub struct Share {
     pub root: PathBuf,
     reach: Option<crate::paths::Roots>,
@@ -143,7 +114,6 @@ impl Share {
         Share { root, reach }
     }
 
-    /// [`crate::paths::Roots::above`]: the names a listing of `dir` keeps (`None`: all).
     fn above(&self, dir: &Path) -> Option<Vec<std::ffi::OsString>> {
         self.reach.as_ref().and_then(|r| r.above(dir))
     }
@@ -183,9 +153,8 @@ fn locate_as(share: Option<&Share>, rel: &str, browse: bool) -> Result<PathBuf, 
 
 /// Leads an RPC error for a path that isn't there, so the reader can tell `NotFound` apart.
 pub const NOT_FOUND: &str = "not_found: ";
-/// ... and for one that is there already (a create or rename never replaces it).
 pub const EXISTS: &str = "exists: ";
-/// ... and for a rename or remove that was done, its folders' sync failing after it.
+/// A rename or remove that was done, its folders' sync failing after it.
 pub const UNSYNCED: &str = "unsynced: ";
 
 fn io_text(p: &Path, e: &io::Error) -> String {
@@ -207,8 +176,24 @@ pub fn stat(root: Option<&Share>, rel: &str) -> Result<FsStat, String> {
     Ok(lstat(&locate_as(root, rel, true)?)?.1)
 }
 
-/// A folder's entries by name; special files and names that aren't UTF-8 are marked, never left
-/// out, so a reader refuses them as a local scan does.
+/// A regular file a peer names (`install_here`), located as every file RPC's path, (PS5) not in
+/// ShadowMount+'s mount folder.
+pub fn local_file(root: Option<&Share>, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() {
+        return Err("the shared folder itself is not a file".into());
+    }
+    let p = locate(root, rel)?;
+    if let Some(why) = ps5_dump_forge_core::out::refusal(&p) {
+        return Err(why);
+    }
+    let (_, s) = lstat(&p)?;
+    if s.dir || s.link {
+        return Err(format!("{} is not a file", p.display()));
+    }
+    Ok(p)
+}
+
+/// A folder's entries by name; special files and non-UTF-8 names marked, never left out.
 pub fn list(root: Option<&Share>, rel: &str) -> Result<Vec<FsEntry>, String> {
     let dir = locate_as(root, rel, true)?;
     if !lstat(&dir)?.1.dir {
@@ -261,8 +246,8 @@ pub fn list(root: Option<&Share>, rel: &str) -> Result<Vec<FsEntry>, String> {
     Ok(entries)
 }
 
-/// Opens a regular file for reading: the handle must be the entry `lstat` saw (so a link swapped
-/// in after the check is refused). ponytail: off unix only `is_file` is re-checked on the handle.
+/// Opens a regular file: the handle must be the entry `lstat` saw (a link swapped in is refused).
+/// ponytail: off unix only `is_file` is re-checked on the handle.
 fn open_file(p: &Path) -> Result<(fs::File, FsStat), String> {
     let (seen, stat) = lstat(p)?;
     if stat.dir || stat.link {
@@ -298,7 +283,6 @@ fn open_file(p: &Path) -> Result<(fs::File, FsStat), String> {
     Ok((file, stat))
 }
 
-/// Up to `len` bytes at `at`; fewer only where the file ends.
 fn read_at(f: &fs::File, mut at: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0; len];
     let mut n = 0;
@@ -326,17 +310,14 @@ struct Open {
     file: Arc<fs::File>,
 }
 
-/// The read handles peers hold open on this device.
 #[derive(Default)]
 pub struct Reads {
     open: Mutex<HashMap<u64, Open>>,
     next: AtomicU64,
-    /// The control sessions up now, by id: a lane joins one of them (reads by path hold no
-    /// handle to find their session by).
+    /// The control sessions up now, by id: a lane joins one of them.
     live: Mutex<HashMap<String, Session>>,
     /// Reads by path under way, by session: they count against the open-file caps.
     by_path: Mutex<HashMap<String, usize>>,
-    /// Tests: a disk stall before each lane read.
     #[cfg(test)]
     stall: Mutex<Duration>,
 }
@@ -399,8 +380,7 @@ impl Reads {
         }
     }
 
-    /// A slot for one read by path of session `sid`: refused once the session has ended (its
-    /// lanes outlive it a moment) or past the caps `open` keeps.
+    /// A slot for one read by path: refused once the session has ended or past the caps.
     fn path_read(&self, sid: &str) -> Result<PathRead<'_>, String> {
         if !self.is_live(sid) {
             return Err(format!("{NO_OPEN_FILE} (the session ended)"));
@@ -486,8 +466,7 @@ impl Reads {
         }
     }
 
-    /// A `read {handle, offset, len}` of an open file, or `read {path, offset, len}`: the file
-    /// opened (as `read_open` opens it), read, closed, and its stat after the read in the head.
+    /// A `read` of an open handle, or of a path (opened, read, closed; its stat in the head).
     fn read(
         &self,
         sid: &str,
@@ -562,8 +541,7 @@ pub fn is_write(f: &Frame) -> bool {
     is_method(f, "write") || is_method(f, "put")
 }
 
-/// The next frame of `kind` on a lane, pings answered on the way and pongs skipped (a reader
-/// before `pinging` answered this side's pings).
+/// The next frame of `kind` on a lane, pings answered on the way and pongs skipped.
 fn recv_kind(conn: &mut Conn, kind: u8, lane: &str) -> io::Result<Frame> {
     loop {
         let f = conn.recv_frame()?;
@@ -581,11 +559,9 @@ fn recv_kind(conn: &mut Conn, kind: u8, lane: &str) -> io::Result<Frame> {
     }
 }
 
-/// A lane's disk work (a chunk read or write, a put) on its own thread while this one sends a
-/// `Ping` every `PING_EVERY`, as the control conn does while an RPC runs: the other side's lane
-/// reader skips them, so a disk stall longer than `DEAD_AFTER` doesn't read there as a dead
-/// peer. Only this thread writes to `conn`, so frames leave in the order their MACs counted. A
-/// failed ping stops the pings; the answer's send then reports the broken lane.
+/// A lane's disk work on its own thread while this one sends a `Ping` every `PING_EVERY`, so a
+/// disk stall past `DEAD_AFTER` doesn't read as a dead peer. Only this thread writes to `conn`,
+/// so frames leave in the order their MACs counted.
 fn pinging<T: Send>(conn: &mut Conn, work: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|s| {
         let (done, finished) = std::sync::mpsc::channel::<()>();
@@ -676,46 +652,34 @@ pub fn answer(
 /// and not yet renamed (a pack's volume, until the pack is done) doesn't count against these.
 const MAX_WRITES: usize = 64;
 const MAX_WRITES_PER_SESSION: usize = MAX_WRITES / 2;
-/// Files one paired device may have created here and not yet renamed or removed, open or
-/// closed, all its sessions together (kept ones too): the most volumes a zstd pack has (4,096)
-/// and its index, with room. Per pairing, so one device can't lock another out.
+/// Unrenamed files per paired device (a zstd pack's 4,096 volumes, with room); per pairing, so
+/// one device can't lock another out.
 const MAX_UNRENAMED: usize = 8192;
 
 /// Whether a path is at, in or above one of this device's unfinished jobs' paths.
 pub type Busy = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
-/// Why a file must not be put in place of a path here (core's `Jobs::replace_check`: what
-/// Delete refuses, an undo journal's image, this device's jobs' paths; on the PS5 mounted
-/// images): a peer's replacing rename is refused with it.
+/// Why a file must not be put in place of a path here (core's `Jobs::replace_check`).
 pub type ReplaceCheck = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
-/// A paired device's Delete here: this device's own `Jobs::delete_path` with its protected
-/// paths (the server's keep list, the app's home folder).
+/// A paired device's Delete and Move to here: this device's own `Jobs::delete_path`/`move_path`.
 pub type DeleteHook = Arc<dyn Fn(&Path) -> Result<(), DeleteError> + Send + Sync>;
-/// ... and its Move to (`from`, `to`, `replace`): `Jobs::move_path`.
 pub type MoveHook = Arc<dyn Fn(&Path, &Path, bool) -> Result<(), DeleteError> + Send + Sync>;
 
-/// Leads the RPC error of a refused delete or move, so the caller keeps the kind (a missing
-/// path leads with [`NOT_FOUND`]; any other failure has no lead).
+/// Lead a refused or held-off delete or move's error, so the caller keeps the kind.
 pub const REFUSED: &str = "refused: ";
-/// ... and of one a job, or a peer's write, holds off.
 pub const BUSY: &str = "busy: ";
 
-/// How long a file whose session ended unrenamed is kept for a `reattach` (the writer's link
-/// broke and it reconnects), then removed.
+/// How long a file whose session ended unrenamed is kept for a `reattach`.
 pub const KEPT_FOR: Duration = Duration::from_secs(60);
 
-/// A file a session created: open until `close`, kept `KEPT_FOR` after the session ends
-/// unless renamed, then removed.
 struct Created {
     session: Session,
     path: PathBuf,
     file: Option<Arc<fs::File>>,
-    /// Its device and length at its last close (`out::closed_stamp`): a `reopen` finding another
-    /// file there is refused. `None` until first closed.
+    /// `out::closed_stamp` at its last close: a `reopen` finding another file there is refused.
     closed: Option<(u64, u64)>,
-    /// Held through each lane write (`write_owned`) and by `reattach`: a write of the old
-    /// session under way ends before the file changes hands, and a later one is refused.
+    /// Held through each lane write, by `close` and by `reattach`: a write under way ends first.
     gate: Arc<Mutex<()>>,
     /// Set when its session ended: removed at that instant unless reattached first.
     kept_until: Option<Instant>,
@@ -1096,8 +1060,7 @@ impl Writes {
                 .find(|(_, c)| c.path == p && c.session.secret == session.secret)
                 .map(|(h, c)| (*h, c.gate.clone()))
         };
-        // A write of the old session under way ends first (it holds the gate): none of its
-        // writes lands once the file is this session's.
+        // A write of the old session under way ends first (it holds the gate).
         let (handle, gate) = find(&lock(&self.files)).ok_or_else(not_kept)?;
         let _held = lock(&gate);
         let mut files = lock(&self.files);
@@ -1134,10 +1097,12 @@ impl Writes {
         ps5_dump_forge_core::out::sync_file(&f).map_err(|e| format!("sync: {e}"))
     }
 
-    /// Closes the handle; the file stays this session's until it is renamed or removed. A
-    /// closed one closes again fine (a close whose answer was lost, asked again after a
-    /// `reattach`).
+    /// Closes the handle; the file stays this session's until renamed or removed. A closed one
+    /// closes again fine (a close whose answer was lost).
     fn close(&self, sid: &str, handle: u64) -> Result<(), String> {
+        // A lane write under way ends first (it holds the gate), so none lands after a rename.
+        let gate = lock(&self.files).get(&handle).map(|c| c.gate.clone());
+        let _held = gate.as_ref().map(|g| lock(g));
         match lock(&self.files).get_mut(&handle) {
             Some(c) if c.session.id() == sid && c.kept_until.is_none() => {
                 // A file that can't be stamped stays open: closed, it couldn't be reopened.
@@ -1153,9 +1118,7 @@ impl Writes {
     }
 
     /// `{handle, size}` of the unrenamed file at `rel` this session created, open for writing
-    /// again: a pack's volume is closed once written and opened for its header at the end. An
-    /// open one stays as it is (the writer asks it to learn the peer can). Counted as a new
-    /// open file while it is.
+    /// again (a pack's volume, for its header at the end); an open one stays as it is.
     fn reopen(
         &self,
         sid: &str,
@@ -1167,8 +1130,7 @@ impl Writes {
         self.check(&p, me)?;
         let mut files = lock(&self.files);
         let handle = Self::created(&files, sid, &p)?;
-        // The writer's `unsupported: ` lead, as for a peer from before `reopen`: it keeps the
-        // file open rather than close one it can't have back.
+        // The `unsupported: ` lead, as an older peer's: the writer keeps such a file open.
         let cant = || {
             format!(
                 "unsupported: {}: this device can't reopen a file",
@@ -1194,7 +1156,6 @@ impl Writes {
         Ok(serde_json::json!({ "handle": handle, "size": size }))
     }
 
-    /// The handle of the file at `p` this session created.
     fn created(files: &HashMap<u64, Created>, sid: &str, p: &Path) -> Result<u64, String> {
         (files.iter())
             .find(|(_, c)| c.session.id() == sid && c.path == p)
@@ -1202,11 +1163,9 @@ impl Writes {
             .ok_or_else(|| format!("{} is not a file this session created", p.display()))
     }
 
-    /// Renames a file this session created to `to`, never over another unless `replace` (a
-    /// job the user confirmed replacing): then over a regular file only, never a folder, a
-    /// link, a special file, a file a peer is writing or what the replace check (core's
-    /// `Jobs::replace_check`) refuses (the check passing, `to` must still be what it was); then it is
-    /// the device's (no longer removed with the session) and both folders are synced.
+    /// Renames a file this session created to `to`, never over another unless `replace`: then
+    /// over a regular file only, never one a peer is writing or the replace check refuses. Then
+    /// it is the device's and both folders are synced.
     fn rename(
         &self,
         sid: &str,
@@ -1234,9 +1193,7 @@ impl Writes {
         if !replace {
             ps5_dump_forge_core::rename_no_replace(&src, &dst).map_err(|e| io_text(&dst, &e))?;
         } else {
-            // Another file a peer is writing (open, closed and not renamed, or kept for a
-            // reattach) is never replaced: its writer would rename these bytes as its own.
-            // Checked under `files`' lock, so none is created there before the rename.
+            // A file a peer is writing is never replaced (checked under `files`' lock).
             let others: Vec<PathBuf> = (files.iter())
                 .filter(|(h, _)| **h != handle)
                 .map(|(_, c)| c.path.clone())
@@ -1267,11 +1224,10 @@ impl Writes {
         sync_parents(&[&src, &dst]).map_err(|e| format!("{UNSYNCED}{e}"))
     }
 
-    /// Removes a file this session created and hasn't renamed (its handle closed first); it
-    /// stays this session's, removed when the session ends, if the removal fails.
+    /// Removes a file this session created and hasn't renamed; it stays this session's if the
+    /// removal fails.
     // ponytail: removed by path, as the kept-file sweep does: a file someone else moved away and
-    // replaced at that name goes instead (open or closed). Compare `Created.id` (or the open
-    // handle's) with the path's identity first if a share is written by others during a job.
+    // replaced at that name goes instead. Compare identities if shares get written by others.
     fn remove(&self, sid: &str, root: Option<&Share>, rel: &str, me: &str) -> Result<(), String> {
         let p = locate(root, rel)?;
         self.check(&p, me)?;
@@ -1292,10 +1248,8 @@ impl Writes {
         sync_parents(&[&p]).map_err(|e| format!("{UNSYNCED}{e}"))
     }
 
-    /// The `write`s and `put`s of a lane (the first request already received): each a
-    /// `Request write {handle, offset, len}` or `put {tmp, path, len}` and then its `Data`
-    /// (head: job = handle or 0, file 0, the offset, BLAKE3), answered `DataOk` once written.
-    /// A failure is the lane's `Error` and ends it.
+    /// The `write`s and `put`s of a lane (the first already received), each with its `Data`,
+    /// answered `DataOk` once written; a failure is the lane's `Error` and ends it.
     pub fn serve(
         &self,
         conn: &mut Conn,
@@ -1327,10 +1281,8 @@ impl Writes {
         }
     }
 
-    /// A whole small file in one round trip, as `create`, `write`, `sync`, `close` and
-    /// `rename` would write it: `tmp` created (never over anything), written, synced, closed
-    /// and renamed to `path` without replacing, the folders synced; on any failure `tmp` is
-    /// removed.
+    /// A whole small file in one round trip: `tmp` created exclusive, written, synced, renamed
+    /// to `path` without replacing, the folders synced; on any failure `tmp` is removed.
     fn put(
         &self,
         session: &Session,
@@ -1380,9 +1332,7 @@ impl Writes {
         })
     }
 
-    /// `bytes` at `at` of the file `handle`, if `sid` owns it, under the file's gate: owned
-    /// when the gate is taken (not only before), so a `reattach` waits for this write and one
-    /// after it is refused.
+    /// `bytes` at `at` of `handle`, owned by `sid` when the gate is taken (not only before).
     fn write_owned(&self, sid: &str, handle: u64, bytes: &[u8], at: u64) -> Result<(), String> {
         let gate = (lock(&self.files).get(&handle))
             .map(|c| c.gate.clone())
@@ -1431,10 +1381,9 @@ impl Writes {
 
 /// What `Connect::speed_test` sends and then fetches.
 pub const SPEED_BYTES: u64 = 128 << 20;
-/// What one speed test sends (and then fetches) at most.
+
 pub const SPEED_MAX: u64 = SPEED_BYTES;
-/// What one paired device's open speed lanes carry at most together, both directions: a
-/// request past it is refused. Released as each lane ends.
+/// What one paired device's open speed lanes carry at most together, both directions.
 pub const SPEED_BUDGET: u64 = SPEED_BYTES * 2;
 /// Lanes a speed test deals its chunks to, as a transfer's writes.
 const SPEED_LANES: usize = KEPT_LANES;
@@ -1443,9 +1392,7 @@ pub const SPEED_OLDER: &str = "that device's Dump Forge is older: update it to r
 /// A speed test its user stopped (`Connect::speed_test_cancel`).
 pub const SPEED_CANCELLED: &str = "cancelled";
 
-/// One speed test's cancel: the flag every lane checks and a clone of its control conn's and
-/// each lane's socket, shut down by `cancel` so a dial, an RPC or a lane blocked on its answer
-/// ends at once.
+/// One speed test's cancel: a flag every lane checks and its sockets, shut by `cancel`.
 #[derive(Default)]
 pub struct SpeedCancel {
     flag: AtomicBool,
@@ -1494,18 +1441,14 @@ pub struct SpeedTest {
 /// Speed lanes one paired device may hold open at once (a test uses `SPEED_LANES`).
 pub const SPEED_PEER_LANES: usize = 8;
 
-/// How long a speed lane's send may get no byte out before it fails (a transfer's lanes keep
-/// `DEAD_AFTER`). A client that was cancelled and closed with a chunk still on its way can
-/// leave its socket reading nothing and sending no reset; the lane, and the slot and bytes it
-/// holds in `SPEED_OPEN`, are then freed after up to twice this, so a Stop followed by another
-/// test is not refused for `2 * DEAD_AFTER` (24 s).
+/// A speed lane's send timeout: a cancelled client can leave its socket reading nothing and
+/// sending no reset (FIN_WAIT2), so the lane's slot is freed after up to twice this, not 24 s.
 pub const SPEED_WRITE_WAIT: Duration = Duration::from_secs(4);
 
 /// Per paired device's key id: its open speed lanes and the bytes they have carried.
 static SPEED_OPEN: Mutex<Option<HashMap<String, (usize, u64)>>> = Mutex::new(None);
 
-/// One open speed lane of a device and the bytes it reserved, counted in `SPEED_OPEN` until
-/// dropped.
+/// One open speed lane of a device and the bytes it reserved, counted until dropped.
 struct SpeedLane {
     peer: String,
     bytes: u64,
@@ -1576,11 +1519,8 @@ pub fn is_speed(f: &Frame) -> bool {
     is_method(f, "speed_up") || is_method(f, "speed_down")
 }
 
-/// The requests of a speed lane (the first already received): `speed_up {offset, len}` and its
-/// `Data` (BLAKE3-checked, then dropped), answered `DataOk`; `speed_down {offset, len}`, answered
-/// by a `Data` of `len` zero bytes. `len` 1..=`CHUNK`; at most `SPEED_PEER_LANES` lanes and
-/// `SPEED_BUDGET` bytes (both directions, reserved per request, released as each lane ends) per
-/// paired device at once; any other method is refused. Nothing is read from or written to disk.
+/// The requests of a speed lane: `speed_up` + `Data` (checked, dropped) answered `DataOk`,
+/// `speed_down` answered by `len` zero bytes; within `SPEED_PEER_LANES` and `SPEED_BUDGET`.
 pub fn serve_speed(
     conn: &mut Conn,
     first: Frame,
@@ -1686,8 +1626,7 @@ pub fn send_read(conn: &mut Conn, handle: u64, offset: u64, len: u64) -> io::Res
     conn.send_frame(&req.frame()?)
 }
 
-/// A lane's next answer; the peer's `Error` as an error. Its pings (`pinging`, sent while its
-/// disk works) are skipped, unanswered: the lane's read timeout measures silence, not disk time.
+/// A lane's next answer; the peer's `Error` as an error, its pings skipped unanswered.
 fn recv_answer(conn: &mut Conn) -> io::Result<Frame> {
     let f = loop {
         let f = conn.recv_frame()?;
@@ -1760,12 +1699,9 @@ pub fn recv_written(conn: &mut Conn, handle: u64, offset: u64) -> io::Result<()>
     }
 }
 
-/// Sends, then fetches, `bytes` (at most `SPEED_MAX`) over up to `SPEED_LANES` lanes of `hs`'s
-/// session (`rpc` keeps it up), in `CHUNK` pieces dealt round robin as a transfer's writes;
-/// each direction timed from its first request to its last answer. Nothing touches a disk on
-/// either side. A peer without the speed lanes: `SPEED_OLDER`. `cancel`, checked before each
-/// chunk is sent or awaited on every lane, ends it with `SPEED_CANCELLED`: it shuts every lane's
-/// socket, so a lane waiting on its answer ends at once too.
+/// Sends, then fetches, `bytes` over up to `SPEED_LANES` lanes in `CHUNK` pieces dealt round
+/// robin, each direction timed from its first request to its last answer. `cancel` ends it with
+/// `SPEED_CANCELLED`.
 pub fn speed_test(
     rpc: &mut Rpc,
     hs: &Handshake,
@@ -1870,9 +1806,8 @@ pub fn speed_test(
 /// One lane's part of a speed test direction: a request and its answer.
 type SpeedStep<'a> = &'a (dyn Fn(&mut Conn, u64, u64) -> io::Result<()> + Sync);
 
-/// `pieces` dealt round robin to `lanes`, each lane sending all of its share before reading the
-/// answers (as `write_lane`); how long the slowest lane took. The peer's refusal comes first,
-/// a cancel before it: a lane that sees `cancel` stops at once, its answers left unread.
+/// `pieces` dealt round robin to `lanes`, each sending its share before reading the answers;
+/// how long the slowest lane took. A cancel comes before the peer's refusal.
 fn speed_run(
     lanes: &mut [Conn],
     pieces: &[(u64, u64)],
@@ -1934,8 +1869,7 @@ const KEPT_LANES: usize = 8;
 /// A session or lane idle this long is redialled first: the peer drops it at `DEAD_AFTER`.
 const IDLE: Duration = Duration::from_secs(DEAD_AFTER.as_secs() / 2);
 
-/// Every running Connect service (tests run several at once); core's registry holds one
-/// dispatcher over them, which asks the first that has the device paired.
+/// Every running Connect service (tests run several); core's registry holds one dispatcher.
 fn services() -> &'static Mutex<Vec<Arc<ConnectRemote>>> {
     static S: Mutex<Vec<Arc<ConnectRemote>>> = Mutex::new(Vec::new());
     &S
@@ -1969,27 +1903,24 @@ pub(crate) fn register(inner: &Arc<Inner>) {
     ONCE.call_once(|| remote::set(Arc::new(Services)));
 }
 
-/// One service's paired devices as core's `Remote`. Per device one control session (stat,
-/// list, read handles, created files) and a few idle data lanes, kept between calls; `read_at`
-/// and `write_at` may run on several threads, each on lanes of its own.
+/// One service's paired devices as core's `Remote`: per device one control session and a few
+/// idle data lanes, kept between calls.
 pub struct ConnectRemote {
     inner: Weak<Inner>,
     peers: Mutex<HashMap<String, Arc<PeerFs>>>,
-    /// Files created on peers by core's handle (unique across services, so `Services` can
-    /// route a handle), until renamed or removed.
+    /// Files created on peers by core's handle (unique across services), until renamed or removed.
     files: Mutex<HashMap<u64, Made>>,
 }
 
-/// A file this device created on a peer: the peer's handle under the session of `generation`,
-/// which owns it (the peer removes it, unrenamed, when that session ends).
+/// A file this device created on a peer: the peer's handle under the session of `generation`.
 #[derive(Clone)]
 struct Made {
     at: FlinkPath,
     generation: u64,
     handle: u64,
     open: bool,
-    /// The end of the furthest write the peer confirmed (offset + length): a resume finding
-    /// the file shorter (cut while the link was down) is refused, never leaving a gap.
+    /// The end of the furthest write the peer confirmed: a resume finding the file shorter is
+    /// refused, never leaving a gap.
     acked: u64,
 }
 
@@ -1998,7 +1929,7 @@ struct PeerFs {
     session: Mutex<Option<Sess>>,
     /// Idle lanes with the generation of the session they joined.
     lanes: Mutex<Vec<(u64, Conn, Instant)>>,
-    /// ... and those that wrote (a lane reads or writes, never both).
+    /// Idle lanes that wrote (a lane reads or writes, never both).
     write_lanes: Mutex<Vec<(u64, Conn, Instant)>>,
     /// Files created and not yet renamed or removed: their session is kept alive meanwhile.
     writing: AtomicUsize,
@@ -2014,8 +1945,7 @@ impl PeerFs {
         *lock(&self.active) = Some(Instant::now());
     }
 
-    /// Unused for `IDLE` with no read under way: its session has had no keepalive since, so it
-    /// is redialled.
+    /// Unused for `IDLE` with no read under way: no keepalive since, so it is redialled.
     fn idle(&self) -> bool {
         self.reading.load(Ordering::SeqCst) == 0
             && self.writing.load(Ordering::SeqCst) == 0
@@ -2040,9 +1970,8 @@ impl Drop for Reading<'_> {
     }
 }
 
-/// Keeps a device's session (generation `g`) alive while it is in use: the peer drops a control
-/// session silent for `DEAD_AFTER`, and every read handle with it, while the reads themselves go
-/// on lanes. Stops once the session is replaced, broken or idle (then left to expire).
+/// Keeps a device's session (generation `g`) alive while in use: the peer drops a session
+/// silent for `DEAD_AFTER` with its read handles, while the reads go on lanes.
 fn keep(peer: Weak<PeerFs>, g: u64) {
     std::thread::spawn(move || {
         loop {
@@ -2081,8 +2010,7 @@ impl Sess {
     }
 }
 
-/// A peer's answer (`Other`, its text) as core expects it: `NotFound` when nothing is there,
-/// `AlreadyExists` when something is.
+/// A peer's answer as core expects it: `NotFound`, `AlreadyExists`, else `Other`.
 fn answered(e: io::Error) -> io::Error {
     if e.kind() != io::ErrorKind::Other {
         return e;
@@ -2117,8 +2045,7 @@ fn mtime(ns: Option<u64>) -> Option<SystemTime> {
     ns.map(|n| UNIX_EPOCH + Duration::from_nanos(n))
 }
 
-/// The created file's session ended (the link broke or went silent) and it wasn't resumed: the
-/// peer removes it.
+/// The created file's session ended and it wasn't resumed: the peer removes it.
 fn lost(c: &Made) -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
@@ -2162,8 +2089,7 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 /// Retried `put`s, for their temporary names.
 static NEXT_RETRY: AtomicU64 = AtomicU64::new(0);
 
-/// A temporary name of a retried `put` beside `tmp` (`<tmp stem>-r<n>.tmp`), never the first
-/// attempt's: that one may still be under way on the peer.
+/// A retried `put`'s own temporary name beside `tmp`: the first may still be under way.
 fn retry_name(tmp: &str) -> String {
     let n = NEXT_RETRY.fetch_add(1, Ordering::SeqCst) + 1;
     match tmp.strip_suffix(".tmp") {
@@ -2176,12 +2102,9 @@ fn retry_name(tmp: &str) -> String {
 const RESUMES: usize = 3;
 
 impl ConnectRemote {
-    /// `op` on the created file `id` (`c` its record). When the session that created it is
-    /// lost, a fresh session takes the file over (`reattach`) and `op` runs again there, at
-    /// most `RESUMES` times and within the peer's `KEPT_FOR`. `at`: where the call resumes, for
-    /// the log (`None`: the file's size). A peer without `reattach` (older) leaves the loss.
-    /// A redone write is positional, so a piece sent twice is the same bytes; core hashes what
-    /// it writes (BLAKE3) as it goes, and a full verify reads the file back against that.
+    /// `op` on the created file `id`. When its session is lost, a fresh session takes the file
+    /// over (`reattach`) and `op` runs again there, at most `RESUMES` times within `KEPT_FOR`.
+    /// `at`: where it resumes, for the log. A redone write is positional: the same bytes.
     // ponytail: the line goes to stderr (the serve log), not the job's log.
     fn resuming<T>(
         &self,
@@ -2210,10 +2133,8 @@ impl ConnectRemote {
         }
     }
 
-    /// `reattach` of `c` on the device's session (a fresh one: the old one is gone), which
-    /// then owns it: the record `id` moves to that session's generation and the handle given.
-    /// A file found shorter than a write the peer confirmed (cut while the link was down) is
-    /// removed there and let go: a resume would leave a gap.
+    /// `reattach` of `c` on a fresh session, which then owns it. A file found shorter than a
+    /// write the peer confirmed is removed there and let go: a resume would leave a gap.
     fn reattach(&self, id: u64, c: &Made, at: Option<u64>) -> io::Result<Made> {
         let acked = lock(&self.files).get(&id).map_or(0, |m| m.acked);
         let body = serde_json::json!({ "path": c.at.path });
@@ -2268,8 +2189,7 @@ impl ConnectRemote {
         if text.starts_with(TRANSFER_FAILED) {
             return Err(e);
         }
-        // A broken lane: once more on fresh lanes while the session still holds the file
-        // (positional writes, so a piece written twice is the same bytes).
+        // A broken lane: once more on fresh lanes while the session still holds the file.
         self.on_session(c, |s| s.rpc.call("info", Value::Null).map(drop))?;
         self.write_lanes(c, offset, bytes).map_err(|e| {
             if e.to_string()
@@ -2346,9 +2266,8 @@ impl ConnectRemote {
         lock(&self.peers).entry(key_id.into()).or_default().clone()
     }
 
-    /// One RPC that may run long (a delete or move of a whole folder) on a control
-    /// session of its own, so the device's shared session (a transfer's per-file calls, the
-    /// keep-alive) never waits behind it. No retry: a fresh session that breaks is the error.
+    /// One RPC that may run long (a folder's delete or move) on a control session of its own,
+    /// so the shared one never waits behind it. No retry.
     fn alone(&self, key_id: &str, method: &str, body: Value) -> io::Result<Value> {
         let inner = self
             .inner
@@ -2365,8 +2284,7 @@ impl ConnectRemote {
             .map_err(|e| if is_answer(&e) { answered(e) } else { e })
     }
 
-    /// `f` on the device's session: a fresh one when there is none or it sat idle, and once
-    /// more on a fresh one when a kept session turns out broken.
+    /// `f` on the device's session (fresh when none or idle), once more when a kept one broke.
     fn with<T>(&self, key_id: &str, f: impl Fn(&mut Sess) -> io::Result<T>) -> io::Result<T> {
         let inner = self
             .inner
@@ -2445,8 +2363,7 @@ impl ConnectRemote {
     }
 
     /// `len` bytes at `offset` of handle `h`: `CHUNK` pieces dealt round robin to up to
-    /// `KEPT_LANES` lanes of generation `g` (kept or joined), as `write_lanes` writes; one short
-    /// piece means the file ended there.
+    /// `KEPT_LANES` lanes; one short piece means the file ended there.
     fn read_lanes(
         peer: &PeerFs,
         hs: &Handshake,
@@ -2502,8 +2419,7 @@ impl ConnectRemote {
         Ok(out)
     }
 
-    /// `pieces` (offset, length) of handle `h` read on one lane of generation `g` (kept or
-    /// joined): every piece asked at once, answered in order.
+    /// `pieces` of handle `h` on one lane: every piece asked at once, answered in order.
     fn read_lane(
         peer: &PeerFs,
         hs: &Handshake,
@@ -2525,8 +2441,7 @@ impl ConnectRemote {
         Ok(out)
     }
 
-    /// `len` bytes at `offset` of the peer's file `rel` (at most `CHUNK`), with its stat after
-    /// the read, on one lane of generation `g`.
+    /// Up to `CHUNK` bytes of the peer's file `rel`, with its stat after the read, on one lane.
     fn read_path(
         peer: &PeerFs,
         hs: &Handshake,
@@ -2838,9 +2753,8 @@ impl remote::Remote for ConnectRemote {
         if text.starts_with(TRANSFER_FAILED) && !gone {
             return Err(e);
         }
-        // A broken lane, or the handle closed under the read (its session ended, or another
-        // read let it go): the session is checked (redialled when broken, which reopens the
-        // handle; other reads' handles stay) and the read asked once more on another lane.
+        // A broken lane, or the handle closed under the read: the session is checked
+        // (redialled when broken) and the read asked once more on another lane.
         self.with(&path.key_id, |s| {
             if gone && s.generation == g {
                 s.handles.retain(|k| k.1 != h);
@@ -2852,9 +2766,7 @@ impl remote::Remote for ConnectRemote {
     }
 
     /// Up to one chunk of a file with no kept handle: one lane round trip by path, the stat
-    /// after the read in its answer (no `read_open`, `read_close` or `stat`), asked once more
-    /// on a broken lane as `read_at` does. Longer reads, and files read through a handle, as
-    /// `read_at` and `stat`.
+    /// after the read in its answer; asked once more on a broken lane.
     fn read_checked(
         &self,
         path: &FlinkPath,
@@ -2883,12 +2795,9 @@ impl remote::Remote for ConnectRemote {
         }
     }
 
-    /// A small file in one round trip: `put` on a write lane, which the peer answers once the
-    /// file is written, synced and renamed (larger ones: the trait's create, write, sync, close
-    /// and rename, which resume a lost session). A broken lane or session: asked once more,
-    /// whole, on a checked (else fresh) session under a temporary name of its own (the first
-    /// may still be writing its own); the first may have landed, so a `to` already there
-    /// holding exactly these bytes is that one.
+    /// A small file in one round trip: `put` on a write lane, answered once written, synced and
+    /// renamed. A broken lane or session: asked once more under a temporary name of its own;
+    /// a `to` already holding exactly these bytes is the first one landed.
     fn put_new(&self, tmp: &FlinkPath, to: &FlinkPath, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() as u64 > CHUNK || tmp.key_id != to.key_id {
             let handle = self.create(tmp)?;
@@ -3049,9 +2958,8 @@ impl remote::Remote for ConnectRemote {
         })
     }
 
-    /// `reopen` on the peer, which opens the closed file again (an open one is left as it is,
-    /// so a pack asks it of a file it hasn't closed to learn the peer can). A peer from before it,
-    /// or one that can't tell a file's identity (`unsupported: `), is `Unsupported`.
+    /// `reopen` on the peer (an open file is left as it is, so a pack asks it to learn the peer
+    /// can); an older peer, or `unsupported: `, is `Unsupported`.
     fn reopen(&self, handle: u64) -> io::Result<()> {
         let c = lock(&self.files)
             .get(&handle)
@@ -3085,9 +2993,7 @@ impl remote::Remote for ConnectRemote {
         self.rename_as(from, to, false)
     }
 
-    /// The peer checks what it replaces (a regular file no peer is writing, refused where its
-    /// own job's replace would be). A peer older
-    /// than `replace` ignores the field and refuses a taken name (`exists`): nothing replaced.
+    /// The peer checks what it replaces; a peer older than `replace` refuses a taken name.
     fn rename_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()> {
         self.rename_as(from, to, true)
     }
@@ -3196,15 +3102,8 @@ mod tests {
         rpc.call(method, serde_json::json!({ "path": path }))
     }
 
-    /// Waits until the serving side has released `peer`'s speed lanes: a test returns once
-    /// its answers are in, and each lane is freed only when the peer sees it close, so a
-    /// test started at once could find the lanes still taken and be refused. Usually that is
-    /// at once, but a lane serving `speed_down` whose client was cancelled and closed with the
-    /// answer still on its way can be left blocked in `send`: the client's socket ends in
-    /// FIN_WAIT2 with a zero window, which neither reads nor resets, so the lane ends only when
-    /// its write times out (`SPEED_WRITE_WAIT`), and `write_all` sends a second time after a
-    /// partial first one: up to twice that (with `DEAD_AFTER` it was 24.03 s). Hence four
-    /// times, not the 5 s that failed on GitHub's.
+    /// Waits until the serving side has released `peer`'s speed lanes: a cancelled `speed_down`
+    /// lane can block in `send` (FIN_WAIT2) for up to twice `SPEED_WRITE_WAIT`, hence four times.
     fn speed_lanes_released(peer: &str) {
         let until = Instant::now() + SPEED_WRITE_WAIT * 4;
         while lock(&SPEED_OPEN)
@@ -3219,6 +3118,39 @@ mod tests {
                     .and_then(|m| m.get(peer).copied())
             );
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A cancel mid-test ends it `cancelled` at once with its lanes released; the next test runs.
+    #[test]
+    fn a_cancelled_speed_test_ends_cancelled_and_frees_its_lanes() {
+        let share = temp_dir("speed-cancel");
+        fs::create_dir_all(&share).unwrap();
+        let (a, b, rpc, _, dirs) = paired("speed-cancel", &share);
+        drop(rpc);
+        let ka = a.state().device.key_id;
+        let kb = b.state().device.key_id;
+        let b = Arc::new(b);
+        let started = Instant::now();
+        let run = std::thread::spawn({
+            let (b, ka) = (b.clone(), ka.clone());
+            move || b.speed_test_of(&ka, "r1", SPEED_MAX)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        while !run.is_finished() {
+            b.speed_test_cancel(&ka, "r1");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(run.join().unwrap().unwrap_err(), SPEED_CANCELLED);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        speed_lanes_released(&kb);
+        assert_eq!(b.speed_test_of(&ka, "r2", CHUNK).unwrap().bytes, CHUNK);
+        speed_lanes_released(&kb);
+
+        a.shutdown();
+        b.shutdown();
+        for d in dirs.iter().chain([&share]) {
+            let _ = fs::remove_dir_all(d);
         }
     }
 
@@ -3243,10 +3175,8 @@ mod tests {
         let kb = b.state().device.key_id;
         speed_lanes_released(&kb);
 
-        // A lane refuses an empty request and a method other than speed_up / speed_down. The
-        // server registers a session on its control thread, after the handshake the client has
-        // already finished, so a Join right after `session` can find none (`bad_join`): an
-        // answered RPC says it is there, as it does before any real lane.
+        // A lane refuses an empty request and any other method. An answered RPC first: the
+        // server registers a session after the handshake, so an early Join finds none.
         let (mut rpc, hs) = b.session(&ka).unwrap();
         rpc.call("speed", serde_json::json!({})).unwrap();
         for (method, len) in [("speed_down", 0), ("speed_up", 0), ("read", 10)] {
@@ -3309,66 +3239,8 @@ mod tests {
         }
     }
 
-    /// A cancel during a speed test ends it `cancelled` at once, its lanes shut and released: the
-    /// next test runs. A cancel before its run starts ends that run `cancelled` as it starts; a
-    /// late cancel of an old run leaves a new one alone.
-    #[test]
-    fn a_cancelled_speed_test_ends_cancelled_and_frees_its_lanes() {
-        let share = temp_dir("speed-cancel");
-        fs::create_dir_all(&share).unwrap();
-        let (a, b, rpc, _, dirs) = paired("speed-cancel", &share);
-        drop(rpc);
-        let ka = a.state().device.key_id;
-        let kb = b.state().device.key_id;
-        let b = Arc::new(b);
-        let started = Instant::now();
-        let run = std::thread::spawn({
-            let (b, ka) = (b.clone(), ka.clone());
-            move || b.speed_test_of(&ka, "r1", SPEED_MAX)
-        });
-        std::thread::sleep(Duration::from_millis(50));
-        while !run.is_finished() {
-            b.speed_test_cancel(&ka, "r1");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(run.join().unwrap().unwrap_err(), SPEED_CANCELLED);
-        assert!(started.elapsed() < Duration::from_secs(5));
-        speed_lanes_released(&kb);
-
-        // Cancelled before it starts: ends `cancelled` at once, the cancel used up.
-        b.speed_test_cancel(&ka, "r2");
-        assert_eq!(
-            b.speed_test_of(&ka, "r2", SPEED_MAX).unwrap_err(),
-            SPEED_CANCELLED
-        );
-        assert_eq!(b.speed_test_of(&ka, "r2", CHUNK).unwrap().bytes, CHUNK);
-        speed_lanes_released(&kb);
-
-        // A stale cancel of r1 (it ended) while r3 runs: r3 finishes.
-        let run = std::thread::spawn({
-            let (b, ka) = (b.clone(), ka.clone());
-            move || b.speed_test_of(&ka, "r3", 8 * CHUNK)
-        });
-        while !run.is_finished() {
-            b.speed_test_cancel(&ka, "r1");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(run.join().unwrap().unwrap().bytes, 8 * CHUNK);
-        speed_lanes_released(&kb);
-        let got = b.speed_test_of(&ka, "r4", CHUNK + 1).unwrap();
-        assert_eq!(got.bytes, CHUNK + 1);
-        assert_eq!(fs::read_dir(&share).unwrap().count(), 0);
-
-        a.shutdown();
-        b.shutdown();
-        for d in dirs.iter().chain([&share]) {
-            let _ = fs::remove_dir_all(d);
-        }
-    }
-
-    /// The PS5's reach (by user request): `/` lists `data` (a link here, shown as the folder)
-    /// and `mnt` while a drive is mounted, `mnt` only the mounted drives, and every RPC refuses
-    /// a path elsewhere.
+    /// The PS5's reach: `/` lists `data` and `mnt` while a drive is mounted, and every RPC
+    /// refuses a path elsewhere.
     #[cfg(unix)]
     #[test]
     fn a_ps5_share_reaches_only_data_and_mounted_drives() {
@@ -3445,8 +3317,7 @@ mod tests {
         }
     }
 
-    /// `rename` with `replace`: over a regular file only, never a folder, a link or a path
-    /// this device's jobs use; without it a taken name is refused as ever.
+    /// `rename` with `replace`: over a regular file only, never a folder, link or a job's path.
     #[test]
     fn rename_replaces_a_file_only_when_asked() {
         let share = temp_dir("rshare");
@@ -3504,8 +3375,46 @@ mod tests {
         }
     }
 
-    /// A replacing rename never goes over a file another peer is writing: open, closed and
-    /// unrenamed, or kept for its reattach.
+    /// `install_here` installs only a regular file inside the share root, never a link or folder.
+    #[cfg(unix)]
+    #[test]
+    fn install_here_refuses_a_path_out_of_the_share_and_a_link() {
+        let share = temp_dir("ishare");
+        fs::create_dir_all(share.join("g")).unwrap();
+        fs::write(share.join("g/x.pkg"), b"\x7FCNT").unwrap();
+        fs::write(share.with_extension("pkg"), b"\x7FCNT").unwrap();
+        std::os::unix::fs::symlink(share.join("g/x.pkg"), share.join("g/l.pkg")).unwrap();
+        let (a, b, _rpc, _hs, dirs) = paired("ih", &share);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let seen = got.clone();
+        a.set_install(Arc::new(move |p: PathBuf| {
+            lock(&seen).push(p);
+            Ok(7)
+        }));
+        let ka = a.state().device.key_id;
+        let install = |p: &str| b.install(&ka, Path::new(&format!("flink://{ka}/{p}")));
+        let up = format!(
+            "../{}",
+            share
+                .with_extension("pkg")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        for bad in [up.as_str(), "g/../../x.pkg", "g/l.pkg", "g", "g/none.pkg"] {
+            assert!(install(bad).is_err(), "{bad} was installed");
+        }
+        assert!(lock(&got).is_empty(), "{:?}", lock(&got));
+        assert_eq!(install("g/x.pkg"), Ok(7));
+        assert!(lock(&got)[0].ends_with("g/x.pkg") && lock(&got)[0].is_absolute());
+        for d in dirs.iter().chain([&share]) {
+            let _ = fs::remove_dir_all(d);
+        }
+        let _ = fs::remove_file(share.with_extension("pkg"));
+    }
+
+    /// A replacing rename never goes over a file another peer is writing.
     #[test]
     fn a_replace_never_takes_another_peers_unfinished_file() {
         let share = temp_dir("r2share");
@@ -3566,8 +3475,7 @@ mod tests {
         }
     }
 
-    /// A replacing rename passes core's `Jobs::replace_check` first (Connect's hook): an image
-    /// with an interrupted edit's undo journal beside it, and the journal, are never replaced.
+    /// A replacing rename passes core's `Jobs::replace_check`: an undo journal's image never goes.
     #[test]
     fn a_replace_is_refused_where_a_jobs_replace_would_be() {
         let share = temp_dir("r3share");
@@ -3649,8 +3557,7 @@ mod tests {
         assert!(writing(&share.join("g/new/f.part")) && writing(&share.join("g")));
         assert!(!writing(&share.join("g/exists")) && !writing(&outside));
 
-        // Receiving a peer's file is busy even though it isn't a local job. Delete and Move
-        // protect the file, its parents and a move's destination; unrelated entries work.
+        // A peer's file being received is busy for Delete and Move; unrelated entries work.
         let jobs = ps5_dump_forge_core::Jobs::new(|_| {});
         jobs.set_external_busy(a.writing_hook());
         let busy = |r| assert!(matches!(r, Err(ps5_dump_forge_core::DeleteError::Busy(_))));
@@ -3730,8 +3637,7 @@ mod tests {
         assert!(call(&mut rpc, "mkdir", "g/busy").is_err());
         assert!(two(&mut rpc, "rename", "g/new/f", "g/busy").is_err());
 
-        // A session that ends keeps what it created and never renamed for a while (its writer
-        // may resume it), busy for this device's jobs meanwhile; then it is removed.
+        // A session that ends keeps its unrenamed files (busy) for a while, then removes them.
         *lock(&a.writes().kept_for) = Some(Duration::from_secs(2));
         let o = handle(call(&mut rpc, "create", "g/new/orphan.part").unwrap());
         let mut lane2 = join_lane(&hs, 1).unwrap();
@@ -3771,8 +3677,7 @@ mod tests {
     fn forgetting_revokes_cached_sessions_and_lanes() {
         use ps5_dump_forge_core::remote::Remote;
 
-        // Forget from either end: the receiving service closes its inbound sockets, and the
-        // initiating service refuses its own cached connection and open write handles.
+        // Forget from either end closes the sockets and refuses cached sessions and handles.
         for local in [false, true] {
             let tag = format!("forget-{local}");
             let share = temp_dir(&tag);
@@ -3832,8 +3737,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
             if !local {
-                // Re-pairing permits a fresh session; the old session's secret and lanes
-                // still cannot be used, even though the peer's key id is paired again.
+                // Re-pairing permits a fresh session; the old one's secret and lanes stay dead.
                 let paired = crate::connect::pair_for_test(
                     &b,
                     &a,
@@ -4013,8 +3917,7 @@ mod tests {
             }))
             .unwrap()
         };
-        // This device's jobs, each waited for; core reaches the peer through the registered
-        // dispatcher.
+        // This device's jobs; core reaches the peer through the registered dispatcher.
         let (tx, rx) = mpsc::channel::<Result<JobReport, String>>();
         let tx = Mutex::new(tx);
         let jobs = Jobs::new(move |e| {
@@ -4036,8 +3939,7 @@ mod tests {
         assert!(share.join("out/game.exfat").is_file());
         let i = ps5_dump_forge_core::inspect(&url("out/game.exfat")).unwrap();
         assert_eq!(i.title_id.as_deref(), Some("PPSA01234"));
-        // And a .pkg, the builder writing through FLINK (its spool and self-check read back
-        // there), fully verified; the peer's file is a package core reads.
+        // And a .pkg written through FLINK, fully verified; core reads the peer's package.
         let report = run(request(&src, "pkg", &url("out/game.pkg"))).unwrap();
         assert!(
             report.checks.iter().any(|c| c.starts_with("published")),
@@ -4085,9 +3987,8 @@ mod tests {
         }
     }
 
-    /// A peer's Delete and Move to: refused until the peer sets its hooks, then its own
-    /// `Jobs::delete_path`/`move_path` (its protected paths) inside its share only; core's
-    /// `Jobs` hands a `flink://` path to the peer.
+    /// A peer's Delete and Move to: refused until the peer sets its hooks, then its own `Jobs`
+    /// rules inside its share only.
     #[cfg(unix)]
     #[test]
     fn a_peer_deletes_and_moves_its_files_for_this_device() {
@@ -4185,9 +4086,7 @@ mod tests {
 
     #[test]
     fn a_lane_outlasts_a_disk_stall_longer_than_its_timeout() {
-        // Lanes keyed as real ones, with 3 s standing in for `DEAD_AFTER`, and a peer whose disk
-        // takes 4.5 s for each write, put and read: its pings keep both lanes up (without them
-        // each wait below times out).
+        // 3 s standing in for `DEAD_AFTER` and a 4.5 s disk stall: pings keep both lanes up.
         let timeout = Duration::from_secs(3);
         let stall = Duration::from_millis(4500);
         let root = temp_dir("stall");
@@ -4233,8 +4132,7 @@ mod tests {
                     };
                 });
             }
-            // The write lane: a chunk, then (after a pong, as a reader before `pinging`
-            // answered pings) a put.
+            // The write lane: a chunk, then (after a pong) a put.
             let data = &data;
             s.spawn(move || {
                 send_write(&mut w, h, 0, data).unwrap();
@@ -4302,8 +4200,7 @@ mod tests {
 
         let h = r.create(&at("f.part")).unwrap();
         r.write_at(h, 0, &data[..first]).unwrap();
-        // The control conn dropped while the rest is written (or just before): the write
-        // resumes the file on a fresh session.
+        // The control conn dropped while the rest is written: it resumes on a fresh session.
         let g = generation().unwrap();
         std::thread::scope(|s| {
             let (r, data) = (&r, &data);
@@ -4359,9 +4256,8 @@ mod tests {
         }
     }
 
-    /// A pack's volumes are closed once written and opened again for their headers: files closed
-    /// and not renamed yet don't count against the open-file cap (issue #42: a pack of more than
-    /// 32 volumes), open ones still do, and a peer from before `reopen` is `Unsupported`.
+    /// Closed, unrenamed files don't count against the open-file cap (issue #42), open ones do,
+    /// and a peer from before `reopen` is `Unsupported`.
     #[test]
     fn closed_volumes_leave_room_and_reopen_for_their_headers() {
         use ps5_dump_forge_core::remote::Remote;
@@ -4490,8 +4386,7 @@ mod tests {
         }
     }
 
-    /// A `reattach` waits for a write of the old session under way (a disk stall), and a write
-    /// of the old session after it is refused: none lands once the file changed hands.
+    /// A `reattach` waits for an old-session write under way, and refuses one after it.
     #[test]
     fn a_reattach_waits_for_the_old_sessions_write_and_refuses_later_ones() {
         let root = temp_dir("gate");
@@ -4533,8 +4428,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A file cut on the peer while the link was down (shorter than a write it confirmed) is
-    /// never resumed: a resumed write would leave a gap. The loss stands and the peer's file goes.
+    /// A file cut on the peer while the link was down is never resumed (it would leave a gap).
     #[test]
     fn a_resume_refuses_a_file_cut_shorter_than_written() {
         use ps5_dump_forge_core::remote::Remote;

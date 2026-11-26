@@ -64,8 +64,15 @@ pub struct BuildRequest {
     /// `smallest`, or `stored` for no compression) overrides the default, Balanced.
     pub level: crate::kraken::Level,
     /// Narrows the package's PlayGo languages to this one (`fr-FR`, …; see
-    /// [`cnt_write::playgo_scenario_json`]). Absent, it declares all of them with `en-US` first.
+    /// [`cnt_write::playgo_scenario_json`]). Absent, it declares the game's own languages
+    /// ([`cnt_write::game_languages`]), or all of them with `en-US` as the default when the
+    /// game names none.
     pub language: Option<String>,
+    /// Read the game through this instead of as it is on disk: the engine's "unpack the asset
+    /// packs" hands back a packed game's files as plain files, decoded as the package is
+    /// written. Everything after it (the checks, the `ampr_emu.index` made from the files
+    /// packaged, the plan) sees only what it gives.
+    pub reader: Option<SourceReader>,
     /// How many threads compress the image: `None` (or `Some(0)`) uses every core, and a cap
     /// above the core count is the core count. A cap leaves the rest of the machine usable while
     /// a build runs; the package is the same either way.
@@ -81,6 +88,22 @@ pub struct BuildRequest {
     /// The scan reads up to 16 MiB of the module plus its dynamic segment, which is slow from a
     /// source that decodes as it reads (an archive). `None` (every constructor) scans, once.
     pub imports_ampr: Option<bool>,
+}
+
+/// The game as the build reads it, made from the source as it was opened, or why it can't be.
+pub type ReadSource = dyn Fn(Box<dyn source::SourceTree>) -> std::result::Result<Box<dyn source::SourceTree>, String>
+    + Send
+    + Sync;
+
+/// A game as the package build reads it, made from the source as it was opened: see
+/// [`BuildRequest::reader`].
+#[derive(Clone)]
+pub struct SourceReader(pub std::sync::Arc<ReadSource>);
+
+impl std::fmt::Debug for SourceReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceReader")
+    }
 }
 
 impl BuildRequest {
@@ -106,6 +129,7 @@ impl BuildRequest {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_default(),
             language: None,
+            reader: None,
             threads: None,
             env_overrides: true,
             imports_ampr: None,
@@ -137,6 +161,7 @@ impl BuildRequest {
             kraken: true,
             level: crate::kraken::Level::Balanced,
             language: None,
+            reader: None,
             threads: None,
             env_overrides: false,
             imports_ampr: None,
@@ -301,7 +326,7 @@ impl Stage {
 
 /// Whether the caller's flag asks for a stop.
 fn stopped(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
-    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    crate::workshop::checkpoint_opt(cancel)
 }
 
 /// Stop with [`crate::Error::Cancelled`] once the caller's flag is set.
@@ -348,9 +373,20 @@ pub struct BuildControl<'a> {
     /// `done` ends at `total`. Called at the pass's first file, every 256 files and once all
     /// are visited, never after a stop.
     pub files: Option<&'a mut dyn FnMut(Stage, u64, u64)>,
-    /// `Some(seed)`: the built package's self-check reads a seeded sample of its blocks
-    /// ([`verify::verify_file_sampled`]), for a caller that checks the files itself.
+    /// Seed for a fast self-check, which sweeps a sample of the data blocks instead of all of
+    /// them (see [`verify::verify_streaming_sampled`]); `None` sweeps every block.
     pub sample: Option<u64>,
+}
+
+/// Whether `id` is a content id's characters only (`UP0000-PPSA00000_00-0123456789ABCDEF`:
+/// letters, digits, `-`, `_`), so it can name the package file. The id comes from the game's own
+/// param.json or param.sfo: one like `../../../../tmp/AAAA…` put the package outside the
+/// folder chosen for it.
+pub fn content_id_is_plain(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Build the package. `progress` receives short phase lines.
@@ -560,7 +596,7 @@ const PARAM_JSON: &str = "sce_sys/param.json";
 /// The most bytes [`prepare`] reads whole: `param.json` and the container's payloads together
 /// (see [`read_whole`]). Real ones are a few megabytes, trophies included.
 // ponytail: 256 MiB held in memory (twice while the container is written), stream the payloads into the container if a title ever needs more
-pub(crate) const MAX_WHOLE_READS: u64 = 256 << 20;
+const MAX_WHOLE_READS: u64 = 256 << 20;
 
 /// The files [`prepare`] reads into memory: `param.json`, the icons and the other
 /// presentation and protected entries the container carries.
@@ -570,29 +606,6 @@ fn read_whole(path: &str) -> bool {
         || path == "sce_sys/icon0.dds"
         || cnt_write::PRESENTATION.iter().any(|(_, p, _)| *p == path)
         || cnt_write::PROTECTED.iter().any(|(_, p, _, _)| *p == path)
-}
-
-/// Require an LZ4-packed source's own `ampr_emu.index` (in `files`) to be there and to parse:
-/// the pack manifest's file ids are its records, so it is the one index the package can carry.
-fn check_packed_index(tree: &mut dyn source::SourceTree, files: &[SourceFile]) -> Result<()> {
-    let at = files
-        .iter()
-        .find(|f| f.path.eq_ignore_ascii_case(AMPR_INDEX))
-        .map(|f| (f.path.clone(), f.size));
-    let readable = match at {
-        Some((path, size)) if size <= MAX_WHOLE_READS => {
-            crate::ampr_index::parse(&tree.read(&path)?).is_some()
-        }
-        _ => false,
-    };
-    if readable {
-        return Ok(());
-    }
-    format_err(format!(
-        "{} holds LZ4 packs (ampr_assets.index) but no readable {AMPR_INDEX}, the one list of \
-         the files inside them: a package cannot be built from it",
-        tree.describe()
-    ))
 }
 
 /// Work out a build from `tree` without writing anything: readiness, the effective
@@ -660,7 +673,8 @@ fn prepare_with(
         .warnings()
         .map(|c| format!("{}: {}", c.name, c.detail))
         .collect();
-    let source_param = tree.read(PARAM_JSON).unwrap_or_default();
+    let source_param =
+        source::read_small(tree, PARAM_JSON, source::MAX_PARAM_BYTES).unwrap_or_default();
     // A "free" or "upgradable" DRM value makes the console show a lock and refuse to start
     // the title, so the package carries "standard". The user's file is untouched: the
     // rewritten bytes are served in its place, and the file list's size for it is adjusted
@@ -681,6 +695,16 @@ fn prepare_with(
             "content id {content_id:?} is {} characters, not 36",
             content_id.len()
         ));
+    }
+    if !content_id_is_plain(&content_id) {
+        return format_err(format!(
+            "content id {content_id:?} has characters a content id never has \
+             (only letters, digits, - and _)"
+        ));
+    }
+    // What doesn't stop the build but may stop the game, said once (see `sdk_rules::notes`).
+    for note in sdk_rules::notes(&content_id, tree) {
+        progress(&format!("warning: {note}"));
     }
     // The packaged copy has to name the id the package is built under, both in `contentId`
     // (the console checks it against the transfer's own) and in `titleId` (which it reads at
@@ -703,21 +727,63 @@ fn prepare_with(
     // Executables some dumpers leave malformed are served repaired (see `self_repair`).
     let mut repairs: std::collections::HashMap<String, (self_repair::SelfRepair, u64)> =
         std::collections::HashMap::new();
+    // This walk opens every file of the game; on a big title on Windows (where each open is
+    // slow) it took ~14 minutes with the stage showing nothing (a 156 GiB Ghost of Yotei
+    // report read as "stuck at Check source"). Report how far it got: in files visited to a
+    // caller that counts them (`control.files`, 256 files a call), else as the share of the
+    // game's bytes walked, the unit the stage row already shows; a folder reads the headers
+    // several files at a time (`read_heads`), which hides most of the per-open cost.
     let total = files.len() as u64;
-    for (done, f) in files.iter_mut().enumerate() {
-        // One header read per file: a quarter of a million of them on a large game.
-        check_cancel(control)?;
-        files_done(control, Stage::Check, done as u64, total);
-        // A backport's `fakelib/` holds newer system libraries the game loads in place of the
-        // console's own; working releases ship some with the PS4 signature, and every one of
-        // them is used exactly as shipped. Rewriting them is not a repair.
-        if f.size < 0x20 || is_fakelib(&f.path) {
-            continue;
+    let walk_total: u64 = files.iter().map(|f| f.size).sum();
+    // A backport's `fakelib/` holds newer system libraries the game loads in place of the
+    // console's own; working releases ship some with the PS4 signature, and every one of
+    // them is used exactly as shipped. Rewriting them is not a repair.
+    let checked: Vec<usize> = (0..files.len())
+        .filter(|&i| files[i].size >= 0x20 && !is_fakelib(&files[i].path))
+        .collect();
+    let checked_paths: Vec<String> = checked.iter().map(|&i| files[i].path.clone()).collect();
+    // Bytes walked once the first `n` checked files are read (plus the skipped ones before
+    // them), so the bar moves the way the old one-by-one walk did.
+    let mut walked_upto: Vec<u64> = Vec::with_capacity(checked.len() + 1);
+    {
+        let mut acc = 0u64;
+        let mut next = 0usize;
+        walked_upto.push(0);
+        for &i in &checked {
+            while next <= i {
+                acc = acc.saturating_add(files[next].size);
+                next += 1;
+            }
+            walked_upto.push(acc);
         }
-        let header = tree.read_range(&f.path, 0, 0x20)?;
+    }
+    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(checked.len());
+    let mut from = 0usize;
+    for first in (0..files.len()).step_by(FILES_EVERY as usize) {
+        check_cancel(control)?;
+        files_done(control, Stage::Check, first as u64, total);
+        let to = checked.partition_point(|&i| i < first + FILES_EVERY as usize);
+        let mut last_report = std::time::Instant::now();
+        let counted = control.files.is_some();
+        let bytes_cb = &mut control.bytes;
+        let cancel = control.cancel;
+        let mut on_progress = |n: usize| -> bool {
+            if !counted && last_report.elapsed() >= std::time::Duration::from_millis(250) {
+                last_report = std::time::Instant::now();
+                if let Some(cb) = bytes_cb.as_deref_mut() {
+                    cb(walked_upto[(from + n).min(checked.len())], walk_total);
+                }
+            }
+            !crate::workshop::checkpoint_opt(cancel)
+        };
+        heads.extend(tree.read_heads(&checked_paths[from..to], 0x20, &mut on_progress)?);
+        from = to;
+    }
+    for (&i, header) in checked.iter().zip(heads.iter()) {
+        let f = &mut files[i];
         let path = f.path.clone();
         let mut read = |offset: u64, len: usize| tree.read_range(&path, offset, len);
-        if let Some(repair) = self_repair::plan(&header, f.size, &mut read) {
+        if let Some(repair) = self_repair::plan(header, f.size, &mut read) {
             progress(&format!("repairing {}: {}", f.path, repair.describe()));
             repairs.insert(f.path.clone(), (repair, f.size));
             f.size = repair.new_size(f.size);
@@ -781,22 +847,23 @@ fn prepare_with(
     if let Some(entry) = files.iter_mut().find(|f| f.path == PARAM_JSON) {
         entry.size = param_json.len() as u64;
     }
-    // Forge patch 0023: no eboot.bin is additional content or an update; `content_class`
+    // Forge: no eboot.bin is additional content or an update; `content_class`
     // already gives it that class, so it is packaged rather than refused.
     let content_version = source::content_version_word(&param_json).unwrap_or(0);
     check_cancel(control)?;
     // The container's payloads, read once: the streaming arm hands them to the writer,
     // and reading them here keeps the source free for the range reader below.
-    let icon_png = tree.read("sce_sys/icon0.png").unwrap_or_default();
+    let mut small = |path: &str| source::read_small(&mut *tree, path, source::MAX_ARTWORK_BYTES);
+    let icon_png = small("sce_sys/icon0.png").unwrap_or_default();
     check_cancel(control)?;
-    let icon_dds = tree.read("sce_sys/icon0.dds").unwrap_or_default();
+    let icon_dds = small("sce_sys/icon0.dds").unwrap_or_default();
     // Only files still in the package: an excluded one must not reappear in the container.
     // A stop skips the reads still to come; the check after them reports it.
     let mut extras = cnt_write::presentation_extras(&mut |path| {
         if stopped(control.cancel) {
             return None;
         }
-        sizes_of(&files, path).and_then(|_| tree.read(path).ok())
+        sizes_of(&files, path).and_then(|_| small(path).ok())
     });
     // The dump's own title and NP binding files, as protected entries (see `PROTECTED`). They
     // stay in the image too; the container copy is what the console's launch checks read.
@@ -804,14 +871,51 @@ fn prepare_with(
         if stopped(control.cancel) {
             return None;
         }
-        sizes_of(&files, path).and_then(|_| tree.read(path).ok())
+        sizes_of(&files, path).and_then(|_| small(path).ok())
     }));
     check_cancel(control)?;
     // The debug license the console's launch checks need (see `license`), generated for this
     // content id. A dump's own license files are never used: they belong to another console.
     extras.extend(cnt_write::license_extras(&content_id));
+    // The game's own languages (its dump's scenario is left out above as a stale copy, but its
+    // language list and default are the game's). Packages used to declare all 31 languages,
+    // Japanese first, with en-US as the default, whatever the game shipped with.
+    let own_scenario = source::read_small(
+        tree,
+        "sce_sys/playgo-scenario.json",
+        source::MAX_PARAM_BYTES,
+    )
+    .unwrap_or_default();
+    let game_languages = cnt_write::game_languages(&own_scenario, &param_json);
+    // No scenario of the game's own naming fewer than all 31, but a chunk table of its own that
+    // does (`playgo::source_languages`): those languages, the default kept where it is one.
+    let game_languages = match game_languages {
+        Some(g) if g.supported.len() < cnt_write::SCENARIO_LANGUAGES.len() => Some(g),
+        other => match source::read_small(tree, "sce_sys/playgo-chunk.dat", 1 << 20)
+            .ok()
+            .and_then(|b| crate::playgo::source_languages(&b))
+        {
+            Some(supported) => {
+                let default = [other.as_ref().map(|g| g.default), Some("en-US")]
+                    .into_iter()
+                    .flatten()
+                    .find(|d| supported.contains(d))
+                    .unwrap_or(supported[0]);
+                Some(cnt_write::GameLanguages { supported, default })
+            }
+            None => other,
+        },
+    };
+    if let (None, Some(g)) = (request.language.as_deref(), &game_languages) {
+        progress(&format!(
+            "languages as the game declares them: {} ({} by default)",
+            g.supported.join(", "),
+            g.default
+        ));
+    }
     extras.push(cnt_write::playgo_scenario_extra(
         request.language.as_deref(),
+        game_languages.as_ref(),
     ));
     // What the container now carries, the image leaves out (see `CONTAINER_ONLY`).
     let mut carried: std::collections::HashSet<&str> = cnt_write::PRESENTATION
@@ -843,19 +947,35 @@ fn prepare_with(
     // A libSceAmpr title looks its files up through `ampr_emu.index` at the image root (see
     // `ampr_index`), and `ampr_emu` trusts its sizes. It is always generated from exactly the
     // files packaged: a dump's own copy lists the folder as it was, before the param.json
-    // rewrite, executable repairs, left-out files and the icons the container carries.
-    // An LZ4-packed source's is the exception: it also lists the files inside the packs, and
-    // ampr_emu checks each record it opens against the pack manifest (file id = record order,
-    // path, size), so any change breaks the game. That one is packaged byte for byte.
+    // rewrite, executable repairs, left-out files and the icons the container carries. An
+    // packed source's is the exception (`source::packed_kind`, LZ4 or zstd packs): it lists the
+    // files inside the packs, which are not on disk to list, so it goes in byte for byte.
     let mut generated: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     let dump_index = files
         .iter()
         .any(|f| f.path.eq_ignore_ascii_case(AMPR_INDEX));
-    if source::lz4_packed(tree)? {
-        check_packed_index(tree, &files)?;
+    if let Some(packs) = source::packed_kind(tree)? {
+        let at = files
+            .iter()
+            .find(|f| f.path.eq_ignore_ascii_case(AMPR_INDEX))
+            .map(|f| f.path.clone());
+        let readable = match at {
+            Some(path) => {
+                crate::ampr_index::parse(&source::read_small(tree, &path, source::MAX_INDEX_BYTES)?)
+                    .is_some()
+            }
+            None => false,
+        };
+        if !readable {
+            return format_err(format!(
+                "{} holds {packs} packs but no readable {AMPR_INDEX}, the one list of the \
+                 files inside them, so a package can't be made from it",
+                tree.describe()
+            ));
+        }
         progress(&format!(
-            "keeping the LZ4-packed source's {AMPR_INDEX} as it is: it must match the packs"
+            "keeping the {packs}-packed game's {AMPR_INDEX}: it has to match the packs"
         ));
     } else if dump_index || readiness.imports_ampr {
         files.retain(|f| !f.path.eq_ignore_ascii_case(AMPR_INDEX));
@@ -1020,8 +1140,8 @@ fn prepare_with(
 /// deletes, and on success it holds the whole package, synced, which the caller publishes.
 /// `tree` is the tree `prepared` came from.
 ///
-/// The package is read back through `out` itself with [`verify::verify_file_controlled`] (a
-/// seeded sample of its blocks with [`BuildControl::sample`]) and the report is returned in [`BuildReport::verify`]; a package that fails a check is an error
+/// The package is read back through `out` itself with [`verify::verify_file_controlled`] and
+/// the report is returned in [`BuildReport::verify`]; a package that fails a check is an error
 /// (whose message carries the report), so an `Ok` report always has `verify.ok()`. A set
 /// [`BuildControl::cancel`] ends any stage with [`crate::Error::Cancelled`].
 pub fn write_package(
@@ -1076,7 +1196,16 @@ fn build_mode(
     control: &mut BuildControl,
     mode: Mode,
 ) -> Result<BuildReport> {
-    let mut tree = source::open(&request.source)?;
+    let opened = source::open(&request.source)?;
+    let opened = match &request.reader {
+        Some(reader) => (reader.0)(opened).map_err(crate::Error::Format)?,
+        None => opened,
+    };
+    // An unsigned executable would install and then never start: it goes in fake-signed.
+    let (mut tree, signing) = crate::fself::wrap(opened);
+    if let Some(line) = signing.describe() {
+        progress(&line);
+    }
     let prepared = prepare_with(tree.as_mut(), request, progress, control)?;
 
     // Refuse before the first write rather than fill the disk and fail halfway: a game
@@ -1129,8 +1258,12 @@ fn build_mode(
             final_path.display()
         ));
     }
-    std::fs::rename(&partial, &final_path)?;
+    // Written and verified: from here the `.partial` is never removed. A rename that still
+    // fails after its retries leaves it for the user to rename.
     leftover.keep();
+    if let Err(e) = crate::finish::rename(&partial, &final_path) {
+        return format_err(crate::finish::kept_message(&partial, &final_path, &e));
+    }
     let size = std::fs::metadata(&final_path)?.len();
     debug_assert_eq!(size, written);
     progress("done");
@@ -1153,7 +1286,13 @@ fn verify_written(
 ) -> Result<crate::verify::Report> {
     enter(control, Stage::Verify);
     let file = crate::PkgFile::from_reader(Box::new(out.try_clone_out()?), out.out_len()?);
-    progress("verifying");
+    match control.sample {
+        Some(seed) => progress(&format!(
+            "verifying (fast: sampled blocks, seed {seed}, policy {})",
+            crate::sample::POLICY
+        )),
+        None => progress("verifying"),
+    }
     // The streaming verifier reads the package block by block, so the self-check of a
     // 155 GB package does not need 155 GB of memory.
     let cancel = control.cancel;
@@ -1162,12 +1301,13 @@ fn verify_written(
             f(done, total);
         }
     };
-    let report = verify::verify_file_sampled(
+    // Stop ends the read-back as it does the write (a 155 GB package takes minutes to check).
+    let report = verify::verify_file_controlled(
         file,
         &prepared.request.passcode,
-        &mut verify_bytes,
-        cancel,
         control.sample,
+        cancel,
+        &mut verify_bytes,
     )?;
     // A stop asked for during the last read is still a stop: the package is not accepted.
     check_cancel(control)?;
@@ -1643,6 +1783,27 @@ pub struct Inspection {
     /// For a libSceAmpr title, whether an image can carry LZ4 asset packs (see
     /// [`crate::ampr_pack::image::readiness`]); `None` for any other title.
     pub ampr_packs: Option<crate::ampr_pack::image::Readiness>,
+    /// For a game in zstd asset packs, the runtime it carries and whether it needs a newer one
+    /// ([`crate::ampr_pack::ng::zstd_runtime`]); `None` for any other game.
+    pub zstd_runtime: Option<crate::ampr_pack::ng::ZstdRuntime>,
+    /// Which asset packs the game's files are in: `lz4` or `zstd` ([`source::packed_kind`]);
+    /// `None` for a plain game. A packed game can be written out as plain files again.
+    pub packs: Option<&'static str>,
+    /// How many of its executables are plain ELF files, which a build fake-signs.
+    pub unsigned_executables: usize,
+    /// A PS4 game, update or add-on: it becomes an image or a folder, not a PS5 package.
+    pub ps4_game: bool,
+    /// The version it says it is: `contentVersion`, or a PS4 game's `APP_VER`.
+    pub content_version: Option<String>,
+    /// What a PS4 source is: `game`, `patch` (an update, which goes into its game: see
+    /// [`crate::ps4_merge`]) or `addon`. Absent for a PS5 one.
+    pub ps4_kind: Option<crate::ps4_pkg::Ps4Kind>,
+    /// The PS4 title it is or belongs to (`CUSA…`): an update's or add-on's game.
+    pub ps4_title_id: Option<String>,
+    /// An add-on: whether it holds files (`false`: a licence, nothing to convert).
+    pub ps4_addon_data: Option<bool>,
+    /// Inspected with an update merged in: what the merge is.
+    pub ps4_merge: Option<crate::ps4_merge::MergeInfo>,
 }
 
 impl Inspection {
@@ -1771,7 +1932,8 @@ pub fn estimate(source_path: &Path, output_dir: Option<&Path>) -> Result<Estimat
     if total == 0 {
         return format_err("the source has no data to estimate");
     }
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // What the build's pool will get, "use less of this computer" included.
+    let threads = crate::workshop::workshop_threads();
     let wanted = ESTIMATE_BLOCKS.max(threads * 4);
     let step = (total / wanted as u64).max(1);
     let mut blocks = Vec::new();
@@ -1852,10 +2014,112 @@ pub fn estimate(source_path: &Path, output_dir: Option<&Path>) -> Result<Estimat
 
 /// Look at a source without building it: readiness, geometry, cost and room.
 pub fn inspect(source_path: &Path, output_dir: &Path) -> Result<Inspection> {
-    let mut tree = source::open(source_path)?;
+    inspect_with_update(source_path, None, output_dir)
+}
+
+/// What an add-on that is only a licence is: nothing to convert, said as a failed check.
+fn licence_only(source_path: &Path, info: &crate::ps4_pkg::Ps4Info) -> Inspection {
+    Inspection {
+        source: format!("PS4 add-on package (a licence) {}", source_path.display()),
+        files: 0,
+        bytes: 0,
+        content_id: Some(info.content_id.clone()),
+        title: info.text("TITLE"),
+        required_firmware: None,
+        planned_size: 0,
+        output_free: None,
+        checks: vec![source::Check {
+            name: "add-on data".into(),
+            ok: false,
+            detail: crate::ps4_pkg::LICENCE_ONLY.into(),
+        }],
+        ampr_packs: None,
+        zstd_runtime: None,
+        packs: None,
+        unsigned_executables: 0,
+        ps4_game: true,
+        content_version: info.text("APP_VER"),
+        ps4_kind: Some(crate::ps4_pkg::Ps4Kind::Addon),
+        ps4_title_id: Some(info.title_id()),
+        ps4_addon_data: Some(false),
+        ps4_merge: None,
+    }
+}
+
+/// [`inspect`], with the PS4 update at `update` merged into the game at `source_path`
+/// ([`crate::ps4_merge`]): the merged game as an image or folder of it would hold it.
+pub fn inspect_with_update(
+    source_path: &Path,
+    update: Option<&Path>,
+    output_dir: &Path,
+) -> Result<Inspection> {
+    use crate::ps4_pkg::Ps4Kind;
+    // A PS4 package says what it is in its container, even an add-on with no files.
+    let peeked = crate::ps4_pkg::peek_path(source_path).ok().flatten();
+    if let Some(info) = &peeked {
+        if update.is_none() && info.kind == Ps4Kind::Addon && !info.has_image {
+            return Ok(licence_only(source_path, info));
+        }
+    }
+    let (mut tree, merge): (Box<dyn source::SourceTree>, _) = match update {
+        Some(update) => {
+            let merged = crate::ps4_merge::open(source_path, update)?;
+            let info = merged.info().clone();
+            (Box::new(merged), Some(info))
+        }
+        None => (source::open(source_path)?, None),
+    };
     let files: Vec<SourceFile> = tree.files().to_vec();
-    let checks = source::readiness(tree.as_mut()).checks;
-    let param = tree.read("sce_sys/param.json").unwrap_or_default();
+    let mut checks = source::readiness(tree.as_mut()).checks;
+    // A source that leaves files out says so (a patch package, a protected container entry
+    // that does not decrypt: see `pkg_source`).
+    checks.extend(tree.notes().into_iter().map(|detail| source::Check {
+        name: "nothing left out".into(),
+        ok: false,
+        detail,
+    }));
+    // A PS4 game: param.sfo, no param.json. What a PS5 package needs is no warning for it.
+    let has = |name: &str| files.iter().any(|f| f.path.eq_ignore_ascii_case(name));
+    let ps4_game = has("sce_sys/param.sfo") && !has("sce_sys/param.json");
+    let sfo = if ps4_game {
+        source::read_small(tree.as_mut(), "sce_sys/param.sfo", source::MAX_PARAM_BYTES)
+            .ok()
+            .and_then(|b| ps5upload_pkg::sfo_params(&b).ok())
+            .unwrap_or_default()
+    } else {
+        // An add-on's param.sfo is in its container, not among its files.
+        peeked
+            .as_ref()
+            .map(|p| p.params.clone())
+            .unwrap_or_default()
+    };
+    let sfo_text = |key: &str| crate::ps4_pkg::sfo_text(&sfo, key);
+    let ps4_kind = match (&merge, &peeked) {
+        (Some(_), _) => Some(Ps4Kind::Game),
+        (None, Some(p)) => Some(p.kind),
+        (None, None) if ps4_game => Some(
+            Ps4Kind::of_category(&sfo_text("CATEGORY").unwrap_or_default())
+                .unwrap_or(Ps4Kind::Game),
+        ),
+        (None, None) => None,
+    };
+    let ps4_game = ps4_game || ps4_kind.is_some();
+    if ps4_kind == Some(Ps4Kind::Addon) {
+        // Its files are what the game reads at its mount point: no game's checks apply.
+        checks.retain(|c| c.name == "source");
+    }
+    if ps4_game {
+        const PS5_ONLY: [&str; 5] = [
+            "param.json present",
+            "no param.sfo",
+            "content id",
+            "icon0.png and icon0.dds present",
+            "sce_sys/about/right.sprx present",
+        ];
+        checks.retain(|c| !PS5_ONLY.contains(&c.name.as_str()));
+    }
+    let param = source::read_small(tree.as_mut(), "sce_sys/param.json", source::MAX_PARAM_BYTES)
+        .unwrap_or_default();
     let json: Option<serde_json::Value> = serde_json::from_slice(
         std::str::from_utf8(&param)
             .unwrap_or_default()
@@ -1863,23 +2127,47 @@ pub fn inspect(source_path: &Path, output_dir: &Path) -> Result<Inspection> {
             .as_bytes(),
     )
     .ok();
-    let title = json.as_ref().and_then(title_of);
+    let title = json
+        .as_ref()
+        .and_then(title_of)
+        .or_else(|| sfo_text("TITLE"));
     let required_firmware = json.as_ref().and_then(firmware_version);
+    let content_version = json
+        .as_ref()
+        .and_then(|j| j.get("contentVersion"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| sfo_text("APP_VER"));
     let planned_size = if files.is_empty() {
         0
     } else {
         estimate_size(&plan::build(&files)?)?
     };
+    let ps4_title_id = ps4_kind.map(|_| match &peeked {
+        Some(p) if merge.is_none() => p.title_id(),
+        _ => sfo_text("TITLE_ID").unwrap_or_default(),
+    });
     Ok(Inspection {
         source: tree.describe(),
         files: files.len(),
         bytes: files.iter().map(|f| f.size).sum(),
-        content_id: source::content_id(&param),
+        content_id: source::content_id(&param)
+            .or_else(|| sfo_text("CONTENT_ID"))
+            .or_else(|| peeked.as_ref().map(|p| p.content_id.clone())),
         title,
         required_firmware,
         planned_size,
         output_free: free_bytes(output_dir),
         checks,
         ampr_packs: crate::ampr_pack::image::readiness(tree.as_mut()),
+        zstd_runtime: crate::ampr_pack::ng::zstd_runtime(tree.as_mut()),
+        packs: source::packed_kind(tree.as_mut()).ok().flatten(),
+        unsigned_executables: crate::fself::unsigned(tree.as_mut()).len(),
+        ps4_game,
+        content_version,
+        ps4_kind,
+        ps4_title_id,
+        ps4_addon_data: (ps4_kind == Some(Ps4Kind::Addon)).then_some(true),
+        ps4_merge: merge,
     })
 }

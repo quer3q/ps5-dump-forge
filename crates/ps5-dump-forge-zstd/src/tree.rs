@@ -1,14 +1,7 @@
-//! The packed output as a tree, without writing it: the source's loose files plus the
-//! `ampr_zstd.index` and volumes `pack` would write, at their sizes from a
-//! [`crate::writer::measure`] pass. A volume's bytes are made on demand: its header from the
-//! index, each chunk re-read from its source file, compressed again by the one encoder `pack`
-//! uses and checked against the index (codec and stored length; a zstd frame is decoded and
-//! must give back the source bytes). So an image writer can take the packs straight from the
-//! source, with no staging folder.
-//!
-//! Memory: the [`Index`] (16 B per chunk), one batch of stored chunks (one per compression
-//! thread, at most [`crate::writer::MAX_THREADS`] x 256 KiB) and the next batch's source bytes,
-//! read while this one compresses.
+//! The packed output as a tree from a [`crate::writer::measure`] pass: loose files plus the index
+//! and volumes, chunks re-read, recompressed and checked against the index (a zstd frame decoded
+//! back). Memory: the [`Index`] (16 B per chunk), one batch of chunks and the next batch's source
+//! bytes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +21,6 @@ fn bad(message: impl Into<String>) -> Error {
     Error::Format(message.into())
 }
 
-/// See the module docs. `inner` is the tree the index was measured on.
 pub struct PackedTree<'a> {
     inner: &'a mut dyn SourceTree,
     index: &'a Index,
@@ -46,8 +38,7 @@ pub struct PackedTree<'a> {
     ahead: Option<(usize, Vec<Vec<u8>>)>,
 }
 
-/// The file chunk `c` belongs to and its offset there. The last record starting at or before
-/// `c` holds it (an empty file starts where the next one does).
+/// The file chunk `c` belongs to and its offset there (an empty file starts where the next does).
 fn locate(index: &Index, c: usize) -> (&FileRecord, u64) {
     let i = index
         .files
@@ -108,9 +99,8 @@ fn regenerate(index: &Index, c: usize, raw: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 impl<'a> PackedTree<'a> {
-    /// `index` must come from `measure` over `inner` (each packed file at its measured size);
-    /// every other file of `inner` stays loose. `threads` compress (0: every core), at most
-    /// [`crate::writer::MAX_THREADS`]; `cancel` stops a volume read between batches.
+    /// `index` must come from `measure` over `inner`; other files stay loose. `threads` (0: every
+    /// core, at most `MAX_THREADS`); `cancel` stops between batches.
     pub fn new(
         inner: &'a mut dyn SourceTree,
         index: &'a Index,
@@ -187,8 +177,8 @@ impl<'a> PackedTree<'a> {
         })
     }
 
-    /// Makes the batch from chunk `c` on (one chunk per thread, in parallel) while the next
-    /// batch's source bytes are read.
+    /// Makes the batch from chunk `c` on, one chunk per thread, while the next batch's source is
+    /// read.
     fn fill(&mut self, c: usize) -> Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
@@ -218,7 +208,6 @@ impl<'a> PackedTree<'a> {
         Ok(())
     }
 
-    /// The stored bytes of chunk `c`.
     fn chunk(&mut self, c: usize) -> Result<&[u8]> {
         let (at, made) = &self.window;
         if !(*at..at + made.len()).contains(&c) {

@@ -23,8 +23,9 @@
 //! the spare and the plan/stream split, are PS5 Dump Forge's.)
 //!
 //! What is deliberately not done: no timestamps from the source (a fixed one, so the same
-//! folder always gives the same image), no volume label, no `ampr_emu.index` generation (the
-//! image is the folder as it is).
+//! folder always gives the same image), no volume label, no `ampr_emu.index` generation here
+//! (the image is the tree it is given; the engine's image build hands it a libSceAmpr game with
+//! a regenerated index, `AmprIndexed`).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -184,7 +185,21 @@ fn name_units(name: &str) -> Result<Vec<u16>> {
             "\"{name}\" cannot be stored: exFAT does not allow {bad:?} in a name"
         ));
     }
+    // macOS hands out decomposed names; a game looks its files up by the composed spelling, and
+    // exFAT compares units, not canonical equivalents. The UFS2 writer refuses these too.
+    if !unicode_normalization::is_nfc(name) {
+        return format_err(format!(
+            "\"{name}\" cannot be stored: the name is decomposed (NFD, usually from a Mac), so \
+             the game could not find the file. Rename it, or copy the game from another computer"
+        ));
+    }
     Ok(units)
+}
+
+/// Why exFAT cannot hold `name`, for a caller that wants to refuse it before planning an image
+/// (the image browser's rename and new folder).
+pub(crate) fn check_name(name: &str) -> Result<()> {
+    name_units(name).map(|_| ())
 }
 
 #[derive(Default)]
@@ -589,6 +604,21 @@ pub fn write_exfat<W: Write>(
     on_progress: &mut dyn FnMut(u64, u64),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<u64> {
+    write_exfat_after(plan, source, w, 0, on_progress, cancelled)
+}
+
+/// [`write_exfat`] for a writer that drops the image's first `skip` bytes because they are on disk
+/// already: a file that ends before them isn't read, only stands in as zeros, so going on after a
+/// crash costs what is left. The image is the same bytes: its layout and serial follow from the
+/// files alone.
+pub fn write_exfat_after<W: Write>(
+    plan: &ExfatPlan,
+    source: &mut dyn SourceTree,
+    w: &mut W,
+    skip: u64,
+    on_progress: &mut dyn FnMut(u64, u64),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<u64> {
     let (tree, l, used) = (&plan.tree, &plan.l, plan.used);
     let total = plan.data_bytes;
     let boot = boot_region(l, tree.nodes[0].first_cluster, used);
@@ -648,6 +678,16 @@ pub fn write_exfat<W: Write>(
     for &f in &l.files {
         let (src, size) = (tree.nodes[f].src.clone(), tree.nodes[f].size);
         let mut at = 0u64;
+        if skip > 0 && size > 0 {
+            let first = u64::from(tree.nodes[f].first_cluster);
+            let start = l.heap_sectors * SECTOR + (first - u64::from(FIRST_CLUSTER)) * l.cluster;
+            if start + tree.nodes[f].clusters * l.cluster <= skip {
+                zeros(w, tree.nodes[f].clusters * l.cluster)?;
+                done += size;
+                on_progress(done, total);
+                continue;
+            }
+        }
         while at < size {
             if cancelled() {
                 return Err(Error::Cancelled);

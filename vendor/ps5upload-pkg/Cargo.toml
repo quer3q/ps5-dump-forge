@@ -2,7 +2,7 @@
 name = "ps5upload-pkg"
 edition = "2021" # upstream ps5upload is 2021; kept to minimise the vendor diff
 license = "GPL-3.0-or-later"
-version = "7.0.22" # pinned upstream tag v7.0.22
+version = "12.6.30" # pinned upstream tag v12.6.30
 
 [dependencies]
 # PS3 NPDRM packages: SHA-1 keystream (debug) and AES-128 counter mode (retail).

@@ -5,20 +5,11 @@
 #
 #   scripts/make-payloads-json.sh dist/ps5-dump-forge-<ver>-ps5.elf [dist/payloads.json]
 #
-# The release uploads the result as `payloads.json`; GitHub serves the latest published release's
-# copy at a fixed address, which is the one to add to the manager:
-#
-#   https://github.com/<owner>/<repo>/releases/latest/download/payloads.json
-#
-# The version is Cargo.toml's (check-versions.sh makes the other files agree) and the ELF's name
-# must be ps5-dump-forge-<version>-ps5.elf, as release-ps5.sh names it. Env: GITHUB_REPOSITORY
-# (default quer3q/ps5-dump-forge) names the repository the download URL points into;
-# PAYLOADS_DATE (default: today, UTC) is `last_update`.
-#
-# `filename` is the stable ps5-dump-forge.elf, not the versioned asset name: it is the name the
-# manager saves the payload under, so an autoload entry keeps working across updates, while `url`
-# names this release's asset. The values are all produced here (digits, hex, a fixed text), so the
-# JSON is written with printf and needs no jq; the check below parses it back.
+# The manager's address: https://github.com/<owner>/<repo>/releases/latest/download/payloads.json
+# The version is Cargo.toml's; the ELF must be named ps5-dump-forge-<version>-ps5.elf.
+# Env: GITHUB_REPOSITORY (default quer3q/ps5-dump-forge), PAYLOADS_DATE (default today, UTC).
+# `filename` is the stable ps5-dump-forge.elf, so an autoload entry survives updates. Every value
+# is made here, so printf writes the JSON (no jq); the check below parses it back.
 set -euo pipefail
 
 # Paths are the caller's: only Cargo.toml is read from the repository root.

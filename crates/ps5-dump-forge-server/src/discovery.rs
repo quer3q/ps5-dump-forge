@@ -1,7 +1,5 @@
-//! Forge discovery on UDP 8094: a passive responder that is always on, and a 10 s active
-//! search (the Discover button). A query is a broadcast; a reply names the device (name,
-//! platform, FLINK port, key id) and never the magic code. A reply from a paired key id is
-//! handed to `Connect::discovered` (its address, for liveness).
+//! Forge discovery on UDP 8094: an always-on responder and a 10 s broadcast search. A reply
+//! names the device (name, platform, FLINK port, key id).
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -25,13 +23,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// What a reply says about its device (never the code).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub key_id: String,
     pub name: String,
     pub platform: String,
-    /// Its FLINK port.
+
     pub port: u16,
 }
 
@@ -48,7 +45,6 @@ impl Node {
     }
 }
 
-/// A Forge device a search found.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Found {
     pub key_id: String,
@@ -115,7 +111,6 @@ struct Worker {
     address: SocketAddr,
 }
 
-/// Owned by the Connect service; the worker owns only the snapshot and the callback.
 pub struct Discovery {
     shared: Arc<Mutex<Snapshot>>,
     worker: Mutex<Option<Worker>>,
@@ -126,8 +121,7 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    /// The responder on `0.0.0.0:port` (`PORT`; 0 = any, for tests). A port in use is
-    /// reported in `scan().error` and retried by `start`.
+    /// The responder on `0.0.0.0:port` (0 = any); a port in use is reported and retried.
     pub fn new(node: Node, port: u16, on_reply: OnReply) -> Self {
         Self::new_on(
             node,
@@ -159,7 +153,6 @@ impl Discovery {
         discovery
     }
 
-    /// The responder's address (tests: queries go there).
     pub fn address(&self) -> Option<SocketAddr> {
         lock(&self.worker).as_ref().map(|w| w.address)
     }
@@ -198,7 +191,6 @@ impl Discovery {
         lock(&self.shared).active_until = None;
     }
 
-    /// Stops and joins the passive responder as well.
     pub fn shutdown(&self) {
         if let Some(worker) = lock(&self.worker).take() {
             worker.cancel.store(true, Ordering::Release);
@@ -267,8 +259,7 @@ impl Discovery {
     }
 }
 
-/// Asks one device's responder (`at`, by unicast: the query Discover broadcasts) who it is,
-/// waiting up to `wait`: its node, or `None` when no valid reply from that address came.
+/// Asks one device's responder by unicast who it is, waiting up to `wait`.
 pub fn ask(at: SocketAddrV4, wait: Duration) -> io::Result<Option<Node>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     let scan_id = random_id()?;
@@ -351,8 +342,7 @@ fn run(
                 continue;
             };
             let targets = injected.clone().unwrap_or_else(|| {
-                // Some payload/libc combinations can't list interfaces; the limited broadcast
-                // still goes out on the interface the OS picks.
+                // Some payload/libc combinations can't list interfaces: limited broadcast only.
                 broadcast_targets()
                     .unwrap_or_else(|_| vec![SocketAddrV4::new(Ipv4Addr::BROADCAST, PORT)])
             });
@@ -390,8 +380,7 @@ fn run(
                     {
                         continue;
                     }
-                    // A network going down and up (or the PS5's rest mode: ENETDOWN, ENOBUFS)
-                    // must not end the responder: this device would stop being found.
+                    // A network down/up or rest mode (ENETDOWN, ENOBUFS) mustn't end the responder.
                     // ponytail: the sockets are never bound again.
                     Err(e) => {
                         if !failing {
@@ -477,8 +466,7 @@ fn broadcast_targets() -> io::Result<Vec<SocketAddrV4>> {
     #[cfg(unix)]
     {
         let mut head = std::ptr::null_mut();
-        // SAFETY: getifaddrs initializes head on success. The list remains alive
-        // throughout traversal; address families are checked before sockaddr casts.
+        // SAFETY: getifaddrs initializes head on success; families are checked before casts.
         unsafe {
             if libc::getifaddrs(&mut head) != 0 {
                 return Err(io::Error::last_os_error());
@@ -520,8 +508,7 @@ fn broadcast_targets() -> io::Result<Vec<SocketAddrV4>> {
             }
         }
     }
-    // ponytail: Windows uses limited broadcast on the OS-selected interface;
-    // multi-interface subnet enumeration there awaits a native adapter API.
+    // ponytail: Windows uses limited broadcast on the OS-selected interface only.
     addresses.push(SocketAddrV4::new(Ipv4Addr::BROADCAST, PORT));
     addresses.sort_unstable();
     addresses.dedup();
@@ -552,8 +539,7 @@ mod tests {
     fn lifecycle_on_loopback() {
         let remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let target = v4(remote.local_addr().unwrap());
-        // A busy responder port is reported. ponytail: the retry once free isn't tested here: a freed
-        // ephemeral port can be taken by a parallel test before the retry binds it.
+        // A busy responder port is reported (the retry isn't tested: a parallel test may take it).
         let busy = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let busy_at = v4(busy.local_addr().unwrap());
         let noop: OnReply = Arc::new(|_, _| {});

@@ -1,0 +1,70 @@
+/* Queue screen and the job row's segmented bar, stage breadcrumb and result line (JobList.tsx, Queue.tsx). Kept out of
+   styles.css while the prototype settles. */
+
+/* Queue head: counts, actions, filter chips (no screen title: the rail names the screen). */
+.queue-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 14px;
+}
+.queue-counts { flex: 1 1 220px; min-width: 0; margin: 0; font-size: 13px; }
+.queue-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.queue-filter { flex-basis: 100%; }
+.queue-filter .chip-count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.queue-head .bad { flex-basis: 100%; margin: 0; }
+
+/* Segmented bar (issue #70): one segment per stage, as wide as its weight; passed ones full,
+   the current one filled to --p with a sheen while the job runs, later ones the track. */
+.segbar { display: flex; gap: 4px; margin-top: 10px; height: 8px; }
+.segbar-seg {
+  position: relative; flex: 1 1 0; min-width: 6px; overflow: hidden; border-radius: 999px; background: var(--bar-track);
+}
+.segbar-seg.done { background: var(--accent); }
+.segbar-seg.now {
+  background: linear-gradient(90deg, var(--accent) calc(var(--p, 0) * 100%), var(--bar-track) 0);
+}
+[dir="rtl"] .segbar-seg.now {
+  background: linear-gradient(270deg, var(--accent) calc(var(--p, 0) * 100%), var(--bar-track) 0);
+}
+.segbar-seg.alive::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.22), transparent);
+  transform: translateX(-100%); animation: seg-sheen 1.8s ease-in-out infinite;
+}
+[dir="rtl"] .segbar-seg.alive::after { animation-direction: reverse; }
+@keyframes seg-sheen { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) { .segbar-seg.alive::after { animation: none; display: none; } }
+
+/* Stage breadcrumb: "✓ Reading › ✓ Checking › Compressing › Writing": done ones with a green
+   tick, the current one bold in the accent, later ones muted, a failed one red. */
+ol.stage-crumbs {
+  list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 0;
+  font-size: 12.5px; line-height: 1.5; color: var(--muted);
+}
+ol.stage-crumbs li { display: inline-flex; align-items: center; gap: 4px; }
+ol.stage-crumbs li .icon { width: 12px; height: 12px; }
+ol.stage-crumbs li.done { color: var(--fg-2); }
+ol.stage-crumbs li.done .icon { color: var(--good, var(--ok)); }
+ol.stage-crumbs li.now { color: var(--accent-ink, var(--accent)); font-weight: 600; }
+ol.stage-crumbs li.fail { color: var(--danger); font-weight: 600; }
+ol.stage-crumbs .sep { margin: 0 6px; color: var(--muted); font-weight: 400; }
+[dir="rtl"] ol.stage-crumbs .sep { display: inline-block; transform: scaleX(-1); }
+
+/* Status line: the pill, then the stage's percent, speed, time left and time in the step; a
+   finished job's size, files and output. */
+.job-status .meta strong { font-variant-numeric: tabular-nums; }
+.result-line { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; min-width: 0; color: var(--fg, var(--ink)); }
+.result-line .arrow { color: var(--muted); }
+[dir="rtl"] .result-line .arrow { display: inline-block; transform: scaleX(-1); }
+.result-line .path { font-family: var(--font-mono); font-size: 12px; direction: ltr; overflow-wrap: anywhere; }
+.result-more { margin: 4px 0 0; font-size: 12.5px; }
+
+/* A job's log panel (JobList.tsx `Log`): count, filter, Auto-scroll, Copy, Save, Clear; lines
+   inked by what they say. */
+.log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 6px 0 6px; font-size: 12.5px; }
+.log-count { color: var(--muted); font-variant-numeric: tabular-nums; margin-inline-end: auto; }
+.log-filter { flex: 0 1 180px; min-width: 0; padding: 3px 8px; font-size: 12.5px; }
+.log-follow { display: inline-flex; align-items: center; gap: 5px; color: var(--fg-2, var(--muted)); cursor: pointer; }
+.log-said { color: var(--muted); font-size: 12px; }
+pre.log.log-panel { max-height: 320px; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
+pre.log-panel .good { color: var(--good, var(--ok)); }
+pre.log-panel .bad { color: var(--danger); }
+pre.log-panel .warn { color: var(--warn, var(--orange)); }

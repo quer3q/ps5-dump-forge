@@ -1,5 +1,5 @@
 diff --git a/ps5upload-fpkg/src/cnt.rs b/ps5upload-fpkg/src/cnt.rs
-index 09c34ae..eca8fb7 100644
+index 09c34aef17ea67fc6bae47d6d2fb61a9ee298805..eca8fb78528e2f30d0a5000943e53276cea00aab 100644
 --- a/ps5upload-fpkg/src/cnt.rs
 +++ b/ps5upload-fpkg/src/cnt.rs
 @@ -28,6 +28,7 @@ pub mod ids {
@@ -40,7 +40,7 @@ index 09c34ae..eca8fb7 100644
      ];
  }
 diff --git a/ps5upload-fpkg/src/cnt_write.rs b/ps5upload-fpkg/src/cnt_write.rs
-index 66e6a93..7ed06d9 100644
+index c7f96124b03d529cdc3cb2f71dce53825b0cce70..b6b86118c215ef3c91b166371358b0ed0458e839 100644
 --- a/ps5upload-fpkg/src/cnt_write.rs
 +++ b/ps5upload-fpkg/src/cnt_write.rs
 @@ -48,8 +48,10 @@ const ENTRIES: [(u32, u32, &str); 13] = [
@@ -80,7 +80,7 @@ index 66e6a93..7ed06d9 100644
      "sce_sys/pic2.dds",
      "sce_sys/snd0.at9",
      "sce_sys/save_data.png",
-@@ -897,7 +902,7 @@ mod tests {
+@@ -959,7 +964,7 @@ mod tests {
  
      /// The layout of a Publishing Tools package with every presentation entry: table in id
      /// order, payloads in its body order and on 16-byte boundaries, the system digest over
@@ -89,7 +89,7 @@ index 66e6a93..7ed06d9 100644
      /// The document LibProsperoPkg writes, byte for byte (its Minecraft package: 2,293 bytes).
      #[test]
      fn playgo_scenario_matches_the_reference() {
-@@ -968,16 +973,16 @@ mod tests {
+@@ -1079,16 +1084,16 @@ mod tests {
          let mut sorted = table.clone();
          sorted.sort();
          assert_eq!(table, sorted, "the entry table is in id order");

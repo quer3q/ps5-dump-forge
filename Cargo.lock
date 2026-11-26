@@ -2572,12 +2572,12 @@ dependencies = [
 name = "ps5-dump-forge-cli"
 version = "0.5.7"
 dependencies = [
- "anyhow",
  "libc",
  "ps5-dump-forge-core",
  "ps5-dump-forge-lz4",
  "ps5-dump-forge-ps5",
  "ps5-dump-forge-server",
+ "ps5-dump-forge-updater",
  "ps5-dump-forge-zstd",
  "ps5upload-fpkg",
  "serde_json",
@@ -2603,6 +2603,7 @@ dependencies = [
  "ps5-dump-forge-pfs",
  "ps5-dump-forge-smb",
  "ps5-dump-forge-ufs2",
+ "ps5-dump-forge-updater",
  "ps5-dump-forge-zstd",
  "ps5upload-fpkg",
  "serde",
@@ -2652,6 +2653,7 @@ dependencies = [
  "anyhow",
  "dunce",
  "ps5-dump-forge-core",
+ "ps5-dump-forge-lz4",
  "ps5-dump-forge-server",
  "ps5-dump-forge-updater",
  "serde_json",
@@ -2713,6 +2715,7 @@ dependencies = [
  "libc",
  "ps5-dump-forge-core",
  "ps5-dump-forge-flink",
+ "ps5-dump-forge-lz4",
  "ps5-dump-forge-nfs",
  "ps5-dump-forge-smb",
  "ps5-dump-forge-updater",
@@ -2749,6 +2752,9 @@ name = "ps5-dump-forge-updater"
 version = "0.5.7"
 dependencies = [
  "libc",
+ "ring",
+ "rustls",
+ "serde_json",
  "ureq",
 ]
 
@@ -2765,9 +2771,10 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-fpkg"
-version = "7.0.22"
+version = "12.6.30"
 dependencies = [
  "aes",
+ "blake3",
  "crc32fast",
  "flate2",
  "getrandom 0.4.3",
@@ -2778,15 +2785,17 @@ dependencies = [
  "ps5upload-pkg",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.11.0",
  "sha3",
  "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "ps5upload-pkg"
-version = "7.0.22"
+version = "12.6.30"
 dependencies = [
  "aes",
  "blake3",

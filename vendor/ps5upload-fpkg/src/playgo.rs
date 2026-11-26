@@ -26,6 +26,38 @@ pub const DEFAULT_CHUNKS: u16 = 1;
 /// The most chunks the format's scenario table and the SDK allow.
 pub const MAX_CHUNKS: u16 = 255;
 
+/// The languages a source's own `playgo-chunk.dat` gives its chunks (`plgx` version `0x1000`:
+/// each chunk's attribute entry, `0x20` bytes from the table at header `0xC0`, holds a `u64`
+/// language mask at `+0x10`, bit 63 the first of [`crate::cnt_write::SCENARIO_LANGUAGES`]),
+/// in that list's order. `None` when the file doesn't read as one, or when its chunks name
+/// every language or none of the known ones: nothing to narrow.
+pub fn source_languages(chunk_dat: &[u8]) -> Option<Vec<&'static str>> {
+    let le16 = |at: usize| u16::from_le_bytes([chunk_dat[at], chunk_dat[at + 1]]);
+    let le32 = |at: usize| u32::from_le_bytes(chunk_dat[at..at + 4].try_into().unwrap()) as usize;
+    if chunk_dat.len() < 0x100
+        || &chunk_dat[..4] != b"plgx"
+        || (le16(4), le16(6)) != (0x1000, 0)
+        || le32(0x10) != chunk_dat.len()
+    {
+        return None;
+    }
+    let chunks = le16(0x0a) as usize;
+    let (at, size) = (le32(0xc0), le32(0xc4));
+    if chunks == 0 || size != chunks * 0x20 || at < 0x100 || at.checked_add(size)? > chunk_dat.len()
+    {
+        return None;
+    }
+    let mask = (0..chunks)
+        .map(|k| u64::from_le_bytes(chunk_dat[at + k * 0x20 + 0x10..][..8].try_into().unwrap()))
+        .fold(0, |all, m| all | m);
+    let known = crate::cnt_write::SCENARIO_LANGUAGES.len();
+    let list: Vec<&'static str> = (0..known)
+        .filter(|&bit| mask >> (63 - bit) & 1 == 1)
+        .map(|bit| crate::cnt_write::SCENARIO_LANGUAGES[bit])
+        .collect();
+    (!list.is_empty() && list.len() < known).then_some(list)
+}
+
 /// The three tables, and the map the install manifest repeats.
 #[derive(Debug, Clone)]
 pub struct PlayGo {
@@ -262,6 +294,36 @@ fn ficm(entries: &[(u64, u16)]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// A source table's chunk masks narrow the languages; one naming them all doesn't.
+    #[test]
+    fn source_languages_follow_the_chunk_masks() {
+        let table = |masks: &[u64]| {
+            let at = 0x100;
+            let mut b = vec![0u8; at + masks.len() * 0x20];
+            b[..4].copy_from_slice(b"plgx");
+            b[4..6].copy_from_slice(&0x1000u16.to_le_bytes());
+            b[0x0a..0x0c].copy_from_slice(&(masks.len() as u16).to_le_bytes());
+            let len = b.len() as u32;
+            b[0x10..0x14].copy_from_slice(&len.to_le_bytes());
+            b[0xc0..0xc4].copy_from_slice(&(at as u32).to_le_bytes());
+            b[0xc4..0xc8].copy_from_slice(&(masks.len() as u32 * 0x20).to_le_bytes());
+            for (k, m) in masks.iter().enumerate() {
+                b[at + k * 0x20 + 0x10..][..8].copy_from_slice(&m.to_le_bytes());
+            }
+            b
+        };
+        let (ja, en) = (1u64 << 63, 1u64 << 62);
+        assert_eq!(
+            source_languages(&table(&[en, ja])),
+            Some(vec!["ja-JP", "en-US"])
+        );
+        assert_eq!(source_languages(&table(&[u64::MAX, en])), None);
+        assert_eq!(source_languages(&table(&[0])), None);
+        let mut short = table(&[en]);
+        short.pop();
+        assert_eq!(source_languages(&short), None);
+    }
+
     use super::*;
 
     #[test]

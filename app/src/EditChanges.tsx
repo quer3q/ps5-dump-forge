@@ -1,6 +1,4 @@
-// The Edit tab's pending changes: what an add brings (a path that the job reads itself, or a
-// browser's files uploaded on Apply), the conflict question, and the bar over the explorer that
-// lists the changes in order with Undo and Discard all. The fold itself is explorer.ts's.
+// Edit's pending changes: what an add brings, the conflict question and the pending bar (the fold is explorer.ts's).
 
 import type { ReactNode } from "react";
 
@@ -12,27 +10,20 @@ import type { Messages } from "./locales/en";
 import { Icon } from "./icons";
 import { readable } from "./peers";
 
-/** Where an add's bytes come from: a path on the machine that runs the job (the app's drops and
- * dialogs; the web page's dialog, which browses the server), or, from a browser drop, files that
- * are uploaded on Apply (a folder's paths relative to it, junk left out as core's scanner does). */
+/** An add's bytes: a path on the machine that runs the job, or a browser drop's files uploaded on Apply. */
 export type AddSource =
   | { path: string }
   | { file: File }
   | { folder: { files: { path: string; file: File }[]; emptyDirs: string[] } };
 
-/** A change as an action makes it (`only`: a folder of which only the listed contents go in,
- * one add each, since some were skipped), before it joins the list. */
+/** A change as an action makes it, before it joins the list. */
 export type NewChange = Planned<AddSource>;
-/** One pending change; `batch` groups what one action made (a drop of several items), which
- * Undo takes back together. */
+/** One pending change; `batch` groups one action's changes, which Undo takes back together. */
 export type Pending = NewChange & { batch: number };
 
-/** Something to add, before it is placed: its name, what it brings, where from. */
 export type Incoming = AddItem<AddSource>;
 
-/** A path on the machine that runs the job, as core will add it (`host_tree`): a file's size,
- * a folder's contents. Its name by the platform's separators (a `\` in a macOS or Linux name
- * stays, and core refuses it). */
+/** A path on the job's machine as core will add it (`host_tree`); a `\` in a macOS or Linux name stays, core refuses it. */
 export async function fromHost(path: string): Promise<Incoming> {
   // A paired device's root (`flink://<key_id>`) has no name to land under but its key id.
   if (/^flink:\/\/[^/\\]*[/\\]*$/i.test(path)) throw new Error(msg().edit.peerRoot);
@@ -44,8 +35,7 @@ export async function fromHost(path: string): Promise<Incoming> {
   };
 }
 
-/** A drop's items. The app's are host paths (listed through `host_tree`); the web page's are
- * the browser's files (a folder walked now, its files uploaded on Apply). */
+/** A drop's items: host paths in the app, the browser's files on the web page (uploaded on Apply). */
 export async function dropped(items: DropItem[]): Promise<Incoming[]> {
   const out: Incoming[] = [];
   for (const item of items) {
@@ -74,8 +64,7 @@ export async function dropped(items: DropItem[]): Promise<Incoming[]> {
 
 export type ConflictAnswer = "replace" | "skip" | "cancel";
 
-/** "N items already exist here": the colliding names in `folder` (shown as given), then
- * Cancel (focused), Skip, Replace. Escape and a click outside cancel. */
+/** "N items already exist here": Cancel (focused), Skip, Replace; Escape and a click outside cancel. */
 export function askConflicts(names: string[], folder: string): Promise<ConflictAnswer> {
   return new Promise((resolve) => {
     let answer: ConflictAnswer = "cancel";
@@ -130,7 +119,6 @@ function ConflictDialog(props: { names: string[]; folder: string; close: () => v
   );
 }
 
-/** "Discard all N changes?": No (focused) / Discard all. True: discard. */
 export function confirmDiscard(n: number): Promise<boolean> {
   return new Promise((resolve) => {
     let yes = false;
@@ -209,25 +197,19 @@ function changeText(t: Messages["edit"], c: Pending): ReactNode {
   }
 }
 
-/** Where an add comes from, for its list entry. */
 function sourceText(src: AddSource | undefined): string | null {
   if (!src) return null;
   if ("path" in src) return src.path;
   return "file" in src ? src.file.name : null;
 }
 
-/**
- * Over the explorer while changes are pending: "N changes not applied yet", Undo (the last
- * action's changes) and Discard all, then the changes in order (folded away), each with why it
- * won't apply when it doesn't. `actions`: Apply; `children`: the mode, uploads and Apply's errors.
- */
+/** Over the explorer while changes are pending: count, Undo, Discard all, then each change and why it won't apply. */
 export function PendingBar(props: {
   changes: Pending[];
   findings: Finding[][];
   onUndo: () => void;
   onDiscard: () => void;
   disabled?: boolean;
-  /** After Discard all in the head: Apply. */
   actions?: ReactNode;
   children?: ReactNode;
 }) {

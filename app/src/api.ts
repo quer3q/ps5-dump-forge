@@ -1,6 +1,4 @@
-// Typed IPC for app/src-tauri/src/main.rs, or the same commands over HTTP
-// (crates/ps5-dump-forge-server) in the http build. Types mirror
-// crates/ps5-dump-forge-core/src/lib.rs.
+// Typed IPC for src-tauri/src/main.rs, or the same commands over HTTP (ps5-dump-forge-server); types mirror core's lib.rs.
 
 import { transport } from "forge-transport";
 import { msg, num } from "./i18n";
@@ -13,120 +11,105 @@ type UnlistenFn = Unlisten;
 const invoke = transport.call;
 const listen = transport.listen;
 
-/** What a source can be (its containing file system or package); each is also a target. */
 export type Kind = "folder" | "exfat" | "ffpkg" | "ffpfs" | "ffpfsc" | "pkg";
-/** An archive holding one game folder: a source only (Edit, Convert, LZ4 Pack/Unpack), never a
- * target. Jobs read it in place, with nothing unpacked to disk. */
+/** An archive holding one game folder: a source only, read in place. */
 export type ArchiveKind = "zip" | "7z" | "rar";
-/** Core's two password errors (`ps5_dump_forge_archive`), matched as they are; the UI shows its
- * own words for them. */
+/** Core's two password errors, matched as they are. */
 export const ARCHIVE_PASSWORD_REQUIRED = "This archive needs a password.";
 export const ARCHIVE_PASSWORD_WRONG = "The password is not correct.";
-/** A target: every source kind, plus the LZ4 packed folder (a folder, read as one). */
 export type Format = Kind | "lz4";
-/** The packs a Pack job makes, the `pack` part of a generated output's name (`zstd`, `LZ4`). */
 export type PackKind = "zstd" | "lz4";
-/** What a job does with LZ4 asset packs, besides the target: write packs back as plain files
- * (`unpack`), or pack into `format` (`pack`: folder, exfat, ffpkg, ffpfs, ffpfsc; the `lz4`
- * format is the same as `folder` with `pack`). */
+/** LZ4 packs: `unpack` writes them back as plain files, `pack` packs into `format`. */
 export type Lz4Mode = "unpack" | "pack";
-/** The image inside a `.ffpfsc` container. */
 export type InnerFormat = "exfat" | "ffpkg" | "ffpfs";
-/** How hard a `.pkg` build compresses (Kraken); `stored`: every inner block raw, same layout. */
+/** `stored`: every inner block raw, same layout. */
 export type KrakenLevel = "fast" | "balanced" | "smallest" | "stored";
 export type JobId = number;
 
-/** One change of an edit job (`ConvertRequest.edits`), applied in order (core's `Edit`). Game
- * paths are relative and `/`-separated, with no empty, `.` or `..` component and no `\`. */
+export type EstimateKind = "zstd" | "lz4" | "kraken" | "zlib";
+/** `level`: zstd 1..22, LZ4 0 or 3..12, Kraken 0 stored..3 smallest, zlib 0..9; `unpack` for Kraken or zlib of a packed game. */
+export interface PackEstimateRequest {
+  source: string;
+  kind: EstimateKind;
+  level: number;
+  password?: string | null;
+  unpack?: boolean;
+}
+/** Core's `PackEstimate`, in bytes of file data (no image or pack metadata). */
+export interface PackEstimate {
+  logical_bytes: number;
+  /** What is compressed: the packed set, or every file for Kraken and zlib. */
+  packed_set_bytes: number;
+  loose_bytes: number;
+  /** The loose bytes plus the packed set as estimated once compressed. */
+  estimated_bytes: number;
+  sampled_bytes: number;
+}
+
+/** One change of an edit job (core's `Edit`), applied in order; game paths relative, `/`-separated. */
 export type Edit =
-  /** Copy `from` (a file or folder on the machine that runs the job; http build: a staged upload)
-   * to game path `to`, replacing a file there; a folder onto a folder merges. */
+  /** `from`: a host file or folder (http build: a staged upload); a folder onto a folder merges. */
   | { op: "add"; from: string; to: string }
-  /** Delete a file, or a folder with everything in it. */
   | { op: "delete"; path: string }
-  /** Move or rename a file or folder; `to` must not exist. */
   | { op: "rename"; from: string; to: string }
-  /** A new empty folder (parents created too). */
   | { op: "mkdir"; path: string };
 
-/** Whether an edit can be applied in place and/or rebuilt (core's `EditCheck`; reads only). */
+/** core's `EditCheck`; reads only. */
 export interface EditCheck {
-  /** Why it can't be applied in place (empty: it can). */
+  /** Why not in place / not rebuilt; empty: that mode works. */
   in_place: string[];
-  /** Why it can't be rebuilt (empty: it can; a folder is never rebuilt). */
   rebuild: string[];
-  /** Bytes the changes need inside the image, and what it has free (images only). */
   needed_inside: number | null;
   free_inside: number | null;
-  /** Free bytes a rebuild needs beside the source, and what that folder has. */
   rebuild_needs: number | null;
   free_beside: number | null;
 }
-
-/** The runtime an LZ4 Pack installs: ampr-emu-ng (reads zstd and LZ4 packs) or upstream ampr_emu. */
-export type Lz4Runtime = "ng" | "ampr_emu";
 
 export interface ConvertRequest {
   source: string;
   format: Format;
   output: string;
-  /** `null`: every core. */
   compression_threads: number | null;
-  /** The image inside a `.ffpfsc`; `null`: `.ffpkg`. Ignored for any other target. */
+  /** `null`: `.ffpkg`. */
   inner: InnerFormat | null;
-  /** Leave the backport libraries (not the emulators) out of fakelib/; refused when the
-   * executables' SDK was lowered. */
+  /** Refused when the executables' SDK was lowered. */
   remove_backport: boolean;
-  /** Re-read every byte of the output; `false`: fast (sampled) verification. */
   full_verify: boolean;
-  /** For `.pkg`: the compression level; missing or any other target: `"fast"`. */
   kraken_level?: KrakenLevel;
-  /** For `.ffpfsc`: the zlib level, 0 (store) to 9 (smallest); missing: 6. */
   ffpfsc_level?: number;
-  /** `"pack"`: pack into LZ4 asset packs; `"unpack"`: write packed assets back as plain files;
-   * missing or null: neither. */
   lz4?: Lz4Mode | null;
-  /** For an LZ4 pack: 0 (fast, the default) or 3..=12 (LZ4 HC; 9 medium, 12 max). */
+  /** 0 (fast) or 3..=12 (LZ4 HC). */
   lz4_level?: number;
-  /** For an LZ4 pack: the runtime it installs; missing: `"ng"` (ampr-emu-ng). */
-  lz4_runtime?: Lz4Runtime;
-  /** The Pack tab's zstd: pack into zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, zstd in
-   * 256 KiB blocks) and install ampr-emu-ng. `format`: folder, exfat, ffpkg or ffpfs; no `lz4` option. */
+  lz4_runtime?: "ng";
   zstd_pack?: boolean;
-  /** With `zstd_pack`: the zstd level, 1 (fastest) to 22 (smallest); missing: 5. */
   zstd_level?: number;
-  /** The Pack tab's zstd: write a zstd packed source's files back as plain files into `format`. */
   zstd_unpack?: boolean;
-  /** With an LZ4 pack or `zstd_pack`: a TOML pack profile (here, on a paired peer or a NAS)
-   * whose rules pick the packed files; missing or null: the built-in packing strategy. */
+  /** A TOML pack profile (here, a peer or a NAS); null: the built-in strategy. */
   pack_profile?: string | null;
-  /** For an archive source: the password inspect accepted. Never echoed back (the job list
-   * from the server has none). */
+  /** Never echoed back (the server's job list has none). */
   archive_password?: string | null;
-  /** Non-empty: an edit job; `output` and `format` are ignored (the source itself is changed). */
+  /** Non-empty: an edit job; `output` and `format` ignored. */
   edits?: Edit[];
-  /** An edit job on an image: write a new image beside it and swap it in, instead of in place. */
   edit_rebuild?: boolean;
-  /** Non-empty: an extract job; game-relative `/` paths of files or folders, each copied into
-   * `output` (an existing folder) under its own last component. `format` is `"folder"`. */
+  /** Non-empty: an extract job; each game path copied into `output` under its last component. */
   extract?: string[];
-  /** Non-empty: a transfer job (Connect's copy job, its own queue beside the others); files or
-   * folders on this device, a peer (`flink://`) or a NAS (`smb://`, `ftp://`, `nfs://`), each
-   * copied into `output` (an existing folder here, on a peer or on a NAS) under its own name. `source` and `format` unused. */
+  /** Non-empty: a transfer job; each path (here, `flink://`, a NAS) copied into `output` under its own name. */
   transfer?: string[];
-  /** An extract or a transfer the user confirmed (`existingTargets` found names there): a file
-   * replaces a file, a folder merges into a folder; any other clash still fails preflight. */
+  /** The user confirmed: a file replaces a file, a folder merges into a folder. */
   replace?: boolean;
-  /** Set: an install job (the PS5 only): this `.pkg` (here, on a peer or a NAS) is handed to the
-   * PS5's installer, which fetches it from the job. `source`, `output` and `format` are ignored. */
+  /** Set: an install job (PS5 only) of this `.pkg`. */
   install?: string;
-  /** A conversion or a pack/unpack only: once the job is Ok (output verified and in place),
-   * delete the source as Delete would; its `checks` then say `source deleted: <path>` or
-   * `source kept: <reason>` (the job stays Ok). */
+  /** Set: a metadata recovery edit of `source` (`url` null: param.json's versionFileUri). */
+  recover_metadata?: { url: string | null; original_runtime: boolean };
+  /** Sony's metadata into the output; a failure is a log warning. */
+  restore_metadata?: boolean;
+  /** Once Ok, delete the source; `checks` then say `source deleted:` or `source kept:`. */
   delete_source?: boolean;
+  /** Missing: true. */
+  replace_ampr_emu?: boolean;
 }
 
-/** How the output was verified. `samples` and `seed` are 0 for full. */
+/** `samples` and `seed` are 0 for full. */
 export interface VerifyReport {
   mode: "fast" | "full";
   checked_bytes: number;
@@ -140,8 +123,11 @@ export interface JobReport {
   bytes: number;
   files: number;
   checks: string[];
-  /** Missing from older servers and restored reports. */
   verify?: VerifyReport;
+  source_bytes?: number;
+  /** ms since the Unix epoch (0 unknown). */
+  started_at_ms?: number;
+  ended_at_ms?: number;
 }
 
 /** serde's externally tagged `Result<JobReport, String>`. */
@@ -153,14 +139,20 @@ export interface ProgressEvent {
   stage: string;
   done: number;
   total: number;
+  /** This stage alone (verify: all its passes); absent from an older peer's mirrored job. */
+  stage_done?: number;
+  stage_total?: number;
+  /** Measured in core over the last few seconds; null until known. */
+  bytes_per_s?: number | null;
+  /** Epoch ms. */
+  stage_started_ms?: number;
 }
 export interface LogEvent {
   kind: "log";
   job: JobId;
   line: string;
 }
-/** Every stage the job will run, in order (the same ids as `ProgressEvent.stage`); sent once,
- * early (possibly after the first `scan` progress). */
+/** Every stage the job will run, in order; sent once, early. */
 export interface StagesEvent {
   kind: "stages";
   job: JobId;
@@ -174,64 +166,46 @@ export interface DoneEvent {
 
 export interface Dlc {
   content_id: string;
-  /** The last 16 characters of the content id. */
   label: string;
   name: string | null;
-  /** Its own folder; null when merged into the game's. */
   folder: string | null;
   bytes: number;
-  /** Listed in the DLC emulator's dlc_emu.ini: its download_status there. */
+  /** Its download_status in dlc_emu.ini. */
   emulated: string | null;
 }
 
 export interface Emulator {
   path: string;
-  /** "AMPR", "DLC", "PlayGo", or "Other": unrecognised homebrew that reads files from /app0/,
-   * or a fakelib file that couldn't be read. Always kept, never removed. */
+  /** Unrecognised homebrew ("Other") included; always kept. */
   name: string;
 }
 
-/** Counts from a sound LZ4 manifest. */
 export interface Lz4Packed {
-  /** Files the manifest lists, packed and loose. */
   files: number;
-  /** Null with `stored_percent` for a manifest too large to inspect fully (over 64 MiB; a
-   * finding says so). */
+  /** Null for a manifest over 64 MiB (a finding says so). */
   packed_files: number | null;
   volumes: number;
-  /** Whole percent: stored bytes of the packed files over their unpacked bytes. */
   stored_percent: number | null;
 }
 
-/** LZ4 asset packs (AMPR): present when eboot.bin imports libSceAmpr or a pack or runtime
- * artifact is there. */
+/** Present when eboot.bin imports libSceAmpr or a pack or runtime is there. */
 export interface Lz4Facts {
   imports_ampr: boolean;
   packed: Lz4Packed | null;
-  /** The manifest starts like one but doesn't parse (also a finding); `packed` is null. */
   manifest_error: string | null;
-  /** `forge_trace`: the old LZ4 trace runtime, which a conversion replaces; `zstd`:
-   * ampr-emu-ng, which reads zstd and LZ4 packs. */
+  /** `forge_trace`: the old trace runtime; `zstd`: ampr-emu-ng. */
   runtime: "forge_release" | "forge_trace" | "zstd" | "other" | "none";
-  /** The ampr_emu version of the runtimes Forge ships (and installs on unpatch), e.g.
-   * "0.4.2.1"; missing from an older backend. */
   shipped_runtime_version?: string;
-  /** The version the game's own runtime names itself with, when it does: ampr_emu's, or
-   * ampr-emu-ng's when runtime is "zstd" (the source card's AMPR tile title). */
   runtime_version?: string | null;
-  /** What a plain conversion does to the runtime: "install" (none there), "replace" (Forge's
-   * trace runtime, an older ampr_emu or one naming no version: the bundled one goes in) or
-   * "keep" (Forge's release runtime, or ampr_emu at the bundled version or newer:
-   * runtime_version names it). Null for a non-AMPR title; missing from an older backend. */
+  /** A plain conversion's action (replace_ampr_emu on); null for a non-AMPR title. */
   runtime_action?: "install" | "replace" | "keep" | null;
-  /** The same for the Pack tab's LZ4 Pack (an unpacked source) or Unpack (a packed one): Pack also
-   * replaces a not-older runtime that can't read packs. */
+  keep_runtime_action?: "install" | "replace" | "keep" | null;
+  unpack_runtime_action?: "install" | "replace" | "keep" | null;
   pack_runtime_action?: "install" | "replace" | "keep" | null;
-  /** ampr_emu.index against the files a plain conversion writes: "stale", "damaged" and
-   * "missing" are written anew by any conversion. Null when no conversion touches it (packed:
-   * kept as it is; a non-AMPR title; an archive's index too large to read); missing from an
-   * older backend. */
+  pkg_runtime_action?: "omit" | null;
+  /** ampr_emu.index against a plain conversion's files; null when no conversion touches it. */
   index?: "ok" | "stale" | "damaged" | "missing" | null;
+  keep_index?: "ok" | "stale" | "damaged" | "missing" | null;
 }
 
 export interface InspectFile {
@@ -239,86 +213,64 @@ export interface InspectFile {
   size: number;
 }
 
-/** An archive source: what the archive itself is. */
 export interface ArchiveFacts {
   format: ArchiveKind;
-  /** Every part on disk. */
   archive_bytes: number;
-  /** The parts' file names, the first one first. */
   volumes: string[];
   solid: boolean;
   encrypted: boolean;
-  /** The game folder inside the archive ("Game/"); "" when the game is at its root. */
+  /** "" when the game is at the archive's root. */
   root: string;
 }
 
 export interface Inspection {
-  /** A `Kind`, or an `ArchiveKind` for an archive. */
   kind: string;
   describe: string;
   title_id: string | null;
   content_id: string | null;
   /** In param.json's default language; `gameTitle` picks from `title_names`. */
   title_name: string | null;
-  /** Every `localizedParameters` title by language tag ("en-US", "ru-RU"). Missing from an older backend. */
   title_names?: Record<string, string>;
   version: string | null;
-  /** Required firmware, e.g. "7.00". */
   firmware: string | null;
   sdk: string | null;
-  /** Backport libraries: fakelib/ (or fakelib2/) files that are not a known emulator;
-   * empty when none. */
+  /** fakelib/ files that are not a known emulator. */
   backport: string[];
-  /** Emulators in fakelib/ (AMPR, DLC, PlayGo, Other): homebrew the game runs with, not a
-   * backport. */
   emulators: Emulator[];
-  /** Why removing the backport is refused (eboot.bin's SDK is below param.json's sdkVersion,
-   * or it can't be told); null when it can be removed or there is none. */
+  /** Why removing the backport is refused; null when it can be or there is none. */
   backport_blocked: string | null;
-  /** With a fakelib/ (backport or emulators): the lowest firmware its executables allow,
-   * e.g. "4.50". */
   backport_firmware: string | null;
-  /** The PS5 Dump Forge version that wrote the image (its maker's mark), e.g. "0.0.1-pre4";
-   * null for folders, .pkg, .ffpfs and images made by other tools. */
+  /** The maker's mark; null for folders, .pkg, .ffpfs and other tools' images. */
   forge_version: string | null;
-  /** DLC embedded in the dump. */
   dlcs: Dlc[];
-  /** No eboot.bin but a param.json with a title ID: a DLC, an update or another package. */
+  /** No eboot.bin but a param.json with a title ID. */
   additional_content?: boolean;
-  /** LZ4 asset packs; null (or missing from an older server) when the title has nothing to do
-   * with AMPR. */
   lz4?: Lz4Facts | null;
-  /** zstd packed (a root `ampr_zstd.index` starting `AMPRZPK1`). Missing from an older backend. */
   zstd_packed?: boolean;
-  /** icon0.png as a data: URL. */
   cover: string | null;
   param_json: unknown;
   files: InspectFile[];
   empty_dirs: string[];
   total_bytes: number;
+  /** The source's own size on disk (an archive's every part); null for a folder. */
+  file_bytes?: number | null;
   details: string[];
   findings: string[];
-  /** An archive source: the archive's own facts (`files` and `total_bytes` are unpacked). */
+  /** `files` and `total_bytes` are unpacked. */
   archive?: ArchiveFacts | null;
-  /** An image whose last in-place edit was interrupted: its undo journal (`<image>.forge-undo`)
-   * is beside it, and the next edit (or check) puts the image back first. Missing from an older
-   * backend. */
+  /** Its undo journal is beside it; the next edit or check restores the image first. */
   interrupted_edit?: boolean;
-  /** A patch package (`.pkg` starting `\x7FLIH`): `files` are the ones it carries whole;
-   * browsed and extracted from only. Missing from an older backend. */
+  /** `files`: the ones it carries whole; browse and extract only. */
   patch?: boolean;
-  /** PS5 executables that are plain ELF, not signed: the console won't start the game; a
-   * conversion signs them. Missing from an older backend. */
+  /** Plain-ELF executables a conversion fake-signs. */
   unsigned?: string[];
 }
 
-/** One job in `GET /api/jobs` (http build): what a reloaded page rebuilds its list from. */
+/** One job in `GET /api/jobs` (http build). */
 export interface SnapshotJob {
   id: JobId;
-  /** Always there: the server lists a job only once its request is known. */
   request: ConvertRequest;
   progress: ProgressEvent | null;
-  /** The job's stages in order (`StagesEvent`); empty until known. */
   stages: string[];
   done: DoneEvent | null;
   /** The last lines (the server keeps 200). */
@@ -327,66 +279,31 @@ export interface SnapshotJob {
   log_total: number;
 }
 
-/** Jobs the page doesn't know yet; `replace`: the whole list (first snapshot after loading, or
- * after the payload restarted). */
+/** `replace`: the whole list (first snapshot, or after the payload restarted). */
 export interface JobsRestore {
   replace: boolean;
   jobs: SnapshotJob[];
 }
 
-/** The http build: a browser on the LAN, paths are the server's, nothing is revealed locally. */
 export const web = transport.web;
 
-/** The product's name in the UI: the PS5 payload's web UI drops "PS5" (its tile says "Dump
- * Forge"); the desktop app keeps it. */
+/** The PS5 web UI drops "PS5"; the desktop app keeps it. */
 export const APP_NAME = web ? "Dump Forge" : "PS5 Dump Forge";
 
-/** A folder or file chosen in the native dialog, or (http build) the server's folder browser. */
 export const pick = (o: PickOptions): Promise<string | null> => transport.pick(o);
-/** Several files at once (file mode), or null when cancelled. */
 export const pickFiles = (o: PickOptions): Promise<string[] | null> => transport.pickFiles(o);
 
-/** The server can't be reached (http build); polling goes on. */
 export const useOffline = transport.useOffline;
 
-/** The server's `host:port` from its session (http build); null in the app or when unknown. */
+/** The server's `host:port` (http build); null in the app or when unknown. */
 export const serverAddress = transport.address;
-/** A debug build of the PS5 payload (http build). */
 export const debugBuild = transport.debug;
 
 export type RuntimePlatform = "host" | "ps5";
 
-export interface LibraryEntry {
-  path: string;
-  kind: Kind;
-  title_id: string;
-  title_name: string | null;
-  /** As `Inspection.title_names`. */
-  title_names?: Record<string, string>;
-  version: string | null;
-  has_cover: boolean;
-  /** LZ4 packed (ampr_emu asset packs: `ampr_assets.index` at the root). Missing from an older backend. */
-  lz4_packed?: boolean;
-  /** zstd packed (`ampr_zstd.index` at the root). Missing from an older backend. */
-  zstd_packed?: boolean;
-  /** No eboot.bin but a param.json with a title ID: a DLC, an update or another package. */
-  additional_content?: boolean;
-}
-
-export interface LibraryScan {
-  roots: string[];
-  entries: LibraryEntry[];
-  truncated: boolean;
-  warnings: string[];
-  /** The PS5 only: the internal storage (`/data`) in bytes, as of this scan. */
-  storage?: { free: number; total: number };
-}
-
-/** What a package installs, by its container (core's `PackageContent`). */
 export type PackageContent = "game" | "patch" | "additional_content" | "unknown";
 
-/** One `.pkg` the PS5's package scan found; the title fields are null when its container can't
- * be read (the console judges it). */
+/** The title fields are null when its container can't be read. */
 export interface PackageEntry {
   path: string;
   size: number;
@@ -399,8 +316,7 @@ export interface PackageEntry {
   has_cover: boolean;
 }
 
-/** A Connect speed test's result (`connect.speedTest`): each direction's bytes per second over
- * `bytes` (sent, then fetched). */
+/** Bytes per second each way over `bytes`. */
 export interface SpeedTest {
   up_bytes_per_s: number;
   down_bytes_per_s: number;
@@ -412,47 +328,41 @@ export interface PackageScan {
   truncated: boolean;
 }
 
-/** One entry of a folder (`list_dir`). A link's `path` is where it points, resolved. */
+/** A link's `path` is where it points, resolved. */
 export interface DirEntry {
   name: string;
   path: string;
   dir: boolean;
-  /** A file's size; null for a folder. */
   size: number | null;
-  /** The entry itself is a link (never deleted, renamed or moved from the explorer). */
   link?: boolean;
-  /** An image ShadowMount+ has mounted (the explorer on the PS5): never deleted, renamed or moved. */
   mounted?: boolean;
   /** Files.tsx only: a link row's resolved target (its `path` is then the link's own). */
   target?: string;
 }
 
-/** A folder's entries, folders first (`list_dir`). */
 export interface DirListing {
-  /** The folder, canonical; null: the server's browse roots. */
+  /** Canonical; null: the server's browse roots. */
   path: string | null;
-  /** The folder above; null at a filesystem or browse root. */
+  /** Null at a filesystem or browse root. */
   parent: string | null;
   entries: DirEntry[];
-  /** More than 10,000 entries: the rest are left out. */
+  /** More than 10,000 entries: the rest left out. */
   truncated?: boolean;
 }
 
-// ---- Connect (the Connect tab; server `connect.rs`) ----------------------------------------
+// ---- Connect (server `connect.rs`) ----
 
-/** This device on the Connect card. */
 export interface ConnectThisDevice {
   key_id: string;
   name: string;
   platform: string;
   port: number;
-  /** Why the FLINK listener isn't running; null while it is. */
+  /** Null while the FLINK listener runs. */
   listen_error: string | null;
-  /** The address the default route leaves from; null when unknown. */
   ip: string | null;
 }
 
-/** A saved (paired) device. `address` `ip:port`; `last_seen` unix seconds, 0 = never. */
+/** `address` `ip:port`; `last_seen` unix seconds, 0 = never. */
 export interface ConnectDevice {
   key_id: string;
   name: string;
@@ -484,24 +394,22 @@ export interface Discovered {
   nas: NasFound[];
 }
 
-/** A saved NAS: one per host + port. The password never comes back: `has_password`. */
+/** One per host + port; the password never comes back (`has_password`). */
 export interface NasDevice {
   id: string;
   name: string;
   host: string;
   port: number;
-  /** A game source and an output, whichever it is (its games aren't edited in place). */
   protocol: NasProtocol;
-  /** Empty: guest (anonymous for FTP; always empty for NFS, which has no login). */
+  /** Empty: guest (anonymous for FTP; always empty for NFS). */
   user: string;
   has_password: boolean;
   online: boolean;
-  /** Unix seconds of the last probe that reached it since the service started; 0 = none. */
+  /** Unix seconds of the last probe that reached it; 0 = none. */
   last_online: number;
 }
 
-/** Another device's pairing request, waiting for this device's user. `check`: the six digits
- * both screens show. */
+/** Another device's pairing request; `check`: the six digits both screens show. */
 export interface PairRequest {
   id: string;
   name: string;
@@ -510,8 +418,7 @@ export interface PairRequest {
   check: string;
 }
 
-/** This device's own pairing request: `asking` (connecting), `waiting` (`check` set: the other
- * device's user decides), then an outcome. */
+/** This device's own request: `asking`, `waiting` (`check` set), then an outcome. */
 export interface PairOutgoing {
   id: number;
   address: string;
@@ -531,7 +438,6 @@ export interface PairOutgoing {
   device: ConnectDevice | null;
 }
 
-/** What answers at an address (`connect.probe`): a Forge (its FLINK port and name) or a NAS. */
 export interface ConnectProbe {
   kind: "forge" | NasProtocol;
   host: string;
@@ -546,96 +452,71 @@ export interface ConnectState {
   discovery: Discovered;
   pending: PairRequest[];
   outgoing: PairOutgoing | null;
-  /** Jobs on paired peers that use this device's files (`connect_jobs.rs`); missing from an
-   * older backend. */
+  /** Peers' jobs that use this device's files; missing from an older backend. */
   remote_jobs?: RemoteJob[];
 }
 
-/** A job running on a paired peer that uses this device's files: shown here read only, only
- * cancellable. Paths on this device are local; the peer's are `flink://<its key_id>/...`. */
+/** A peer's job using this device's files: read only, cancellable; the peer's paths are `flink://<key_id>/...`. */
 export interface RemoteJob {
   key_id: string;
-  /** The peer's saved name. */
   name: string;
-  /** This device's user asked the peer to cancel it. */
   cancelling: boolean;
-  /** The peer's run: its job ids start again at 1 when it restarts. */
+  /** The peer's run: its job ids restart at 1. */
   instance?: string;
   job: Omit<SnapshotJob, "log_total"> & { log_total?: number };
 }
 
 const cc = <T,>(cmd: string, args?: Record<string, unknown>) => transport.connect<T>(cmd, args);
 
-/** The Connect service. Errors are strings: a refusal's code (`too_many_attempts`,
- * `not_paired`, ...) or the service's text. */
+/** Errors are strings: a refusal's code (`too_many_attempts`, ...) or the service's text. */
 export const connect = {
   state: () => cc<ConnectState>("state"),
-  /** Asks the device at `address` (ip, ip:port or host[:port]) to pair; `state.outgoing`
-   * follows it. */
   pair: (address: string) => cc<null>("pair", { address }),
   pairCancel: () => cc<null>("pair_cancel"),
-  /** What answers at `address` (host or host:port, IPv6 in brackets; about 3 s at most):
-   * with no port a Forge first, then SMB, NFS, FTP; a Forge off the local network and
-   * "nothing to connect to at <address>" are errors. */
+  /** With no port a Forge first, then SMB, NFS, FTP (about 3 s at most). */
   probe: (address: string) => cc<ConnectProbe>("probe", { address }),
-  /** This device's user answers another device's request; false when it no longer waits. */
+  /** False when it no longer waits. */
   approve: (id: string, allow: boolean) => cc<boolean>("approve", { id, allow }),
   forget: (keyId: string) => cc<boolean>("forget", { key_id: keyId }),
   discoverStart: () => cc<null>("discover_start"),
   discoverStop: () => cc<null>("discover_stop"),
-  /** Saves a NAS (`host` host[:port], port default the protocol's own: 445, 21 or 2049; updated
-   * in place when saved before; NFS drops `user` and `password`);
-   * its id. `id`: the saved entry an edit changes. `user`/`password` undefined keep the saved
-   * ones, "" clears them. */
+  /** Its id; `id`: the entry an edit changes; `user`/`password` undefined keep the saved ones, "" clears them. */
   nasSave: (nas: { id?: string; name: string; host: string; port?: number; protocol?: NasProtocol; user?: string; password?: string }) =>
     cc<string>("nas_save", nas),
   nasForget: (id: string) => cc<boolean>("nas_forget", { id }),
-  /** Asks the paired peer `keyId` to cancel its job `job` shown here (`state.remote_jobs`);
-   * false when it is no longer listed. */
+  /** False when it is no longer listed. */
   cancelJob: (keyId: string, job: JobId) => cc<boolean>("cancel_job", { key_id: keyId, job }),
-  /** Desktop app: elfldr at `address` (host[:port], port 9021 by default) downloads release
-   * `version`'s PS5 ELF from GitHub and starts it (within a minute). */
+  /** Desktop app: elfldr at `address` downloads release `version`'s PS5 ELF from GitHub and starts it. */
   payloadInstall: (address: string, version: string) => cc<null>("payload_install", { address, version }),
-  /** Desktop app: the ELF file at `path` streamed to elfldr at `address`; the bytes sent. */
+  /** Desktop app: the bytes sent. */
   payloadSend: (address: string, path: string) => cc<number>("payload_send", { address, path }),
-  /** Asks the paired PS5 `keyId` to install the `.pkg` at `path` on this device (it reads the
-   * file over FLINK; the job shows here mirrored); the PS5's job id. */
+  /** The PS5 reads the file over FLINK; its job id. */
   install: (keyId: string, path: string) => transport.connectInstall(keyId, path),
-  /** Times the link to the paired device `keyId`: 256 MiB sent, then fetched, nothing on disk
-   * (several seconds; rejects with the backend's text, e.g. an older peer's). */
+  /** 128 MiB each way, nothing on disk. */
   speedTest: (keyId: string, run: string) => transport.connectSpeedTest(keyId, run),
-  /** Stops the speed test `run` with `keyId` (its `speedTest` rejects with "cancelled", at once
-   * when it starts after this). */
+  /** A cancel before the run starts is remembered. */
   speedTestCancel: (keyId: string, run: string) => transport.connectSpeedTestCancel(keyId, run),
-  /** http build: a browser file into the server's folder `dir`; its path. */
   upload: transport.connectUpload,
-  /** http build: the URL that downloads the server's file; the app: null. */
+  /** http build only; the app: null. */
   downloadUrl: transport.connectDownloadUrl,
 };
 
-/** Where the backend runs (the server's own answer in the http build); rejects when unknown. */
+/** Rejects when unknown. */
 export const runtimePlatform: () => Promise<RuntimePlatform> = transport.platform;
 
-/** PS5 only: the About tab's saved job-end notification choice. */
+/** PS5 only. */
 export const jobNotifications = {
   get: transport.notifications,
   set: transport.setNotifications,
 };
 
 export const api = {
-  /** `password`: for an archive that needs one (else core answers `ARCHIVE_PASSWORD_REQUIRED`). */
+  /** `password`: else core answers `ARCHIVE_PASSWORD_REQUIRED`. */
   inspect: (path: string, password?: string) =>
     invoke<Inspection>("inspect", password === undefined ? { path } : { path, password }),
-  /** `password`: an archive's, as `inspect` takes it (else a locked one can't be named). */
   defaultOutput: (source: string, format: Format, dir: string, password: string | null = null) =>
     invoke<string>("default_output", { source, format, dir, password }),
-  /**
-   * `[GAME_NAME]-[TITLE_ID].<ext>` (brackets included) in `dir`, from the source's
-   * param.json, or by the `naming` template (`null`: `[{title}]-[{title_id}]`; tokens
-   * `{title}`, `{title_id}`, `{version}`, `{pack}` (from `pack`), `{region}`, `{fw}`; core refuses an
-   * invalid one);
-   * never an existing path nor one in `taken` (outputs of running jobs): `-2`, `-3`, ... instead.
-   */
+  /** A free name in `dir` by the `naming` template (`null`: the default), never an existing path nor one in `taken`. */
   generatedOutput: (
     source: string,
     format: Format,
@@ -646,16 +527,15 @@ export const api = {
     naming: string | null = null,
   ) => invoke<string>("generated_output", { source, format, dir, taken, password, pack, naming }),
   startJob: (request: ConvertRequest) => invoke<JobId>("start_job", { request }),
-  /** A file or folder on the machine that runs the job, as an edit would add it (sizes; a
-   * folder's files and empty folders, junk left out; bounded: `truncated`). */
+  /** As an edit would add it; bounded (`truncated`). */
   hostTree: (path: string) => transport.hostTree(path),
-  /** Whether `request`'s edits can go in place and/or be rebuilt, before Apply (reads only). */
+  /** A sample compressed with the real encoder (reads only; about 10 s at most). */
+  packEstimate: (req: PackEstimateRequest) =>
+    invoke<PackEstimate>("pack_estimate", { ...req, password: req.password ?? null, unpack: req.unpack ?? false }),
   editCheck: (request: ConvertRequest) => invoke<EditCheck>("edit_check", { request }),
-  /** An extract's or transfer's targets that exist already (top level; on a peer or NAS too),
-   * so the page asks before it sends `replace` (reads only). */
+  /** Top-level targets that exist already, so the page asks before it sends `replace`. */
   existingTargets: (request: ConvertRequest) => invoke<string[]>("existing_targets", { request }),
-  /** http build: upload a dropped file for `gamePath` of `source`; resolves with the staged path
-   * an `add` takes as `from`. The app rejects (its drops are host paths). */
+  /** http build: resolves with the staged path an `add` takes as `from`; the app rejects. */
   stage: (
     source: string,
     gamePath: string,
@@ -663,46 +543,30 @@ export const api = {
     onProgress?: (sent: number, total: number) => void,
     signal?: AbortSignal,
   ) => transport.stage(source, gamePath, file, onProgress, signal),
-  /** http build: drop `source`'s staged uploads (after Discard all, or once the job is done). */
   discardStaged: (source: string) => transport.discardStaged(source),
   cancelJob: (id: JobId) => invoke<void>("cancel_job", { id }),
-  /** Delete a file or folder for good (the page asks first). Refused for a link, a drive or
-   * browse root or a folder holding one, and anything an unfinished job reads or writes. */
+  /** The page asks first; core refuses links, roots and anything a job uses. */
   deletePath: (path: string) => invoke<null>("delete_path", { path }).then(() => undefined),
-  /** Move or rename a file or folder on its drive: `to` (the new path) is replaced only with
-   * `replace` (the user confirmed it: a file over a file, a folder merged into a folder);
-   * refused as `deletePath` refuses `from`, and between drives. */
+  /** `to` replaced only with `replace`; refused as `deletePath` refuses `from`, and between drives. */
   movePath: (from: string, to: string, replace = false) =>
     invoke<null>("move_path", { from, to, replace }).then(() => undefined),
-  /** One folder's entries; null (http build only): the server's browse roots. */
+  /** Null (http build only): the server's browse roots. */
   listDir: (path: string | null) => invoke<DirListing>("list_dir", { path, explorer: true }),
-  /** http build on the PS5: its internal storage (`/data`) in bytes; null when unknown. */
+  /** http build on the PS5: `/data` in bytes; null when unknown. */
   storage: () => invoke<{ free: number; total: number } | null>("storage", {}),
-  /** The app: this user's home folder (the File explorer's start), or null when there is none.
-   * The http build has none (it starts at the server's roots). */
+  freeSpace: (path: string) => invoke<number | null>("free_space", { path }),
+  /** The app: the home folder; null in the http build. */
   homeFolder: () => (web ? Promise.resolve(null) : invoke<string | null>("home_folder")),
-  /** Discover game dumps under the chosen folder, or the PS5's roots (read-only, bounded). `root`
-   * may be left out only in the http build (the PS5 scans its roots; a computer answers 400);
-   * the app's `library_scan` requires it. */
-  libraryScan: (root?: string) => invoke<LibraryScan>("library_scan", root ? { root } : {}),
-  /** http build on the PS5: every `.pkg` under its roots (read-only, bounded like the Library). */
+  bundledNgVersion: () => invoke<string | null>("bundled_ng_version"),
   packageScan: () => transport.packageScan(),
-  /** A dump's cover as a data URL, or null. */
-  libraryCover: (path: string) => invoke<string | null>("library_cover", { path }),
-  /** Leftover `.part` files in these folders (deduplicated,
-   * missing ones skipped). */
   staleParts: (dirs: string[]) => invoke<string[]>("stale_parts", { dirs }),
-  /** Show a finished job's output in Finder, Explorer or its folder (Rust looks the path up by
-   * job id). The http build does nothing here: the job row shows the path instead. */
+  /** The http build does nothing here (the row shows the path). */
   reveal: (id: JobId) => invoke<void>("reveal", { id }),
-  /** The app's GitHub button: the project page in the default browser (the http build links it). */
   openRepo: () => invoke<void>("open_repo"),
-  /** Cancel every job, wait for cleanup, exit. http build: resolves once the server is gone. */
+  /** http build: resolves once the server is gone. */
   quitApp: () => invoke<void>("quit_app"),
-  /** This build's version and release file suffix; null: no updates here (`serve` on a computer). */
+  /** Null: no updates here. */
   updateTarget: () => transport.updateTarget(),
-  /** PS5: elfldr loads `version`, the page reloads into it. The app: its download opens in the
-   * browser. */
   startUpdate: (version: string) => transport.startUpdate(version),
 };
 
@@ -715,23 +579,19 @@ export const events = {
     listen<LogEvent>("job://log", f),
   done: (f: (e: DoneEvent) => void): Promise<UnlistenFn> =>
     listen<DoneEvent>("job://done", f),
-  /** A close/quit was held back because jobs are running or (`peer`) a paired device is reading
-   * or writing files here. Never in the http build. */
+  /** Never in the http build. */
   closeRequested: (f: (peer: boolean) => void): Promise<UnlistenFn> =>
     listen<{ peer?: boolean } | null>("close-requested", (e) => f(e?.peer === true)),
-  /** http build: jobs from the server's list (after loading, a payload restart, or another
-   * browser's Build). Never in the app. */
+  /** http build only. */
   restore: (f: (e: JobsRestore) => void): Promise<UnlistenFn> =>
     listen<JobsRestore>("jobs://restore", f),
 };
 
-/** Files and folders dropped on the window (`over`: the pointer while dragging, null once gone).
- * Positions are CSS pixels, for `document.elementFromPoint`. */
+/** `over`: the pointer while dragging (CSS pixels), null once gone. */
 export const onDrop = (f: (d: DropEvent) => void, over?: (at: { x: number; y: number } | null) => void): Unlisten =>
   transport.onDrop(f, over);
 
-/** What an http drop holds, as game-relative paths under `item.name`: every file and every empty
- * folder (a folder entry walked to the end). An item without an entry is its one file. */
+/** Game-relative paths under `item.name`: every file and every empty folder. */
 export async function dropContents(item: DropItem): Promise<{ files: { path: string; file: File }[]; emptyDirs: string[] }> {
   const files: { path: string; file: File }[] = [];
   const emptyDirs: string[] = [];
@@ -758,9 +618,7 @@ export async function dropContents(item: DropItem): Promise<{ files: { path: str
   return { files, emptyDirs };
 }
 
-/** Invoke errors arrive as the command's `String` error. */
 export function errorText(e: unknown): string {
-  // A paired device's `flink://` address by its name.
   return readable(typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
 }
 

@@ -1,7 +1,5 @@
-//! What `GET /api/jobs` shows: every unfinished job and the last finished ones, built from
-//! core's events. Core can emit a job's events, `Done` included, before `Jobs::start`
-//! returns its id, so an entry is made by its first event and the request merged in later.
-//! A job's end notice (`notice::ended`) comes from whichever of the two is last.
+//! `GET /api/jobs`: unfinished jobs and the last finished ones. Core can emit `Done` before
+//! `Jobs::start` returns, so an entry is made by its first event and the request merged later.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -18,27 +16,24 @@ const LOG_LINES: usize = 200;
 #[derive(Default)]
 pub(crate) struct Table {
     jobs: BTreeMap<JobId, Entry>,
-    /// Finished ids, oldest first.
+    /// Oldest first.
     finished: VecDeque<JobId>,
 }
 
 #[derive(Default)]
 struct Entry {
     request: Option<ConvertRequest>,
-    /// `Event::Stages`' list; empty until it comes.
     stages: Vec<String>,
     progress: Option<Value>,
     done: Option<Value>,
-    /// When `Done` was recorded.
     finished_at: Option<Instant>,
-    /// `Done`'s result: the report's output, or the error.
     outcome: Option<Result<PathBuf, String>>,
     log: VecDeque<String>,
     log_total: u64,
 }
 
 impl Table {
-    /// Keeps `event`; a `Done` of an admitted job gives its end notice, if any.
+    /// A `Done` of an admitted job gives its end notice, if any.
     pub fn record(&mut self, event: &Event) -> Option<Ended> {
         let (Event::Stages { job, .. }
         | Event::Progress { job, .. }
@@ -77,10 +72,9 @@ impl Table {
         None
     }
 
-    /// `Jobs::start` returned `job` for `request`.
+    /// A job whose `Done` came first gives its end notice here, if any.
     // ponytail: an entry already dropped from history would come back here, but that needs 32
     // jobs to finish while `start` runs, and admission (held across it) caps them at 8.
-    /// A job whose `Done` came first gives its end notice here, if any.
     pub fn admit(&mut self, job: JobId, request: ConvertRequest) -> Option<Ended> {
         let entry = self.jobs.entry(job).or_default();
         let ended = (entry.outcome.as_ref()).and_then(|o| crate::notice::ended(&request, o));
@@ -88,18 +82,16 @@ impl Table {
         ended
     }
 
-    /// The unfinished jobs' ids and outputs (an edit job's is its source, whose `output` is
-    /// ignored; a rebuild writes its `.part` beside the source).
+    /// An edit job's output is its source (a rebuild writes its `.part` beside it).
     pub fn unfinished(&self) -> Vec<(JobId, PathBuf)> {
         self.requests()
             .map(|(id, r)| {
-                let in_place = !r.edits.is_empty();
+                let in_place = !r.edits.is_empty() || r.recover_metadata.is_some();
                 (id, if in_place { &r.source } else { &r.output }.clone())
             })
             .collect()
     }
 
-    /// What the unfinished edit jobs add (`Edit::Add.from`): staged uploads among them.
     pub fn adds(&self) -> Vec<PathBuf> {
         (self.requests().flat_map(|(_, r)| &r.edits))
             .filter_map(|e| match e {
@@ -119,15 +111,14 @@ impl Table {
         self.jobs.values().all(|e| e.request.is_some())
     }
 
-    /// By id; a job shows once its request is known.
+    /// A job shows once its request is known.
     pub fn snapshot(&self) -> Vec<Value> {
         (self.jobs.iter())
             .filter_map(|(id, e)| e.json(*id))
             .collect()
     }
 
-    /// `snapshot` of the jobs unfinished or finished less than `keep` ago (Connect mirrors
-    /// them to the peers they use).
+    /// Unfinished or finished less than `keep` ago.
     pub fn recent(&self, keep: Duration) -> Vec<Value> {
         (self.jobs.iter())
             .filter(|(_, e)| e.finished_at.is_none_or(|t| t.elapsed() < keep))
@@ -150,8 +141,7 @@ impl Entry {
     }
 }
 
-/// Where unfinished jobs write: core's `part_path`, `<output name>.<job>-<pid>.part` beside
-/// the output, in the output's resolved folder (as `stale_parts` lists it).
+/// Core's `part_path`, in the output's resolved folder (as `stale_parts` lists it).
 pub(crate) fn running_parts(running: &[(JobId, PathBuf)]) -> Vec<PathBuf> {
     let pid = std::process::id();
     running
@@ -189,12 +179,15 @@ mod tests {
             zstd_unpack: false,
             lz4_level: 0,
             lz4_runtime: Default::default(),
+            replace_ampr_emu: true,
             edits: Vec::new(),
             extract: Vec::new(),
             transfer: Vec::new(),
             replace: false,
             edit_rebuild: false,
             install: None,
+            recover_metadata: None,
+            restore_metadata: false,
             delete_source: false,
             pack_profile: None,
             archive_password: None,
@@ -217,18 +210,19 @@ mod tests {
                         samples: 0,
                         seed: 0,
                     },
+                    source_bytes: 0,
+                    started_at_ms: 0,
+                    ended_at_ms: 0,
                 })
                 .map_err(str::to_string),
         }
     }
 
-    /// The end notice comes once, from whichever of `admit` and `Done` is last; none for an
-    /// edit, an extract or a cancel.
+    /// The end notice comes once, from whichever of `admit` and `Done` is last.
     #[test]
     fn end_notice_once_whichever_comes_last() {
         use crate::notice::{Ended, JobKind};
         let mut t = Table::default();
-        // Done before admission (core can emit it before `Jobs::start` returns).
         assert_eq!(t.record(&done(1, Ok("/o/b.exfat"))), None);
         assert_eq!(
             t.admit(1, request("/o/a.exfat")),

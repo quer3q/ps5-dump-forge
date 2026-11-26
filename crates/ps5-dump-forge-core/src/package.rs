@@ -1,6 +1,4 @@
-//! FPKG output: preflight the source for a package, let the vendored
-//! builder prepare and write it into this job's `.part`, read it back through `FpkgSource`
-//! against the effective manifest, then publish it.
+//! FPKG output: preflight the source, let the vendored builder write the `.part`, read it back through `FpkgSource` against the effective manifest, publish.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -37,9 +35,7 @@ const APP: u64 = 65536;
 const AMPR_INDEX: &str = "ampr_emu.index";
 const MIB: u64 = 1024 * 1024;
 
-/// What stops a package build before anything is prepared (findings), and what is worth
-/// showing either way (notes): readiness, category, firmware, ids, package path names, and
-/// the AMPR case-collision rule. Last, whether `eboot.bin` imports libSceAmpr, for `prepare`.
+/// What stops a package build (findings) and what is worth showing either way (notes); last, whether `eboot.bin` imports libSceAmpr.
 pub(crate) fn source_findings(
     tree: &mut dyn SourceTree,
     info: &GameInfo,
@@ -53,10 +49,8 @@ pub(crate) fn source_findings(
         .filter(|p| sdk_rules::excluded(p).is_none())
         .collect();
 
-    // ponytail: the category is read from applicationCategoryType alone; a patch that keeps
-    // its game's category passes. Tell patches apart once a dumped patch's param.json is in hand.
-    // Additional content (no eboot.bin) is packaged whatever its category (by user decision);
-    // the no-eboot note below says so.
+    // ponytail: the category is read from applicationCategoryType alone; a patch keeping its game's category passes.
+    // Additional content (no eboot.bin) is packaged whatever its category.
     if let Some(json) = &info.param_json
         && !info.additional_content
     {
@@ -79,7 +73,6 @@ pub(crate) fn source_findings(
         }
     }
     if !files.iter().any(|p| p == "eboot.bin") {
-        // By user decision: packaged as additional content (the builder's content class).
         notes.push("no eboot.bin: packaged as additional content (DLC) or an update".into());
     }
     if let (Some(title), Some(cid)) = (&info.title_id, &info.content_id)
@@ -92,8 +85,7 @@ pub(crate) fn source_findings(
         ));
     }
 
-    // ponytail: readiness scans eboot.bin for libSceAmpr (up to ~80 MiB, not cancellable);
-    // `prepare` takes the answer (`BuildRequest::imports_ampr`) instead of scanning again.
+    // ponytail: readiness scans eboot.bin for libSceAmpr (up to ~80 MiB, not cancellable); `prepare` reuses the answer.
     let readiness = source::readiness(tree);
     for c in &readiness.checks {
         let mark = if c.ok { "ok" } else { "warning" };
@@ -119,14 +111,9 @@ pub(crate) fn source_findings(
     findings.extend(listing("package path", &bad));
 
     let ampr = readiness.imports_ampr;
-    // `prepare` builds the index anew for a libSceAmpr title and for a source with its own,
-    // except an LZ4- or zstd-packed one (its index is kept: it lists the packed files, and
-    // the LZ4 pack manifest's file ids come from it; vendor patch 0030);
-    // that copy itself is left out, and so is artwork the container may carry instead (`prepare`
-    // still refuses a clash it does index). A manifest that cannot be read skips this check:
-    // `prepare` fails with that read's error.
+    // `prepare` indexes a libSceAmpr title or one with its own index, except a packed one (kept as it is); a manifest that doesn't read skips this check (`prepare` fails with it).
     let own_index = files.iter().any(|p| p.eq_ignore_ascii_case(AMPR_INDEX));
-    if (ampr || own_index) && matches!(source::lz4_packed(tree), Ok(false)) {
+    if (ampr || own_index) && matches!(source::packed_kind(tree), Ok(None)) {
         let listed: Vec<String> = files
             .iter()
             .filter(|p| !p.eq_ignore_ascii_case(AMPR_INDEX))
@@ -159,8 +146,7 @@ fn bad_package_path(path: &str) -> Option<&'static str> {
     })
 }
 
-/// Paths the AMPR index cannot tell apart, as `a = b` pairs. Its key folds ASCII case and
-/// reads `\` as `/` (`ampr_index::key`).
+/// Paths the AMPR index can't tell apart (`a = b`): its key folds ASCII case and reads `\` as `/`.
 fn case_clashes(files: &[String]) -> Vec<String> {
     let key = |p: &str| p.replace('\\', "/").to_ascii_lowercase();
     let mut seen: HashMap<String, &str> = HashMap::new();
@@ -176,8 +162,7 @@ fn case_clashes(files: &[String]) -> Vec<String> {
     clashes
 }
 
-/// `prepare`'s error as the job reports it: the AMPR index case clash it refuses (the
-/// backstop of `source_findings`' rule) is a preflight finding, the rest as `fpkg` has them.
+/// `prepare`'s error as the job reports it: its AMPR index case clash is a preflight finding.
 fn prepare_error(e: Error) -> anyhow::Error {
     match e {
         Error::Format(m) if m.contains(&format!("which {AMPR_INDEX} cannot tell apart")) => {
@@ -187,8 +172,7 @@ fn prepare_error(e: Error) -> anyhow::Error {
     }
 }
 
-/// The vendored error as the job reports it; a stop the job asked for is `cancelled`. The
-/// error stays in the chain, so U7 finds its errno.
+/// The vendored error as the job reports it (a stop asked for is `cancelled`); it stays in the chain for U7.
 fn fpkg(what: &str) -> impl Fn(Error) -> anyhow::Error + '_ {
     move |e| match e {
         Error::Cancelled => anyhow!("cancelled"),
@@ -196,16 +180,8 @@ fn fpkg(what: &str) -> impl Fn(Error) -> anyhow::Error + '_ {
     }
 }
 
-/// `.pkg` output on FreeBSD (U5): the vendored builder writes the file itself, so a thread
-/// beside `build` syncs it through `file` (a clone of the builder's handle) with `sync` once it
-/// has grown by `every` bytes, or each second it grew at all. The build's control watches
-/// `abort`, not the job's `cancel`: the syncer mirrors a cancel into it, and sets it on its
-/// first failure, after which it stops, so the build stops writing unsynced data. Returns
-/// what `build` returned and that failure; the syncer stops promptly once `build` returns, and
-/// `file` is closed by then (U6).
-// ponytail: asynchronous, with no backpressure (the verify pass still hashes every packaged
-// file); the upgrade is a vendor patch threading `durable::Output`
-// through `build::write_package` and `kraken_image::compress`.
+/// `.pkg` output on FreeBSD (U5): a thread beside `build` syncs `file` every `every` bytes or each second it grew; the build watches `abort`, which the syncer sets on a cancel or its first failure, so no unsynced data follows.
+// ponytail: asynchronous, no backpressure; the upgrade is a vendor patch threading `durable::Output` through the builder.
 #[cfg(any(target_os = "freebsd", test))]
 fn sync_beside<T>(
     file: std::fs::File,
@@ -257,8 +233,7 @@ fn sync_beside<T>(
     })
 }
 
-/// What a build beside [`sync_beside`] reports: a sync failure is the error (its errno at the
-/// root, for U7), with the build's own error, if any, as context; else the build's result.
+/// A build beside [`sync_beside`]: a sync failure is the error (errno at the root for U7), the build's own as context.
 #[cfg(any(target_os = "freebsd", test))]
 fn synced_build<T>(built: ps5upload_fpkg::Result<T>, synced: io::Result<()>) -> anyhow::Result<T> {
     let Err(e) = synced else {
@@ -287,15 +262,12 @@ fn build_request(req: &ConvertRequest, dir: &Path, imports_ampr: bool) -> BuildR
     request
 }
 
-/// Free bytes a package of about `size` bytes needs at its destination: the size, 1% more and
-/// 64 MiB for what the destination's own file system spends on the new file.
+/// Free bytes a package of about `size` needs: 1% more and 64 MiB for the destination's filesystem.
 pub(crate) fn room(size: u64) -> u64 {
     size.saturating_add(size / 100).saturating_add(64 * MIB)
 }
 
-/// The package `tree` would build into, sized as [`run`]'s preflight sizes it (its findings,
-/// then the builder's `prepare`, reading per-file headers only), for an edit's check: the
-/// package's estimated size, or every finding.
+/// The package `tree` would build into, sized as [`run`]'s preflight does (for an edit's check): its estimated size or every finding.
 pub(crate) fn size(
     req: &ConvertRequest,
     tree: &mut dyn SourceTree,
@@ -322,9 +294,7 @@ pub(crate) fn size(
     }
 }
 
-/// Builds the package of `tree` into `out`'s `.part`, verifies it and publishes it, or, when
-/// `in_place` (an edit's rebuild: `out` is the source), renames it over the source once the
-/// source's `stamp` still holds and ShadowMount+ hasn't mounted it.
+/// Builds `tree`'s package into `out`'s `.part`, verifies and publishes it; `in_place` renames it over the source once `stamp` holds and ShadowMount+ hasn't mounted it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     req: &ConvertRequest,
@@ -361,13 +331,11 @@ pub(crate) fn run(
         .files()
         .iter()
         .fold(0u64, |sum, f| sum.saturating_add(f.size));
-    // `prepare` sizes the package, filled in below; each pass renews the estimate as it
-    // learns its own size.
+    // `prepare` sizes the package; each pass renews the estimate as it learns its own size.
     let estimate = Cell::new(0u64);
     let mut on_bytes = |done: u64, total: u64| {
         if !sized.replace(true) {
-            // Compress reads the source, write and the builder's verify the package, our
-            // verify the files.
+            //
             let rest = match stage.get() {
                 "compress" => total.saturating_add(estimate.get().saturating_mul(2)),
                 "write" => total.saturating_mul(2),
@@ -377,14 +345,7 @@ pub(crate) fn run(
         }
         ctx.progress(stage.get(), done, total)
     };
-    // `prepare`'s per-file reads (a SELF header in check, 4 bytes in plan) move the bar too, each
-    // counted as `unit` bytes. The passes after them are not sized yet: compress reads the
-    // source, write and verify about as much again each (a package is at most a little over its
-    // files), so 4x the source until compress renews it, the source taken as at least 40 bytes
-    // a file (a package spends more than that on each). One read counts 1/40 of a file's share
-    // of that source, at most 64 KiB (about what streaming 64 KiB costs: a seek, an archive
-    // entry found), so the two passes take at most ~1% of the stand-in: a game of many tiny
-    // files would otherwise fill the bar before compress begins.
+    // `prepare`'s per-file reads move the bar too, each as `unit` bytes of a 4x-the-source stand-in (at least 40 bytes a file), so they take at most ~1% and a game of tiny files doesn't fill the bar before compress.
     let files = (tree.files().len() as u64).max(1);
     let source = file_bytes.max(files.saturating_mul(40));
     let unit = (source / files.saturating_mul(40)).min(64 * 1024);
@@ -427,8 +388,7 @@ pub(crate) fn run(
     for line in prepared.log() {
         ctx.log(format!("fpkg: {line}"));
     }
-    // The builder spools its compressed image inside the package itself (production requests
-    // read no spool dir), so the package is the only thing written.
+    // The builder spools its compressed image inside the package itself: the package is the only thing written.
     let size = prepared.estimated_size();
     estimate.set(size);
     let need = room(size);
@@ -476,11 +436,7 @@ pub(crate) fn run(
     if let (Out::Local(part), Some(dest)) = (&mut part, &dest) {
         part.set_dest(dest);
     }
-    // As in `convert`: reads run one range ahead on their own thread, so the builder's producer
-    // hashes and lays out one range while the next is read (a `.pkg` source's Kraken blocks
-    // decoded); `HashingTree` sees exactly the calls and bytes it would without read-ahead.
-    // The builder asks 256 KiB at a time, and a `.pkg` source pays its decode threads per read:
-    // 4 MiB windows (about 12 MiB in memory, see `Prefetch`) keep the producer fed.
+    // As in `convert`: reads run one range ahead (4 MiB windows, a `.pkg` source pays decode threads per read); `HashingTree` sees the same calls and bytes.
     let mut ahead = Prefetch::with_window(tree, 4 << 20)
         .map_err(|e| anyhow::Error::new(e).context("starting the read-ahead thread"))?;
     let mut hashing = HashingTree::new(&mut ahead);
@@ -494,9 +450,7 @@ pub(crate) fn run(
         &mut control,
     )
     .map_err(fpkg("writing the package"))?;
-    // ponytail: the builder's last `sync_all` (vendor `stream.rs:534`) has no U4 retries, so a
-    // transient fsync error there fails the job: safe, nothing is lost or published. Upgrade: a
-    // numbered vendor patch with a final-sync callback.
+    // ponytail: the builder's last `sync_all` has no U4 retries, so a transient fsync error fails the job (nothing lost or published).
     // A package on a peer is synced there (its `sync_out`), with no syncer beside it here.
     #[cfg(target_os = "freebsd")]
     let report = if let Handle::Peer(pkg) = &mut file {
@@ -553,8 +507,7 @@ pub(crate) fn run(
         report.size, report.content_id
     ));
 
-    // Verification: the expected manifest is what the package must carry, each file hashed as the
-    // builder serves it; files the build passed through keep the hash of the source read.
+    // Verify: the expected manifest, each file hashed as the builder serves it (passed-through files keep the source read's hash).
     ctx.progress("verify", 0, 1);
     let source_hashes = hashing.into_digests();
     let mut packaged = Packaged::new(&prepared, &mut ahead);
@@ -565,8 +518,7 @@ pub(crate) fn run(
         .collect();
     let expected = verify::expected_from(&mut packaged, &known, ctx, mode)?;
     checks.push(source_summary(&prepared));
-    // The source is read no more: its handles close before the package may replace it
-    // (Windows refuses to rename over an open file).
+    // The source's handles close before the package may replace it (Windows refuses to rename over an open file).
     drop(packaged);
     drop(ahead);
     ctx.check()?;
@@ -611,12 +563,17 @@ pub(crate) fn run(
         checks.push(format!("published {}", out.display()));
     }
     ctx.progress("finalize", 1, 1);
+    let summary = verify::summary(&expected.files, mode);
     Ok(JobReport {
         output: out.to_path_buf(),
         bytes: report.size,
         files: expected.files.len() as u64,
         checks,
-        verify: verify::summary(&expected.files, mode),
+        verify: summary,
+        // The source's files as read, before the builder's SDK filtering.
+        source_bytes: file_bytes,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
@@ -723,8 +680,7 @@ fn source_summary(prepared: &Prepared) -> String {
     line
 }
 
-/// What the package must read back as: the effective manifest plus the container-only
-/// artwork, each served exactly as the builder packaged it.
+/// What the package must read back as: the effective manifest plus the container-only artwork, as packaged.
 struct Packaged<'a> {
     prepared: &'a Prepared,
     tree: &'a mut dyn SourceTree,
@@ -942,8 +898,7 @@ mod tests {
         assert!(text.starts_with("preflight failed:"), "{text}");
         assert!(text.contains("data/Level.bin"), "{text}");
 
-        // A source's own index is rebuilt too, so it does not help; without libSceAmpr or an
-        // index of its own the collision never mattered.
+        // A source's own index is rebuilt too, so it doesn't help; without libSceAmpr or an index the collision never mattered.
         let mut plain = files.to_vec();
         plain[0].1 = vec![0x7f; 4096];
         let (findings, _, ampr) = findings_of(&mut Mem::new(&plain));

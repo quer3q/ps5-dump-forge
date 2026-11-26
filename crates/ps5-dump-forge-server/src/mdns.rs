@@ -1,8 +1,5 @@
-//! NAS services on the LAN by mDNS (RFC 6762): one PTR query for SMB, FTP and NFS to
-//! 224.0.0.251:5353 from an ephemeral port (a "legacy unicast" query: responders answer us
-//! directly), then PTR → SRV → A from the answers. `Nas::service` `smb`/`ftp`/`nfs` is the
-//! saved NAS's protocol (`nas::Protocol`, same spelling), so Discover's Save passes it on.
-//! `merge` adds what a probe confirmed on each host found (`probe::serves`).
+//! NAS services by mDNS (RFC 6762): one PTR query for SMB, FTP and NFS to 224.0.0.251:5353
+//! from an ephemeral port (legacy unicast: responders answer us directly), then PTR → SRV → A.
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io;
@@ -36,17 +33,15 @@ pub struct Nas {
 /// The records seen so far, by lower-cased owner name.
 #[derive(Default)]
 pub struct Records {
-    /// Service type → instance names.
     ptr: Vec<(String, String)>,
-    /// Instance → (target host, port).
+
     srv: HashMap<String, (String, u16)>,
-    /// Host → address.
+
     a: HashMap<String, Ipv4Addr>,
     /// Instance → the address its PTR came from (when no A record names one).
     from: HashMap<String, Ipv4Addr>,
 }
 
-/// The query: three PTR questions, class IN.
 pub fn query() -> Vec<u8> {
     let mut q = vec![0, 0, 0, 0, 0, SERVICES.len() as u8, 0, 0, 0, 0, 0, 0];
     for (name, _) in SERVICES {
@@ -90,7 +85,6 @@ fn u16_at(msg: &[u8], at: usize) -> Option<u16> {
 }
 
 impl Records {
-    /// Adds every PTR, SRV and A record of one response (answers, authority, additional).
     pub fn add(&mut self, msg: &[u8], source: Ipv4Addr) -> Option<()> {
         let flags = u16_at(msg, 2)?;
         if flags & 0x8000 == 0 {
@@ -146,8 +140,7 @@ impl Records {
         Some(())
     }
 
-    /// Every instance of the three services whose SRV and A are known (else the replying
-    /// address, with the service's usual port when no SRV came).
+    /// Every instance found; without SRV/A, the replying address and the service's usual port.
     pub fn candidates(&self) -> Vec<Nas> {
         let mut out = Vec::new();
         for (service, instance) in &self.ptr {
@@ -189,10 +182,8 @@ impl Records {
 /// while its probe runs.
 pub type Probed = HashMap<String, Option<Vec<(&'static str, u16)>>>;
 
-/// What Discover lists: every mDNS service as announced, then each service a probe confirmed on
-/// a host mDNS or WS-Discovery named, under that host's name (mDNS's first, else WS-Discovery's);
-/// one entry per host + protocol + port, sorted. A WS-Discovery host shows only once its probe
-/// confirmed something there.
+/// Every mDNS service as announced, plus what a probe confirmed on each host mDNS or WSD named
+/// (mDNS's name first); one entry per host + protocol + port, sorted.
 pub fn merge(mdns: &[Nas], wsd: &[Nas], probed: &Probed) -> Vec<Nas> {
     let mut out = mdns.to_vec();
     for (address, confirmed) in probed {
@@ -228,8 +219,7 @@ fn default_port(service: &str) -> u16 {
     }
 }
 
-/// Queries until `until` (again every `RESEND`) or `stop`, calling `found` with the whole list
-/// each time it changes.
+/// Queries until `until` or `stop`, calling `found` with the whole list each time it changes.
 pub fn search(until: Instant, stop: &AtomicBool, found: &dyn Fn(Vec<Nas>)) -> io::Result<()> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -300,10 +290,7 @@ mod tests {
         assert_eq!(&q[4..6], &[0, 3]);
         assert!(name(&q, 12).unwrap().0 == "_smb._tcp.local");
 
-        // A response: PTR _smb._tcp.local → "Home NAS" + a pointer back to the service name
-        // (offset 12), SRV (owner: a pointer to that instance) → nas.local:445, A nas.local
-        // 192.168.1.20; its FTP on nas.local:2121 (PTR + SRV); an FTP PTR with no SRV/A
-        // (falls back to the sender, port 21).
+        // SMB by PTR/SRV/A, FTP on 2121 by PTR + SRV, an FTP PTR with no SRV/A (the sender, 21).
         let named = |n: &str| {
             let mut o = Vec::new();
             put_name(&mut o, n);

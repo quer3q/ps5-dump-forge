@@ -1,8 +1,5 @@
 //! exFAT names: what a component may hold, how the volume upcases it, and its hash.
-//!
-//! The volume is case-insensitive through its up-case table, so two names that upcase to
-//! the same UTF-16 units are one name. The table written into the image is the one used
-//! here, which keeps the collision check, the name hashes and the driver in agreement.
+//! The table written into the image is the one used here, so collisions and hashes agree.
 
 use std::sync::OnceLock;
 
@@ -27,8 +24,7 @@ pub(crate) fn problem(name: &str) -> Option<String> {
     if name.contains('\u{FFFD}') {
         why.push("name contains U+FFFD — it was renamed lossily somewhere".into());
     }
-    // macOS hands out decomposed names; the game looks its files up by the composed
-    // spelling, and exFAT compares units, not canonical equivalents.
+    // exFAT compares units, not canonical equivalents: a decomposed macOS name would not match.
     if !unicode_normalization::is_nfc(name) {
         why.push("not in Unicode NFC".into());
     }
@@ -57,7 +53,6 @@ fn forbidden(c: char) -> bool {
 }
 
 /// `name` as the volume compares it: UTF-16, every unit through the up-case table.
-/// Surrogate halves map to themselves, as the table leaves them.
 pub(crate) fn upcase(name: &str) -> Vec<u16> {
     let table = table();
     name.encode_utf16().map(|u| table[usize::from(u)]).collect()
@@ -86,16 +81,14 @@ pub(crate) fn table_checksum(bytes: &[u8]) -> u32 {
     })
 }
 
-/// The table expanded to one entry per BMP code unit. `0xFFFF, n` is a run of `n`
-/// identity mappings; a trailing `0xFFFF` with nothing after it is the literal mapping
-/// of U+FFFF, which is how the recommended table ends.
+/// The table expanded to one entry per BMP code unit.
 fn table() -> &'static [u16] {
     static TABLE: OnceLock<Vec<u16>> = OnceLock::new();
     TABLE.get_or_init(|| expand(&COMPRESSED))
 }
 
-/// An up-case table as stored (compressed or not) expanded to one entry per BMP code unit;
-/// units past its end map to themselves.
+/// A stored up-case table expanded: `0xFFFF, n` is `n` identity mappings, a trailing `0xFFFF`
+/// the literal U+FFFF; units past its end map to themselves.
 pub(crate) fn expand(stored: &[u16]) -> Vec<u16> {
     let mut out: Vec<u16> = (0..=u16::MAX).collect();
     let mut at = 0usize;

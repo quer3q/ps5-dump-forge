@@ -116,8 +116,7 @@ fn le64(f: &mut File, at: u64) -> u64 {
     u64::from_le_bytes(b)
 }
 
-/// Nested folders, two empty ones, an empty file, files needing an indirect block, and a
-/// folder whose entries fill more than one 64 KiB block.
+/// Nested and empty folders, an empty file, indirect blocks, a folder over one 64 KiB block.
 fn nested(name: &str) -> PathBuf {
     let mut files: Vec<(String, u64)> = [
         ("eboot.bin", 3 * B + 17),
@@ -204,8 +203,7 @@ fn damaged_entries_and_pointers_are_findings() {
         damage(v.lookup(f, "data"), "listed twice");
         damage(v.lookup(f, "eboot.bin"), "listed twice");
     });
-    // A bad record after the match: root entries are ".", "..", "Data", "data",
-    // "eboot.bin", "many", "sce_sys", "z" (at byte 108).
+    // A bad record after the match ("z" at byte 108 of the root).
     edited(&img, dir + 108 + 4, &3u16.to_le_bytes(), |v, f| {
         damage(v.lookup(f, "Data"), "directory entry at byte 108");
     });

@@ -1,5 +1,4 @@
-//! The source tree as inodes: names checked, directories derived from the file paths,
-//! everything ordered so the image comes out the same every time.
+//! The source tree as inodes: names checked, directories derived, the order deterministic.
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,10 +8,8 @@ use unicode_normalization::{IsNormalized, is_nfc_quick};
 
 /// FreeBSD's `UFS_LINK_MAX`: a directory's link count is 2 + its subdirectories.
 const LINK_MAX: u64 = 65500;
-/// `UFS_MAXNAMLEN`.
 const MAXNAMLEN: usize = 255;
-/// FreeBSD's `MAXPATHLEN` (with its NUL): a longer path cannot be opened on the console
-/// anyway, and the bound keeps the per-directory path keys and the recursion below small.
+/// FreeBSD's `MAXPATHLEN` (with its NUL): a longer path cannot be opened on the console.
 pub(crate) const MAXPATHLEN: usize = 1023;
 /// FreeBSD's `MAXDIRSIZE`: directory offsets are a signed 32-bit `doff_t`.
 pub const MAXDIRSIZE: u64 = 0x7fff_ffff;
@@ -27,7 +24,7 @@ pub struct Node {
     pub kind: Kind,
     /// Bytes: the file's length, or the directory's size (a multiple of DIRBLKSIZ).
     pub size: u64,
-    /// Data index of slot 0 (see `bmap`); fixed by `plan`.
+    /// Data index of slot 0 (see `bmap`).
     pub start: u64,
     /// Data + indirect blocks the node owns.
     pub slots: u64,
@@ -53,7 +50,6 @@ impl Node {
     pub fn nlink(&self) -> u16 {
         match self.kind {
             Kind::File { .. } => 1,
-            // Bounded by LINK_MAX in `build`.
             Kind::Dir { subdirs, .. } => (2 + subdirs) as u16,
         }
     }
@@ -83,7 +79,7 @@ pub(crate) fn bad_component(c: &str) -> Option<&'static str> {
     None
 }
 
-/// Builds the inode list. Collects every naming problem first and fails with all of them.
+/// Builds the inode list, failing with every naming problem.
 pub fn build(tree: &dyn SourceTree) -> Result<Vec<Node>> {
     let mut problems: Vec<String> = Vec::new();
     let check = |path: &str, problems: &mut Vec<String>| -> bool {
@@ -198,8 +194,7 @@ fn ensure_dir(path: &str, nodes: &mut Vec<Node>, dirs: &mut HashMap<String, u32>
     Some(idx)
 }
 
-/// Puts the nodes in depth-first pre-order with children sorted by name bytes, so the
-/// inode numbers and the block layout depend only on the tree, never on scan order.
+/// Puts the nodes in depth-first pre-order, children sorted by name bytes.
 fn renumber(mut nodes: Vec<Node>) -> Result<Vec<Node>> {
     let mut order: Vec<u32> = Vec::with_capacity(nodes.len());
     let mut stack: Vec<u32> = vec![0];
@@ -210,8 +205,6 @@ fn renumber(mut nodes: Vec<Node>) -> Result<Vec<Node>> {
             Kind::File { .. } => continue,
         };
         let mut kids = kids;
-        // Names are unique per directory: files were de-duplicated, dirs come from a map,
-        // and file/dir clashes were rejected.
         kids.sort_by(|a, b| {
             nodes[*a as usize]
                 .name
@@ -303,9 +296,8 @@ fn entries<'a>(nodes: &'a [Node], i: usize) -> impl Iterator<Item = (u32, u8, &'
     }))
 }
 
-/// Directory size: entries packed into DIRBLKSIZ chunks, none straddling a chunk. Errors
-/// past `MAXDIRSIZE`. ponytail: `dir_bytes` builds a directory whole in memory (~64 bytes
-/// an entry, so a 100K-entry directory is ~6 MB); the cap bounds it at 2 GiB.
+/// Directory size: entries packed into DIRBLKSIZ chunks; errors past `MAXDIRSIZE`.
+/// ponytail: `dir_bytes` builds a directory whole in memory (~6 MB for 100K entries).
 pub fn dir_size(nodes: &[Node], i: usize) -> Result<u64> {
     let size = packed_size(nodes, i);
     if size > MAXDIRSIZE {
@@ -331,8 +323,7 @@ fn packed_size(nodes: &[Node], i: usize) -> u64 {
     chunks * DIRBLKSIZ as u64
 }
 
-/// The directory's bytes (exactly `dir_size` long). The last entry of each chunk takes
-/// the chunk's leftover space in its record length, as the kernel and newfs do.
+/// The directory's bytes; the last entry of each chunk takes the chunk's leftover space.
 pub fn dir_bytes(nodes: &[Node], i: usize) -> Vec<u8> {
     let mut out = vec![0u8; nodes[i].size as usize];
     let mut chunk = 0usize;

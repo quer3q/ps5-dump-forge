@@ -23,30 +23,65 @@ impl Kind {
     }
 }
 
-/// `content_type` values the container header carries, with their platform.
+/// `content_type` values the container header carries, with their platform. PS4: 0x1A game
+/// data (a game or its patch), 0x1B additional content with data, 0x1C additional content
+/// without data (a licence that unlocks something already in the game), 0x1E a delta patch.
+/// PS5: 0x20 a game, 0x21 additional content, 0x26 an application.
 pub fn content_type_platform(content_type: u32) -> Option<&'static str> {
     match content_type {
-        0x1A | 0x1B => Some("PS4"),
+        0x1A | 0x1B | 0x1C | 0x1E => Some("PS4"),
         0x20 | 0x21 | 0x26 => Some("PS5"),
         _ => None,
     }
 }
 
-const DLC_CONTENT_TYPES: [u32; 2] = [0x1B, 0x21];
+const DLC_CONTENT_TYPES: [u32; 3] = [0x1B, 0x1C, 0x21];
+/// A PS4 delta patch says it is a patch by its type alone.
+const PATCH_CONTENT_TYPES: [u32; 1] = [0x1E];
 /// 0x40000000 a later patch, 0x00100000 the first patch.
 const PATCH_FLAG_MASK: u32 = 0x4010_0000;
+
+/// The PARAM-style category a PS5 package's header says, for when its param.json (which has no
+/// category) is all there is: `gp` for a patch, `ac` for additional content, else `gd`. A PS5
+/// add-on read as `gd` was refused as a full game whose title runs from an image (#724).
+pub fn category_from_header(content_type: u32, content_flags: u32) -> &'static str {
+    if content_flags & PATCH_FLAG_MASK != 0 {
+        "gp"
+    } else if DLC_CONTENT_TYPES.contains(&content_type) {
+        "ac"
+    } else {
+        "gd"
+    }
+}
+
+/// What a PARAM category says, when it says one of the three.
+fn kind_of_category(category: &str) -> Option<Kind> {
+    match category.trim().to_ascii_lowercase().as_str() {
+        "gd" => Some(Kind::Base),
+        "gp" => Some(Kind::Patch),
+        "ac" => Some(Kind::Dlc),
+        _ => None,
+    }
+}
 
 /// What the header says the package is, whether that is certain, and why.
 ///
 /// The header (`content_type`, `content_flags`) decides. On PS4 the `param.sfo` CATEGORY is a
 /// second witness: when it disagrees the header still wins, but the answer is marked unsure,
-/// and the reason names both.
+/// and the reason names both. Two exceptions, both because a DLC taken for the game makes the
+/// game look stored twice (#638): a CATEGORY of `ac` beats a header that only says "game"
+/// (no add-on type, no patch bit), and a header type that is not known defers to the CATEGORY.
 pub fn classify(content_type: u32, content_flags: u32, category: &str) -> (Kind, bool, String) {
     let known = content_type_platform(content_type).is_some();
     let (kind, why) = if DLC_CONTENT_TYPES.contains(&content_type) {
         (
             Kind::Dlc,
             format!("content_type={content_type:#04x} is additional content"),
+        )
+    } else if PATCH_CONTENT_TYPES.contains(&content_type) {
+        (
+            Kind::Patch,
+            format!("content_type={content_type:#04x} is a delta patch"),
         )
     } else if content_flags & PATCH_FLAG_MASK != 0 {
         (
@@ -64,23 +99,30 @@ pub fn classify(content_type: u32, content_flags: u32, category: &str) -> (Kind,
             ),
         )
     };
+    let sfo_kind = kind_of_category(category);
     if !known {
-        return (
-            kind,
-            false,
-            format!("content_type={content_type:#04x} unrecognized; {why}"),
-        );
+        return match sfo_kind {
+            Some(sfo) => (
+                sfo,
+                false,
+                format!("content_type={content_type:#04x} unrecognized; param.sfo CATEGORY={category} says {}", sfo.as_str()),
+            ),
+            None => (
+                kind,
+                false,
+                format!("content_type={content_type:#04x} unrecognized; {why}"),
+            ),
+        };
     }
-    let sfo_kind = match category.trim().to_ascii_lowercase().as_str() {
-        "gd" => Some(Kind::Base),
-        "gp" => Some(Kind::Patch),
-        "ac" => Some(Kind::Dlc),
-        _ => None,
-    };
     if let Some(sfo) = sfo_kind {
         if sfo != kind {
+            let decided = if kind == Kind::Base && sfo == Kind::Dlc {
+                Kind::Dlc
+            } else {
+                kind
+            };
             return (
-                kind,
+                decided,
                 false,
                 format!(
                     "header says {} ({why}) but param.sfo CATEGORY={category} says {}",

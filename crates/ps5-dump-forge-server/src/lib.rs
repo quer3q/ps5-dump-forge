@@ -1,41 +1,28 @@
-//! `ps5-dump-forge serve`: the app's web UI over plain HTTP/1.1, for the PS5 payload (Tauri
-//! can't run on the console) and for trying that UI on a computer. Std only, one request
-//! per connection, and the page polls `GET /api/jobs` (no server push). The rules (limits,
-//! routes) are in ps5/README.md, "Web server".
-//!
-//! No protections, by decision: no pairing, no Host/Origin checks, no path confinement (but
-//! on the PS5 listings reach only `/data` and the drives plugged in, by user request). It
-//! behaves like the Tauri commands over HTTP, for anyone (and any web page in a browser) that
-//! can reach it on the network.
+//! `ps5-dump-forge serve`: the web UI over plain HTTP/1.1 (routes and limits: ps5/README.md).
+//! No protections, by decision: it behaves like the Tauri commands over HTTP, for anyone
+//! (and any web page in a browser) that can reach it on the network.
 
 mod api;
-// Connect (Forge ↔ Forge over FLINK, discovery, saved NAS devices): public for the desktop app, which runs
-// the same service without the HTTP server.
+// Public for the desktop app, which runs Connect without the HTTP server.
 pub mod connect;
 pub mod connect_fs;
-// Jobs mirrored to the paired peers they use (read only there; the peer may cancel them).
 pub mod connect_jobs;
-// PS5 bring-up only (and only with FORGE_DEBUG_API set): never built for a desktop target.
 #[cfg(target_env = "ps5")]
 mod debug;
-// Connect's discovery: Forge (UDP 8094) and NAS (mDNS; Windows PCs: wsd.rs).
 // A few helpers (`address`, `keepalive`, ...) only tests use yet.
 #[allow(dead_code)]
 mod discovery;
 mod http;
 mod mdns;
-// Connect's saved NAS devices.
 pub mod nas;
 mod notice;
 mod paths;
 pub mod payload;
-// Connect's smart Pair by address: what answers at an address (Forge, SMB, NFS or FTP).
 pub mod probe;
-// The payload's copy of its own ELF (`ps5/build.sh` stage 2).
 #[cfg(any(all(test, unix), target_env = "ps5"))]
 mod self_copy;
+mod shared;
 mod table;
-// Connect's Discover: Windows PCs by WS-Discovery.
 mod wsd;
 // Unix: the owner file names the title folder by (st_dev, st_ino).
 #[cfg(any(all(test, unix), target_env = "ps5"))]
@@ -49,14 +36,10 @@ use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
-/// Forge's home folder on the PS5 (`ps5/entry.c`'s `FORGE_DIR`): the self copy, the tile's
-/// owner record, Connect's data and the settings the console keeps.
+/// `ps5/entry.c`'s `FORGE_DIR`.
 pub const FORGE_DIR: &str = "/data/dumpforge";
 
-/// Where the PS5's file browser starts: `/data`, and each drive while a filesystem is mounted
-/// on it (re-checked each time, for hot-plugged drives). By user request they are all it
-/// reaches: a listing, and a paired device, refuses any other path (`paths::Roots::confine`);
-/// not `/mnt/shadowmnt` either.
+/// All a PS5 listing or paired device reaches (drives only while mounted; never `/mnt/shadowmnt`).
 pub const PS5_ROOTS: [&str; 11] = [
     "/data",
     "/mnt/usb0",
@@ -73,8 +56,7 @@ pub const PS5_ROOTS: [&str; 11] = [
 
 pub const DEFAULT_PORT: u16 = 8095;
 
-/// `ps5-dump-forge-version:<version>\0`: scripts/release-ps5.sh wants exactly one in the PS5
-/// ELF; the self copy reads the version of an ELF on disk from it. The CLI keeps it linked.
+/// scripts/release-ps5.sh wants exactly one in the PS5 ELF; the self copy reads it on disk.
 pub static VERSION_MARKER: &[u8] =
     concat!("ps5-dump-forge-version:", env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
@@ -82,40 +64,29 @@ const MAX_HANDLERS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// The roots are [`PS5_ROOTS`]-like candidates, those that exist (`/mnt/...` drives: that
-    /// are mounted), each served under its canonical path (dropped only when that is `/`).
     Ps5,
-    /// The roots are folders named on the command line, pinned at startup.
     Host,
 }
 
 pub struct Options {
     pub port: u16,
-    /// The file browser's starting points (`list_dir` with a `null` path); on the PS5 also
-    /// all that listings and paired devices reach.
+    /// On the PS5 also all that listings and paired devices reach.
     pub roots: Vec<PathBuf>,
     pub platform: Platform,
-    /// Shows the user a line: the URL, "can't close", "stopped".
     pub notify: Arc<dyn Fn(&str) + Send + Sync>,
-    /// The absolute time a client has to send one whole request (10 s).
+    /// For one whole request, however slowly it trickles in.
     pub deadline: Duration,
-    /// The absolute time a response has to reach a client, however slowly it reads (30 s).
+    /// For one whole response, however slowly the client reads.
     pub write_timeout: Duration,
-    /// Called once quit has cancelled every job and waited for its cleanup:
-    /// `std::process::exit` unless a test replaces it.
     pub exit: Arc<dyn Fn(i32) + Send + Sync>,
-    /// Set from a signal handler: the server then quits as `POST /api/quit` does.
+    /// Set from a signal handler: quits as `POST /api/quit` does.
     pub interrupt: Option<&'static AtomicBool>,
-    /// The loader `POST /api/self_update` asks to fetch and start a release (elfldr on
-    /// `127.0.0.1:9021`; tests point it at a fake).
     pub elfldr: SocketAddr,
-    /// Connect's data folder (node secret, peers); `None` runs no Connect service (tests). The
-    /// CLI's `serve` passes [`connect::default_dir`].
+    /// `None` runs no Connect service.
     pub connect_dir: Option<PathBuf>,
-    /// Connect's FLINK port: 9883, or `FORGE_FLINK_PORT` (local tests of two copies; 0 = any).
+    /// `FORGE_FLINK_PORT` for local tests of two copies (0 = any).
     pub connect_port: u16,
-    /// Where settings are kept (the job notifications' `notifications.off` marker); `None`
-    /// keeps them in memory only (tests). The CLI's `serve` passes [`FORGE_DIR`] on the PS5.
+    /// `None` keeps settings in memory only.
     pub settings_dir: Option<PathBuf>,
 }
 
@@ -146,9 +117,7 @@ impl Options {
     }
 }
 
-/// Binds `0.0.0.0:<port>` and serves until quit. A port in use by another copy of this
-/// server, of any version, is taken over when it is idle ([`take_over`]); a port in use by
-/// anything else is an error.
+/// Serves until quit; another copy of any version on the port is taken over when idle.
 pub fn serve(opts: Options) -> io::Result<()> {
     #[cfg(target_env = "ps5")]
     self_copy::start();
@@ -164,8 +133,7 @@ pub fn serve(opts: Options) -> io::Result<()> {
         },
         Err(e) => Err(e),
     };
-    // Not serving (another copy is busy, or the bind failed): the self copy still finishes
-    // before the process exits, so a newer payload loaded over an older one saves itself.
+    // Not serving: a newer payload loaded over a busy older one still saves itself.
     #[cfg(target_env = "ps5")]
     self_copy::wait();
     result
@@ -175,10 +143,8 @@ fn bind(port: u16) -> io::Result<TcpListener> {
     TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
 }
 
-/// Another copy (any version) holds the port: asks it to quit if idle (no job queued or running), then binds once its port is free (every 200 ms, up to 30 s) and serves. A busy
-/// one keeps serving; the notice says how to update.
+/// Asks the copy on the port to quit if idle, then binds once the port is free (up to 30 s).
 fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
-    // A start that can't serve (no usable root) must not stop the one that does.
     api::usable_roots(&opts)?;
     let (lang, new, port) = (notice::console_lang(), env!("CARGO_PKG_VERSION"), opts.port);
     let old = peer.version.as_str();
@@ -228,8 +194,7 @@ fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     };
-    // The older copy finished its own save before it exited; saving again after this one's
-    // startup save makes the newest version's the last, whatever order the two ran in.
+    // Saving again after the older copy exited makes the newest version's the last.
     #[cfg(target_env = "ps5")]
     {
         self_copy::wait();
@@ -238,7 +203,6 @@ fn take_over(opts: Options, peer: &Peer) -> io::Result<()> {
     serve_on(listener, opts)
 }
 
-/// The `self_copy` field of `GET /api/session`.
 fn self_copy_status() -> String {
     #[cfg(target_env = "ps5")]
     return self_copy::status();
@@ -246,7 +210,7 @@ fn self_copy_status() -> String {
     "none".into()
 }
 
-/// Serves on a listener the caller bound (tests bind port 0). Never returns `Ok`.
+/// Never returns `Ok`.
 pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
     let local = listener.local_addr()?;
     let interrupt = opts.interrupt;
@@ -274,7 +238,7 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
-            // Out of descriptors, say: back off rather than spin.
+            // Out of descriptors, say: back off.
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
@@ -286,7 +250,6 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
         active.fetch_add(1, Ordering::SeqCst);
         let slot = Slot(active.clone());
         let server = server.clone();
-        // A thread that can't start drops the closure, its slot and the socket with it.
         let _ = std::thread::Builder::new()
             .name("forge-http".into())
             .spawn(move || {
@@ -297,8 +260,6 @@ pub fn serve_on(listener: TcpListener, opts: Options) -> io::Result<()> {
     Ok(())
 }
 
-/// The notice once serving. The console's own browser opens the page from the icon; the
-/// address is in the page's header (and the log) for anyone else on the network.
 fn started(url: &str, ps5: bool) -> String {
     match ps5 {
         true => notice::started(notice::console_lang()).into(),
@@ -306,7 +267,6 @@ fn started(url: &str, ps5: bool) -> String {
     }
 }
 
-/// One handler thread; frees its place even when the handler unwinds.
 struct Slot(Arc<AtomicUsize>);
 
 impl Drop for Slot {
@@ -325,8 +285,7 @@ pub(crate) fn local_ip() -> Option<IpAddr> {
         .filter(|ip| !ip.is_unspecified())
 }
 
-/// `http://<ip>:<port>`: the listener's own address, or for a wildcard listener the
-/// address the default route leaves from (a UDP `connect` sends no packet).
+/// A wildcard listener's address is the default route's.
 // ponytail: `sceNetCtlGetInfo` is the hardware-tested alternative, if this proves unreliable.
 fn console_url(local: SocketAddr, platform: Platform) -> String {
     let ip = if local.ip().is_unspecified() {
@@ -343,15 +302,12 @@ fn console_url(local: SocketAddr, platform: Platform) -> String {
     format!("http://{host}:{}", local.port())
 }
 
-/// The copy of this app answering `GET /api/session` on `127.0.0.1:<port>`.
 struct Peer {
     version: String,
-    /// It takes `quit {"if_idle": true}` (session `handover`; v0.1.1 and older lack it, ignore
-    /// the body and cancel their jobs).
+    /// v0.1.1 and older lack it: they ignore `if_idle` and cancel their jobs.
     handover: bool,
 }
 
-/// Whether `127.0.0.1:<port>` answers `GET /api/session` as this app, and as which version.
 fn running_forge(port: u16) -> Option<Peer> {
     let request =
         format!("GET /api/session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
@@ -365,11 +321,9 @@ fn running_forge(port: u16) -> Option<Peer> {
     })
 }
 
-/// Whether `GET /api/jobs` on `127.0.0.1:<port>` lists only finished jobs (each has `done`).
 fn idle_by_jobs(port: u16) -> bool {
     let request =
         format!("GET /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    // Up to 32 finished jobs with 200 log lines each: well past 64 KiB.
     let Ok(reply) = local(port, &request, 16 << 20) else {
         return false;
     };
@@ -384,7 +338,7 @@ fn idle_by_jobs(port: u16) -> bool {
         .unwrap_or(false)
 }
 
-/// One request to `127.0.0.1:<port>` and its reply (at most `max` bytes), within 3 s overall.
+/// Within 3 s overall.
 fn local(port: u16, request: &str, max: usize) -> io::Result<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -392,7 +346,6 @@ fn local(port: u16, request: &str, max: usize) -> io::Result<Vec<u8>> {
     ask(stream, request, deadline, max)
 }
 
-/// The time to `deadline`; an error once it has passed.
 fn left(deadline: Instant) -> io::Result<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     (!left.is_zero())
@@ -400,8 +353,7 @@ fn left(deadline: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
 }
 
-/// Sends `request` and reads the reply until the peer closes, at most `max` bytes, all by
-/// `deadline` (a peer that trickles bytes can't stall the caller).
+/// All by `deadline`: a peer that trickles bytes can't stall the caller.
 fn ask(mut stream: TcpStream, request: &str, deadline: Instant, max: usize) -> io::Result<Vec<u8>> {
     stream.set_write_timeout(Some(left(deadline)?))?;
     stream.write_all(request.as_bytes())?;
@@ -418,7 +370,6 @@ fn ask(mut stream: TcpStream, request: &str, deadline: Instant, max: usize) -> i
     Ok(reply)
 }
 
-/// The status code of a raw HTTP/1.x reply.
 pub(crate) fn status_of(reply: &[u8]) -> Option<u16> {
     let line = reply.split(|&b| b == b'\r').next()?;
     let mut parts = std::str::from_utf8(line).ok()?.split(' ');
@@ -429,8 +380,7 @@ pub(crate) fn status_of(reply: &[u8]) -> Option<u16> {
 /// `a` against `b`: `x.y.z` numerically, then a release above its pre-releases
 /// (`0.0.1` > `0.0.1-pre3`), and pre-releases by their digit runs as numbers (`pre10` > `pre3`).
 pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    /// A run of digits `(false, n, "")` or of anything else `(true, 0, text)`: numbers sort
-    /// below text.
+    /// Digits `(false, n, "")` or text `(true, 0, text)`: numbers sort below text.
     type Run<'a> = (bool, u64, &'a str);
     fn runs(s: &str) -> Vec<Run<'_>> {
         let mut out = Vec::new();
@@ -468,7 +418,6 @@ pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     })
 }
 
-/// `n` random bytes as hex; fails closed when the system RNG does.
 fn random_hex(n: usize) -> io::Result<String> {
     let mut bytes = vec![0u8; n];
     getrandom::fill(&mut bytes).map_err(|e| io::Error::other(format!("no randomness: {e}")))?;

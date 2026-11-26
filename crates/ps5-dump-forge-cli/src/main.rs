@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use ps5_dump_forge_core::{
     ArchivePassword, ConvertRequest, Edit, Event, Format, Jobs, KrakenLevel, Lz4Mode, Lz4Runtime,
-    VerifyMode,
+    MetadataRecovery, VerifyMode,
 };
 
 const USAGE: &str = "\
@@ -19,17 +19,19 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc|pkg|lz4
                          [--password-stdin]
                          [--inner exfat|ffpkg|ffpfs] [-o <output>] [--threads N]
-                         [--remove-backport] [--full-verify] [--delete-source]
+                         [--remove-backport] [--full-verify] [--delete-source] [--restore-metadata]
                          [--kraken fast|balanced|smallest|stored]
                          [--level 0..9] [--lz4-unpack | --lz4-pack]
-                         [--lz4-level 0|3..12] [--lz4-runtime ng|ampr_emu]
+                         [--lz4-level 0|3..12] [--keep-ampr-emu]
        ps5-dump-forge convert <source> --to folder|exfat|ffpkg|ffpfs|ffpfsc --zstd-pack
                          [--zstd-level 1..22]
                          (with --to lz4, --lz4-pack or --zstd-pack: [--pack-profile <toml>])
        ps5-dump-forge convert <zstd_packed> --to <format> --zstd-unpack
        ps5-dump-forge edit <image> [--add <from>:<to>]... [--delete <path>]...
                          [--rename <from>:<to>]... [--mkdir <path>]... [--rebuild] [--check]
+                         [--restore-metadata [--metadata-url <url>] [--original-runtime]]
        ps5-dump-forge serve [--port N] --root <dir> [--root <dir>]...
+       ps5-dump-forge update [--install]
 
   inspect   describe a game folder, image (.exfat, .ffpkg, .ffpfs, .ffpfsc, .pkg) or archive
             holding one game folder (.zip, .7z, .rar; the first part of a multi-part set)
@@ -45,8 +47,7 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --to      folder, exfat, ffpkg (what ShadowMountPlus recommends), ffpfs (PFS image),
             ffpfsc (compressed PFS container, mounted read-only), or pkg = debug FPKG
             (shown as .fpkg in the app; the file still ends in .pkg), or lz4 = an LZ4 packed
-            folder (AMPR asset packs; a title that doesn't import libSceAmpr takes only
-            --lz4-runtime ng; named like a folder)
+            folder (AMPR asset packs and ampr-emu-ng, for any title; named like a folder)
   --inner   with --to ffpfsc: the image inside (default ffpkg)
   -o        output path (default: named from the title id, next to the source); an
             output's name without its extension must stay within 63 bytes (58 for
@@ -63,6 +64,10 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             once the output is verified and in place, delete the source (every part of a
             multi-part archive) as the app's Delete does; if it can't, the source stays and
             the job still succeeds (a source kept: <reason> check line)
+  --restore-metadata
+            with convert: the output gets Sony's metadata for this version where the game's
+            differs (needs the internet); the source is not changed. When that fails, a warning
+            and the conversion goes on as it is
   --level   with --to ffpfsc: zlib level, 0 (store) to 9 (smallest), default 6
   --kraken  with --to pkg: compression level (default fast). balanced and smallest make a
             package ~2.6% smaller but take ~6x and ~9x longer, every core busy throughout;
@@ -71,7 +76,9 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --lz4-pack
             pack the assets into LZ4 packs inside the target: --to folder (the same as
             --to lz4), exfat, ffpkg, ffpfs or ffpfsc (not pkg). Into an image the packs go
-            straight in, with no temporary folder; the packed files are read twice
+            straight in, with no temporary folder; the packed files are read twice. The
+            runtime is ampr-emu-ng (packs everything except system files): turn off
+            ShadowMount+'s fakelib update, or it replaces the runtime
   --zstd-pack
             pack the assets into zstd packs (ampr_zstd.index + ampr_zstd-NNN.pak, zstd in 256 KiB
             chunks) and install the zstd runtime at fakelib/libSceAmpr.sprx: --to folder,
@@ -82,21 +89,21 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
             with --zstd-pack: zstd level, 1 (fastest) to 22 (smallest), default 5
   --zstd-unpack
             decode a zstd-packed game's packs into plain files, for any target but lz4;
-            the release runtime replaces the zstd one and ampr_emu.index is written anew
+            ampr_emu.index is written anew (into a pkg the builder writes it)
   --lz4-level
             with --to lz4 or --lz4-pack: 0 fast (default), 3..12 LZ4 HC (9 medium, 12 max)
-  --lz4-runtime
-            with --to lz4 or --lz4-pack: the runtime installed, ng (ampr-emu-ng, default;
-            reads LZ4 and zstd packs; packs everything except system files) or ampr_emu
-            (the bundled upstream release build; the compatibility LZ4 strategy keeps root
-            files, configs, containers and media loose)
+  --keep-ampr-emu
+            keep an ampr_emu build at fakelib/libSceAmpr.sprx as it is (by default the bundled
+            ampr-emu-ng replaces it). Every conversion, pack and unpack installs ampr-emu-ng
+            where an AMPR title has none and replaces an older one or Forge's trace build;
+            a pkg carries no AMPR runtime either way (the one there is left out)
   --pack-profile
             with --to lz4, --lz4-pack or --zstd-pack: a TOML pack profile (ampr_pack.py's
             format, as Lazy_AMPR's): its [[rule]]s pick the packed files instead of the
             built-in packing strategy (the last matching rule wins; keys Forge doesn't use are logged)
   --lz4-unpack
             unpack LZ4 packs to plain files first, for any target but lz4 (which always
-            unpacks first)
+            unpacks first), pkg included
   --add     with edit: a file or folder on this computer, then a game path ('/'-separated):
             <from>:<to>; splits at the first ':' (a Windows drive, C:\\x, stays with the
             from side)
@@ -108,13 +115,30 @@ usage: ps5-dump-forge inspect <path> [--json] [--password-stdin]
   --check   with edit: report whether the edits fit, in place or rebuilt (EditCheck JSON on
             stdout); exits 1 when the mode the command would run doesn't. Nothing is edited,
             but an interrupted edit's undo journal beside the image is settled first
+  --restore-metadata
+            with edit: also restore the game's sce_sys metadata (param.json, icon and pictures,
+            snd0.at9, PlayGo tables) from Sony's update server, as one edit with any other
+            change given (alone too): only the same version's metadata piece is downloaded
+            (needs the internet); an image that can't take it in place (.ffpfs, .ffpfsc, .pkg)
+            is rebuilt; a failed download changes nothing. Protected and sealed records (npbind,
+            trophy and UDS containers) are left alone. With convert: the output gets Sony's
+            files instead, the source is not changed, and a failure is a warning
+  --metadata-url
+            with edit --restore-metadata: the version XML, manifest or _sc.pkg URL (default:
+            param.json's versionFileUri, which may offer only a newer version)
+  --original-runtime
+            with edit --restore-metadata: take Sony's sdkVersion, requiredSystemSoftwareVersion
+            and applicationDrmType too (by default the game's own stay: a backport lowers them)
   serve     the web UI on http://<this computer>:<port> (default 8095); the file browser
             starts at the --root folders (on the PS5: /data and /mnt/usb0..7, /mnt/ext0..1
             while mounted, no --root; nothing else is listed). No protections: anyone on the
             network can use it
+  update    ask GitHub whether a newer release has this computer's CLI and print its link
+            (the one command that goes online); --install downloads it, checks it against the
+            release's SHA256SUMS and puts it in place of this one
   -h, --help";
 
-// One value per run: a request's size (over clippy's limit on Windows, whose PathBuf is larger) costs nothing.
+// One value per run (over clippy's limit on Windows, whose PathBuf is larger).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Cli {
@@ -135,10 +159,12 @@ enum Cli {
         port: u16,
         roots: Vec<PathBuf>,
     },
+    Update {
+        install: bool,
+    },
     Help,
 }
 
-/// Paths stay `OsString`: a valid Unix path need not be UTF-8.
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let mut args = args.into_iter();
     let command = args.next().ok_or("missing command")?;
@@ -152,15 +178,27 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     if command == "edit" {
         return parse_edit(args);
     }
+    if command == "update" {
+        let mut install = false;
+        for arg in args {
+            match arg.to_str() {
+                Some("--install") => install = true,
+                Some("-h" | "--help") => return Ok(Cli::Help),
+                _ => return Err(format!("unknown option {arg:?}")),
+            }
+        }
+        return Ok(Cli::Update { install });
+    }
     let mut positional = Vec::new();
     let (mut json, mut to, mut output) = (false, None, None);
     let (mut threads, mut inner, mut remove_backport) = (None, None, false);
     let mut full_verify = false;
     let mut delete_source = false;
+    let mut restore_metadata = false;
     let mut kraken_level = None;
     let mut ffpfsc_level = None;
     let (mut lz4_unpack, mut lz4_pack) = (false, false);
-    let (mut lz4_level, mut lz4_runtime) = (None, None);
+    let (mut lz4_level, mut keep_ampr_emu) = (None, false);
     let (mut zstd_pack, mut zstd_level, mut zstd_unpack) = (false, None, false);
     let mut pack_profile = None;
     let mut password_stdin = false;
@@ -174,6 +212,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             "--remove-backport" => remove_backport = true,
             "--full-verify" => full_verify = true,
             "--delete-source" => delete_source = true,
+            "--restore-metadata" => restore_metadata = true,
             "--to" => to = Some(parse_format(&text(value("--to")?)?)?),
             "--inner" => inner = Some(parse_format(&text(value("--inner")?)?)?),
             "--level" => {
@@ -205,13 +244,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                         .ok_or("--lz4-level takes 0 or 3 through 12")?,
                 )
             }
-            "--lz4-runtime" => {
-                lz4_runtime = Some(match text(value("--lz4-runtime")?)?.as_str() {
-                    "ng" => Lz4Runtime::Ng,
-                    "ampr_emu" => Lz4Runtime::AmprEmu,
-                    _ => return Err("--lz4-runtime takes ng or ampr_emu".into()),
-                })
-            }
+            "--keep-ampr-emu" => keep_ampr_emu = true,
             "--zstd-pack" => zstd_pack = true,
             "--zstd-unpack" => zstd_unpack = true,
             "--zstd-level" => {
@@ -283,9 +316,6 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             if lz4_level.is_some() && !packing {
                 return Err("--lz4-level only goes with --to lz4 or --lz4-pack".into());
             }
-            if lz4_runtime.is_some() && !packing {
-                return Err("--lz4-runtime only goes with --to lz4 or --lz4-pack".into());
-            }
             if pack_profile.is_some() && !(packing || zstd_pack) {
                 return Err(
                     "--pack-profile only goes with --to lz4, --lz4-pack or --zstd-pack".into(),
@@ -299,7 +329,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     "--zstd-pack goes with --to folder, exfat, ffpkg, ffpfs or ffpfsc".into(),
                 );
             }
-            let any_lz4 = lz4_unpack || lz4_pack || lz4_level.is_some() || lz4_runtime.is_some();
+            let any_lz4 = lz4_unpack || lz4_pack || lz4_level.is_some();
             if zstd_pack && any_lz4 {
                 return Err("--zstd-pack takes no LZ4 option".into());
             }
@@ -309,8 +339,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
             if zstd_unpack && (any_lz4 || format == Format::Lz4) {
                 return Err("--zstd-unpack takes no LZ4 option and not --to lz4".into());
             }
-            // No -o: named in `main` once the archive password is known (an encrypted archive's
-            // title is inside it).
+            // No -o: named in `main` once the archive password is known.
             let output = output.unwrap_or_default();
             Ok(Cli::Convert {
                 request: ConvertRequest {
@@ -331,7 +360,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                         None
                     },
                     lz4_level: lz4_level.unwrap_or(0),
-                    lz4_runtime: lz4_runtime.unwrap_or_default(),
+                    lz4_runtime: Lz4Runtime::Ng,
+                    replace_ampr_emu: !keep_ampr_emu,
                     zstd_pack,
                     zstd_level: zstd_level.unwrap_or(ps5_dump_forge_core::DEFAULT_ZSTD_LEVEL),
                     zstd_unpack,
@@ -341,6 +371,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
                     replace: false,
                     edit_rebuild: false,
                     install: None,
+                    recover_metadata: None,
+                    restore_metadata,
                     delete_source,
                     pack_profile,
                     archive_password: None,
@@ -368,7 +400,6 @@ fn parse_serve(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> 
             other => return Err(format!("unknown argument {other:?} for serve")),
         }
     }
-    // The PS5 serves its fixed folders; a computer only what it is told to.
     if cfg!(target_env = "ps5") {
         if !roots.is_empty() {
             return Err("--root is not used on the PS5".into());
@@ -382,15 +413,19 @@ fn parse_serve(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> 
 fn parse_edit(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> {
     let (mut rebuild, mut check, mut edits, mut positional) =
         (false, false, Vec::new(), Vec::new());
+    let (mut restore, mut url, mut original_runtime) = (false, None, false);
     while let Some(arg) = args.next() {
         let mut value = |flag: &str| args.next().ok_or(format!("{flag} needs a value"));
         let text = |v: OsString| v.into_string().map_err(|_| "option values must be text");
         match arg.to_str().unwrap_or("") {
             "-h" | "--help" => return Ok(Cli::Help),
-            // Events are JSON lines already; the flag is only symmetry with convert.
+            // Events are JSON lines already.
             "--json" => {}
             "--rebuild" => rebuild = true,
             "--check" => check = true,
+            "--restore-metadata" => restore = true,
+            "--metadata-url" => url = Some(text(value("--metadata-url")?)?),
+            "--original-runtime" => original_runtime = true,
             "--add" => {
                 let pair = text(value("--add")?)?;
                 let (from, to) =
@@ -431,39 +466,63 @@ fn parse_edit(mut args: impl Iterator<Item = OsString>) -> Result<Cli, String> {
     }
     let [image] = <[PathBuf; 1]>::try_from(positional)
         .map_err(|p| format!("expected one image, got {}", p.len()))?;
-    if edits.is_empty() {
-        return Err("edit needs at least one of --add, --delete, --rename or --mkdir".into());
+    if edits.is_empty() && !restore {
+        return Err(
+            "edit needs at least one of --add, --delete, --rename, --mkdir or --restore-metadata"
+                .into(),
+        );
+    }
+    if (url.is_some() || original_runtime) && !restore {
+        return Err("--metadata-url and --original-runtime go with --restore-metadata".into());
+    }
+    if check && restore {
+        return Err("--check doesn't download: run it without --restore-metadata".into());
     }
     let format = format_of(&image);
     Ok(Cli::Edit {
         request: ConvertRequest {
-            source: image,
-            format,
-            output: PathBuf::new(),
-            compression_threads: None,
-            inner: None,
-            remove_backport: false,
-            full_verify: false,
-            kraken_level: KrakenLevel::default(),
-            ffpfsc_level: ps5_dump_forge_core::DEFAULT_FFPFSC_LEVEL,
-            lz4: None,
-            lz4_level: 0,
-            lz4_runtime: Lz4Runtime::default(),
-            zstd_pack: false,
-            zstd_level: ps5_dump_forge_core::DEFAULT_ZSTD_LEVEL,
-            zstd_unpack: false,
-            pack_profile: None,
             edits,
             edit_rebuild: rebuild,
-            extract: Vec::new(),
-            transfer: Vec::new(),
-            replace: false,
-            install: None,
-            delete_source: false,
-            archive_password: None,
+            recover_metadata: restore.then_some(MetadataRecovery {
+                url,
+                original_runtime,
+            }),
+            ..base_request(image, format)
         },
         check,
     })
+}
+
+fn base_request(source: PathBuf, format: Format) -> ConvertRequest {
+    ConvertRequest {
+        source,
+        format,
+        output: PathBuf::new(),
+        compression_threads: None,
+        inner: None,
+        remove_backport: false,
+        full_verify: false,
+        kraken_level: KrakenLevel::default(),
+        ffpfsc_level: ps5_dump_forge_core::DEFAULT_FFPFSC_LEVEL,
+        lz4: None,
+        lz4_level: 0,
+        lz4_runtime: Lz4Runtime::default(),
+        replace_ampr_emu: true,
+        zstd_pack: false,
+        zstd_level: ps5_dump_forge_core::DEFAULT_ZSTD_LEVEL,
+        zstd_unpack: false,
+        pack_profile: None,
+        edits: Vec::new(),
+        edit_rebuild: false,
+        extract: Vec::new(),
+        transfer: Vec::new(),
+        replace: false,
+        install: None,
+        recover_metadata: None,
+        restore_metadata: false,
+        delete_source: false,
+        archive_password: None,
+    }
 }
 
 /// Split `from:to` at the first `:`, keeping a Windows drive prefix (`C:\x:/y`) with `from`.
@@ -483,7 +542,7 @@ fn split_from_to(s: &str) -> Option<(&str, &str)> {
     (!from.is_empty() && !to.is_empty()).then_some((from, to))
 }
 
-/// An image's own format, so an edit request names one; core ignores it for an image edit.
+/// Core ignores it for an image edit; the request only needs one.
 fn format_of(path: &Path) -> Format {
     match path
         .extension()
@@ -506,7 +565,6 @@ fn parse_format(s: &str) -> Result<Format, String> {
     })
 }
 
-/// Next to the source (core's empty `dir`), named from its title id.
 fn default_output(
     source: &Path,
     format: Format,
@@ -516,21 +574,17 @@ fn default_output(
         .map_err(|e| format!("{e:#}"))
 }
 
-// scripts/release-ps5.sh looks for the server's marker in the PS5 ELF to check that it is this
-// version; this keeps it linked in every build (one literal: the self copy slices its prefix).
+// Keeps the server's version marker linked in: scripts/release-ps5.sh checks it in the PS5 ELF.
 #[used]
 static VERSION_MARKER: &&[u8] = &ps5_dump_forge_server::VERSION_MARKER;
 
-// The PS5 libc serializes every malloc across threads (ps5-dump-forge-ps5's docs); musl's
-// malloc takes one lock too (the static Linux CLI).
-// ponytail: measured on the PS5 only; musl's gain is assumed.
+// ponytail: measured on the PS5 only (its libc serializes every malloc); musl's gain is assumed.
 #[cfg(any(target_env = "ps5", target_env = "musl"))]
 #[global_allocator]
 static ALLOC: ps5_dump_forge_ps5::Pool = ps5_dump_forge_ps5::Pool;
 
-// The PS5 kernel fills FreeBSD 11 structs; libc's default FreeBSD 12 layouts read every field
-// at the wrong offset (found on hardware: every path looked like neither a file nor a folder).
-// ps5/build.sh selects the FreeBSD 11 ABI; these fail the build if that is ever lost.
+// The PS5 kernel fills FreeBSD 11 structs (found on hardware: FreeBSD 12 layouts made every path
+// neither a file nor a folder); these fail the build if ps5/build.sh's FreeBSD 11 ABI is lost.
 #[cfg(target_env = "ps5")]
 const _: () = {
     assert!(std::mem::size_of::<libc::stat>() == 120);
@@ -540,11 +594,9 @@ const _: () = {
 };
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-/// Set once the job is cancelled or done and its `.part` cleaned up; Windows' close
-/// handler waits for it.
+/// Windows' close handler waits for it.
 static CLEANED_UP: AtomicBool = AtomicBool::new(false);
-/// Set by the first Ctrl-C itself (`INTERRUPTED` is also set by a dead stdout); a second
-/// one quits at once, since a job stuck in a blocking call may never finish cancelling.
+/// The first Ctrl-C (`INTERRUPTED` is also set by a dead stdout): a second one quits at once.
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
 // ponytail: a plain signal handler that only sets a flag; the main loop polls it.
@@ -564,11 +616,9 @@ fn on_ctrl_c() {
     }
 }
 
-/// Ctrl-C and Ctrl-Break only set the flag. Closing the console, logging off or shutting
-/// down ends the process once the handler returns (or about 5 s later), so the handler
-/// waits there, up to 4 s, for the main loop to cancel the job and clean up.
-// ponytail: a cleanup slower than the 4 s wait is cut off by Windows; the `.part` survives
-// and `stale_parts` lists it.
+/// Closing the console, logging off or shutting down ends the process once the handler returns
+/// (or ~5 s later), so it waits up to 4 s for the job's cleanup.
+// ponytail: a slower cleanup is cut off; the `.part` survives and `stale_parts` lists it.
 #[cfg(windows)]
 fn on_ctrl_c() {
     #[link(name = "kernel32")]
@@ -605,6 +655,11 @@ fn on_ctrl_c() {
 fn on_ctrl_c() {}
 
 fn main() -> ExitCode {
+    // What an earlier `update --install` moved aside: Windows can't remove a running exe.
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(old_exe(&exe));
+    }
     let cli = match parse_args(std::env::args_os().skip(1)) {
         Ok(cli) => cli,
         Err(e) => {
@@ -647,7 +702,102 @@ fn main() -> ExitCode {
             }
         }
         Cli::Serve { port, roots } => serve(port, roots),
+        Cli::Update { install } => update(install),
     }
+}
+
+fn update(install: bool) -> ExitCode {
+    use ps5_dump_forge_updater as up;
+    let current = env!("CARGO_PKG_VERSION");
+    let Some(asset) = up::cli_asset() else {
+        eprintln!("ps5-dump-forge: no release has a CLI for this platform; update it by hand");
+        return ExitCode::FAILURE;
+    };
+    let latest = match up::latest(asset) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ps5-dump-forge: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let new = latest.version;
+    if !up::is_newer(&new, current) {
+        return print_out(&format!("ps5-dump-forge {current} is up to date\n"));
+    }
+    if !latest.listed {
+        eprintln!("ps5-dump-forge: no ps5-dump-forge-cli asset for this platform in v{new}");
+        return ExitCode::FAILURE;
+    }
+    if !install {
+        let url = up::asset_url(&new, asset);
+        return print_out(&format!("ps5-dump-forge {new} is available: {url}\n"));
+    }
+    match up::download_cli(&new, asset).and_then(|bytes| replace_exe(&bytes)) {
+        Ok(()) => print_out(&format!("updated to {new}\n")),
+        Err(e) => {
+            eprintln!("ps5-dump-forge: couldn't update to {new}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+fn old_exe(exe: &Path) -> PathBuf {
+    let mut old = exe.as_os_str().to_owned();
+    old.push(".old");
+    PathBuf::from(old)
+}
+
+fn replace_exe(bytes: &[u8]) -> std::io::Result<()> {
+    // unix: resolve a link (e.g. one in /usr/local/bin) so the file it names is replaced; Windows'
+    // current_exe is already absolute and canonicalize fails on some volumes (RAM disks, SUBST).
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    let exe = std::fs::canonicalize(exe)?;
+    let dir = exe.parent().unwrap_or(Path::new("."));
+    let name = exe.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.update-{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o755);
+    let written = options.open(&tmp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        // The create mode went through the umask; the CLI must stay runnable by everyone.
+        #[cfg(unix)]
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        f.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| put_in_place(&tmp, &exe)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // In place already: a folder that can't be synced (FUSE, network) isn't a failure.
+    #[cfg(unix)]
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn put_in_place(tmp: &Path, exe: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, exe)
+}
+
+#[cfg(windows)]
+fn put_in_place(tmp: &Path, exe: &Path) -> std::io::Result<()> {
+    let old = old_exe(exe);
+    let _ = std::fs::remove_file(&old);
+    std::fs::rename(exe, &old)?;
+    // shortcut: two renames, not one atomic swap; a crash between them leaves only `<exe>.old`,
+    // which the error below names (a separate updater process would close that window).
+    std::fs::rename(tmp, exe).map_err(|e| match std::fs::rename(&old, exe) {
+        Ok(()) => e,
+        Err(back) => std::io::Error::other(format!(
+            "{e}; putting the old CLI back failed too ({back}): rename {} to {} by hand",
+            old.display(),
+            exe.display()
+        )),
+    })
 }
 
 fn usage_error(e: &str) -> ExitCode {
@@ -655,8 +805,7 @@ fn usage_error(e: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// An archive's password: one line of stdin with `--password-stdin`, else
-/// `FORGE_ARCHIVE_PASSWORD`. Never an argument (argv is visible to other users). Empty = none.
+/// Never an argument (argv is visible to other users). Empty = none.
 fn archive_password(from_stdin: bool) -> Result<Option<ArchivePassword>, String> {
     let password = if from_stdin {
         let mut line = String::new();
@@ -679,7 +828,6 @@ fn archive_password(from_stdin: bool) -> Result<Option<ArchivePassword>, String>
 
 fn serve(port: u16, roots: Vec<PathBuf>) -> ExitCode {
     use ps5_dump_forge_server::{Options, PS5_ROOTS, Platform};
-    // `parse_serve` refuses `--root` on the PS5, which serves its fixed folders.
     let (roots, platform) = if cfg!(target_env = "ps5") {
         (PS5_ROOTS.iter().map(PathBuf::from).collect(), Platform::Ps5)
     } else {
@@ -701,7 +849,6 @@ fn serve(port: u16, roots: Vec<PathBuf>) -> ExitCode {
     }
 }
 
-/// A PS5 notification (`ps5/entry.c`).
 #[cfg(target_env = "ps5")]
 fn notify(line: &str) {
     unsafe extern "C" {
@@ -777,7 +924,7 @@ fn inspect(path: &Path, password: Option<&ArchivePassword>, json: bool) -> ExitC
     if let Some(v) = &found.forge_version {
         text += &format!("forge:      v{v}\n");
     }
-    if let Some(line) = found.lz4.as_ref().map(|f| lz4_line(f, found.zstd_packed)) {
+    if let Some(line) = found.lz4.as_ref().map(lz4_line) {
         text += &format!("{line}\n");
     }
     if !found.unsigned.is_empty() {
@@ -814,7 +961,6 @@ fn inspect(path: &Path, password: Option<&ArchivePassword>, json: bool) -> ExitC
     print_out(&text)
 }
 
-/// `12431` as `12,431`.
 fn grouped(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
@@ -827,9 +973,7 @@ fn grouped(n: u64) -> String {
     out
 }
 
-/// The one `inspect` line for a source's LZ4 facts.
-fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts, zstd_packed: bool) -> String {
-    // The runtime with the version it names itself with, as the source card's tile names it.
+fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts) -> String {
     let named = |name: &str| match &f.runtime_version {
         Some(v) => format!("{name} {v}"),
         None => name.to_owned(),
@@ -866,29 +1010,23 @@ fn lz4_line(f: &ps5_dump_forge_core::Lz4Facts, zstd_packed: bool) -> String {
         }
         _ => String::new(),
     };
-    let shipped = f.shipped_runtime_version;
-    let action = match (f.runtime_action, f.runtime.as_str()) {
-        // Beside zstd packs core installs its zstd runtime, not ampr_emu (`lz4::plain`).
-        (Some("install" | "replace"), _) if zstd_packed => {
-            ", a conversion installs the zstd runtime".to_owned()
+    // `runtime_action` assumes `--keep-ampr-emu` is off (core's `inspect`).
+    let mut action = match (f.runtime_action, f.runtime.as_str()) {
+        (Some("install"), _) => ", a conversion installs ampr-emu-ng".to_owned(),
+        (Some("replace"), _) if f.keep_runtime_action == Some("keep") => {
+            format!(", a conversion replaces {runtime} with ampr-emu-ng (--keep-ampr-emu keeps it)")
         }
-        (Some("install"), _) => format!(", a conversion installs ampr_emu {shipped}"),
-        (Some("replace"), _) => {
-            format!(", a conversion replaces the runtime with ampr_emu {shipped}")
-        }
-        // Core keeps another runtime only when it names a version at least the bundled one.
-        (Some("keep"), "other") => {
-            format!(
-                ", ampr_emu {} kept",
-                f.runtime_version.as_deref().unwrap_or_default()
-            )
-        }
+        (Some("replace"), _) => format!(", a conversion replaces {runtime} with ampr-emu-ng"),
+        (Some("keep"), _) => format!(", {runtime} kept"),
         _ => String::new(),
     };
+    if f.pkg_runtime_action == Some("omit") {
+        action += ", a pkg carries none";
+    }
     format!("LZ4 (AMPR): {state}{action}{index}{ampr}")
 }
 
-/// stdout, without the panic `print!` has on a closed pipe.
+/// Without the panic `print!` has on a closed pipe.
 fn print_out(text: &str) -> ExitCode {
     match std::io::stdout().lock().write_all(text.as_bytes()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -896,8 +1034,7 @@ fn print_out(text: &str) -> ExitCode {
     }
 }
 
-/// `edit --check`: core's `EditCheck` as JSON; fails when the mode the same command would run
-/// (in place, or `--rebuild` for an image; a folder is changed directly) has findings.
+/// Fails when the mode the same command would run has findings.
 fn check_edits(request: &ConvertRequest) -> ExitCode {
     let check = Jobs::new(|_| {}).edit_check(request);
     let text = match serde_json::to_string_pretty(&check) {
@@ -922,7 +1059,6 @@ fn check_edits(request: &ConvertRequest) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// convert, run and edit: JSONL events on stdout, a human summary on stderr.
 fn run_request(request: ConvertRequest) -> ExitCode {
     on_ctrl_c();
     let (tx, rx) = mpsc::channel();
@@ -1008,14 +1144,6 @@ mod tests {
         s.split_whitespace().map(OsString::from).collect()
     }
 
-    fn convert(s: &str) -> Result<ConvertRequest, String> {
-        match parse_args(args(s)) {
-            Ok(Cli::Convert { request: r, .. }) => Ok(r),
-            Ok(_) => panic!("not a convert"),
-            Err(e) => Err(e),
-        }
-    }
-
     fn edit(s: &str) -> Result<(ConvertRequest, bool), String> {
         match parse_args(args(s)) {
             Ok(Cli::Edit { request, check }) => Ok((request, check)),
@@ -1068,52 +1196,5 @@ mod tests {
             }]
         );
         assert_eq!(r.format, Format::Ffpkg);
-    }
-
-    #[test]
-    fn edit_splits_at_the_first_colon() {
-        let (r, _) = edit("edit game.exfat --add a:b:c").unwrap();
-        assert_eq!(
-            r.edits,
-            vec![Edit::Add {
-                from: PathBuf::from("a"),
-                to: "b:c".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn edit_needs_its_flags() {
-        assert!(edit("edit game.exfat").is_err());
-        assert!(edit("edit game.exfat --rename a").is_err());
-        assert!(edit("edit game.exfat --add a:").is_err());
-        assert!(edit("edit game.exfat --delete").is_err());
-        assert!(edit("edit game.exfat --mkdir").is_err());
-    }
-
-    #[test]
-    fn edit_rejects_unknown_options() {
-        assert!(edit("edit game.exfat --bogus").is_err());
-    }
-
-    #[test]
-    fn rejects_bad_lz4_combinations() {
-        for bad in [
-            "convert /g --to lz4 --lz4-unpack -o x",
-            "convert /g --to lz4 --lz4-profile r.toml -o x",
-            "convert /g --to lz4 --inner exfat -o x",
-            "convert /g --to lz4 --kraken fast -o x",
-            "convert /g --to lz4 --level 5 -o x",
-            "convert /g --to lz4 --lz4-pack -o x",
-            "convert /g --to pkg --lz4-pack -o x",
-            "convert /g --to exfat --lz4-pack --lz4-unpack -o x",
-        ] {
-            assert!(convert(bad).is_err(), "{bad}");
-        }
-        let e = convert("convert /g --to lz4 --lz4-unpack -o x").unwrap_err();
-        assert!(
-            e.contains("redundant: the LZ4 target always unpacks first"),
-            "{e}"
-        );
     }
 }

@@ -1,5 +1,4 @@
-//! FTP servers (`ftp://host[:port]/path`): a game source and an output, read and written through
-//! the [`crate::remote::Remote`] calls a paired Forge's files use, over `ps5-dump-forge-ftp`.
+//! FTP servers (`ftp://host[:port]/path`) as a [`crate::remote::Remote`], over `ps5-dump-forge-ftp`.
 
 use std::collections::HashMap;
 use std::io;
@@ -11,15 +10,12 @@ use ps5_dump_forge_ftp::Session;
 
 use crate::remote::{FlinkPath, Remote, RemoteEntry, RemoteStat};
 
-/// `host[:port]` as `ftp://` paths spell it ([`crate::remote::authority`]): lower case, the
-/// port only when it isn't 21; `None` for anything else (a user name, a path, an empty host, a
-/// bad port).
+/// `host[:port]` as `ftp://` paths spell it ([`crate::remote::authority`], default port 21).
 pub fn authority(s: &str) -> Option<String> {
     crate::remote::authority(s, ps5_dump_forge_ftp::DEFAULT_PORT)
 }
 
-/// A saved FTP server's login: `host[:port]` as `ftp://` paths spell it ([`authority`]); an empty
-/// user is anonymous.
+/// A saved FTP server's login; an empty user is anonymous.
 #[derive(Clone)]
 pub struct FtpLogin {
     pub authority: String,
@@ -32,8 +28,7 @@ fn logins() -> &'static Mutex<HashMap<String, FtpLogin>> {
     L.get_or_init(Mutex::default)
 }
 
-/// The saved FTP servers' logins (the server hands them over at start and on every change); a
-/// server not listed is tried anonymously. Sessions made with an old login are dropped.
+/// The saved servers' logins (others anonymous); sessions made with an old login are dropped.
 pub fn set_logins(list: Vec<FtpLogin>) {
     *lock(logins()) = list.into_iter().map(|l| (l.authority.clone(), l)).collect();
     let ftp = remote_inner();
@@ -46,7 +41,6 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The FTP client as a [`Remote`].
 pub(crate) fn remote() -> Arc<dyn Remote> {
     remote_inner().clone()
 }
@@ -56,29 +50,24 @@ fn remote_inner() -> &'static Arc<Ftp> {
     R.get_or_init(|| Arc::new(Ftp::default()))
 }
 
-/// One shared session per server for listings, stats and reads, and a session of its own for
-/// each upload (an FTP control connection is busy while a file goes up).
-// ponytail: no reconnect beyond one fresh login when a cached session died (`with`); no
-// read-ahead here (each `read_at` is one REST + RETR; `RemotePkgOut` keeps windows of its own).
+/// One shared session per server for listings, stats and reads, one per upload (a control
+/// connection is busy while a file goes up).
+// ponytail: no read-ahead here (each `read_at` is one REST + RETR).
 #[derive(Default)]
 struct Ftp {
     sessions: Mutex<HashMap<String, Session>>,
     uploads: Mutex<HashMap<u64, Upload>>,
     next: AtomicU64,
-    /// Bumped (under `sessions`) whenever the logins change: a session that began logging in
-    /// before is used once but not cached.
+    /// Bumped under `sessions` on a login change: a session begun before it is used once, not cached.
     logins: AtomicU64,
 }
 
-/// A file going up, through the crate's [`ps5_dump_forge_ftp::Writer`] (any offset, `REST` to go
-/// back) on a session of its own.
 struct Upload {
     at: FlinkPath,
     w: ps5_dump_forge_ftp::Writer,
 }
 
-/// Whether the FTP server holding `dir` can rewrite a file in place (an fpkg and LZ4 packs in a
-/// folder go back over what they wrote): the crate's probe, with a probe file in `dir`.
+/// Whether the server can rewrite a file in place (an fpkg, LZ4 packs): a probe file in `dir`.
 pub(crate) fn can_rewrite(dir: &FlinkPath) -> io::Result<bool> {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
@@ -93,12 +82,10 @@ fn connect(authority: &str) -> io::Result<Session> {
     Session::connect(host, port, &user, &pass)
 }
 
-/// `host[:port]` (`[v6]` or `[v6]:port` for IPv6) as host and port (21 when not given).
 fn host_port(authority: &str) -> (&str, u16) {
     crate::remote::host_port(authority, ps5_dump_forge_ftp::DEFAULT_PORT)
 }
 
-/// The server's absolute path for `at`.
 fn abs(at: &FlinkPath) -> String {
     format!("/{}", at.path)
 }
@@ -116,8 +103,7 @@ fn stat_of(e: &ps5_dump_forge_ftp::Entry) -> RemoteStat {
     }
 }
 
-/// A failure of the connection, not the server's answer: the session is dead. A timeout counts
-/// too (a late reply would answer the next command), though it isn't retried ([`timed_out`]).
+/// The connection failed (not the server's answer): the session is dead. Timeouts too, unretried.
 fn dead(e: &io::Error) -> bool {
     timed_out(e)
         || matches!(
@@ -129,7 +115,7 @@ fn dead(e: &io::Error) -> bool {
         )
 }
 
-/// A socket timeout: `WouldBlock` on unix, `TimedOut` on Windows.
+/// `WouldBlock` on unix, `TimedOut` on Windows.
 fn timed_out(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -143,19 +129,16 @@ fn mtime(secs: Option<i64>) -> Option<SystemTime> {
 }
 
 impl Ftp {
-    /// `f` on the server's shared session (made when there is none); a failure that isn't the
-    /// server's answer drops the session, and on a cached one (a server closes idle sessions,
-    /// vsftpd after 300 s) `f` runs once more on a fresh login.
-    // ponytail: as smb.rs, a request whose reply was lost is sent again: a mkdir or rename that
-    // took may then answer AlreadyExists / NotFound. Calls that find no session at once each log
-    // in (the last one is cached).
+    /// `f` on the shared session; a connection failure drops it, and on a cached one (servers close
+    /// idle sessions) `f` runs once more on a fresh login.
+    // ponytail: a request whose reply was lost is sent again (a mkdir may answer AlreadyExists);
+    // calls finding no session at once each log in.
     fn with<T>(&self, at: &FlinkPath, f: impl Fn(&Session) -> io::Result<T>) -> io::Result<T> {
-        // Bound first: a guard in the `if let` would live through the login's own lock.
+        // Bound first: a guard in the `if let` would live through the login.
         let cached = lock(&self.sessions).get(&at.key_id).cloned();
         if let Some(session) = cached {
             match f(&session) {
                 Err(e) if dead(&e) => {
-                    // Only this session: another call may have cached a fresh one meanwhile.
                     let mut sessions = lock(&self.sessions);
                     if sessions.get(&at.key_id).is_some_and(|s| s.same(&session)) {
                         sessions.remove(&at.key_id);
@@ -210,7 +193,7 @@ impl Remote for Ftp {
     }
 
     fn read_at(&self, path: &FlinkPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        // A file still going up: its open `STOR` is completed first.
+        // A file still going up: its open `STOR` completed first.
         for u in lock(&self.uploads).values_mut().filter(|u| &u.at == path) {
             u.w.pause().map_err(|e| named(path, e))?;
         }
@@ -222,7 +205,7 @@ impl Remote for Ftp {
     }
 
     fn create(&self, path: &FlinkPath) -> io::Result<u64> {
-        // Never over a file there: FTP's STOR would replace it.
+        // Never over a file: STOR replaces.
         match self.stat(path) {
             Ok(_) => {
                 return Err(io::Error::new(
@@ -245,7 +228,7 @@ impl Remote for Ftp {
         Ok(handle)
     }
 
-    // ponytail: one lock over every upload's network calls (one transfer runs at a time).
+    // ponytail: one lock over every upload's network calls.
     fn write_at(&self, handle: u64, offset: u64, bytes: &[u8]) -> io::Result<()> {
         let mut uploads = lock(&self.uploads);
         let u = uploads.get_mut(&handle).ok_or_else(|| no_upload(handle))?;
@@ -253,8 +236,7 @@ impl Remote for Ftp {
         u.w.write_at(offset, bytes).map_err(|e| named(&at, e))
     }
 
-    // ponytail: FTP has no sync: the upload is completed (the server has every byte); what it
-    // keeps on its disk is its own matter.
+    // ponytail: FTP has no sync: the upload is completed, the server's disk is its own matter.
     fn sync(&self, handle: u64) -> io::Result<()> {
         let mut uploads = lock(&self.uploads);
         uploads
@@ -286,7 +268,30 @@ impl Remote for Ftp {
         self.with(path, |s| s.remove(&abs(path)))
     }
 
-    // ponytail: FTP can't tell free space; a full disk fails the upload itself.
+    fn rmdir(&self, path: &FlinkPath) -> io::Result<()> {
+        self.with(path, |s| s.rmdir(&abs(path)))
+    }
+
+    fn delete_path(&self, path: &FlinkPath) -> Result<(), crate::DeleteError> {
+        if path.path.is_empty() {
+            return Err(crate::delete::nas_root(path));
+        }
+        crate::delete::nas_delete(self, path)
+    }
+
+    fn move_path(
+        &self,
+        from: &FlinkPath,
+        to: &FlinkPath,
+        replace: bool,
+    ) -> Result<(), crate::DeleteError> {
+        if let Some(root) = [from, to].into_iter().find(|p| p.path.is_empty()) {
+            return Err(crate::delete::nas_root(root));
+        }
+        crate::delete::nas_move(self, from, to, replace)
+    }
+
+    // ponytail: no free space over FTP; a full disk fails the upload.
     fn free_space(&self, _: &FlinkPath) -> io::Result<u64> {
         Ok(u64::MAX)
     }

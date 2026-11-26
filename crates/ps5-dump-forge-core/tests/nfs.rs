@@ -1,10 +1,6 @@
-//! An NFS export as a game source and as an output. Runs only with
-//! `FORGE_NFS_TEST=nfs://host[:port]/path/to/out`: a writable folder whose parent holds the
-//! generated game `game-nfs` (`tests/scripts/nfs.sh up` prints one line per server: unfs3 for
-//! NFSv3, NFS-Ganesha for NFSv4.1). Everything is checked over NFS itself (Ganesha's export is a Docker
-//! volume, not a folder here). `FORGE_NFS_TEST_LOCAL` (the `out` folder on this machine) or
-//! `FORGE_NFS_TEST_CONTAINER` (the server's container: `docker exec rm -rf`) removes the run's
-//! folder afterwards (the client removes files only).
+//! An NFS export as a game source and an output; runs only with `FORGE_NFS_TEST=nfs://host[:port]/out`
+//! beside the game `game-nfs` (`tests/scripts/nfs.sh up`). `FORGE_NFS_TEST_LOCAL` (that folder
+//! here) or `FORGE_NFS_TEST_CONTAINER` (`docker exec rm -rf`) removes the run's folder after.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,12 +27,15 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         zstd_unpack: false,
         lz4_level: 0,
         lz4_runtime: Default::default(),
+        replace_ampr_emu: true,
         edits: Vec::new(),
         extract: Vec::new(),
         transfer: Vec::new(),
         replace: false,
         edit_rebuild: false,
         install: None,
+        recover_metadata: None,
+        restore_metadata: false,
         delete_source: false,
         pack_profile: None,
         archive_password: None,
@@ -61,7 +60,6 @@ fn run(jobs: &Jobs, rx: &mpsc::Receiver<Event>, req: ConvertRequest) -> Result<J
     }
 }
 
-/// Every file under a local folder by its `/`-separated path, junk left out.
 fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
@@ -154,7 +152,6 @@ fn outputs_onto_an_export_read_back_as_the_game() {
         server_path: format!("/{}", at.path),
         name,
     };
-    // An output folder's parent exists, as on a local disk.
     let (host, port) = ps5_dump_forge_core::remote::host_port(&at.key_id, 2049);
     let session = ps5_dump_forge_nfs::Session::connect(host, Some(port)).unwrap();
     eprintln!("{}", session.version());

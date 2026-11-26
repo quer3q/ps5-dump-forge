@@ -124,8 +124,7 @@ pub fn detect(path: &Path) -> Option<ArchiveFormat> {
     }
 }
 
-/// Whether `path` names, by its name alone, a later part of the set `first` starts. A RAR
-/// `.partN.rar` number is compared as a number: `x.part10.rar` follows `x.part1.rar`.
+/// Whether `path` names, by name alone, a later part of `first`'s set.
 pub fn later_part_of(path: &Path, first: &Path) -> bool {
     let key = |name: &str| {
         let lower = name.to_ascii_lowercase();
@@ -229,8 +228,7 @@ trait Sink {
     fn enough(&self) -> bool {
         false
     }
-    /// Reads whole files front to back (a job's session), so a 7z block may decode on several
-    /// threads; small reads (Inspect, naming, covers, password probes) stay on one.
+    /// Whole files front to back (a job's session): a 7z block may decode on several threads.
     fn streams(&self) -> bool {
         false
     }
@@ -252,7 +250,6 @@ fn walk(
         ArchiveFormat::Rar => rar::walk(path, password, sink, cancel),
     }
 }
-/// Reads only selected files. `max_bytes` limits the sum of their unpacked sizes.
 pub fn read_files(
     path: &Path,
     password: Option<&str>,
@@ -268,9 +265,8 @@ pub fn read_files(
         cancel,
     )
 }
-/// Like [`read_files`], keeping only the first `keep(path, size)` bytes of each file (`None`
-/// or `Some(0)` of a non-empty file: not read). `max_bytes` limits the sum kept. A ZIP entry stops decoding once its head is read (its
-/// CRC is then not checked); 7z and RAR entries are decoded and checked whole, the rest dropped.
+/// [`read_files`] keeping only the first `keep(path, size)` bytes of each (`None`/`Some(0)`: not
+/// read); a ZIP entry stops at its head (CRC unchecked), 7z/RAR are checked whole.
 pub fn read_heads(
     path: &Path,
     password: Option<&str>,
@@ -313,7 +309,6 @@ pub fn read_heads(
     Ok(sink.files)
 }
 struct Memory {
-    /// Path and the bytes to keep, until read.
     selected: BTreeMap<String, u64>,
     files: BTreeMap<String, Vec<u8>>,
     current: String,

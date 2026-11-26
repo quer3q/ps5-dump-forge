@@ -1,5 +1,4 @@
-// The one "Delete this folder/image?" question, shared by Edit and the Library. It only
-// asks; the caller makes the api call and owns the errors and the operation guards.
+// The one "Delete this folder/image?" question: it only asks; the caller calls the api and owns the errors.
 
 import { Modal, openOverlay } from "./common";
 import { useMessages } from "./i18n";
@@ -7,9 +6,7 @@ import { Icon } from "./icons";
 
 export type DeletedFile = "image" | "archive" | "file";
 
-/** Asks before deleting `path` for good; true: Yes. Two buttons, No first and focused.
- * `file` (not a folder): an image, an archive (only the file chosen goes, not its other parts)
- * or any other file (the Storage tab's explorer). */
+/** Asks before deleting `path` for good; No first and focused. `file`: an archive's other parts stay. */
 export function confirmDelete(path: string, folder: boolean, file: DeletedFile = "image"): Promise<boolean> {
   return new Promise((resolve) => {
     let yes = false;

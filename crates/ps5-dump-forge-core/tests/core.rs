@@ -58,22 +58,23 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         zstd_level: 5,
         zstd_unpack: false,
         lz4_level: 0,
-        // The tests below expect the release runtime in packs; one test picks ampr-emu-ng.
-        lz4_runtime: ps5_dump_forge_core::Lz4Runtime::AmprEmu,
+        lz4_runtime: Default::default(),
+        replace_ampr_emu: true,
         edits: Vec::new(),
         extract: Vec::new(),
         transfer: Vec::new(),
         replace: false,
         edit_rebuild: false,
         install: None,
+        recover_metadata: None,
+        restore_metadata: false,
         delete_source: false,
         pack_profile: None,
         archive_password: None,
     }
 }
 
-/// Runs one job to completion; returns its events and result. Every job's stage list is
-/// checked against what it reports ([`announced_stages`]).
+/// Runs one job to completion, its stages checked ([`announced_stages`]).
 fn run(req: ConvertRequest) -> (Vec<Event>, Result<JobReport, String>) {
     let (tx, rx) = mpsc::channel();
     let tx = Mutex::new(tx);
@@ -94,8 +95,7 @@ fn run(req: ConvertRequest) -> (Vec<Event>, Result<JobReport, String>) {
     }
 }
 
-/// The one `Stages` event comes first and lists every `Progress` stage, which only ever moves
-/// forward through it (a failed job stops part way). Returns the list.
+/// The one `Stages` event comes first; `Progress` stages only move forward through it.
 fn announced_stages(events: &[Event]) -> Vec<String> {
     let lists: Vec<&Vec<String>> = events
         .iter()
@@ -391,7 +391,7 @@ fn folder_to_pkg_verifies_and_publishes() {
     // Fast by default, the builder's own sweep sampled with the same seed.
     for want in [
         "in 7 files, match the source (fast, seed",
-        "imagedigs entry 0 of 7 failed (a sample of 7, seed",
+        "imagedigs entry 0 of 7 sampled failed (7 blocks, seed",
         "empty dirs: 1 match",
         "(2 as container entries)",
         "sce_sys/keystone (generated)",
@@ -434,23 +434,11 @@ fn folder_to_pkg_verifies_and_publishes() {
     assert_eq!(found.empty_dirs, ["data/empty"]);
     assert!(found.details.iter().any(|d| d.starts_with("FIH: debug")));
     assert!(found.details.len() > 1, "{:?}", found.details);
-}
 
-#[test]
-fn pkg_to_folder_round_trip() {
-    let root = dir("pkg-back");
-    let src = root.join("src");
-    game(&src);
-    let pkg = root.join("PPSA01234.pkg");
-    let report = run(request(&src, Format::Pkg, &pkg)).1.unwrap();
-    assert!(
-        report.checks.iter().any(|c| c.starts_with("blake3: ")),
-        "{:?}",
-        report.checks
-    );
+    // And back: to a folder, and straight into an image.
     let back = root.join("back");
     run(request(&pkg, Format::Folder, &back)).1.unwrap();
-    // The build rewrites param.json and adds a keystone; every other file is the source's.
+    // param.json is rewritten; every other file is the source's.
     let got = tree_bytes(&back);
     let want: Vec<_> = tree_bytes(&src)
         .into_iter()
@@ -469,23 +457,8 @@ fn pkg_to_folder_round_trip() {
     assert!(stale_parts(&root).is_empty());
 }
 
-/// Cancels `format`'s job at the first progress of `at`, while its `.part` exists.
-fn cancel_removes_only_this_jobs_part(format: Format, out: &str, at: &'static str) {
-    cancel_removes_only_this_jobs_part_of(game, format, out, at);
-}
-
-/// The same for the game `make` writes.
-fn cancel_removes_only_this_jobs_part_of(
-    make: fn(&Path),
-    format: Format,
-    out: &str,
-    at: &'static str,
-) {
-    cancel_at(make, |src, out| request(src, format, out), out, at, true);
-}
-
-/// Cancels the job `req` makes (from the source and output paths) at the first progress of
-/// `at`; `part` says whether its `.part` exists by then. Nothing of it is left.
+/// Cancels the job `req` makes at the first progress of `at` (`part`: its `.part` exists by
+/// then); nothing of it is left.
 fn cancel_at(
     make: fn(&Path),
     req: impl FnOnce(&Path, &Path) -> ConvertRequest,
@@ -531,8 +504,7 @@ fn cancel_at(
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A `.ffpfs` whose flat path table is damaged after writing (one byte of its first hash, at
-/// block 3) fails verification: the job errs and leaves no `.part` and no output.
+/// A `.ffpfs` whose flat path table is damaged after writing fails verification, leaving nothing.
 #[test]
 fn ffpfs_with_a_damaged_path_table_fails_verification() {
     let root = dir("ffpfs-fpt");
@@ -581,11 +553,11 @@ fn ffpfs_with_a_damaged_path_table_fails_verification() {
 #[test]
 fn cancel_ffpfsc_removes_only_this_jobs_part() {
     // Mid-stream: the inner exFAT writer is held at its first file data.
-    cancel_removes_only_this_jobs_part(Format::Ffpfsc, "out.ffpfsc", "write");
+    let req = |src: &Path, out: &Path| request(src, Format::Ffpfsc, out);
+    cancel_at(game, req, "out.ffpfsc", "write", true);
 }
 
-/// `src` to `format` (with `inner` for `.ffpfsc`) and back to a folder, both verified; the
-/// image is inspected in between. Returns the test's folder, its source and the image.
+/// `src` to `format` and back to a folder, both verified, the image inspected in between.
 fn image_round_trip(
     format: Format,
     inner: Option<Format>,
@@ -818,7 +790,8 @@ fn remove_backport_keeps_emulators_and_refuses_a_lowered_sdk() {
 // ---- LZ4 asset packs ----------------------------------------------------------------------------
 
 use ps5_dump_forge_core::Lz4Mode;
-use ps5_dump_forge_lz4::runtime::release;
+/// The bundled ampr-emu-ng, the one runtime a job installs.
+use ps5_dump_forge_lz4::runtime::zstd as bundled;
 
 /// Bytes that do not compress.
 fn noise(len: usize, seed: u64) -> Vec<u8> {
@@ -962,7 +935,13 @@ fn zstd_pack_refusals_and_packed_sources() {
     let renewed = root.join("renewed");
     let (events, result) = run(request(&old, Format::Folder, &renewed));
     result.unwrap();
-    assert!(logged(&events, "with the zstd runtime"), "{events:?}");
+    assert!(
+        logged(
+            &events,
+            "zstd: replacing ampr-emu-ng 0.3.4 at fakelib/libSceAmpr.sprx with the bundled"
+        ),
+        "{events:?}"
+    );
     assert!(
         std::fs::read(renewed.join("fakelib/libSceAmpr.sprx")).unwrap()
             == ps5_dump_forge_lz4::runtime::zstd()
@@ -972,10 +951,7 @@ fn zstd_pack_refusals_and_packed_sources() {
     let (events, result) = run(zstd_request(&packed, &again));
     result.unwrap();
     assert!(logged(&events, "with zstd packs unpacked"), "{events:?}");
-    assert!(logged(
-        &events,
-        "the zstd runtime at fakelib/libSceAmpr.sprx is written again"
-    ));
+    assert!(!logged(&events, "zstd: replacing"), "{events:?}");
     assert_eq!(zstd_logical(&again), zstd_logical(&packed));
     let mut source = tree_bytes(&src);
     source.push((
@@ -990,56 +966,98 @@ fn zstd_pack_refusals_and_packed_sources() {
     assert!(std::fs::read(copy.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
 }
 
-/// ampr-emu-ng goes into a game only by packing (by user decision): a plain conversion of an
-/// unpacked game carrying it, and an LZ4 Unpack of one packed with it, put the release ampr_emu
-/// in its place; a zstd-packed game keeps it (above).
+/// The runtime rule (by user decision): ampr-emu-ng at the bundled version is kept by every job,
+/// an ampr_emu build replaced unless the request keeps it, and a `.pkg` carries none.
 #[test]
-fn ampr_emu_ng_is_replaced_outside_packing() {
-    let root = dir("ng-replaced");
+fn the_runtime_rule() {
+    let root = dir("runtime-rule");
     let src = root.join("src");
     ampr_game(&src);
-    let ng = ps5_dump_forge_lz4::runtime::zstd();
+    let ng = bundled();
     write(&src, "fakelib/libSceAmpr.sprx", ng);
-    let info = ps5_dump_forge_core::inspect(&src).unwrap();
-    let facts = info.lz4.unwrap();
+    let facts = ps5_dump_forge_core::inspect(&src).unwrap().lz4.unwrap();
     assert_eq!(facts.runtime, "zstd");
-    assert_eq!(facts.runtime_action, Some("replace"));
+    assert_eq!(facts.runtime_action, Some("keep"));
+    assert_eq!(facts.pkg_runtime_action, Some("omit"));
     let out = root.join("out");
-    let (events, result) = run(request(&src, Format::Folder, &out));
-    result.unwrap();
-    assert!(
-        logged(&events, "replacing ampr-emu-ng at fakelib/libSceAmpr.sprx"),
-        "{events:?}"
-    );
-    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    run(request(&src, Format::Folder, &out)).1.unwrap();
+    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
     assert_eq!(assets(&out), assets(&src));
 
-    // LZ4 Pack with ampr-emu-ng keeps it; unpacking puts the release runtime back.
+    // LZ4 Pack and Unpack keep it.
     let packed = root.join("packed");
-    let (_, result) = run(ConvertRequest {
-        lz4_runtime: ps5_dump_forge_core::Lz4Runtime::Ng,
-        ..lz4_request(&src, Format::Folder, &packed, Some(Lz4Mode::Pack))
-    });
-    result.unwrap();
+    let pack = lz4_request(&src, Format::Folder, &packed, Some(Lz4Mode::Pack));
+    run(pack.clone()).1.unwrap();
     assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
     let facts = ps5_dump_forge_core::inspect(&packed).unwrap().lz4.unwrap();
-    assert_eq!(facts.pack_runtime_action, Some("replace"));
+    assert_eq!(facts.pack_runtime_action, Some("keep"));
     let back = root.join("back");
-    let (_, result) = run(lz4_request(
-        &packed,
-        Format::Folder,
-        &back,
-        Some(Lz4Mode::Unpack),
-    ));
-    result.unwrap();
-    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    let unpack = lz4_request(&packed, Format::Folder, &back, Some(Lz4Mode::Unpack));
+    run(unpack).1.unwrap();
+    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
     assert_eq!(assets(&back), assets(&src));
+
+    // An ampr_emu build: replaced by default, kept on request.
+    let ampr_emu = b"AMPRPAK4 AMPRDAT3 0.4.2.1 (c) Drakmor";
+    write(&src, "fakelib/libSceAmpr.sprx", ampr_emu);
+    let replaced = root.join("replaced");
+    let (events, result) = run(request(&src, Format::Folder, &replaced));
+    result.unwrap();
+    assert!(
+        logged(&events, "replacing the game's ampr_emu 0.4.2.1 at"),
+        "{events:?}"
+    );
+    assert!(std::fs::read(replaced.join("fakelib/libSceAmpr.sprx")).unwrap() == ng);
+    let kept = root.join("kept");
+    run(ConvertRequest {
+        replace_ampr_emu: false,
+        ..request(&src, Format::Folder, &kept)
+    })
+    .1
+    .unwrap();
+    assert_eq!(
+        std::fs::read(kept.join("fakelib/libSceAmpr.sprx")).unwrap(),
+        ampr_emu
+    );
+
+    // A `.pkg` leaves it out, and its fresh index doesn't list it.
+    let pkg = root.join("plain.pkg");
+    let (events, result) = run(request(&src, Format::Pkg, &pkg));
+    result.unwrap();
+    assert!(
+        logged(&events, "a .pkg carries no AMPR runtime"),
+        "{events:?}"
+    );
+    let facts = ps5_dump_forge_core::inspect(&pkg).unwrap().lz4.unwrap();
+    assert_eq!(facts.runtime, "none");
+    let out = root.join("plain.pkg.dir");
+    std::fs::create_dir(&out).unwrap();
+    run(ConvertRequest {
+        extract: vec!["ampr_emu.index".into()],
+        ..request(&pkg, Format::Folder, &out)
+    })
+    .1
+    .unwrap();
+    let listed = index_paths(&out);
+    assert!(
+        !listed.iter().any(|(p, _)| p.starts_with("fakelib/")),
+        "{listed:?}"
+    );
+    // A packed game goes into a `.pkg` unpacked, without being asked (issue #73).
+    let pkg = root.join("packed.pkg");
+    let (events, result) = run(request(&packed, Format::Pkg, &pkg));
+    result.unwrap();
+    assert!(
+        logged(&events, "unpacking the game's LZ4 packs"),
+        "{events:?}"
+    );
+    let facts = ps5_dump_forge_core::inspect(&pkg).unwrap().lz4.unwrap();
+    assert!(facts.packed.is_none(), "{facts:?}");
+    assert_eq!(facts.runtime, "none");
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// zstd packs straight into a `.ffpkg`: measured, written with no staging folder, verified as
-/// written and through the packs; the image read back through the zstd reader gives the source's
-/// files and the zstd runtime.
+/// zstd packs straight into a `.ffpkg`, verified as written and through the packs.
 #[test]
 fn zstd_pack_straight_into_an_ffpkg() {
     let root = dir("zstd-pack-image");
@@ -1089,8 +1107,7 @@ fn zstd_pack_straight_into_an_ffpkg() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// zstd unpack writes the logical files with the release runtime in place of the zstd one
-/// and a fresh index; it refuses a source without zstd packs and any LZ4 or pack option.
+/// zstd unpack writes the logical files and a fresh index, and refuses what it can't unpack.
 #[test]
 fn zstd_unpack_restores_the_logical_files() {
     let root = dir("zstd-unpack");
@@ -1107,7 +1124,7 @@ fn zstd_unpack_restores_the_logical_files() {
     result.unwrap();
     assert!(logged(&events, "with zstd packs unpacked"), "{events:?}");
     assert!(!out.join("ampr_zstd.index").exists() && !out.join("ampr_zstd-000.pak").exists());
-    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    assert!(std::fs::read(out.join("fakelib/libSceAmpr.sprx")).unwrap() == bundled());
     assert_eq!(assets(&out), assets(&src));
     let mut listed = index_paths(&out);
     listed.sort();
@@ -1128,7 +1145,7 @@ fn zstd_unpack_restores_the_logical_files() {
         run(request(&image, Format::Folder, &back)).1.unwrap();
         assert!(!back.join("ampr_zstd.index").exists(), "{name}");
         assert!(back.join("data/assets/level1.bin").is_file(), "{name}");
-        assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+        assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == bundled());
     }
 
     let refused = |req: ConvertRequest, want: &str| {
@@ -1153,6 +1170,15 @@ fn zstd_unpack_restores_the_logical_files() {
         },
         "zstd pack and zstd unpack can't go together",
     );
+    // A packed game goes into a `.pkg` unpacked, without being asked (issue #73).
+    let pkg = root.join("d.pkg");
+    let (events, result) = run(request(&packed, Format::Pkg, &pkg));
+    result.unwrap();
+    assert!(
+        logged(&events, "unpacking the game's zstd packs"),
+        "{events:?}"
+    );
+    assert!(!ps5_dump_forge_core::inspect(&pkg).unwrap().zstd_packed);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1173,13 +1199,15 @@ fn folder_to_lz4_and_back() {
         stages(&events),
         ["scan", "preflight", "write", "pack", "verify", "finalize"]
     );
-    assert!(logged(&events, ps5_dump_forge_lz4::runtime::WARNING));
     assert!(
-        logged(&events, "packing strategy: compatibility LZ4 strategy"),
+        logged(
+            &events,
+            "packing strategy: pack everything except system files"
+        ),
         "{events:?}"
     );
     assert!(
-        logged(&events, "wrote LZ4 packs: 3 files packed into 1 volumes"),
+        logged(&events, "wrote LZ4 packs: 4 files packed into 1 volumes"),
         "{events:?}"
     );
     assert!(
@@ -1191,17 +1219,18 @@ fn folder_to_lz4_and_back() {
     // One read of each file, front to back, gave every digest: nothing was hashed again.
     assert!(!logged(&events, "not read whole"), "{events:?}");
     assert!(report.checks.iter().any(|c| c == "empty dirs: 1 match"));
-    // Packed assets are gone from the folder; loose files, packs, runtime and index are there.
+    // Packed assets are gone from the folder (a root file too); system files, empty files,
+    // packs, runtime and index are there.
     for gone in [
         "data/big.bin",
         "data/assets/level1.bin",
         "data/assets/noise.bin",
+        "readme.txt",
     ] {
         assert!(!packed.join(gone).exists(), "{gone}");
     }
     for kept in [
         "eboot.bin",
-        "readme.txt",
         "data/zero.bin",
         "sce_sys/param.json",
         "ampr_assets.index",
@@ -1212,13 +1241,13 @@ fn folder_to_lz4_and_back() {
     }
     assert!(!packed.join("ampr_assets.index.runtime").exists());
     assert!(packed.join("data/empty").is_dir());
-    assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    assert!(std::fs::read(packed.join("fakelib/libSceAmpr.sprx")).unwrap() == bundled());
     let mut want: Vec<(String, u64)> = tree_bytes(&src)
         .into_iter()
         .map(|(p, b)| (p, b.len() as u64))
         .chain([(
             "fakelib/libSceAmpr.sprx".to_string(),
-            release().len() as u64,
+            bundled().len() as u64,
         )])
         .collect();
     want.sort();
@@ -1238,10 +1267,10 @@ fn folder_to_lz4_and_back() {
     result.unwrap();
     assert!(logged(
         &events,
-        "with LZ4 packs unpacked (3 packed files in 1 volumes)"
+        "with LZ4 packs unpacked (4 packed files in 1 volumes)"
     ));
     assert_eq!(assets(&back), tree_bytes(&src));
-    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+    assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == bundled());
     // Unpacking keeps the index byte for byte: it lists exactly the unpacked files.
     assert!(logged(&events, "keeping ampr_emu.index"), "{events:?}");
     let index = |dir: &Path| std::fs::read(dir.join("ampr_emu.index")).unwrap();
@@ -1270,10 +1299,8 @@ fn folder_to_lz4_and_back() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A conversion without LZ4 options of an AMPR title (by user decision): the release runtime
-/// installed where there is none and in place of an older or unknown one, another as new as
-/// ours kept (by Pack only when it reads packs); the index kept only when it lists exactly the
-/// files written, else a new one without the journal and logs. A non-AMPR title is untouched.
+/// A conversion without LZ4 options of an AMPR title: the runtime installed or replaced, the
+/// index kept only when it lists exactly the files written. A non-AMPR title is untouched.
 #[test]
 fn a_plain_conversion_repairs_an_ampr_title() {
     let root = dir("lz4-plain-repair");
@@ -1285,18 +1312,15 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     let fixed = root.join("fixed");
     let (events, result) = run(request(&src, Format::Folder, &fixed));
     result.unwrap();
-    assert!(
-        logged(&events, "installing the release runtime"),
-        "{events:?}"
-    );
+    assert!(logged(&events, "installing ampr-emu-ng"), "{events:?}");
     assert!(logged(&events, "no ampr_emu.index yet"), "{events:?}");
-    assert!(runtime(&fixed).unwrap() == release());
+    assert!(runtime(&fixed).unwrap() == bundled());
     assert_indexes_folder(&fixed);
     assert_eq!(assets(&fixed), tree_bytes(&src));
     write(&fixed, "ampr_commands.bin", b"a session's journal");
     write(&fixed, "ampr_emu.log", b"log");
 
-    // An exact index beside Forge's release runtime: everything kept as it is.
+    // An exact index beside the bundled ampr-emu-ng: everything kept as it is.
     let exact = root.join("exact");
     let (events, result) = run(request(&fixed, Format::Folder, &exact));
     result.unwrap();
@@ -1318,7 +1342,7 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     run(request(&image, Format::Folder, &back)).1.unwrap();
     assert!(!back.join("ampr_commands.bin").exists() && !back.join("ampr_emu.log").exists());
     assert_indexes_folder(&back);
-    assert!(runtime(&back).unwrap() == release());
+    assert!(runtime(&back).unwrap() == bundled());
 
     // A damaged index is written anew too.
     write(&fixed, "ampr_emu.index", b"not an index");
@@ -1328,30 +1352,40 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     assert!(logged(&events, "ampr_emu.index does not read (damaged)"));
     assert_indexes_folder(&out);
 
-    // Another ampr_emu as new as the bundled one: kept, its index repaired. Pack keeps it only
-    // when it holds the pack format.
+    // An ampr_emu build kept on request (whatever its version), its index repaired; Pack
+    // always puts ampr-emu-ng in.
     let newer: &[u8] = b"\x7fELF AMPRPAK4 AMPRDAT3 9.9 (c) Drakmor";
-    let no_packs: &[u8] = b"\x7fELF 0.4.2.1 (c) Drakmor";
-    for (name, bytes, packs) in [("newer", newer, true), ("no-packs", no_packs, false)] {
+    let older: &[u8] = b"\x7fELF 0.4.2 (c) Drakmor";
+    for (name, bytes) in [("newer", newer), ("kept-older", older)] {
         let other = root.join(name);
         copy_tree(&back, &other);
         write(&other, "fakelib/libSceAmpr.sprx", bytes);
         let out = root.join(format!("{name}-out"));
-        let (events, result) = run(request(&other, Format::Folder, &out));
+        let (events, result) = run(ConvertRequest {
+            replace_ampr_emu: false,
+            ..request(&other, Format::Folder, &out)
+        });
         result.unwrap();
         assert!(logged(&events, "keeping the game's ampr_emu"), "{events:?}");
         assert!(logged(&events, "(stale)"), "{events:?}");
         assert!(runtime(&out).unwrap() == bytes, "{name}");
         assert_indexes_folder(&out);
         let packed = root.join(format!("{name}-packed"));
-        run(request(&other, Format::Lz4, &packed)).1.unwrap();
-        let want = if packs { bytes } else { release() };
-        assert!(runtime(&packed).unwrap() == want, "{name}");
+        run(ConvertRequest {
+            replace_ampr_emu: false,
+            ..request(&other, Format::Lz4, &packed)
+        })
+        .1
+        .unwrap();
+        assert!(runtime(&packed).unwrap() == bundled(), "{name}");
     }
 
-    // An older one, or one naming no version: replaced.
+    // By default an ampr_emu build, or a file naming no version, is replaced.
     for (name, bytes) in [
-        ("older", &b"\x7fELF AMPRPAK4 AMPRDAT3 0.4.2 (c) Drakmor"[..]),
+        (
+            "replaced",
+            &b"\x7fELF AMPRPAK4 AMPRDAT3 9.9 (c) Drakmor"[..],
+        ),
         ("unknown", &b"\x7fELF someone else's AMPR"[..]),
     ] {
         let other = root.join(name);
@@ -1360,11 +1394,8 @@ fn a_plain_conversion_repairs_an_ampr_title() {
         let out = root.join(format!("{name}-out"));
         let (events, result) = run(request(&other, Format::Folder, &out));
         result.unwrap();
-        assert!(
-            logged(&events, "replacing the game's runtime"),
-            "{events:?}"
-        );
-        assert!(runtime(&out).unwrap() == release(), "{name}");
+        assert!(logged(&events, "replacing the game's"), "{events:?}");
+        assert!(runtime(&out).unwrap() == bundled(), "{name}");
         assert_indexes_folder(&out);
     }
 
@@ -1375,8 +1406,8 @@ fn a_plain_conversion_repairs_an_ampr_title() {
     let out = root.join("none-out");
     let (events, result) = run(request(&none, Format::Folder, &out));
     result.unwrap();
-    assert!(logged(&events, "installing the release runtime"));
-    assert!(runtime(&out).unwrap() == release());
+    assert!(logged(&events, "installing ampr-emu-ng"));
+    assert!(runtime(&out).unwrap() == bundled());
     assert!(
         std::fs::read(out.join("ampr_emu.index")).unwrap()
             == std::fs::read(exact.join("ampr_emu.index")).unwrap()
@@ -1417,14 +1448,14 @@ fn lz4_refusals() {
         "LZ4 level 2 is not 0 (fast) or 3 through 12",
     );
 
-    // A title that does not use AMPR: its packs need ampr-emu-ng (`request` picks ampr_emu).
-    let plain = root.join("plain");
-    game(&plain);
-    let no_ampr = "does not import libSceAmpr";
-    refused(request(&plain, Format::Lz4, &root.join("n")), no_ampr);
+    // LZ4 Pack is ampr-emu-ng only.
+    let ampr_emu = "ampr_emu is no longer bundled";
     refused(
-        lz4_request(&plain, Format::Folder, &root.join("n"), Some(Lz4Mode::Pack)),
-        no_ampr,
+        ConvertRequest {
+            lz4_runtime: ps5_dump_forge_core::Lz4Runtime::AmprEmu,
+            ..request(&src, Format::Lz4, &root.join("n"))
+        },
+        ampr_emu,
     );
 
     // A packed folder's backport is in its manifest: left out only from an unpacked view.
@@ -1454,8 +1485,7 @@ fn lz4_refusals() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Runs an `Lz4` job and applies `damage` to its `.part` folder before verification; returns
-/// the job's error.
+/// Runs an `Lz4` job, applying `damage` to its `.part` before verification: the job's error.
 fn damaged_lz4(name: &str, damage: fn(&Path)) -> String {
     let root = dir(name);
     let src = root.join("src");
@@ -1625,7 +1655,7 @@ fn lz4_pack_straight_into_each_image() {
             .1
             .unwrap();
             assert_eq!(assets(&back), tree_bytes(&src), "{rules} {ext}");
-            assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == release());
+            assert!(std::fs::read(back.join("fakelib/libSceAmpr.sprx")).unwrap() == bundled());
             assert!(
                 index_paths(&back)
                     .iter()

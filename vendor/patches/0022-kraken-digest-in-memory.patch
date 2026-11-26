@@ -1,0 +1,490 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index 5da506f322b8cd678b673a334f863a728017f652..40b56848a434147d56f3b506f27dc4c3cb7bf0ce 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -1109,8 +1109,9 @@ fn prepare_with(
+ 
+ /// Write the package `prepared` describes into `out`, then verify it.
+ ///
+-/// `out` is the caller's: created empty and opened for reading **and** writing (a compressed
+-/// image is written in place and read back for its digests). `out_path` is where it lives: it
++/// `out` is the caller's: created empty and opened for reading **and** writing (the self-check
++/// reads it back, and so does an encrypted compressed image, transformed after it is written in
++/// place; a plaintext one is digested as it is compressed). `out_path` is where it lives: it
+ /// names the package in the report and in errors, and nothing reopens it. Nothing here names,
+ /// renames or removes the output: on an error `out` holds a partial package the caller
+ /// deletes, and on success it holds the whole package, synced, which the caller publishes.
+@@ -1207,7 +1208,8 @@ fn build_mode(
+         ));
+     }
+ 
+-    // Read too: a compressed image is written in place and read back for its digests.
++    // Read too: the self-check reads the package back (and an encrypted image is read back to be
++    // transformed in place).
+     let mut file = std::fs::OpenOptions::new()
+         .read(true)
+         .write(true)
+diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
+index ec84f4f44e69691316ddd595067412ece784ab12..089d047768b9a2bc429caa75c1ab315d1c23a31d 100644
+--- a/ps5upload-fpkg/src/kraken_image.rs
++++ b/ps5upload-fpkg/src/kraken_image.rs
+@@ -66,6 +66,9 @@ pub struct KrakenImage {
+     /// Where each file's first byte is stored, by afid.
+     pub file_stored_at: Vec<u64>,
+     pub mount_size: u64,
++    /// Each stored 64 KiB block's `(SHA3, CRC32C)`, taken as it was written, when [`compress`]
++    /// was asked for them: a plaintext image spooled in place needs nothing else of its bytes.
++    pub block_digests: Option<Vec<([u8; 32], u32)>>,
+     /// The logical end of the data.
+     pub data_end: u64,
+     pub meta_base: u64,
+@@ -249,8 +252,97 @@ fn hash_files(
+     digests
+ }
+ 
++/// Blocks of the stored image queued for [`BlockDigests`]' threads: at most 16 × 64 KiB.
++const DIGEST_DEPTH: usize = 16;
++
++/// Each stored 64 KiB block's SHA3 and CRC32C, from the compressed bytes as they are written,
++/// on threads of their own (one per 8 compressing threads: the stored image is a fraction of
++/// the source, and SHA3 runs far faster than the encoder).
++struct BlockDigests {
++    block: Vec<u8>,
++    sent: u64,
++    tx: Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>,
++    workers: Vec<std::thread::JoinHandle<Digested>>,
++}
++
++/// One digest thread's blocks: `(index, SHA3, CRC32C)`.
++type Digested = Vec<(u64, [u8; 32], u32)>;
++
++impl BlockDigests {
++    fn start(threads: usize) -> Result<Self> {
++        use std::sync::{Arc, Mutex};
++        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(DIGEST_DEPTH);
++        let rx = Arc::new(Mutex::new(rx));
++        let mut workers = Vec::new();
++        for _ in 0..threads.div_ceil(8).max(1) {
++            let rx = Arc::clone(&rx);
++            workers.push(
++                std::thread::Builder::new()
++                    .name("block-sha3".into())
++                    .spawn(move || {
++                        let mut done = Vec::new();
++                        while let Ok(Ok((i, block))) = rx.lock().map(|rx| rx.recv()) {
++                            done.push((
++                                i,
++                                crate::crypto::sha3(&block),
++                                crate::crypto::crc32c(&block),
++                            ));
++                        }
++                        done
++                    })?,
++            );
++        }
++        Ok(Self {
++            block: Vec::with_capacity(crate::BLOCK as usize),
++            sent: 0,
++            tx: Some(tx),
++            workers,
++        })
++    }
++
++    /// The next bytes of the stored image.
++    fn feed(&mut self, mut bytes: &[u8]) -> Result<()> {
++        while !bytes.is_empty() {
++            let take = (crate::BLOCK as usize - self.block.len()).min(bytes.len());
++            self.block.extend_from_slice(&bytes[..take]);
++            bytes = &bytes[take..];
++            if self.block.len() == crate::BLOCK as usize {
++                let full =
++                    std::mem::replace(&mut self.block, Vec::with_capacity(crate::BLOCK as usize));
++                let tx = self.tx.as_ref().expect("fed after finish");
++                tx.send((self.sent, full))
++                    .map_err(|_| crate::Error::Format("the block hasher stopped".into()))?;
++                self.sent += 1;
++            }
++        }
++        Ok(())
++    }
++
++    /// Every block's digests, in image order; the image fed must end on a block boundary.
++    fn finish(mut self) -> Result<Vec<([u8; 32], u32)>> {
++        drop(self.tx.take());
++        let mut all = vec![([0u8; 32], 0u32); self.sent as usize];
++        let mut seen = 0u64;
++        for worker in self.workers.drain(..) {
++            let done = worker
++                .join()
++                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
++            seen += done.len() as u64;
++            for (i, digest, crc) in done {
++                all[i as usize] = (digest, crc);
++            }
++        }
++        if !self.block.is_empty() || seen != self.sent {
++            return format_err("the stored image's block digests are incomplete");
++        }
++        Ok(all)
++    }
++}
++
+ /// Compress the image described by `plan` into `spool` from byte `base` on. `read` fetches a byte range of a source
+ /// file, `metadata` is the metadata region's logical bytes and `keystone` the generated one.
++/// With `digest_blocks`, each stored 64 KiB block is digested as it is written
++/// ([`KrakenImage::block_digests`]), so nothing reads the spool back for them.
+ #[allow(clippy::too_many_arguments)]
+ pub fn compress(
+     plan: &Plan,
+@@ -259,6 +351,7 @@ pub fn compress(
+     read: SourceRead<'_>,
+     spool: impl Write + Seek,
+     base: u64,
++    digest_blocks: bool,
+     threads: usize,
+     level: kraken::Level,
+     cancel: &AtomicBool,
+@@ -287,6 +380,11 @@ pub fn compress(
+     let hasher = std::thread::Builder::new()
+         .name("file-sha3".into())
+         .spawn(move || hash_files(hashed, files))?;
++    let mut block_digests = if digest_blocks {
++        Some(BlockDigests::start(threads)?)
++    } else {
++        None
++    };
+     let piped = pipeline_local(
+         threads.max(1),
+         || {
+@@ -368,6 +466,9 @@ pub fn compress(
+             for (k, h) in halves.iter().enumerate() {
+                 let b = h.bytes();
+                 out.write_all(b)?;
++                if let Some(d) = block_digests.as_mut() {
++                    d.feed(b)?;
++                }
+                 cursor += b.len() as u64;
+                 parts.push((b.len() as u32, h.is_lz()));
+                 delta[k] = h.is_delta();
+@@ -402,14 +503,23 @@ pub fn compress(
+         }
+     }
+     let image_len = cursor.next_multiple_of(crate::BLOCK).max(crate::BLOCK);
+-    out.write_all(&vec![0u8; (image_len - cursor) as usize])?;
++    let pad = vec![0u8; (image_len - cursor) as usize];
++    out.write_all(&pad)?;
+     out.flush()?;
++    let block_digests = match block_digests {
++        Some(mut d) => {
++            d.feed(&pad)?;
++            Some(d.finish()?)
++        }
++        None => None,
++    };
+     Ok(KrakenImage {
+         blocks,
+         image_len,
+         file_digests,
+         file_stored_at,
+         mount_size: mount,
++        block_digests,
+         data_end,
+         meta_base: plan.meta_base,
+     })
+@@ -1054,6 +1164,7 @@ mod tests {
+             file_digests: Vec::new(),
+             file_stored_at: Vec::new(),
+             mount_size: mount,
++            block_digests: None,
+             data_end,
+             meta_base,
+         }
+@@ -2012,19 +2123,18 @@ mod tests {
+             .collect();
+         let plan = plan::build(&files).unwrap();
+         let data = |path: &str, size: u64| -> Vec<u8> {
++            // Scrambled, so the stored image spans many blocks.
+             let salt = path.len() as u64;
+-            (0..size).map(|i| ((i * 7 + salt) % 251) as u8).collect()
++            (0..size)
++                .map(|i| {
++                    let x = (i ^ salt << 40).wrapping_mul(0x9E37_79B9_7F4A_7C15);
++                    ((x ^ x >> 29).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 56) as u8
++                })
++                .collect()
+         };
+         let keystone: Vec<u8> = (0..plan::KEYSTONE_LEN).map(|i| i as u8).collect();
+         let metadata = vec![0u8; (plan.ndblock * crate::BLOCK - plan.meta_base) as usize];
+-        let path = std::env::temp_dir().join(format!("kraken-digests-{}", std::process::id()));
+-        let spool = std::fs::File::options()
+-            .read(true)
+-            .write(true)
+-            .create(true)
+-            .truncate(true)
+-            .open(&path)
+-            .unwrap();
++        let mut spool = std::io::Cursor::new(Vec::new());
+         let mut read = |p: &str, off: u64, len: usize| -> Result<Vec<u8>> {
+             let size = sizes.iter().find(|(q, _)| *q == p).unwrap().1;
+             Ok(data(p, size)[off as usize..off as usize + len].to_vec())
+@@ -2035,15 +2145,25 @@ mod tests {
+             &metadata,
+             &keystone,
+             &mut read,
+-            spool,
+-            0,
++            &mut spool,
++            crate::BLOCK,
++            true,
+             3,
+             kraken::Level::Fast,
+             &cancel,
+             &mut |_, _| {},
+         );
+-        std::fs::remove_file(&path).ok();
+         let image = image.unwrap();
++        // The stored blocks' digests, taken as they were written, are those of the spool's
++        // blocks from `base` on.
++        let spooled = spool.into_inner();
++        assert_eq!(spooled.len() as u64, crate::BLOCK + image.image_len);
++        let expected: Vec<([u8; 32], u32)> = spooled[crate::BLOCK as usize..]
++            .chunks(crate::BLOCK as usize)
++            .map(|b| (crate::crypto::sha3(b), crate::crypto::crc32c(b)))
++            .collect();
++        assert!(expected.len() > 1);
++        assert!(image.block_digests.as_ref() == Some(&expected));
+         for (afid, &fi) in plan.afid_order.iter().enumerate() {
+             let f = &plan.files[fi];
+             let bytes = if f.generated {
+diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
+index 1291ca2d32365ad1e728d183d3fe1565cdd239cf..b1d5f1ba1edb5dae32af70575226743e843875fa 100644
+--- a/ps5upload-fpkg/src/stream.rs
++++ b/ps5upload-fpkg/src/stream.rs
+@@ -257,6 +257,10 @@ pub fn write_package(
+     if crate::workshop::checkpoint(cancel) {
+         return Err(cancelled());
+     }
++    // A plaintext image spooled in place is already where the outer image keeps it, as it is
++    // stored: its blocks are digested as they are compressed, and nothing reads them back.
++    let digest_in_memory = matches!(request.kraken_spool, Some(KrakenSpool::InPlace))
++        && matches!(request.image_mode, crate::ImageMode::PlaintextNoAuth);
+     let kraken = match &request.kraken_spool {
+         Some(where_to) => {
+             (progress.phase)("compressing the image");
+@@ -269,6 +273,7 @@ pub fn write_package(
+                 read,
+                 spool_file(out, where_to)?,
+                 spool_base(where_to),
++                digest_in_memory,
+                 threads,
+                 request.level,
+                 cancel,
+@@ -303,10 +308,13 @@ pub fn write_package(
+             )?,
+         ),
+     };
+-    // Where the compressed image is read back from: the package itself when it was written in
+-    // place, where it already sits, or its separate spool file.
++    // Where the compressed image is read back from, when its blocks were not digested as they
++    // were written (an encrypted image, transformed here; a separate spool, copied in): the
++    // package itself when it was written in place, where it already sits, or its spool file.
+     let in_place = matches!(request.kraken_spool, Some(KrakenSpool::InPlace));
++    let digested = kraken.as_ref().and_then(|k| k.block_digests.as_ref());
+     let mut spool = match &request.kraken_spool {
++        _ if digested.is_some() => None,
+         Some(KrakenSpool::InPlace) if kraken.is_some() => Some(out.try_clone_out()?),
+         Some(KrakenSpool::File(path)) if kraken.is_some() => {
+             Some(Box::new(File::open(path)?) as Box<dyn crate::PkgOut>)
+@@ -341,9 +349,25 @@ pub fn write_package(
+     let mut file_digests = FileDigester::new(files.len());
+     let mut block = vec![0u8; BLOCK as usize];
+     let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(8);
+-    // The compressed image: its files' digests were taken as it was compressed. It is read
+-    // back a batch at a time and its blocks digested (and encrypted) on every core.
++    // The compressed image: its files' digests were taken as it was compressed, and a plaintext
++    // one's block digests too. Any other is read back a batch at a time and its blocks digested
++    // (and encrypted) on every core.
+     let mut index = 0u64;
++    if let Some(blocks) = digested {
++        if blocks.len() as u64 != inner_blocks {
++            return Err(crate::Error::Format(format!(
++                "{} block digests for an image of {inner_blocks} blocks",
++                blocks.len()
++            )));
++        }
++        for (at, &(digest, crc)) in blocks.iter().enumerate() {
++            digests[at] = digest;
++            crcs[1 + at] = crc;
++            file_digests.blocks.push(digest);
++        }
++        index = inner_blocks;
++        (progress.bytes)((index * BLOCK).min(outer_size), outer_size);
++    }
+     if let Some(spool) = spool.as_mut() {
+         let threads = compression_threads(request.threads);
+         let mut batch = Vec::new();
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index e20d0ee561a4173f240fc613bd9eafcd7f264c66..78d8bca948ac7230a419be6ca90d48eb82cc200f 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -928,15 +928,21 @@ fn the_written_handle_is_what_gets_verified() {
+ 
+ /// An output that is not a file (Forge writes onto another device): clones share one buffer,
+ /// each with a position of its own. The package is the one a file gets, byte for byte, and its
+-/// self-check (and the in-place Kraken spool) reads it back through clones.
++/// self-check (and the in-place Kraken spool) reads it back through clones. A plaintext Kraken
++/// build digests its blocks as it compresses them, so it reads none of its own output before
++/// the self-check; an encrypted one still reads its image back to transform it.
+ #[test]
+ fn a_package_is_written_into_any_pkg_out() {
+     use std::io::{Read, Seek, SeekFrom, Write};
++    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+     use std::sync::{Arc, Mutex};
+ 
+     struct Mem {
+         data: Arc<Mutex<Vec<u8>>>,
+         pos: u64,
++        /// Set once the self-check starts; bytes read before that are counted in `early`.
++        verifying: Arc<AtomicBool>,
++        early: Arc<AtomicU64>,
+     }
+     impl Read for Mem {
+         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+@@ -945,6 +951,9 @@ fn a_package_is_written_into_any_pkg_out() {
+             let n = buf.len().min(data.len() - at);
+             buf[..n].copy_from_slice(&data[at..at + n]);
+             self.pos += n as u64;
++            if !self.verifying.load(Ordering::Relaxed) {
++                self.early.fetch_add(n as u64, Ordering::Relaxed);
++            }
+             Ok(n)
+         }
+     }
+@@ -979,6 +988,8 @@ fn a_package_is_written_into_any_pkg_out() {
+             Ok(Box::new(Mem {
+                 data: self.data.clone(),
+                 pos: 0,
++                verifying: self.verifying.clone(),
++                early: self.early.clone(),
+             }))
+         }
+         fn out_len(&self) -> std::io::Result<u64> {
+@@ -990,45 +1001,79 @@ fn a_package_is_written_into_any_pkg_out() {
+     }
+ 
+     let src = TempDir::new("pkgout-src");
+-    let out = TempDir::new("pkgout-out");
+     write_tree(src.path());
+-    let mut tree = FolderSource::open(src.path()).unwrap();
+-    let prepared = build::prepare(
+-        &mut tree,
+-        &request(src.path()),
+-        &mut BuildControl::default(),
+-    )
+-    .unwrap();
+-    let path = out.path().join("file.part");
+-    let mut file = std::fs::OpenOptions::new()
+-        .read(true)
+-        .write(true)
+-        .create_new(true)
+-        .open(&path)
++    for (mode, name) in [
++        (ps5upload_fpkg::ImageMode::PlaintextNoAuth, "plain"),
++        (ps5upload_fpkg::ImageMode::Native, "native"),
++    ] {
++        let out = TempDir::new(&format!("pkgout-out-{name}"));
++        let mut tree = FolderSource::open(src.path()).unwrap();
++        let prepared = build::prepare(
++            &mut tree,
++            &BuildRequest {
++                image_mode: mode,
++                kraken: true,
++                env_overrides: false,
++                ..request(src.path())
++            },
++            &mut BuildControl::default(),
++        )
+         .unwrap();
+-    let on_file = build::write_package(
+-        &prepared,
+-        &mut tree,
+-        &mut file,
+-        &path,
+-        &mut |_| {},
+-        &mut BuildControl::default(),
+-    )
+-    .unwrap();
+-    let mut mem = Mem {
+-        data: Arc::new(Mutex::new(Vec::new())),
+-        pos: 0,
+-    };
+-    let in_mem = build::write_package(
+-        &prepared,
+-        &mut tree,
+-        &mut mem,
+-        Path::new("mem.part"),
+-        &mut |_| {},
+-        &mut BuildControl::default(),
+-    )
+-    .unwrap();
+-    assert!(in_mem.verify.ok(), "{}", in_mem.verify);
+-    assert_eq!(in_mem.size, on_file.size);
+-    assert!(*mem.data.lock().unwrap() == std::fs::read(&path).unwrap());
++        let path = out.path().join("file.part");
++        let mut file = std::fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .open(&path)
++            .unwrap();
++        let on_file = build::write_package(
++            &prepared,
++            &mut tree,
++            &mut file,
++            &path,
++            &mut |_| {},
++            &mut BuildControl::default(),
++        )
++        .unwrap();
++        let mut mem = Mem {
++            data: Arc::new(Mutex::new(Vec::new())),
++            pos: 0,
++            verifying: Arc::new(AtomicBool::new(false)),
++            early: Arc::new(AtomicU64::new(0)),
++        };
++        let verifying = mem.verifying.clone();
++        let mut on_stage = |s: build::Stage| {
++            if s == build::Stage::Verify {
++                verifying.store(true, Ordering::Relaxed);
++            }
++        };
++        let in_mem = build::write_package(
++            &prepared,
++            &mut tree,
++            &mut mem,
++            Path::new("mem.part"),
++            &mut |_| {},
++            &mut BuildControl {
++                stage: Some(&mut on_stage),
++                ..BuildControl::default()
++            },
++        )
++        .unwrap();
++        assert!(in_mem.verify.ok(), "{name}: {}", in_mem.verify);
++        assert!(mem.verifying.load(Ordering::Relaxed), "{name}");
++        assert_eq!(in_mem.size, on_file.size, "{name}");
++        assert!(
++            *mem.data.lock().unwrap() == std::fs::read(&path).unwrap(),
++            "{name}: the packages differ"
++        );
++        let early = mem.early.load(Ordering::Relaxed);
++        match mode {
++            ps5upload_fpkg::ImageMode::PlaintextNoAuth => {
++                assert_eq!(early, 0, "a plaintext build read its own output back")
++            }
++            ps5upload_fpkg::ImageMode::Native => {
++                assert!(early > 0, "an encrypted build reads its image back")
++            }
++        }
++    }
+ }

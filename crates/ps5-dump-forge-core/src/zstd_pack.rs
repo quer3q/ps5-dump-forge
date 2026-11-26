@@ -1,31 +1,24 @@
-//! zstd packs in a conversion (`docs/zstd.md`): the tree the job writes (the zstd
-//! runtime installed, a fresh `ampr_emu.index` listing every file, loose and packed), which
-//! files go into the packs, and the packing (`ps5-dump-forge-zstd` does the bytes; this is the
-//! job's glue). Into a folder, or straight into an image through a measure pass
-//! ([`measure`], then `ps5_dump_forge_zstd::tree::PackedTree`); no keep-loose list.
+//! zstd packs in a conversion (`docs/zstd.md`): the tree the job writes, the packed set and the packing, into a folder or an image through [`measure`]; `ps5-dump-forge-zstd` does the bytes.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use ps5_dump_forge_lz4::runtime::{self, RuntimeKind};
+use ps5_dump_forge_lz4::runtime;
 use ps5_dump_forge_lz4::{INDEX, JOURNAL, LOGS, RUNTIME};
 use ps5_dump_forge_zstd::writer::PackOutput;
 use ps5_dump_forge_zstd::{CHUNK_SIZE, INDEX_HEADER_SIZE, VOLUME_HEADER_SIZE, VOLUME_LIMIT};
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
 use crate::jobs::Ctx;
-use crate::lz4::Prepared;
+use crate::lz4::{Prepared, RuntimeAction};
 use crate::preflight::listing;
 use crate::{ConvertRequest, Format};
 
-/// The zstd index at the game root.
 pub(crate) const PACK_INDEX: &str = ps5_dump_forge_zstd::reader::INDEX;
 
-/// The zstd index's first bytes.
 pub(crate) const INDEX_MAGIC: &[u8; 8] = b"AMPRZPK1";
 
-/// Whether `tree` is zstd packed: a root `ampr_zstd.index` that starts with [`INDEX_MAGIC`]
-/// (Inspect's and the Library's label). An index that can't be read is not.
+/// Whether `tree` is zstd packed: a root `ampr_zstd.index` starting with [`INDEX_MAGIC`] (Inspect's label).
 pub(crate) fn packed(tree: &mut dyn SourceTree) -> bool {
     let listed = (tree.files().iter()).any(|f| f.path == PACK_INDEX && f.size >= 8);
     listed
@@ -34,28 +27,22 @@ pub(crate) fn packed(tree: &mut dyn SourceTree) -> bool {
             .is_ok_and(|b| b == INDEX_MAGIC)
 }
 
-/// Whether `path` is a name the zstd writer puts at the root (`ampr_zstd.index`, `ampr_zstd-*.pak`),
-/// as a case-insensitive destination sees it.
+/// Whether `path` is a root name the zstd writer puts there, case-insensitively.
 pub(crate) fn is_pack_name(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     !p.contains('/') && (p == PACK_INDEX || (p.starts_with("ampr_zstd-") && p.ends_with(".pak")))
 }
 
-/// Whether `path` stays loose whatever the rules say: the `always_loose` list (eboot,
-/// executables, `sce_sys/`, `sce_module/`, `fakelib*/`, every `.ini`, the ampr_emu artifacts) plus
-/// `ampr_zstd.index`, `ampr_zstd-*.pak` and `ampr_emu.index`.
+/// Whether `path` stays loose whatever the rules say: `always_loose`, the pack files and `ampr_emu.index`.
 pub(crate) fn loose(path: &str) -> bool {
     ps5_dump_forge_lz4::always_loose(path) || is_pack_name(path) || path == INDEX
 }
 
 /// The files to pack and how.
 pub(crate) struct Plan {
-    /// The packed files, as the prepared tree lists them.
     pub files: Vec<SourceFile>,
-    /// zstd level, 1..=22.
     pub level: u8,
-    /// Compression threads: the request's `compression_threads`, else every core (the pak
-    /// writer uses at most 8).
+    /// Compression threads (the pak writer uses at most 8).
     pub threads: usize,
 }
 
@@ -72,15 +59,13 @@ impl Plan {
             .fold(0u64, |sum, f| sum.saturating_add(f.size))
     }
 
-    /// Volumes the packer may need: each holds at least `VOLUME_LIMIT` less its header and
-    /// one chunk that did not fit.
+    /// Volumes the packer may need: each holds at least `VOLUME_LIMIT` less its header and one chunk.
     fn max_volumes(&self) -> u64 {
         let per = VOLUME_LIMIT - VOLUME_HEADER_SIZE as u64 - CHUNK_SIZE;
         self.packed_bytes().div_ceil(per).max(1)
     }
 
-    /// `ampr_zstd.index`'s size: header, 32-byte file records, 8-byte chunk and volume records,
-    /// the paths.
+    /// `ampr_zstd.index`'s size: header, 32-byte file, 8-byte chunk and volume records, the paths.
     fn index_bytes(&self) -> u64 {
         let chunks = self.files.iter().fold(0u64, |sum, f| {
             sum.saturating_add(f.size.div_ceil(CHUNK_SIZE))
@@ -96,16 +81,14 @@ impl Plan {
             .saturating_add(paths)
     }
 
-    /// Every byte the packer may write: every chunk stored raw (a zstd chunk is strictly
-    /// smaller), the volume headers and the index.
+    /// Every byte the packer may write: every chunk raw (a zstd chunk is strictly smaller), headers and index.
     pub(crate) fn worst_case_bytes(&self) -> u64 {
         self.packed_bytes()
             .saturating_add(self.max_volumes() * VOLUME_HEADER_SIZE as u64)
             .saturating_add(self.index_bytes())
     }
 
-    /// The biggest file the packer writes, for the destination's file size limit: a volume
-    /// (4 GiB less 64 KiB at most) or the index.
+    /// The biggest file the packer writes (a volume or the index), for the destination's file size limit.
     pub(crate) fn largest_file(&self) -> u64 {
         let volume = self
             .packed_bytes()
@@ -142,11 +125,7 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     findings
 }
 
-/// The tree a zstd pack job writes and its [`Plan`] (`tree` from [`crate::lz4::open`],
-/// which decoded any LZ4 or zstd packs; the backport already left out). The zstd runtime
-/// replaces whatever is at `fakelib/libSceAmpr.sprx`; the journal, logs and old index are left
-/// out and a fresh `ampr_emu.index` (`mtime`: the job's timestamp) lists every file written,
-/// loose and packed. `None` with findings.
+/// The tree a zstd pack job writes and its [`Plan`] (`tree` from [`crate::lz4::open`], the backport out): ampr-emu-ng by `ng_action`, journal, logs and old index out, a fresh `ampr_emu.index` listing every file; `None` with findings.
 pub(crate) fn prepare(
     req: &ConvertRequest,
     mut tree: Box<dyn SourceTree>,
@@ -155,8 +134,7 @@ pub(crate) fn prepare(
 ) -> anyhow::Result<(Prepared, Option<Plan>)> {
     let mut findings = request_findings(req);
     let eboot = tree.files().iter().any(|f| f.path == "eboot.bin");
-    // A title without AMPR is packed too (by user decision): ShadowMount+ loads the injected
-    // ampr-emu-ng.
+    // A title without AMPR is packed too: ShadowMount+ loads the injected ampr-emu-ng.
     if eboot && !crate::lz4::imports_ampr(tree.as_mut()) {
         ctx.log("zstd: eboot.bin does not import libSceAmpr; injecting ampr-emu-ng");
     }
@@ -181,23 +159,28 @@ pub(crate) fn prepare(
     if !findings.is_empty() {
         return Ok((refused(tree, findings), None));
     }
-    ctx.log(match crate::lz4::runtime_of(tree.as_mut()).kind {
-        RuntimeKind::None => format!("zstd: installing the zstd runtime at {RUNTIME}"),
-        RuntimeKind::Zstd => format!("zstd: the zstd runtime at {RUNTIME} is written again"),
-        _ => format!("zstd: replacing the runtime at {RUNTIME} with the zstd runtime"),
-    });
+    //
+    let rt = crate::lz4::runtime_of(tree.as_mut());
+    let keep = rt.ng_action() == RuntimeAction::Keep;
+    if keep {
+        crate::lz4::keep_log("zstd", &rt, ctx);
+    } else {
+        ctx.log(crate::lz4::install_log("zstd", &rt));
+    }
     let mut files: Vec<SourceFile> = Vec::with_capacity(tree.files().len() + 2);
     for f in tree.files() {
         if f.path == JOURNAL || LOGS.contains(&f.path.as_str()) {
             ctx.log(format!("zstd: leaving out {}", f.path));
-        } else if f.path != INDEX && f.path != RUNTIME {
+        } else if f.path != INDEX && (keep || f.path != RUNTIME) {
             files.push(f.clone());
         }
     }
-    files.push(SourceFile {
-        path: RUNTIME.into(),
-        size: runtime::zstd().len() as u64,
-    });
+    if !keep {
+        files.push(SourceFile {
+            path: RUNTIME.into(),
+            size: runtime::zstd().len() as u64,
+        });
+    }
     let rows: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
     let index = match ps5upload_fpkg::ampr_index::build(&rows, mtime) {
         Ok(index) => index,
@@ -211,11 +194,7 @@ pub(crate) fn prepare(
         path: INDEX.into(),
         size: index.len() as u64,
     });
-    // Pack everything except system files (`rules::select_everything`): all but `always_loose`,
-    // root files, media and configs included; ampr-emu-ng serves plain and libc I/O on packed
-    // files. Every source, an LZ4-packed one too (by user decision), takes it. A pack profile,
-    // given, decides instead (a `store` file is packed as any other: a chunk zstd can't shrink
-    // is kept raw anyway).
+    // The built-in strategy (`rules::select_everything`) or a profile's rules (`store` packs as compress: a chunk zstd can't shrink stays raw).
     let mut findings = Vec::new();
     let profile = crate::lz4::pack_profile(req, ctx, &mut findings);
     if !findings.is_empty() {
@@ -252,7 +231,9 @@ pub(crate) fn prepare(
         .collect();
     ctx.log(crate::lz4::everything_loose_line(&loose, profile.as_ref()));
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
-    generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::zstd()));
+    if !keep {
+        generated.insert(RUNTIME.into(), Cow::Borrowed(runtime::zstd()));
+    }
     generated.insert(INDEX.into(), Cow::Owned(index));
     let plan = Plan {
         files: packed,
@@ -263,16 +244,14 @@ pub(crate) fn prepare(
     Ok((refused(tree, Vec::new()), Some(plan)))
 }
 
-/// Packs `plan`'s files from `tree` (the job's hashing tree) into `out`: the volumes, then
-/// `ampr_zstd.index`. Compression runs chunk-parallel in bounded batches on a pool of
-/// `plan.threads` (the pak crate).
+/// Packs `plan`'s files from `tree` into `out`: the volumes, then `ampr_zstd.index`, chunk-parallel on `plan.threads`.
 pub(crate) fn pack<O: PackOutput>(
     tree: &mut dyn SourceTree,
     plan: &Plan,
     out: &mut O,
     ctx: &Ctx,
 ) -> anyhow::Result<ps5_dump_forge_zstd::Index> {
-    let total = plan.packed_bytes().saturating_mul(2);
+    let total = plan.packed_bytes();
     ctx.progress("pack", 0, total);
     let started = std::time::Instant::now();
     let index = ps5_dump_forge_zstd::writer::pack_with(
@@ -310,9 +289,7 @@ pub(crate) fn pack<O: PackOutput>(
     Ok(index)
 }
 
-/// The measure pass of zstd packs into an image: [`pack`]'s compression over `plan`'s files,
-/// keeping only the index, so the image can be laid out from exact sizes. The write pass
-/// reads the packed files again.
+/// zstd's measure pass into an image: [`pack`]'s compression keeping only the index, so the image is laid out from exact sizes.
 pub(crate) fn measure(
     tree: &mut dyn SourceTree,
     plan: &Plan,
@@ -323,8 +300,7 @@ pub(crate) fn measure(
         "zstd into an image: packing straight into it, no temporary folder; the packed files \
          are read again to write them",
     );
-    // Each file counts twice (one pass, counted as two: the writer's progress).
-    let total = plan.packed_bytes().saturating_mul(2);
+    let total = plan.packed_bytes();
     ctx.expect_rest(total.saturating_add(crate::convert::after_measure(tree, req)));
     ctx.progress("measure", 0, total);
     let started = std::time::Instant::now();
@@ -356,8 +332,7 @@ pub(crate) fn measure(
     Ok(index)
 }
 
-/// Every check the runtime makes on the packs `tree` holds (the index and each volume header),
-/// then the logical files read back through the packs against `expected`.
+/// Every runtime check on the packs `tree` holds, then the logical files read back through them against `expected`.
 pub(crate) fn checks(
     expected: &crate::verify::Expected,
     tree: Box<dyn SourceTree>,

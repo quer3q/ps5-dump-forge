@@ -2,8 +2,9 @@
 # The static Linux CLI (PR #57: a NAS, Alpine, an old glibc): ps5-dump-forge alone, the web UI
 # embedded for `serve`. Built in the pinned Rust's Alpine image, a musl host, so the C and C++
 # parts (liblz4, libzstd, UnRAR, BLAKE3, ring) link statically with no cross toolchain. Writes
-# dist/ps5-dump-forge-<version>-linux-<arch>-musl.tar.gz for this machine's arch (the release
-# job runs it on an x86-64 and an arm64 runner). Needs Docker and npm.
+# the bare stripped binary dist/ps5-dump-forge-cli-<version>-linux-<arch> for this machine's arch
+# (the release job runs it on an x86-64 and an arm64 runner; musl's MIT notice, in
+# THIRD-PARTY-NOTICES.md, ships in the release's source archives). Needs Docker and npm.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,7 +17,7 @@ case $(uname -m) in
   aarch64 | arm64) arch=arm64 ;;
   *) echo "release-linux-musl.sh: unsupported arch $(uname -m)" >&2; exit 1 ;;
 esac
-name=ps5-dump-forge-$version-linux-$arch-musl
+name=ps5-dump-forge-cli-$version-linux-$arch
 
 (cd app && npm ci --no-audit --no-fund && npm run build:http)
 
@@ -26,7 +27,7 @@ docker run --rm -v "$PWD:/src" -w /src \
   -e FORGE_REQUIRE_WEB=1 -e RUSTUP_TOOLCHAIN=1.100.0 -e RUSTUP_AUTO_INSTALL=0 \
   -e CARGO_TARGET_DIR=/src/target/musl -e NAME="$name" -e OWNER="$(id -u):$(id -g)" \
   "$image" sh -euc '
-    apk add --no-cache build-base tar >/dev/null
+    apk add --no-cache build-base >/dev/null
     cargo build --release --locked -p ps5-dump-forge-cli
     bin=$CARGO_TARGET_DIR/release/ps5-dump-forge
     strip "$bin"
@@ -36,12 +37,11 @@ docker run --rm -v "$PWD:/src" -w /src \
       exit 1
     fi
     "$bin" --help >/dev/null
-    stage=$(mktemp -d)
-    mkdir "$stage/$NAME"
-    # musl is linked in statically: its MIT notice (THIRD-PARTY-NOTICES.md) goes with it.
-    cp "$bin" LICENSE THIRD-PARTY-NOTICES.md "$stage/$NAME/"
-    tar -czf "dist/$NAME.tar.gz" -C "$stage" --owner=0 --group=0 --numeric-owner "$NAME"
-    tar -tzvf "dist/$NAME.tar.gz"
-    chown -R "$OWNER" "$CARGO_TARGET_DIR" "dist/$NAME.tar.gz"'
+    # The real web UI for `serve`, not the placeholder page.
+    grep -qF forge.appcache "$bin" ||
+      { echo "release-linux-musl.sh: $bin does not embed the web UI" >&2; exit 1; }
+    cp "$bin" "dist/$NAME"
+    chmod 755 "dist/$NAME"
+    chown -R "$OWNER" "$CARGO_TARGET_DIR" "dist/$NAME"'
 
-ls -l "dist/$name.tar.gz"
+ls -l "dist/$name"

@@ -1,8 +1,5 @@
-//! NFSv4.1 (RFC 8881) COMPOUNDs over one session (EXCHANGE_ID, CREATE_SESSION with one
-//! fore-channel slot, every later compound led by SEQUENCE). Paths are walked from the
-//! pseudo-fs root (PUTROOTFH + LOOKUPs, handles cached). Reads with the anonymous stateid
-//! (else inside an OPEN); creates by OPEN (GUARDED4, else EXCLUSIVE4_1), writes UNSTABLE4 +
-//! COMMIT (verifier checked), makes folders by CREATE, renames by LINK + REMOVE.
+//! NFSv4.1 (RFC 8881) COMPOUNDs over one session with one fore-channel slot, every compound
+//! after setup led by SEQUENCE; paths walked from the pseudo-fs root, handles cached.
 
 use crate::Entry;
 use crate::rpc::{self, Xdr, XdrReader};
@@ -15,7 +12,6 @@ use std::sync::{Mutex, MutexGuard};
 pub(crate) const PROGRAM: u32 = 100003;
 pub(crate) const VERSION: u32 = 4;
 pub(crate) const PROC_COMPOUND: u32 = 1;
-/// The minor version every COMPOUND asks for.
 pub(crate) const MINOR_VERSION: u32 = 1;
 
 /// Operation numbers (RFC 8881 section 16.2, `nfs_opnum4`).
@@ -105,7 +101,6 @@ pub(crate) mod status {
     pub const WRONG_TYPE: u32 = 10083;
 }
 
-/// The name of an `nfsstat4` this client knows, for messages.
 fn status_name(code: u32) -> Option<&'static str> {
     use status::*;
     Some(match code {
@@ -166,7 +161,7 @@ fn status_name(code: u32) -> Option<&'static str> {
     })
 }
 
-/// An `nfsstat4` as an `io::Error`: the kind as v3 maps it, the code's name in the text.
+/// The kind as v3 maps it, the code's name in the text.
 pub(crate) fn nfs4_error(code: u32) -> io::Error {
     use status::*;
     let (kind, text) = match code {
@@ -189,8 +184,7 @@ pub(crate) fn nfs4_error(code: u32) -> io::Error {
         BADHANDLE => (ErrorKind::InvalidData, "bad file handle"),
         MINOR_VERS_MISMATCH => (ErrorKind::Unsupported, "the server has no NFSv4.1"),
         NOTSUPP | ATTRNOTSUPP | OP_ILLEGAL => (ErrorKind::Unsupported, "operation not supported"),
-        // An idle session the server let go (its lease ran out): a fresh connection's
-        // EXCHANGE_ID and CREATE_SESSION make a new one, as after a dropped connection.
+        // An idle session the server let go (lease ran out): reconnect makes a new one.
         BADSESSION | DEADSESSION => (ErrorKind::NotConnected, "the server ended the session"),
         _ => (ErrorKind::Other, "error"),
     };
@@ -198,12 +192,12 @@ pub(crate) fn nfs4_error(code: u32) -> io::Error {
     io::Error::new(kind, format!("NFS: {text} ({name}, {code})"))
 }
 
-/// True when `e` came from NFS4ERR_STALE/FHEXPIRED (drop the cached handle, look it up again).
+/// NFS4ERR_STALE/FHEXPIRED: drop the cached handle, look it up again.
 pub(crate) fn is_stale(e: &io::Error) -> bool {
     e.kind() == ErrorKind::StaleNetworkFileHandle
 }
 
-/// COMPOUND4args being built: an empty tag, minor version 1, then the ops in order.
+/// An empty tag, minor version 1, then the ops in order.
 #[derive(Default)]
 pub(crate) struct Compound {
     ops: Xdr,
@@ -215,19 +209,16 @@ impl Compound {
         Compound::default()
     }
 
-    /// Starts the next op: its number is written, the caller appends its arguments.
     pub fn op(&mut self, op: u32) -> &mut Xdr {
         self.count += 1;
         self.ops.u32(op)
     }
 
-    /// The number of ops so far.
     #[cfg(test)]
     pub fn len(&self) -> u32 {
         self.count
     }
 
-    /// The encoded COMPOUND4args.
     pub fn into_bytes(self) -> Vec<u8> {
         let mut head = Xdr::new();
         head.string("").u32(MINOR_VERSION).u32(self.count);
@@ -237,8 +228,7 @@ impl Compound {
     }
 }
 
-/// Walks a COMPOUND4res op by op: `op` checks the number and status of the next result
-/// and hands back the reader at its body; the first failing op ends the walk with its error.
+/// Walks a COMPOUND4res op by op; the first failing op ends the walk with its error.
 pub(crate) struct Walk<'a> {
     r: XdrReader<'a>,
     status: u32,
@@ -246,11 +236,10 @@ pub(crate) struct Walk<'a> {
     failed: Option<u32>,
 }
 
-/// Results a COMPOUND reply may hold (RFC 8881 caps nothing; this bounds a hostile count).
+/// Bounds a hostile result count (RFC 8881 caps nothing).
 const MAX_RESULTS: usize = 1024;
 
 impl<'a> Walk<'a> {
-    /// Reads the overall status, the tag and the result count.
     pub fn new(mut r: XdrReader<'a>) -> io::Result<Walk<'a>> {
         let status = r.u32()?;
         r.opaque(1024)?; // tag: ours is empty, a server echoes it
@@ -263,19 +252,18 @@ impl<'a> Walk<'a> {
         })
     }
 
-    /// The overall status (that of the last op the server ran).
+    /// That of the last op the server ran.
     pub fn status(&self) -> u32 {
         self.status
     }
 
-    /// The next result, which must be op `op`: its body on NFS4_OK, else its status as an error.
+    /// The next result, which must be op `op`.
     pub fn op(&mut self, op: u32) -> io::Result<&mut XdrReader<'a>> {
         if let Some(code) = self.failed {
             return Err(nfs4_error(code));
         }
         if self.left == 0 {
-            // The server stopped early: the overall status says why (an OK reply that
-            // is short is malformed).
+            // The server stopped early: the overall status says why (a short OK reply is malformed).
             return Err(match self.status {
                 status::OK => rpc::bad(format!("NFSv4 reply has no result for op {op}")),
                 code => {
@@ -299,7 +287,6 @@ impl<'a> Walk<'a> {
         Ok(&mut self.r)
     }
 
-    /// Checks the walk read every result and the overall status is OK.
     pub fn finish(&self) -> io::Result<()> {
         if let Some(code) = self.failed {
             return Err(nfs4_error(code));
@@ -317,34 +304,27 @@ impl<'a> Walk<'a> {
     }
 }
 
-/// One NFSv4.1 session: its client id and session id, the one fore-channel slot's next
-/// seqid and the sizes the server granted.
 pub(crate) struct Nfs4 {
     client: rpc::Client,
     clientid: u64,
     session: [u8; 16],
-    /// The seqid the next SEQUENCE on slot 0 carries.
     seqid: u32,
-    /// The fore channel's largest request and response (READ/WRITE chunks fit inside).
+    /// The fore channel's largest request and response.
     max_request: u32,
     max_response: u32,
-    /// The most ops one compound may carry (the server may grant fewer than asked).
+    /// The server may grant fewer than asked.
     max_ops: u32,
-    /// File handles by canonical path (v3's bounded cache).
     handles: Handles,
     /// Set once the server refused a READ with the anonymous stateid: reads OPEN first.
     open_reads: bool,
 }
 
-/// A file this session created: its handle, its open stateid and the WRITE verifiers since
-/// the last COMMIT.
 pub(crate) struct Open {
     fh: Vec<u8>,
     stateid: [u8; 16],
     verf: Mutex<Verf>,
 }
 
-/// The verifier the WRITEs since the last COMMIT gave, and whether it changed among them.
 #[derive(Debug, Default)]
 struct Verf {
     seen: Option<[u8; 8]>,
@@ -356,7 +336,7 @@ impl Open {
         self.verf.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A WRITE's verifier: one unlike the earlier ones means the server restarted between them.
+    /// One unlike the earlier ones means the server restarted between them.
     fn wrote(&self, verf: [u8; 8]) {
         let mut v = self.state();
         match v.seen {
@@ -366,8 +346,8 @@ impl Open {
         }
     }
 
-    /// A COMMIT's verifier: it must be the one every WRITE since the last COMMIT got, else the
-    /// server restarted and its unstable writes may be lost (every later sync fails too).
+    /// It must be every WRITE's since the last COMMIT, else the server restarted and the unstable
+    /// writes may be lost (every later sync fails too).
     fn committed(&self, verf: [u8; 8]) -> io::Result<()> {
         let mut v = self.state();
         if v.changed || v.seen.is_some_and(|s| s != verf) {
@@ -381,21 +361,16 @@ impl Open {
     }
 }
 
-/// EXCHANGE_ID's `state_protect4_a`/`_r` discriminant for no state protection.
 const SP4_NONE: u32 = 0;
-/// The fore channel this client asks for: one slot, requests and replies up to 4 MiB
-/// (the server lowers them to what it allows).
+/// One slot, up to 4 MiB each way (the server lowers them).
 const ASK_MAX_REQUEST: u32 = 4 << 20;
 const ASK_MAX_RESPONSE: u32 = 4 << 20;
 const ASK_MAX_OPS: u32 = 16;
-/// Header room every fore-channel request and reply needs beyond a READ's or WRITE's data.
 const HEADROOM: u32 = 4096;
-/// The smallest request and reply a session must allow: the headers plus room for a READDIR
-/// entry, a READ or a WRITE of at least 4 KiB.
+/// The smallest the session must allow: headers plus 4 KiB of READ, WRITE or READDIR.
 const MIN_CHANNEL: u32 = 2 * HEADROOM;
 
-/// A client owner unique to this process and connection (two sessions of one process must
-/// not share one: a new verifier for a known owner reads as a client reboot and drops state).
+/// Unique per process and connection: a new verifier for a known owner reads as a reboot.
 fn owner() -> Vec<u8> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -406,7 +381,6 @@ fn owner() -> Vec<u8> {
     format!("ps5-dump-forge {host} {} {n}", std::process::id()).into_bytes()
 }
 
-/// An 8-byte verifier: this connection's start time.
 fn verifier() -> [u8; 8] {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -414,13 +388,12 @@ fn verifier() -> [u8; 8] {
     ((now.as_secs() << 32) ^ u64::from(now.subsec_nanos())).to_be_bytes()
 }
 
-/// Appends a `channel_attrs4` (no RDMA).
 fn channel(x: &mut Xdr, max_request: u32, max_response: u32, cached: u32, ops: u32) {
     x.u32(0).u32(max_request).u32(max_response).u32(cached);
     x.u32(ops).u32(1).u32(0);
 }
 
-/// Reads a `channel_attrs4`: (max request, max response, max requests, max ops).
+/// (max request, max response, max requests, max ops).
 fn read_channel(r: &mut XdrReader) -> io::Result<(u32, u32, u32, u32)> {
     let _headerpad = r.u32()?;
     let (request, response) = (r.u32()?, r.u32()?);
@@ -433,12 +406,12 @@ fn read_channel(r: &mut XdrReader) -> io::Result<(u32, u32, u32, u32)> {
     Ok((request, response, requests, ops))
 }
 
-/// The fewest ops per compound this client needs (a LINK: SEQUENCE, PUTFH, SAVEFH, PUTFH, LINK).
+/// A LINK: SEQUENCE, PUTFH, SAVEFH, PUTFH, LINK.
 const MIN_OPS: u32 = 5;
 
 impl Nfs4 {
-    /// Connects to `host` (`port`, else 2049): EXCHANGE_ID, CREATE_SESSION (one slot, no
-    /// back channel), RECLAIM_COMPLETE. A server without v4.1 gives `Unsupported`.
+    /// EXCHANGE_ID, CREATE_SESSION (one slot, no back channel), RECLAIM_COMPLETE; a server
+    /// without v4.1 gives `Unsupported`.
     pub fn connect(host: &str, port: Option<u16>) -> io::Result<Nfs4> {
         let addr = resolve(host, port.unwrap_or(crate::DEFAULT_PORT))?;
         let client = rpc::Client::connect(addr)?;
@@ -523,7 +496,6 @@ impl Nfs4 {
         c.op(op::RECLAIM_COMPLETE).bool(false); // rca_one_fs: all filesystems
         nfs.run(c, |w| {
             let done = w.op(op::RECLAIM_COMPLETE).map(drop);
-            // A server that saw this client id before already has it.
             if done.is_err() && w.status() == status::COMPLETE_ALREADY {
                 return Ok(());
             }
@@ -532,7 +504,7 @@ impl Nfs4 {
         Ok(nfs)
     }
 
-    /// A compound that starts with SEQUENCE on slot 0 (the slot's next seqid, no caching).
+    /// SEQUENCE on slot 0 with the slot's next seqid, no caching.
     fn sequenced(&self) -> Compound {
         let mut c = Compound::new();
         c.op(op::SEQUENCE)
@@ -544,9 +516,7 @@ impl Nfs4 {
         c
     }
 
-    /// Sends `c` (from [`Nfs4::sequenced`]), checks its SEQUENCE result (the slot's seqid
-    /// moves on once the server ran it), then hands the walk after it to `parse`, which reads
-    /// the other results and ends with `finish`.
+    /// Checks the SEQUENCE result (the seqid moves on once the server ran it), then `parse`.
     fn run<T>(
         &mut self,
         c: Compound,
@@ -574,16 +544,13 @@ impl Nfs4 {
     }
 }
 
-/// LOOKUPs one compound carries at most (each with a GETFH; with SEQUENCE and PUTFH: 14 of
-/// the 16 ops asked for), fewer when the server granted fewer ops.
+/// LOOKUPs (each with a GETFH) per compound, fewer when the server granted fewer ops.
 const MAX_LOOKUPS: usize = 6;
-/// READDIR's `dircount` (names and cookies) and its largest `maxcount`.
 const DIRCOUNT: u32 = 32 << 10;
 const MAX_DIR_REPLY: u32 = 256 << 10;
 
 impl Nfs4 {
-    /// `path`'s file handle: cached, else PUTROOTFH (or the nearest cached folder's PUTFH)
-    /// and LOOKUPs, each one's handle cached. Links are not followed.
+    /// Cached, else PUTROOTFH (or the nearest cached folder) and LOOKUPs; links not followed.
     fn handle(&mut self, path: &str) -> io::Result<Vec<u8>> {
         let comps = components(path)?;
         let mut done = comps.len();
@@ -638,8 +605,7 @@ impl Nfs4 {
         Ok(fh.expect("walked to the path"))
     }
 
-    /// Runs `f` on `path`'s handle; on STALE the cache is dropped and it runs once more
-    /// from fresh LOOKUPs.
+    /// On STALE the cache is dropped and `f` runs once more.
     fn with_handle<T>(
         &mut self,
         path: &str,
@@ -658,7 +624,6 @@ impl Nfs4 {
         }
     }
 
-    /// GETATTR of `attrs` on `fh`.
     fn getattr(&mut self, fh: &[u8], attrs: [u32; 2]) -> io::Result<Fattr> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(fh);
@@ -676,7 +641,6 @@ impl Nfs4 {
         self.with_handle(path, |s, fh| s.getattr(fh, STAT_ATTRS)?.entry(name.clone()))
     }
 
-    /// `space_avail` of the filesystem holding `path`.
     pub fn free_space(&mut self, path: &str) -> io::Result<u64> {
         self.with_handle(path, |s, fh| {
             s.getattr(fh, FREE_ATTRS)?.space_avail.ok_or_else(|| {
@@ -685,8 +649,7 @@ impl Nfs4 {
         })
     }
 
-    /// A folder's entries (no `.`/`..`), READDIR page by page; each entry's handle cached.
-    /// A name that isn't UTF-8 or holds `/` is listed as special (never usable as a path).
+    /// READDIR page by page; a name not UTF-8 or holding `/` is listed as special.
     pub fn list(&mut self, path: &str) -> io::Result<Vec<Entry>> {
         let base = key(&components(path)?);
         self.with_handle(path, |s, fh| {
@@ -736,6 +699,7 @@ impl Nfs4 {
                             mtime: None,
                             link: false,
                             special: true,
+                            fsid: None,
                         });
                         continue;
                     }
@@ -762,20 +726,16 @@ impl Nfs4 {
     }
 }
 
-/// The anonymous stateid (all zero): READ without an OPEN, where the server allows it.
 const ANON_STATEID: [u8; 16] = [0; 16];
-/// OPEN's share_access (read, no delegation wanted), opentype and claim (RFC 8881 18.16).
+/// OPEN's share_access (read, no delegation), opentype and claim (RFC 8881 18.16).
 const OPEN4_SHARE_ACCESS_READ: u32 = 1;
 const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0400;
 const OPEN4_NOCREATE: u32 = 0;
 const CLAIM_FH: u32 = 4;
-/// The open owner of this client's reads.
 const READ_OWNER: &[u8] = b"forge-read";
 
 impl Nfs4 {
-    /// Up to `len` bytes at `offset` (fewer only at the end): with the anonymous stateid,
-    /// else (once the server refused it, for the rest of the session) inside an OPEN for
-    /// read, closed after.
+    /// With the anonymous stateid, else (once refused, for the session) inside an OPEN for read.
     pub fn read_at(&mut self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         self.with_handle(path, |s, fh| {
             if !s.open_reads {
@@ -791,7 +751,6 @@ impl Nfs4 {
         })
     }
 
-    /// READs of `fh` under `stateid`, each as big as the fore channel's replies allow.
     fn read_with(
         &mut self,
         fh: &[u8],
@@ -842,7 +801,6 @@ impl Nfs4 {
         Ok(out)
     }
 
-    /// OPEN of `fh` for read (CLAIM_FH, no create): its open stateid.
     fn open_read(&mut self, fh: &[u8]) -> io::Result<[u8; 16]> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(fh);
@@ -865,7 +823,7 @@ impl Nfs4 {
         })
     }
 
-    /// CLOSE of an open stateid (best effort: the lease ends it anyway).
+    /// Best effort: the lease ends it anyway.
     fn close_stateid(&mut self, fh: &[u8], stateid: &[u8; 16]) {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(fh);
@@ -878,8 +836,7 @@ impl Nfs4 {
     }
 }
 
-/// One READDIR entry: its raw name (`utf8` false when it isn't UTF-8 or holds `/` or NUL),
-/// cookie and attributes.
+/// `utf8` false when the name isn't UTF-8 or holds `/` or NUL.
 #[derive(Debug)]
 pub(crate) struct DirEntry {
     pub cookie: u64,
@@ -888,7 +845,6 @@ pub(crate) struct DirEntry {
     pub attr: Fattr,
 }
 
-/// One READDIR4resok: the cookie verifier, the entries and whether the folder ended.
 #[derive(Debug)]
 pub(crate) struct DirPage {
     pub verf: [u8; 8],
@@ -921,24 +877,20 @@ impl DirPage {
     }
 }
 
-/// OPEN for writing with create (`opentype4` OPEN4_CREATE, `createmode4` GUARDED4 or
-/// EXCLUSIVE4_1, the file named in its folder: CLAIM_NULL).
+/// OPEN4_CREATE with GUARDED4 or EXCLUSIVE4_1, CLAIM_NULL.
 const OPEN4_SHARE_ACCESS_WRITE: u32 = 2;
 const OPEN4_CREATE: u32 = 1;
 const GUARDED4: u32 = 1;
 const EXCLUSIVE4_1: u32 = 3;
 const CLAIM_NULL: u32 = 0;
-/// `open_delegation_type4` values.
 const OPEN_DELEGATE_NONE: u32 = 0;
 const OPEN_DELEGATE_READ: u32 = 1;
 const OPEN_DELEGATE_WRITE: u32 = 2;
 const OPEN_DELEGATE_NONE_EXT: u32 = 3;
-/// `stable_how4` UNSTABLE4 and `createtype4` NF4DIR is [`NF4DIR`].
 const UNSTABLE4: u32 = 0;
-/// The open owner of the files this client creates.
 const WRITE_OWNER: &[u8] = b"forge-write";
 
-/// `path`'s folder and name; the root has neither (`at_root`: the error kind then).
+/// The root has neither (`at_root`: the error kind then).
 fn parent(path: &str, at_root: ErrorKind) -> io::Result<(String, String)> {
     let comps = components(path)?;
     match comps.split_last() {
@@ -947,7 +899,6 @@ fn parent(path: &str, at_root: ErrorKind) -> io::Result<(String, String)> {
     }
 }
 
-/// A `fattr4` that sets only the mode.
 fn put_mode(x: &mut Xdr, mode: u32) {
     put_bitmap(x, bits(&[attr::MODE]));
     let mut v = Xdr::new();
@@ -955,7 +906,6 @@ fn put_mode(x: &mut Xdr, mode: u32) {
     x.opaque(&v.into_bytes());
 }
 
-/// Skips a `change_info4`.
 fn skip_cinfo(r: &mut XdrReader) -> io::Result<()> {
     r.bool()?;
     r.u64()?;
@@ -963,7 +913,6 @@ fn skip_cinfo(r: &mut XdrReader) -> io::Result<()> {
     Ok(())
 }
 
-/// Skips a `bitmap4` (at most 8 words).
 fn skip_bitmap(r: &mut XdrReader) -> io::Result<()> {
     for _ in 0..r.len(8)? {
         r.u32()?;
@@ -971,7 +920,6 @@ fn skip_bitmap(r: &mut XdrReader) -> io::Result<()> {
     Ok(())
 }
 
-/// Skips an `nfsace4`.
 fn skip_ace(r: &mut XdrReader) -> io::Result<()> {
     r.u32()?;
     r.u32()?;
@@ -980,7 +928,6 @@ fn skip_ace(r: &mut XdrReader) -> io::Result<()> {
     Ok(())
 }
 
-/// Reads an `OPEN4resok`: the open stateid (the rest is read past).
 // ponytail: a delegation granted although none was wanted (no callback channel) is not
 // returned; the lease ends it.
 fn open_result(r: &mut XdrReader) -> io::Result<[u8; 16]> {
@@ -1018,8 +965,7 @@ fn open_result(r: &mut XdrReader) -> io::Result<[u8; 16]> {
 }
 
 impl Nfs4 {
-    /// A new empty file (mode 0666) open for writing: OPEN with GUARDED4 create, else (a
-    /// server without it) EXCLUSIVE4_1; `AlreadyExists` when the name is taken.
+    /// GUARDED4, else EXCLUSIVE4_1; `AlreadyExists` when the name is taken.
     pub fn create(&mut self, path: &str) -> io::Result<Open> {
         let (dir, name) = parent(path, ErrorKind::AlreadyExists)?;
         let made = self.with_handle(&dir, |s, dh| s.open_create(dh, &name, GUARDED4));
@@ -1037,7 +983,6 @@ impl Nfs4 {
         })
     }
 
-    /// OPEN of `name` in the folder `dh`, created by `how`: the new file's handle and stateid.
     fn open_create(&mut self, dh: &[u8], name: &str, how: u32) -> io::Result<(Vec<u8>, [u8; 16])> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(dh);
@@ -1050,8 +995,8 @@ impl Nfs4 {
             .u32(OPEN4_CREATE)
             .u32(how);
         if how == EXCLUSIVE4_1 {
-            // ponytail: a time verifier; a file another create made in the same nanosecond
-            // with it would be opened instead of refused.
+            // ponytail: a time verifier; a file another create made in the same nanosecond would be
+            // opened instead of refused.
             o.fixed(&verifier());
         }
         put_mode(o, 0o666);
@@ -1066,15 +1011,13 @@ impl Nfs4 {
         })
     }
 
-    /// CLOSE of the file's open state (best effort, on drop).
     pub fn close(&mut self, open: &Open) {
         self.close_stateid(&open.fh, &open.stateid);
     }
 }
 
 impl Nfs4 {
-    /// UNSTABLE4 WRITEs of `bytes` at `offset`, each as big as the fore channel's requests
-    /// allow (a short count continues where it stopped; none is an error).
+    /// A short count continues where it stopped; none is an error.
     pub fn write_at(&mut self, open: &Open, offset: u64, bytes: &[u8]) -> io::Result<()> {
         // The request, headers included, must fit the session's max_request.
         let chunk = self.max_request.saturating_sub(HEADROOM).max(1) as usize;
@@ -1109,8 +1052,7 @@ impl Nfs4 {
         Ok(())
     }
 
-    /// COMMIT of the whole file; fails when the server's write verifier changed since the
-    /// WRITEs (it restarted: unstable writes may be lost).
+    /// Fails when the write verifier changed since the WRITEs (unstable writes may be lost).
     pub fn sync(&mut self, open: &Open) -> io::Result<()> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(&open.fh);
@@ -1124,7 +1066,6 @@ impl Nfs4 {
         open.committed(verf)
     }
 
-    /// A new folder (mode 0777) by CREATE NF4DIR; `AlreadyExists` when the name is taken.
     pub fn mkdir(&mut self, path: &str) -> io::Result<()> {
         let (dir, name) = parent(path, ErrorKind::AlreadyExists)?;
         self.with_handle(&dir, |s, dh| {
@@ -1146,7 +1087,7 @@ impl Nfs4 {
         Ok(())
     }
 
-    /// REMOVE of a file. v4's REMOVE takes an empty folder too, so a folder is refused first.
+    /// v4's REMOVE takes an empty folder too, so a folder is refused first.
     // ponytail: two compounds; a folder put at the name between them is removed if empty.
     pub fn remove(&mut self, path: &str) -> io::Result<()> {
         let (dir, name) = parent(path, ErrorKind::ReadOnlyFilesystem)?;
@@ -1159,7 +1100,19 @@ impl Nfs4 {
         removed
     }
 
-    /// REMOVE of `name` in the folder `dh`.
+    /// REMOVE takes a file too, so a file is refused first.
+    // ponytail: two compounds; a file put at the name between them is removed.
+    pub fn rmdir(&mut self, path: &str) -> io::Result<()> {
+        let (dir, name) = parent(path, ErrorKind::ReadOnlyFilesystem)?;
+        self.handles.forget(&key(&components(path)?));
+        if !self.stat(path)?.dir {
+            return Err(io::Error::new(ErrorKind::NotADirectory, "not a folder"));
+        }
+        let removed = self.with_handle(&dir, |s, dh| s.remove_in(dh, &name));
+        self.handles.forget(&key(&components(path)?));
+        removed
+    }
+
     fn remove_in(&mut self, dh: &[u8], name: &str) -> io::Result<()> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(dh);
@@ -1172,8 +1125,7 @@ impl Nfs4 {
     }
 }
 
-/// LINK refusals that mean "no hard link here" (the server, the filesystem or a folder can't
-/// have one): the rename falls back to a check and RENAME.
+/// LINK refusals meaning "no hard link here": the rename falls back to a check and RENAME.
 fn link_falls_back(code: u32) -> bool {
     matches!(
         code,
@@ -1187,7 +1139,6 @@ fn link_falls_back(code: u32) -> bool {
 }
 
 impl Nfs4 {
-    /// Runs `f`; on STALE every cached handle is dropped and it runs once more.
     fn retry_stale<T>(&mut self, mut f: impl FnMut(&mut Self) -> io::Result<T>) -> io::Result<T> {
         match f(self) {
             Err(e) if is_stale(&e) => {
@@ -1198,11 +1149,8 @@ impl Nfs4 {
         }
     }
 
-    /// Renames `from` to `to`, never replacing what is at `to`: LINK then REMOVE (LINK
-    /// refuses a taken name); where there are no hard links, a check that `to` is free and
-    /// RENAME.
-    // ponytail: no identity: REMOVE goes by name, so a file another client put at `from`
-    // between LINK and REMOVE is the one removed (NFS has no conditional remove).
+    /// LINK then REMOVE (LINK refuses a taken name); without hard links a check, then RENAME.
+    // ponytail: REMOVE goes by name: a file another client put at `from` meanwhile is removed.
     pub fn rename_no_replace(&mut self, from: &str, to: &str) -> io::Result<()> {
         let (from_dir, from_name) = parent(from, ErrorKind::ReadOnlyFilesystem)?;
         let (to_dir, to_name) = parent(to, ErrorKind::AlreadyExists)?;
@@ -1220,8 +1168,7 @@ impl Nfs4 {
                 io::Error::new(e.kind(), format!("{to} was made, but {from} stays: {e}"))
             });
         }
-        // ponytail: two steps; something made at `to` between the check and the RENAME is
-        // replaced (RENAME has no no-replace flag).
+        // ponytail: two steps; something made at `to` meanwhile is replaced (no no-replace RENAME).
         match self.handle(to) {
             Ok(_) => return Err(io::Error::new(ErrorKind::AlreadyExists, "already exists")),
             Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -1230,8 +1177,7 @@ impl Nfs4 {
         self.rename_replace(from, to)
     }
 
-    /// RENAME of `from` to `to`, replacing a file there (the server renames as POSIX does,
-    /// which refuses to put a file over a folder).
+    /// Replacing a file there (POSIX refuses a file over a folder).
     pub fn rename_replace(&mut self, from: &str, to: &str) -> io::Result<()> {
         let (from_dir, from_name) = parent(from, ErrorKind::ReadOnlyFilesystem)?;
         let (to_dir, to_name) = parent(to, ErrorKind::AlreadyExists)?;
@@ -1246,8 +1192,7 @@ impl Nfs4 {
         renamed
     }
 
-    /// LINK of `file` as `name` in the folder `dir`: `OK`, or the refusal's code when it is
-    /// one [`link_falls_back`] takes (other failures are errors).
+    /// `OK`, or the refusal's code when [`link_falls_back`] takes it.
     fn link(&mut self, file: &[u8], dir: &[u8], name: &str) -> io::Result<u32> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(file);
@@ -1275,7 +1220,6 @@ impl Nfs4 {
         })
     }
 
-    /// RENAME of `from` (folder handle, name) to `to` (replacing what is there).
     fn rename(&mut self, from: (&[u8], &str), to: (&[u8], &str)) -> io::Result<()> {
         let mut c = self.sequenced();
         c.op(op::PUTFH).opaque(from.0);
@@ -1295,7 +1239,7 @@ impl Nfs4 {
 }
 
 impl Drop for Nfs4 {
-    /// DESTROY_SESSION, then DESTROY_CLIENTID (best effort: the lease ends them anyway).
+    /// Best effort: the lease ends them anyway.
     fn drop(&mut self) {
         let mut c = Compound::new();
         c.op(op::DESTROY_SESSION).fixed(&self.session);
@@ -1314,7 +1258,6 @@ impl Drop for Nfs4 {
     }
 }
 
-/// `host` (a name, an IP, or `[v6]`) as an address on `port` (the first the resolver gives).
 fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     (host, port)
@@ -1323,10 +1266,11 @@ fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, format!("{host}: no address found")))
 }
 
-/// The `fattr4` attribute numbers this client asks for (RFC 8881 5.6, 5.7).
+/// RFC 8881 5.6, 5.7.
 mod attr {
     pub const TYPE: u32 = 1;
     pub const SIZE: u32 = 4;
+    pub const FSID: u32 = 8;
     pub const FILEHANDLE: u32 = 19;
     pub const FILEID: u32 = 20;
     pub const MODE: u32 = 33;
@@ -1334,7 +1278,7 @@ mod attr {
     pub const TIME_MODIFY: u32 = 53;
 }
 
-/// A `bitmap4` of attribute numbers (each below 64).
+/// Each below 64.
 const fn bits(attrs: &[u32]) -> [u32; 2] {
     let mut words = [0u32; 2];
     let mut i = 0;
@@ -1346,43 +1290,48 @@ const fn bits(attrs: &[u32]) -> [u32; 2] {
 }
 
 /// What GETATTR asks for a stat; READDIR asks the same plus each entry's handle.
-const STAT_ATTRS: [u32; 2] = bits(&[attr::TYPE, attr::SIZE, attr::FILEID, attr::TIME_MODIFY]);
+const STAT_ATTRS: [u32; 2] = bits(&[
+    attr::TYPE,
+    attr::SIZE,
+    attr::FSID,
+    attr::FILEID,
+    attr::TIME_MODIFY,
+]);
 const LIST_ATTRS: [u32; 2] = bits(&[
     attr::TYPE,
     attr::SIZE,
+    attr::FSID,
     attr::FILEHANDLE,
     attr::FILEID,
     attr::TIME_MODIFY,
 ]);
 const FREE_ATTRS: [u32; 2] = bits(&[attr::SPACE_AVAIL]);
 
-/// Appends a `bitmap4`.
 fn put_bitmap(x: &mut Xdr, words: [u32; 2]) {
     x.u32(2).u32(words[0]).u32(words[1]);
 }
 
-/// `nfs_ftype4` values.
 const NF4REG: u32 = 1;
 const NF4DIR: u32 = 2;
 const NF4LNK: u32 = 5;
 /// Largest `nfs_fh4` (NFS4_FHSIZE).
 const FHSIZE: usize = 128;
 
-/// The attributes of one `fattr4` this client reads; those the server left out are `None`.
+/// Those the server left out are `None`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Fattr {
     pub kind: Option<u32>,
     pub size: Option<u64>,
     pub fh: Option<Vec<u8>>,
+    pub fsid: Option<(u64, u64)>,
     pub fileid: Option<u64>,
     pub space_avail: Option<u64>,
-    /// `time_modify`: seconds since the epoch (may be negative) and nanoseconds.
+    /// Seconds (may be negative) and nanoseconds.
     pub mtime: Option<(i64, u32)>,
 }
 
 impl Fattr {
-    /// Reads a `fattr4` (bitmap, then the values in attribute order). An attribute this
-    /// client didn't ask for can't be skipped (its size is unknown), so it is refused.
+    /// An attribute not asked for can't be skipped (its size is unknown), so it is refused.
     pub fn read(r: &mut XdrReader) -> io::Result<Fattr> {
         let n = r.len(8)?;
         let mut words = [0u32; 8];
@@ -1400,6 +1349,7 @@ impl Fattr {
                 match i as u32 * 32 + b {
                     attr::TYPE => a.kind = Some(v.u32()?),
                     attr::SIZE => a.size = Some(v.u64()?),
+                    attr::FSID => a.fsid = Some((v.u64()?, v.u64()?)),
                     attr::FILEHANDLE => a.fh = Some(v.opaque(FHSIZE)?.to_vec()),
                     attr::FILEID => a.fileid = Some(v.u64()?),
                     attr::SPACE_AVAIL => a.space_avail = Some(v.u64()?),
@@ -1425,8 +1375,7 @@ impl Fattr {
         Ok(a)
     }
 
-    /// The entry named `name` these attributes describe (as v3's: links and special files
-    /// marked, a folder's size 0). Without a type it can't be told: an error.
+    /// Links and special files marked, a folder's size 0; without a type: an error.
     pub fn entry(&self, name: String) -> io::Result<Entry> {
         let kind = self
             .kind
@@ -1449,6 +1398,9 @@ impl Fattr {
             mtime,
             link: kind == NF4LNK,
             special: !matches!(kind, NF4REG | NF4DIR | NF4LNK),
+            fsid: self
+                .fsid
+                .map(|(a, b)| (u128::from(a) << 64) | u128::from(b)),
         })
     }
 }

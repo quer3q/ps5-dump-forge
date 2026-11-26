@@ -1,12 +1,7 @@
-//! Transfer (a request with [`ConvertRequest::transfer`]): files and folders of this device, a
-//! paired one (`flink://`) or a NAS (`smb://`) copied into a folder on this device or a paired
-//! one, each under its own name, as Extract copies (`extract_paths`): every check before the
-//! first byte, nothing replaced (unless [`ConvertRequest::replace`], as Extract replaces), each
-//! file through an exclusive temporary name, synced, renamed without replacing; folders
-//! recreated, empty ones too; BLAKE3 while writing, sizes checked
-//! (fast) or every file re-read and re-hashed (full). Peer to peer is relayed through here.
-// ponytail: no rollback, as Extract: a failure part way leaves the files already copied (the
-// error says how many).
+//! Transfer ([`ConvertRequest::transfer`]): files and folders of this device, a peer or a NAS
+//! copied into a folder here, on a peer or on a NAS, each under its own name, as Extract
+//! copies (`extract_paths`). Peer to peer is relayed through here.
+// ponytail: no rollback, as Extract: a failure part way leaves the files already copied.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -24,11 +19,9 @@ use crate::jobs::Ctx;
 use crate::remote::{FlinkPath, RemoteDir, is_remote};
 use crate::{ConvertRequest, JobReport, VerifyMode, VerifySummary};
 
-/// The stages a transfer reports, in order.
 pub(crate) const STAGES: [&str; 4] = crate::extract_paths::STAGES;
 
-/// The name `path` gets in the destination: its last component (on a peer or a share, of the
-/// path there).
+/// The name `path` gets in the destination: its last component (of the path on its device).
 pub(crate) fn name_of(path: &Path) -> Option<String> {
     let inner = if is_remote(path) {
         PathBuf::from(FlinkPath::parse(path).ok()?.path)
@@ -38,14 +31,13 @@ pub(crate) fn name_of(path: &Path) -> Option<String> {
     inner.file_name()?.to_str().map(str::to_string)
 }
 
-/// Where each source of `req` lands (the output itself for one with no name).
+/// Where each source lands (the output itself for one with no name).
 pub(crate) fn targets(req: &ConvertRequest) -> Vec<PathBuf> {
     (req.transfer.iter())
         .map(|s| name_of(s).map_or_else(|| req.output.clone(), |n| req.output.join(n)))
         .collect()
 }
 
-/// What the request itself can't be, before anything is read.
 fn request_findings(req: &ConvertRequest) -> Vec<String> {
     let mut findings = Vec::new();
     if !req.edits.is_empty()
@@ -83,7 +75,7 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
                 source.display()
             ));
         }
-        // Local: never a link or a special file (the folder scanner refuses those inside).
+        // Local: never a link or a special file (the scanner refuses those inside).
         if !crate::net::is_network(source) {
             match std::fs::symlink_metadata(source) {
                 Ok(m) if m.is_symlink() => findings.push(format!(
@@ -109,8 +101,7 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     findings
 }
 
-/// Whether `output` is at or inside `source`: on one device as spelled (normalized), locally
-/// by the canonical paths; never across devices.
+/// Whether `output` is at or inside `source`: as spelled on a device, canonical locally.
 fn inside(output: &Path, source: &Path) -> bool {
     if is_remote(output) || is_remote(source) {
         return match (FlinkPath::parse(output), FlinkPath::parse(source)) {
@@ -124,7 +115,7 @@ fn inside(output: &Path, source: &Path) -> bool {
     }
 }
 
-/// A source folder's tree with every path under `<name>/`, so the folder is one selection.
+/// A source folder's tree under `<name>/`, so the folder is one selection.
 struct Rooted {
     tree: Box<dyn SourceTree>,
     prefix: String,
@@ -187,8 +178,7 @@ impl SourceTree for Rooted {
     }
 }
 
-/// One source file as a tree of its own, named `<name>`. Its handle is opened at the first read
-/// and closed at the file's end, so a transfer of many files holds one at a time.
+/// One source file as a tree named `<name>`, its handle open only from first read to its end.
 struct OneFile {
     files: Vec<SourceFile>,
     path: PathBuf,
@@ -199,8 +189,7 @@ struct OneFile {
 }
 
 impl OneFile {
-    /// The tree and the file's stamp (a local file's from the opened handle, so it describes
-    /// exactly what is read). The file is opened (so a folder or link is refused) and closed.
+    /// The tree and the file's stamp (a local one's from the opened handle); the file is closed.
     fn open(path: &Path, name: &str) -> anyhow::Result<(Self, SourceStamp)> {
         let (_, size, stamp) = Self::handle(path)?;
         let tree = Self {
@@ -276,7 +265,6 @@ impl SourceTree for OneFile {
     }
 }
 
-/// The transfer job: scan, preflight, write, verify.
 pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     ctx.stages(&STAGES);
     ctx.progress("scan", 0, 1);
@@ -334,7 +322,6 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             ));
         }
     }
-    // Checked as one: the room for every source and the names beside each other.
     let (found, replacing) = target_findings("transfer", &root, &selections, req.replace, ctx);
     findings.extend(found);
     ctx.check()?;
@@ -423,6 +410,9 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             samples: 0,
             seed: 0,
         },
+        source_bytes: total,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
@@ -443,8 +433,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// `src/g` (a file longer than a read, an empty file, an empty folder, junk) and
-    /// `src/f.bin`; the long file's bytes.
+    /// `src/g` (a long file, an empty file, an empty folder, junk) and `src/f.bin`; the long file's bytes.
     fn sources(src: &Path) -> Vec<u8> {
         let big: Vec<u8> = (0..9 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
         put(src, "g/data/big.bin", &big);
@@ -492,8 +481,7 @@ mod tests {
         assert!(out.join("g/data/empty").is_dir());
         assert!(!out.join("g/.DS_Store").exists());
         assert_eq!(std::fs::read(out.join("f.bin")).unwrap(), b"one file");
-        // A taken name, two sources with one name, a destination inside a source, other
-        // options: refused before anything is written.
+        // Refused before anything is written.
         has(run(&request(&both, &out)).unwrap_err(), "already exists");
         std::fs::create_dir_all(src.join("x")).unwrap();
         put(&src, "x/f.bin", b"other");
@@ -554,7 +542,6 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
-        // The log line's target is a host path: `\g` on Windows.
         let folder = format!("{}g (2 files", std::path::MAIN_SEPARATOR);
         let emit: Box<dyn Fn(Event) + Send + Sync> = Box::new(move |e| {
             // As the folder starts: its first file's temporary name is made, then cut.
@@ -565,8 +552,7 @@ mod tests {
                 flag.store(true, Ordering::Relaxed);
             }
         });
-        // The small file first: it is finished and stays; the folder's first file is cut and
-        // its temporary file removed.
+        // The small file is finished and stays; the folder's first file is cut, its temp removed.
         let req = request(&[src.join("f.bin"), src.join("g")], &out);
         let e = crate::convert::run(&req, &Ctx::new(1, &emit, &cancel)).unwrap_err();
         has(format!("{e:#}"), "cancel");
@@ -690,7 +676,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Runs `req` as `run` does, with its log lines.
     fn run_logged(req: &ConvertRequest) -> (anyhow::Result<JobReport>, Vec<String>) {
         let cancel = AtomicBool::new(false);
         let lines = Arc::new(Mutex::new(Vec::new()));
@@ -705,7 +690,6 @@ mod tests {
         (result, lines)
     }
 
-    /// Every path under `root` with a file's bytes, sorted.
     fn listing(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
         let mut out = Vec::new();
         let mut todo = vec![root.to_path_buf()];
@@ -783,8 +767,7 @@ mod tests {
         has(&e, "data is a file: a folder is not put in its place");
         assert_eq!(listing(&other), before);
 
-        // On a peer the same: asked first, then a file over a file (small ones in calls of
-        // their own, a large one streamed), the folder merged.
+        // On a peer the same (small files in calls of their own, a large one streamed).
         let at_peer = dir.join("a");
         put(&at_peer, "f.bin", b"old");
         put(&at_peer, "g/old.bin", b"keep");
@@ -817,8 +800,7 @@ mod tests {
         let line = log.iter().find(|l| l.starts_with("replace: ")).unwrap();
         assert!(line.starts_with("replace: 3 files replaced: "), "{line}");
 
-        // A kind mismatch there, a link, or a name the device may fold into another: refused,
-        // nothing written.
+        // A kind mismatch, a link, or a name the device may fold into another: refused.
         let at_other = dir.join("b");
         std::fs::create_dir_all(at_other.join("f.bin")).unwrap();
         put(&at_other, "g/data", b"a file where a folder goes");
@@ -863,8 +845,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A job never replaces what it copies from: a file sent into its own folder, or a folder
-    /// merged into itself, is refused with nothing changed.
+    /// A job never replaces what it copies from (a file into its own folder, a folder into itself).
     #[test]
     fn replace_refuses_the_jobs_own_source() {
         let dir = crate::test_dir("transfer-replace-own");

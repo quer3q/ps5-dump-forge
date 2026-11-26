@@ -1,8 +1,6 @@
-//! A NAS share as a game source and as an output. Runs only with
-//! `FORGE_SMB_TEST=smb://[user[:pass]@]host[:port]/share` (the share holds `Stub Game`, see
-//! `tests/scripts/nas.sh`); `FORGE_SMB_TEST_SHARE_DIR` (the share's folder on this machine, with a
-//! writable `out`) also checks an `.exfat` image read over SMB and the outputs: an image, an
-//! fpkg, an Extract and a transfer written onto the share and read back.
+//! A NAS share as a game source and an output; runs only with
+//! `FORGE_SMB_TEST=smb://[user[:pass]@]host[:port]/share` (`tests/scripts/nas.sh`);
+//! `FORGE_SMB_TEST_SHARE_DIR` (the share's folder here) also checks the outputs.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,12 +28,15 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         zstd_unpack: false,
         lz4_level: 0,
         lz4_runtime: Default::default(),
+        replace_ampr_emu: true,
         edits: Vec::new(),
         extract: Vec::new(),
         transfer: Vec::new(),
         replace: false,
         edit_rebuild: false,
         install: None,
+        recover_metadata: None,
+        restore_metadata: false,
         delete_source: false,
         pack_profile: None,
         archive_password: None,
@@ -77,7 +78,6 @@ fn share() -> Option<String> {
     Some(at.url().display().to_string())
 }
 
-/// Every file under a local folder by its `/`-separated path, junk left out.
 fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];

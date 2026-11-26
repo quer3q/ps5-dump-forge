@@ -1,0 +1,60 @@
+/* DeviceTabs.tsx and bookmarks.tsx: the device tabs (a browser's tabs over the card they show)
+   and the bookmark chips. Logical properties only, so RTL mirrors itself. */
+
+/* ---------- Device tabs ---------- */
+.dev-tabs-row { display: flex; align-items: flex-end; gap: 2px; min-width: 0; padding: 0 10px; }
+.dev-tabs { display: flex; align-items: flex-end; gap: 2px; flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
+button.dev-tab {
+  display: flex; align-items: center; gap: 8px; flex: 0 1 220px; min-width: 110px; height: 38px; padding: 0 14px;
+  border-radius: 12px 12px 0 0; background: transparent; color: var(--muted); font-size: 13px; position: relative;
+}
+button.dev-tab:active:not(:disabled, [aria-disabled="true"]) { transform: none; }
+.dev-tab .icon { width: 16px; height: 16px; flex: none; }
+.dev-tab-name { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: start; }
+.dev-tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+.dev-tab.offline .dev-tab-dot { background: var(--muted); opacity: 0.6; }
+/* Greyed, not the base button's disabled look (it is still read out and titled). */
+button.dev-tab.offline { opacity: 0.55; cursor: default; }
+button.dev-tab:hover:not([aria-selected="true"], [aria-disabled="true"]) { background: var(--surface-2); color: var(--fg); }
+button.dev-tab[aria-selected="true"] { background: var(--card); color: var(--fg); font-weight: 600; }
+.dev-tab[aria-selected="true"] .icon { color: var(--accent); }
+.dev-tab:focus-visible { outline-offset: -2px; }
+/* The separators between unselected tabs, as a browser draws them. */
+.dev-tab + .dev-tab:not([aria-selected="true"])::before {
+  content: ""; position: absolute; inset-inline-start: -1px; top: 10px; bottom: 10px; width: 1px; background: var(--line);
+}
+.dev-tab[aria-selected="true"] + .dev-tab::before { display: none; }
+button.dev-tab-add { flex: none; width: 34px; height: 30px; margin-bottom: 4px; padding: 0; background: transparent; color: var(--muted); }
+button.dev-tab-add:hover:not(:disabled, [aria-disabled="true"]) { background: var(--surface-2); color: var(--fg); }
+/* The card under the tabs: the chosen tab joins it. */
+.dev-tabs-row + .dev-window { margin-top: 0; border-start-start-radius: 0; }
+/* The File explorer keeps a card per tab mounted (hidden ones between): the shown one joins too. */
+.dev-tabs-row ~ .dev-window { margin-top: 0; border-start-start-radius: 0; }
+
+/* ---------- Bookmarks ---------- */
+.bm-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 10px; min-width: 0; }
+.bm-chip { display: inline-flex; align-items: center; max-width: 100%; min-width: 0; height: 32px; border-radius: 999px; background: var(--accent-soft); overflow: hidden; }
+.bm-chip:hover { background: var(--accent-soft-hi, var(--accent-soft)); }
+.bm-chip > button {
+  height: 32px; margin: 0; border-radius: 0; background: transparent; color: var(--accent); font-size: 13px; font-weight: 500;
+}
+.bm-chip > button:hover:not(:disabled, [aria-disabled="true"]) { background: transparent; }
+.bm-chip > button:focus-visible { outline-offset: -2px; }
+.bm-chip .icon { width: 15px; height: 15px; flex: none; }
+button.bm-go { min-width: 0; gap: 6px; padding: 0; padding-inline: 12px 4px; }
+.bm-chip.here .bm-go { font-weight: 700; }
+.bm-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* A folder name stays left to right in RTL text. */
+[dir="rtl"] .bm-name { direction: ltr; unicode-bidi: isolate; }
+button.bm-x { padding: 0; padding-inline: 4px 10px; }
+button.bm-toggle { flex: none; width: 32px; height: 30px; padding: 0; background: transparent; color: var(--muted); }
+button.bm-toggle:hover:not(:disabled, [aria-disabled="true"]) { background: var(--surface-2); color: var(--fg); }
+button.bm-toggle[aria-pressed="true"] { color: var(--accent); }
+/* Filled while bookmarked. */
+button.bm-toggle[aria-pressed="true"] svg { fill: currentColor; }
+
+/* Touch: bigger targets. */
+@media (pointer: coarse) {
+  .bm-chip, .bm-chip > button { height: 40px; }
+  button.bm-toggle { width: 40px; height: 40px; }
+}

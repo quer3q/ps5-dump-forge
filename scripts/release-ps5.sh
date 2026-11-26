@@ -1,26 +1,13 @@
 #!/usr/bin/env bash
-# Build and check the PS5 release (on macOS or GitHub's ubuntu-latest; needs Docker and Node):
-#
-#   dist/ps5-dump-forge-<ver>-ps5.elf  the CLI as a PS5 payload (ps5/build.sh), the web UI embedded
-#
-# Just the ELF: no zip, no PS5 README, no notices (the release page's source archives carry those).
-# The checks run on the copy in dist/ (B) and on ps5/build.sh's stage 1 (A, which B embeds and
-# saves on the console): llvm-readelf from the ps5-dump-forge-ps5 Docker image (built here if
-# missing) for the payload's shape (ELF64 little-endian x86-64, a PIE DYN, NEEDED exactly the
-# SDK's six modules, no PT_INTERP or TLS, the entry point in an executable PT_LOAD), then
-# python3 on the host: every file of app/dist-http is in it byte for byte, or as a gzip stream
-# that decodes to it byte for byte (the server's build.rs gzips what that shrinks; not the
-# placeholder page), no debug routes, and its version marker (VERSION_MARKER in the server) is the
-# workspace version. Then the self copy (crates/ps5-dump-forge-server/src/self_copy.rs): A carries
-# none, and B exactly one, which decompresses (the zstd CLI) to A byte for byte, its length and
-# SHA-256 matching.
-# The release asset is B alone.
+# Build and check the PS5 release, dist/ps5-dump-forge-<ver>-ps5.elf (needs Docker and Node).
+# Checked on the copy in dist/ (B) and on ps5/build.sh's stage 1 (A, which B embeds): the payload's
+# ELF shape (llvm-readelf in the ps5 Docker image), every app/dist-http file embedded (plain or
+# gzipped), no debug routes, the version marker, and B's one self copy decompressing to A.
 #
 #   scripts/release-ps5.sh                 # build the web UI and the ELF, then copy and check
 #   SKIP_BUILD=1 scripts/release-ps5.sh    # copy and check what is already built
 #
-# Env: DIST_DIR (default <repo>/dist). FORGE_SKIP_WEB=1 is refused: the release always embeds a
-# freshly built web UI.
+# Env: DIST_DIR (default <repo>/dist). FORGE_SKIP_WEB=1 is refused.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,8 +21,7 @@ dist=${DIST_DIR:-$root/dist}
 image=ps5-dump-forge-ps5
 want_needed="libSceAppInstUtil.sprx libSceLibcInternal.sprx libSceNet.sprx libSceNotification.sprx libSceSystemService.sprx libkernel_web.sprx"
 
-# The debug routes (crates/ps5-dump-forge-server/src/debug.rs) are for bring-up only; any value
-# of FORGE_DEBUG_API compiles them in, and the check below rejects an ELF that has them.
+# Any value of FORGE_DEBUG_API compiles the bring-up debug routes in.
 [[ -z ${FORGE_DEBUG_API+x} ]] ||
   { echo "release-ps5.sh: FORGE_DEBUG_API is set: a release has no debug routes; unset it" >&2; exit 1; }
 if [[ ${SKIP_BUILD:-} != 1 ]]; then
@@ -65,8 +51,7 @@ cp "$src" "$elf"
 
 docker image inspect "$image" > /dev/null 2>&1 || docker build -q -t "$image" ps5 > /dev/null
 
-# check <elf> [<stage 1 elf>]: every check on one ELF. With a stage 1, the ELF is the final one,
-# which must carry that stage 1 as its self copy; without, it must carry none.
+# check <elf> [<stage 1 elf>]: with a stage 1, the ELF must carry it as its self copy, else none.
 check() {
   local file=$1 a=${2:-}
   echo "== verify $file"
@@ -74,8 +59,7 @@ check() {
     echo "release-ps5.sh: $file: $*" >&2
     exit 1
   }
-  # The ELF goes in on stdin, not a bind mount: Docker Desktop's file sharing can serve a stale
-  # view of a file just replaced.
+  # On stdin, not a bind mount: Docker Desktop can serve a stale view of a file just replaced.
   readelf=$(docker run --rm -i "$image" sh -c "cat > /tmp/check.elf && llvm-readelf --wide -h -l -d /tmp/check.elf" \
     < "$file") || fail "llvm-readelf failed"
 
@@ -114,8 +98,6 @@ check() {
   done < <(sed -n '/^Program Headers:/,/^$/p' <<< "$readelf" | sed '1,2d')
   [[ $in_exec_load == 1 ]] || fail "entry point $entry is not inside an executable PT_LOAD"
 
-  # Embedded web UI (build.rs's rule: every file, dotfiles left out), the version marker and the
-  # self copy.
   python3 -I - "$file" app/dist-http "$version" "$a" <<'EOF'
 import hashlib, os, re, struct, subprocess, sys, zlib
 elf, web, version, stage1 = sys.argv[1:]
@@ -123,9 +105,8 @@ data = open(elf, "rb").read()
 def fail(why):
     sys.exit(f"release-ps5.sh: {elf}: {why}")
 
-# Every valid blob: `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256, then a zstd
-# frame that decompresses to exactly that length and hash. The magic also sits in the code that
-# reads it, with no such descriptor behind it.
+# A blob: `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256, then a zstd frame of
+# exactly that; the magic also sits in the reading code, with no descriptor behind it.
 def blobs(data):
     found, at = [], data.find(b"PDFGSELF")
     while at >= 0:

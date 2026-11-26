@@ -1,5 +1,5 @@
-//! The in-place editor's write side: plans applied through the undo journal, read back by
-//! the vendored reader, the volume reopened (every count cross-checked) and the test fsck.
+//! The in-place editor's write side: plans applied through the undo journal, then read back,
+//! reopened and fsck'd. `FORGE_UFS2_KEEP=<dir>` keeps the edited images.
 
 mod common;
 
@@ -70,8 +70,7 @@ fn clean_bytes(v: &Volume) -> Vec<u64> {
     std::iter::once(B + 209).chain(backups).collect()
 }
 
-/// Plans `ops`, checks the fs_clean bracket, applies the writes through the journal and
-/// commits.
+/// Plans `ops`, checks the fs_clean bracket, applies through the journal and commits.
 fn edit(img: &Path, ops: &[Op]) {
     edit_from(img, ops, &mut |_, _, _| unreachable!())
 }
@@ -199,9 +198,7 @@ fn rolls_back(img: &Path, gone: &[&str]) {
     std::fs::remove_file(&copy).unwrap();
 }
 
-/// The test game plus a 100 MiB file and a folder of 5000 one-block files: with no extra
-/// free space the writer lays it out in 4 groups of ~2200 blocks and ~2300 inodes, so its
-/// blocks and inodes reach every group.
+/// The test game plus a 100 MiB file and 5000 one-block files: 4 groups, all of them used.
 fn bulk_files() -> Vec<(String, u64)> {
     let mut f = files();
     f.push(("bulk/big.bin".into(), 100 << 20));
@@ -250,10 +247,8 @@ fn sb_counts(f: &mut File, sb: u64) -> (Vec<u8>, u8) {
     (b, clean[0])
 }
 
-/// Deletes reaching every cylinder group: each group's `cg_cs` (and so its `fs_cs` entry,
-/// which open checks against it) gains exactly what the deleted inodes held there, every
-/// backup superblock carries the primary's `fs_cstotal` and is clean, the rest reads back;
-/// a rollback first restores every byte. `FORGE_UFS2_KEEP=<dir>` keeps the image.
+/// Deletes reaching every group: each `cg_cs` gains exactly what was deleted there, every
+/// backup superblock matches the primary; a rollback restores every byte.
 #[test]
 fn delete_across_cylinder_groups() {
     let all = bulk_files();
@@ -357,10 +352,8 @@ fn reads_back_renamed(img: &Path, renames: &[(&str, &str)], empty: &[&str]) {
     assert!(r.errors.is_empty(), "{:?}", r.errors);
 }
 
-/// Renames in place (shorter, same length, another case), into a new entry (longer), files
-/// and folders moved between folders (`..` and link counts following), and an op on what an
-/// earlier one moved, in one plan: everything reads back under its new path, the free counts
-/// stay. With `FORGE_UFS2_KEEP=<dir>` the edited image is copied there.
+/// Renames in place and into new entries, moves between folders (`..` and link counts
+/// following) and an op on what an earlier one moved, in one plan: all read back.
 #[test]
 fn rename_and_move() {
     let img = image("edit-rename");
@@ -493,10 +486,8 @@ fn slots(n: u64) -> u64 {
     n + u64::from(n > 12)
 }
 
-/// New files (one needing an indirect block, an empty one, one of zeros) and replaced files
-/// (bigger, smaller) in one plan: everything reads back, a replaced file keeps its inode and
-/// times, a new file is one run with its indirect block where the writer puts it, and the
-/// counts follow. With `FORGE_UFS2_KEEP=<dir>` the image is kept as `edit-put.ffpkg`.
+/// New and replaced files in one plan: all read back, a replaced file keeps its inode and
+/// times, a new one is laid out as the writer lays it out.
 #[test]
 fn put_new_and_replaced() {
     let img = image("edit-put");
@@ -557,9 +548,7 @@ fn put_new_and_replaced() {
     }
 }
 
-/// Short of room: one finding, the need counting every block the plan takes or lacks, the
-/// free space as the image has it (blocks this plan frees are not reused); findings before
-/// the shortfall stand, later ones are dropped.
+/// Short of room: one finding counting every block taken or lacked; later findings dropped.
 #[test]
 fn no_room_is_one_finding() {
     let img = image("edit-put-no-room");
@@ -608,10 +597,8 @@ fn inode_bytes(v: &Volume, f: &mut File, path: &str, at: u64, len: usize) -> Vec
     b
 }
 
-/// Mkdir (nested, into an empty folder, of an existing folder: a no-op) and Puts making
-/// their missing folders: each new folder is the writer's (mode 040777, nlink 2, one block,
-/// `di_dirdepth` one past its parent's), parents gain a link; findings for a file on the
-/// way and a bad name.
+/// Mkdir and Puts making their folders: each new folder is the writer's, parents gain a link;
+/// a file on the way and a bad name are findings.
 #[test]
 fn mkdir_and_missing_parents() {
     let img = image("edit-mkdir");
@@ -688,9 +675,7 @@ fn mkdir_and_missing_parents() {
     assert!(root.iter().any(|n| n.name == "n1" && n.is_dir()));
 }
 
-/// A block the plan took and then freed is never taken again: repeated Puts of one path, and
-/// a Delete, Put, Delete, Put, each give free-space writes that overlap nothing (else the
-/// journal refuses the job), and the counts follow.
+/// A block the plan took and then freed is never taken again: free-space writes overlap nothing.
 #[test]
 fn a_block_taken_and_freed_is_not_taken_again() {
     let img = image("edit-retake");

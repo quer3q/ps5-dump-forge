@@ -64,10 +64,9 @@ impl Rng {
     }
 }
 
-/// A game folder: artwork the container carries, trophy data both carry, a multi-block file
-/// that mixes compressible and random stretches, an empty file, empty directories, nesting
-/// and a non-ASCII name. `big_random` adds that many random bytes as `data/random.bin`.
-pub fn write_tree(root: &Path, big_random: usize) {
+/// A game folder: container artwork, trophy data, a multi-block mixed file, an empty file,
+/// empty directories, nesting and a non-ASCII name.
+pub fn write_tree(root: &Path) {
     let mut rng = Rng::new(7);
     let put = |path: &str, data: Vec<u8>| {
         let full = root.join(path);
@@ -112,9 +111,7 @@ pub fn write_tree(root: &Path, big_random: usize) {
     for i in 0..40 {
         put(&format!("data/many/f{i:02}.bin"), rng.bytes(10 + i * 37));
     }
-    if big_random > 0 {
-        put("data/random.bin", rng.bytes(big_random));
-    }
+
     std::fs::create_dir_all(root.join("data/empty")).unwrap();
     std::fs::create_dir_all(root.join("emptytop/inner")).unwrap();
 }
@@ -145,16 +142,14 @@ impl Built {
     }
 }
 
-/// Build a package from the test tree through `prepare` + `write_package` (which verifies it),
-/// starting from `BuildRequest::production` and letting `tweak` change the request.
-pub fn build(name: &str, big_random: usize, tweak: impl FnOnce(&mut BuildRequest)) -> Built {
+/// Build a package from the test tree (`BuildRequest::production`, then `tweak`).
+pub fn build(name: &str, tweak: impl FnOnce(&mut BuildRequest)) -> Built {
     let src = TempDir::new(&format!("{name}-src"));
     let out = TempDir::new(&format!("{name}-out"));
-    write_tree(src.path(), big_random);
+    write_tree(src.path());
     let mut request = BuildRequest::production(src.path(), out.path());
     request.time = Some((1_700_000_000, 0));
     request.threads = Some(2);
-    // The app's default; tests build at this level only.
     request.level = ps5upload_fpkg::kraken::Level::Fast;
     tweak(&mut request);
     let mut tree = FolderSource::open(src.path()).unwrap();
@@ -199,8 +194,7 @@ pub fn build(name: &str, big_random: usize, tweak: impl FnOnce(&mut BuildRequest
     }
 }
 
-/// The reader lists exactly the expected files and empty directories and serves every byte,
-/// whole and by odd-sized ranges.
+/// Exactly the expected listing, every byte served whole and by odd-sized ranges.
 pub fn assert_matches(source: &mut FpkgSource, built: &Built) {
     let listed: Vec<(String, u64)> = source
         .files()
@@ -246,7 +240,7 @@ pub fn error_of(result: ps5upload_fpkg::Result<FpkgSource>) -> String {
     }
 }
 
-/// Where `imagedigs` sits in a package (read with the trusted vendored parser).
+/// Where `imagedigs` sits (by the vendored parser).
 pub fn imagedigs_at(pkg: &[u8]) -> usize {
     let cnt_offset = u64::from_le_bytes(pkg[0x58..0x60].try_into().unwrap()) as usize;
     let cnt = ps5upload_fpkg::cnt::Cnt::from_bytes(pkg[cnt_offset..].to_vec()).unwrap();

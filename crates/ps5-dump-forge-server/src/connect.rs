@@ -1,8 +1,5 @@
-//! Connect: Forge ↔ Forge over FLINK (the `ps5_dump_forge_flink` crate). This part is the
-//! device's identity: the data folder, the node secret, the paired peers and the device name,
-//! and the service (`Connect`): the FLINK listener, pairing (asked of the other device's user:
-//! `Approvals` here, `Outgoing` for this device's own request), saved devices and their online
-//! state.
+//! Connect: Forge ↔ Forge over FLINK. The device's identity (node secret, paired peers, name)
+//! and the service: the FLINK listener, pairing, saved devices and their online state.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -24,14 +21,11 @@ use ps5_dump_forge_flink::{
     check_path, client_handshake, hex, kind2, refusal, server_handshake, server_join, unhex,
 };
 
-/// The PS5's Connect folder (Forge's home is `/data/dumpforge`).
 pub const PS5_DIR: &str = "/data/dumpforge/connect";
 const SECRET_FILE: &str = "node.key";
 const PEERS_FILE: &str = "peers.json";
 
-/// Where `serve` keeps Connect's files when nobody names a folder: the PS5's `PS5_DIR`, else
-/// the OS's per-user data folder + `ps5-dump-forge/connect`. The desktop app passes its own
-/// app data folder instead.
+/// Where `serve` keeps Connect's files when nobody names a folder.
 pub fn default_dir() -> Option<PathBuf> {
     if cfg!(target_env = "ps5") {
         return Some(PathBuf::from(PS5_DIR));
@@ -51,8 +45,7 @@ pub fn default_dir() -> Option<PathBuf> {
     Some(base.join("ps5-dump-forge").join("connect"))
 }
 
-/// This device's FLINK identity: a random 32-byte secret kept in the data folder, and its key
-/// id (the first 16 bytes of BLAKE3(secret), 32 hex digits), which peers know it by.
+/// A random 32-byte secret and its key id (the first 16 bytes of BLAKE3(secret), in hex).
 #[derive(Clone)]
 pub struct Identity {
     pub secret: [u8; 32],
@@ -129,14 +122,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// A paired device, known by its key id (never by address: its `address` is the last one it
-/// was seen at, updated whenever it is seen elsewhere).
+/// A paired device, known by its key id, never by address (the last one it was seen at).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub key_id: String,
     pub name: String,
     pub platform: String,
-    /// `ip:port` of its FLINK listener, as last seen.
     pub address: Option<String>,
     /// Unix seconds; 0 = never.
     pub last_seen: u64,
@@ -150,14 +141,12 @@ impl Peer {
     }
 }
 
-/// `peers.json`: one entry per key id.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peers {
     pub peers: Vec<Peer>,
 }
 
 impl Peers {
-    /// The saved peers; none when the file isn't there.
     pub fn load(dir: &Path) -> io::Result<Peers> {
         let path = dir.join(PEERS_FILE);
         match fs::read(&path) {
@@ -182,8 +171,7 @@ impl Peers {
         self.peers.iter().find(|p| p.key_id == key_id)
     }
 
-    /// Adds `peer`, or replaces the entry with its key id (pairing again updates that one).
-    /// Other entries are never touched, even one last seen at the same address.
+    /// Adds `peer`, or replaces the entry with its key id (never one at the same address).
     pub fn upsert(&mut self, peer: Peer) {
         match self.peers.iter_mut().find(|p| p.key_id == peer.key_id) {
             Some(p) => *p = peer,
@@ -191,8 +179,7 @@ impl Peers {
         }
     }
 
-    /// A known peer seen at `address` (a handshake or a discovery reply): its address and
-    /// last-seen time updated. False when the key id isn't paired.
+    /// A known peer seen at `address`; false when the key id isn't paired.
     pub fn seen(&mut self, key_id: &str, address: &str, now: u64) -> bool {
         let Some(p) = self.peers.iter_mut().find(|p| p.key_id == key_id) else {
             return false;
@@ -202,7 +189,6 @@ impl Peers {
         true
     }
 
-    /// Removes the pairing on this side. False when there was none.
     pub fn forget(&mut self, key_id: &str) -> bool {
         let n = self.peers.len();
         self.peers.retain(|p| p.key_id != key_id);
@@ -210,8 +196,7 @@ impl Peers {
     }
 }
 
-/// What this device calls itself to peers: the PS5's console name (Settings → System →
-/// Console Information), else the host name, else "PS5" / "PC"; at most 32 characters.
+/// The PS5's console name, else the host name, else "PS5" / "PC"; at most 32 characters.
 pub fn device_name() -> String {
     #[cfg(target_env = "ps5")]
     if let Some(name) = console_nickname() {
@@ -288,12 +273,9 @@ fn console_nickname() -> Option<String> {
 
 // ---- The service ------------------------------------------------------------------------------
 //
-// One FLINK listener (a thread per inbound conn, at most `MAX_CONNS`), one prober (every
-// `PROBE_EVERY` an `info` RPC to each paired device on a fresh conn) and the shared state behind
-// `Connect`. A device is online while a handshake with it, either way, succeeded within
-// `DEAD_AFTER`. ponytail: a fresh conn per probe instead of a held control link with keepalive.
+// A device is online while a handshake with it, either way, succeeded within `DEAD_AFTER`.
+// ponytail: a fresh conn per probe instead of a held control link with keepalive.
 
-/// FLINK's TCP port.
 pub const PORT: u16 = 9883;
 /// Saved devices shown (the UI's 3×3 grid).
 pub const MAX_SHOWN: usize = 9;
@@ -302,7 +284,6 @@ const MAX_CONNS: usize = 64;
 const PROBE_EVERY: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// This device on the Connect card.
 #[derive(Clone, Debug, Serialize)]
 pub struct ThisDevice {
     pub key_id: String,
@@ -311,7 +292,7 @@ pub struct ThisDevice {
     pub port: u16,
     /// Why the FLINK listener isn't running (port in use, ...); `None` while it is.
     pub listen_error: Option<String>,
-    /// The address the default route leaves from (`crate::local_ip`); `None` when unknown.
+    /// The address the default route leaves from (`crate::local_ip`).
     pub ip: Option<String>,
 }
 
@@ -332,8 +313,7 @@ pub struct State {
     pub devices: Vec<Device>,
 }
 
-/// An inbound connection, attributed after authentication so Forget closes its control
-/// session and every lane. The session id lets a lane find its authenticated peer.
+/// An inbound connection, attributed after authentication so Forget closes it.
 struct Inbound {
     stream: TcpStream,
     peer: Option<(String, String)>,
@@ -346,67 +326,54 @@ pub(crate) struct Inner {
     peers: Mutex<Peers>,
     /// `peers`' generation: bumped (under its lock) by each change a save must carry.
     peers_gen: AtomicU64,
-    /// Held while peers.json is written (`save_peers`), never with `peers` waiting on it from
-    /// a lane: saves run one at a time, outside the `peers` lock. Holds the generation last
-    /// written, so an older snapshot never overwrites a newer one.
+    /// Held while peers.json is written, outside the `peers` lock; the generation last written,
+    /// so an older snapshot never overwrites a newer one.
     peers_saved: Mutex<u64>,
     /// A save outside the lock failed: the next handshake saves again.
     peers_dirty: AtomicBool,
-    /// Saved NAS devices (`nas.rs`) and the ids that answered the last TCP probe.
     nas: Mutex<crate::nas::NasList>,
     nas_online: Mutex<HashSet<String>>,
     /// Id → unix seconds of its last successful probe (memory only; 0 = not since start).
     nas_seen: Mutex<HashMap<String, u64>>,
     budget: Mutex<Budget>,
-    /// Other devices' pairing requests, waiting for this device's user.
     approvals: Approvals,
-    /// This device's own pairing request, while it runs and after (until the next one).
     outgoing: Mutex<Option<Outgoing>>,
     next_pair: AtomicU64,
-    /// Key id → the last successful handshake with it.
     alive: Mutex<HashMap<String, Instant>>,
-    /// Key id → the newest address a discovery reply gave for it.
     found: Mutex<HashMap<String, SocketAddr>>,
-    /// Inbound conns, for the bound and for `shutdown`.
     conns: Mutex<HashMap<u64, Inbound>>,
     next_conn: AtomicU64,
     stop: AtomicBool,
-    /// What paired peers may list, read and write (canonical; on the PS5 only `/data` and the
-    /// drives plugged in within it); `None`: nothing.
+    /// What paired peers may list, read and write (canonical); `None`: nothing.
     share: Option<crate::connect_fs::Share>,
-    /// Lane nonces taken (`serve_lane`).
     lane_nonces: Mutex<HashSet<[u8; 16]>>,
-    /// Files peers read in place (`connect_fs`).
     reads: crate::connect_fs::Reads,
-    /// Files peers write here (`connect_fs`).
     writes: crate::connect_fs::Writes,
-    /// Jobs mirrored both ways (`connect_jobs`).
     jobs: crate::connect_jobs::Mirror,
-    /// How a peer's `install` starts a job here (the PS5's server sets it); `None`: refused.
+    /// How a peer's `install` starts a job here (the PS5's server); `None`: refused.
     install: Mutex<Option<InstallHook>>,
 }
 
 /// Starts an install job of a package (a `flink://<peer>/...` path): the job's id, or why not.
 pub type InstallHook = Arc<dyn Fn(PathBuf) -> Result<JobId, String> + Send + Sync>;
 
-/// A peer's `install` with no hook set: this device isn't a PS5.
 pub const CANT_INSTALL: &str = "this device can't install packages";
+
+pub const INSTALL_OLDER: &str =
+    "that device's Dump Forge is older: update it to install a package that is on it";
 
 pub struct Connect {
     inner: Arc<Inner>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// One per sleeping thread (prober, job pusher); dropped to stop them.
     wake: Mutex<Vec<mpsc::Sender<()>>>,
-    /// Forge discovery (UDP 8094): the passive responder and the Forge part of a search.
     discovery: crate::discovery::Discovery,
-    /// The NAS (mDNS) part of a search.
     lan: Arc<Lan>,
     lan_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// The speed tests running and the cancels that came before their run (`speed_test_cancel`).
     speed: Mutex<SpeedRuns>,
 }
 
-/// A speed test's run: the device's key id and the id the UI gave it.
+/// (key id, the run id the UI gave).
 type SpeedRun = (String, String);
 
 /// Cancels kept for a run not started yet, at most this many (the oldest dropped)...
@@ -430,8 +397,7 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// A Connect error as the UI gets it: a refusal's code (`denied`, `timed_out`,
-/// `too_many_attempts`, `not_paired`, ...), which it translates, else the error's text.
+/// A refusal's code (`denied`, `not_paired`, ...), which the UI translates, else the text.
 pub fn error_text(e: &io::Error) -> String {
     refusal(e).map_or_else(|| e.to_string(), str::to_string)
 }
@@ -445,11 +411,10 @@ pub fn platform() -> &'static str {
 }
 
 impl Connect {
-    /// Loads (or makes) the identity and peers in `dir` and starts the listener on `port` (0 =
-    /// any, for tests) and the prober. A listener that can't bind is reported in `state()`, not
-    /// an error; only the data folder's files are.
+    /// Loads (or makes) the identity and peers in `dir` and starts the listener (port 0 = any)
+    /// and the prober. A listener that can't bind is reported in `state()`, not an error.
     pub fn start(dir: &Path, port: u16) -> io::Result<Connect> {
-        // The PS5 (by user request): peers reach only `/data` and the drives plugged in.
+        // The PS5: peers reach only `/data` and the drives plugged in.
         let reach = cfg!(target_env = "ps5").then(|| {
             let roots = crate::PS5_ROOTS.map(PathBuf::from);
             crate::paths::Roots::new(crate::Platform::Ps5, &roots).0
@@ -457,7 +422,6 @@ impl Connect {
         Connect::start_confined(dir, port, default_share_root(), reach)
     }
 
-    /// `start` with this device's share root (tests use a temporary folder).
     pub fn start_rooted(dir: &Path, port: u16, share_root: Option<PathBuf>) -> io::Result<Connect> {
         Connect::start_confined(dir, port, share_root, None)
     }
@@ -536,8 +500,7 @@ impl Connect {
             let inner = inner.clone();
             let every = crate::connect_jobs::PUSH_EVERY;
             threads.push(std::thread::spawn(move || {
-                // U8: while a paired device reads or writes files here, auto rest mode waits
-                // as during this device's own jobs.
+                // U8: auto rest mode waits while a paired device reads or writes files here.
                 let mut awake: Option<ps5_dump_forge_core::Awake> = None;
                 while let Err(mpsc::RecvTimeoutError::Timeout) = push_sleep.recv_timeout(every) {
                     inner.push_jobs(false);
@@ -573,10 +536,8 @@ impl Connect {
             lan_thread: Mutex::default(),
             speed: Mutex::default(),
         };
-        // One search at every start (by user request; the desktop app and the PS5 alike): its
-        // finds wait under Nearby, and a saved device that moved to a new address is found: a
-        // peer's one entry once a handshake there succeeds (`discovered`), a NAS's when the
-        // search ends (`migrate_nas`). Tests (port 0) search at start only with a saved device.
+        // One search at every start, so a saved device that moved is found; tests (port 0)
+        // search at start only with a saved device.
         let saved = !lock(&connect.inner.peers).peers.is_empty()
             || !lock(&connect.inner.nas).nas.is_empty();
         if port != 0 || saved {
@@ -589,10 +550,8 @@ impl Connect {
         &self.inner.me
     }
 
-    /// Asks the device at `addr` (`ip` or `ip:port`) to pair; its user allows or denies it there
-    /// within `flink::PAIR_WAIT`. Runs on a thread of its own: `outgoing()` follows it (the check
-    /// number both screens show, then the outcome). Pairing again with a known device updates
-    /// its one entry. A new request replaces the last (a running one is cancelled).
+    /// Asks the device at `addr` to pair, on a thread of its own (`outgoing()` follows it). A
+    /// new request replaces the last (a running one is cancelled).
     pub fn pair(&self, addr: &str) -> io::Result<()> {
         let addr = parse_addr(addr)?;
         if !is_local(addr.ip()) {
@@ -611,7 +570,6 @@ impl Connect {
         Ok(())
     }
 
-    /// What answers at `address` (Pair by address, made smart: `probe.rs`).
     pub fn probe(&self, address: &str) -> io::Result<crate::probe::Probe> {
         crate::probe::probe(address, &self.inner.me)
     }
@@ -628,18 +586,15 @@ impl Connect {
         }
     }
 
-    /// This device's last pairing request.
     pub fn outgoing(&self) -> Option<Outgoing> {
         lock(&self.inner.outgoing).clone()
     }
 
-    /// This device's user answers another device's pairing request `id`; false when it no
-    /// longer waits (answered, timed out, or that device gave up).
+    /// This device's user answers pairing request `id`; false when it no longer waits.
     pub fn approve(&self, id: &str, allow: bool) -> bool {
         self.inner.approvals.answer(id, allow)
     }
 
-    /// Other devices' pairing requests waiting for this device's user.
     pub fn pending(&self) -> Vec<PairRequest> {
         self.inner.approvals.waiting()
     }
@@ -669,7 +624,6 @@ impl Connect {
         self.devices().into_iter().find(|d| d.key_id == key_id)
     }
 
-    /// Removes the pairing on this side. False when there was none.
     pub fn forget(&self, key_id: &str) -> io::Result<bool> {
         let mut peers = lock(&self.inner.peers);
         // Saved first: a pairing still in peers.json would be back after a restart.
@@ -701,8 +655,7 @@ impl Connect {
         Ok(true)
     }
 
-    /// The saved NAS devices, in saving order (the UI shows peers first, then these, at most
-    /// `MAX_SHOWN` in all).
+    /// The saved NAS devices, in saving order.
     pub fn nas_devices(&self) -> Vec<crate::nas::NasDevice> {
         let online = lock(&self.inner.nas_online).clone();
         let seen = lock(&self.inner.nas_seen).clone();
@@ -723,7 +676,7 @@ impl Connect {
             .collect()
     }
 
-    /// Saves a NAS (one entry per host + port, updated in place) and probes it; its id.
+    /// Saves a NAS (one entry per host + port) and probes it; its id.
     pub fn nas_save(&self, req: &crate::nas::NasSave) -> io::Result<String> {
         let mut list = lock(&self.inner.nas);
         let mut next = list.clone();
@@ -752,7 +705,6 @@ impl Connect {
         Ok(id)
     }
 
-    /// Removes a saved NAS. False when there was none.
     pub fn nas_forget(&self, id: &str) -> io::Result<bool> {
         let mut list = lock(&self.inner.nas);
         let mut next = list.clone();
@@ -765,11 +717,6 @@ impl Connect {
         lock(&self.inner.nas_online).remove(id);
         lock(&self.inner.nas_seen).remove(id);
         Ok(true)
-    }
-
-    /// The saved NAS devices with their credentials, for the SMB source (never for a reply).
-    pub fn nas_saved(&self) -> Vec<crate::nas::SavedNas> {
-        lock(&self.inner.nas).nas.clone()
     }
 
     pub fn state(&self) -> State {
@@ -792,7 +739,7 @@ impl Connect {
         self.inner.discovered(key_id, addr);
     }
 
-    /// One probe round now (the prober runs one every `PROBE_EVERY`).
+    /// One probe round now.
     pub fn refresh(&self) {
         self.inner.probe_all();
     }
@@ -808,21 +755,17 @@ impl Connect {
         self.inner.session(key_id)
     }
 
-    /// What says a path is in use by one of this device's unfinished jobs: peers' writes
-    /// there are refused.
+    /// Whether a path is in use by this device's unfinished jobs: peers' writes there are refused.
     pub fn set_busy(&self, busy: crate::connect_fs::Busy) {
         self.inner.writes.set_busy(busy);
     }
 
-    /// What a peer's replacing rename here must pass first (core's `Jobs::replace_check`):
-    /// unset, only the checks Connect makes itself.
+    /// What a peer's replacing rename here must pass first (core's `Jobs::replace_check`).
     pub fn set_replace_check(&self, check: crate::connect_fs::ReplaceCheck) {
         self.inner.writes.set_replace_check(check);
     }
 
-    /// What a paired device's Delete and Move to here run (this device's own
-    /// `Jobs::delete_path`/`move_path` with its protected paths), after the paths are confined
-    /// to the share; unset, both are refused.
+    /// What a paired device's Delete and Move to here run, once confined; unset, both refused.
     pub fn set_delete_move(
         &self,
         delete: crate::connect_fs::DeleteHook,
@@ -831,15 +774,13 @@ impl Connect {
         self.inner.writes.set_delete_move(delete, move_);
     }
 
-    /// What says a peer is writing a path here (a file it created and hasn't renamed), for
-    /// core's `Jobs::set_external_busy`. Holds the service weakly (Connect holds the jobs' hook).
+    /// Whether a peer is writing a path here, for core's `Jobs::set_external_busy` (weak).
     pub fn writing_hook(&self) -> crate::connect_fs::Busy {
         let inner = Arc::downgrade(&self.inner);
         Arc::new(move |p| inner.upgrade().is_some_and(|i| i.writes.writing(p)))
     }
 
-    /// Whether a paired device is using files here: one it is writing (created, not renamed,
-    /// kept for a reattach included) or reading. Quitting would cut its transfer short.
+    /// Whether a paired device is writing (kept files included) or reading files here.
     pub fn peers_active(&self) -> bool {
         self.inner.peers_active()
     }
@@ -855,13 +796,11 @@ impl Connect {
         crate::connect_fs::ConnectRemote::new(&self.inner)
     }
 
-    /// `Jobs::start` returned `id` for `request`: mirrored to the peers it uses
-    /// (`connect_jobs`).
+    /// `Jobs::start` returned `id` for `request`: mirrored to the peers it uses.
     pub fn job_started(&self, id: JobId, request: &ConvertRequest) {
         self.inner.jobs.started(id, request);
     }
 
-    /// Each of this device's job events, for the mirror.
     pub fn job_event(&self, event: &Event) {
         self.inner.jobs.event(event);
     }
@@ -876,10 +815,22 @@ impl Connect {
         *lock(&self.inner.install) = Some(install);
     }
 
-    /// Asks the paired PS5 `key_id` to install the package at `path` on this device (read by
-    /// it over FLINK, so the job is mirrored here); the PS5's job id. `path` must be inside
-    /// this device's share root.
+    /// Asks the paired PS5 to install the package at `path` (inside this share root, or
+    /// `flink://<key_id>/<rel>` on that PS5: `install_here`); the PS5's job id.
     pub fn install(&self, key_id: &str, path: &Path) -> Result<JobId, String> {
+        let there = (path.to_str()).and_then(|s| s.strip_prefix(&format!("flink://{key_id}/")));
+        if let Some(rel) = there {
+            let rel = plain_path(rel)?;
+            let reply = match self.call(key_id, "install_here", serde_json::json!({ "path": rel }))
+            {
+                Ok(reply) => reply,
+                Err(e) if e.to_string().starts_with("unknown method") => {
+                    return Err(INSTALL_OLDER.into());
+                }
+                Err(e) => return Err(error_text(&e)),
+            };
+            return (reply["job"].as_u64()).ok_or_else(|| "the device answered no job".to_string());
+        }
         let root = (self.inner.share_root()).ok_or("this device shares no files")?;
         let rel = (path.to_str())
             .and_then(|s| crate::connect_jobs::relative(root, s))
@@ -892,9 +843,8 @@ impl Connect {
             .ok_or_else(|| "the device answered no job".to_string())
     }
 
-    /// Times the link to the paired device `key_id`: `SPEED_BYTES` sent, then fetched, over
-    /// FLINK's data lanes, nothing written to disk on either side. Holds `awake()` meanwhile.
-    /// `run` is the UI's id for this test, the one `speed_test_cancel` names.
+    /// Times the link to `key_id`: `SPEED_BYTES` sent, then fetched, over the data lanes,
+    /// nothing written to disk. `run` is the id `speed_test_cancel` names.
     pub fn speed_test(
         &self,
         key_id: &str,
@@ -921,8 +871,7 @@ impl Connect {
             speed.running.insert(id.clone(), cancel.clone());
         }
         let _awake = ps5_dump_forge_core::awake();
-        // A control conn of its own (never the shared cached session), its socket kept for
-        // `cancel`, so a Stop while it connects or waits for the `speed` RPC ends it at once.
+        // A control conn of its own, its socket kept for `cancel`, so a Stop ends setup at once.
         let got = (self.inner.session_with(key_id, Some(&cancel))).and_then(|(mut rpc, hs)| {
             if cancel.cancelled() {
                 return Err(io::Error::other(crate::connect_fs::SPEED_CANCELLED));
@@ -944,9 +893,8 @@ impl Connect {
         got.map_err(|e| error_text(&e))
     }
 
-    /// Stops the speed test `run` with `key_id` (it ends `cancelled`, its lanes shut). A run not
-    /// started yet is remembered (the last `SPEED_EARLY_MAX`, for `SPEED_EARLY_FOR`) and ends
-    /// `cancelled` as it starts; any other run is left alone.
+    /// Stops the speed test `run` with `key_id`; a run not started yet is remembered and ends
+    /// `cancelled` as it starts.
     pub fn speed_test_cancel(&self, key_id: &str, run: &str) {
         let id: SpeedRun = (key_id.to_string(), run.to_string());
         let mut speed = lock(&self.speed);
@@ -968,7 +916,7 @@ impl Connect {
         self.inner.jobs.cancel_remote(key_id, job)
     }
 
-    /// One push of this device's jobs now (the pusher runs one every `PUSH_EVERY`).
+    /// One push of this device's jobs now.
     pub fn push_jobs(&self) {
         self.inner.push_jobs(true);
     }
@@ -1000,13 +948,11 @@ impl Connect {
 }
 
 impl Inner {
-    /// A search's finds move a saved NAS that went offline to its new IP (`NasList::migrate`);
-    /// the next probe round shows it online there.
+    /// A search's finds move a saved NAS that went offline to its new IP (`NasList::migrate`).
     fn migrate_nas(&self, found: &[crate::mdns::Nas]) {
         let snapshot = lock(&self.nas).clone();
         let mut online = lock(&self.nas_online).clone();
-        // One missed probe isn't enough: an entry moves only when its saved address still
-        // doesn't answer now (checked without the list locked).
+        // An entry moves only when its saved address still doesn't answer now (unlocked).
         for id in snapshot.clone().migrate(found, &online) {
             if let Some(n) = snapshot.nas.iter().find(|n| n.id == id)
                 && crate::nas::reachable(&n.host, n.port, CONNECT_TIMEOUT)
@@ -1044,7 +990,6 @@ impl Inner {
         lock(&self.peers).get(key_id).and_then(Peer::pair_secret)
     }
 
-    /// The paired device's name, else its key id.
     pub(crate) fn peer_name(&self, key_id: &str) -> String {
         lock(&self.peers)
             .get(key_id)
@@ -1055,8 +1000,8 @@ impl Inner {
         !self.stop.load(Ordering::SeqCst) && self.secret_of(key_id) == Some(session.secret)
     }
 
-    /// Attributes an authenticated inbound control connection or lane. A lane inherits its
-    /// peer from the control session. A session from before Forget/re-pair is never revived.
+    /// Attributes an authenticated inbound conn or lane (a lane inherits its control session's
+    /// peer); a session from before Forget/re-pair is never revived.
     fn attribute(&self, id: u64, peer: Option<&str>, session: &Session) -> io::Result<String> {
         let peers = lock(&self.peers);
         let mut conns = lock(&self.conns);
@@ -1081,8 +1026,7 @@ impl Inner {
         self.writes.active() || self.reads.active()
     }
 
-    /// Writes `snapshot`, `peers` as of generation `version`, to peers.json, unless a newer one is
-    /// written already: one save at a time, and never an older snapshot over a newer one.
+    /// Writes `snapshot` (generation `version`) to peers.json unless a newer one is written.
     fn save_peers(&self, snapshot: &Peers, version: u64) -> io::Result<()> {
         let mut saved = lock(&self.peers_saved);
         if *saved >= version {
@@ -1093,11 +1037,9 @@ impl Inner {
         Ok(())
     }
 
-    /// A handshake succeeded, either way: a new pair secret is stored under the peer's key id
-    /// (one entry per key id), a known peer's address, name and platform updated; saved when
-    /// any of those changed or `last_seen` moved a minute. It is online from now. A pairing is
-    /// saved before it counts, under the `peers` lock; any other change after the lock is
-    /// released (every lane chunk and RPC takes it, and a sync can stall for seconds).
+    /// A handshake succeeded, either way: a new secret or a known peer's address, name and
+    /// platform stored. A pairing is saved before it counts, under the `peers` lock; any other
+    /// change after it is released (every lane chunk takes it, and a sync can stall).
     fn record(&self, hs: &Handshake) -> io::Result<()> {
         let p = &hs.peer;
         let address = Some(SocketAddr::new(hs.remote.ip(), p.port).to_string());
@@ -1147,8 +1089,7 @@ impl Inner {
             let version = self.peers_gen.fetch_add(1, Ordering::SeqCst) + 1;
             let snapshot = peers.clone();
             drop(peers);
-            // An address, name or time seen: a failure doesn't fail the handshake (who is
-            // paired is unchanged); the next one saves again.
+            // A failure doesn't fail the handshake (who is paired is unchanged); saved next time.
             if self.save_peers(&snapshot, version).is_err() {
                 self.peers_dirty.store(true, Ordering::SeqCst);
             }
@@ -1159,9 +1100,7 @@ impl Inner {
         Ok(())
     }
 
-    /// A control conn to `addr` with a stored pair secret.
-    /// Its socket kept for `cancel` when given (a speed test's Stop shuts it, the handshake and
-    /// the RPCs after it with it).
+    /// A control conn to `addr` with a stored pair secret, its socket kept for `cancel`.
     fn dial(
         &self,
         addr: SocketAddr,
@@ -1184,9 +1123,8 @@ impl Inner {
         Ok((conn, hs))
     }
 
-    /// `Connect::pair`'s request `id` to `addr`: the handshake asking to pair (the check number
-    /// goes to `outgoing` as soon as both sides have it), then one request, which the peer
-    /// answers only once it has recorded the pairing.
+    /// `Connect::pair`'s request: the handshake (the check number to `outgoing` as soon as
+    /// known), then one request the peer answers once it has recorded the pairing.
     fn pair_now(&self, id: u64, addr: SocketAddr) -> io::Result<Device> {
         let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
         {
@@ -1228,9 +1166,8 @@ impl Inner {
         })
     }
 
-    /// Request `id`'s outcome into `outgoing` (unless a newer one replaced it, or it was
-    /// cancelled and failed). A pairing that finished as Cancel came is saved on both sides, so
-    /// it says `paired`, not `cancelled`.
+    /// Request `id`'s outcome into `outgoing` unless a newer one replaced it; a pairing that
+    /// finished as Cancel came says `paired` (it is saved on both sides).
     fn pair_done(&self, id: u64, result: io::Result<Device>) {
         let mut out = lock(&self.outgoing);
         let Some(o) = out.as_mut().filter(|o| o.id == id) else {
@@ -1271,7 +1208,7 @@ impl Inner {
         self.session_with(key_id, None)
     }
 
-    /// `session` on a conn of its own whose socket `cancel` shuts (a speed test's).
+    /// `session` on a conn of its own whose socket `cancel` shuts.
     pub(crate) fn session_with(
         self: &Arc<Self>,
         key_id: &str,
@@ -1295,10 +1232,8 @@ impl Inner {
         Ok((rpc, hs))
     }
 
-    /// A control conn to the paired device `key_id`: its last address, then the newest
-    /// discovery address for it, then (saved on 9120, the port before 9883) its IP on `PORT`.
-    /// Another device answering there is recorded as itself (its own entry, if paired) and the
-    /// next address tried.
+    /// A control conn to `key_id`: its last address, the newest discovery address, then (saved
+    /// on 9120, the old port) its IP on `PORT`. Another device answering there is skipped.
     fn open(&self, key_id: &str) -> io::Result<(Conn, Handshake)> {
         self.open_with(key_id, None)
     }
@@ -1316,8 +1251,7 @@ impl Inner {
             .as_deref()
             .and_then(|a| a.parse::<SocketAddr>().ok());
         let found = lock(&self.found).get(key_id).copied();
-        // Saved on the old port: a device updated since is found again where discovery can't
-        // reach it (the handshake saves the new address). Only its refusal (`not_paired`, ...)
+        // Saved on the old port: found again where discovery can't reach it. Only a refusal
         // replaces the error, so a guess that finds nothing never hides the saved address's.
         let moved = last
             .filter(|a| a.port() == 9120)
@@ -1341,8 +1275,7 @@ impl Inner {
         Err(err)
     }
 
-    /// An `info` RPC to every paired device at once. A device that answers `not_paired`
-    /// (it forgot this one) is offline at once; others expire after `DEAD_AFTER`.
+    /// An `info` RPC to every paired device at once; `not_paired` is offline at once.
     fn probe_all(&self) {
         let keys: Vec<String> = lock(&self.peers)
             .peers
@@ -1391,9 +1324,8 @@ impl Inner {
         });
     }
 
-    /// This device's jobs to the paired peers they use, each on its own thread, so a peer that
-    /// can't be reached never holds back the others' pushes; a reply's cancels applied. A peer
-    /// whose last push is still going is skipped this round. `wait`: until every push ends.
+    /// This device's jobs to the peers they use, a thread each; a peer whose last push is still
+    /// going is skipped. `wait`: until every push ends.
     fn push_jobs(self: &Arc<Self>, wait: bool) {
         let paired = |k: &str| lock(&self.peers).get(k).is_some();
         let root = self.share_root();
@@ -1420,8 +1352,7 @@ impl Inner {
         }
     }
 
-    /// One inbound conn: a data lane when it opens with a `Join`, else a control conn: the
-    /// handshake, then requests until the peer closes or goes silent for `DEAD_AFTER`.
+    /// One inbound conn: a data lane when it opens with a `Join`, else a control conn.
     fn serve(&self, id: u64, stream: TcpStream) -> io::Result<()> {
         stream.set_read_timeout(Some(DEAD_AFTER))?;
         let lane = first_kind(&stream)? == kind2::JOIN;
@@ -1445,10 +1376,8 @@ impl Inner {
         let tx = Mutex::new(tx);
         loop {
             if let Control::Request(r) = rx.recv_control(&tx)? {
-                // Pings while it works, so a long answer (a big folder's manifest) doesn't look
-                // like a silent peer to the caller after `DEAD_AFTER`.
-                // The answer comes back over a channel, so a quick one is sent at once (a
-                // 50 ms poll here made every RPC, and so every small file, take 50 ms).
+                // Pings while it works, so a long answer doesn't look like a silent peer; a
+                // channel, so a quick answer goes at once (a 50 ms poll slowed every small file).
                 let result = std::thread::scope(|s| {
                     let (done, finished) = mpsc::channel();
                     let (hs, r) = (&hs, &r);
@@ -1576,33 +1505,41 @@ impl Inner {
                 let job = hook(peer_package(&hs.peer.key_id, path)?)?;
                 Ok(serde_json::json!({ "job": job }))
             }
+            // A package on this device installed here, located as the file RPCs' paths are.
+            "install_here" => {
+                let path =
+                    (r.body["path"].as_str()).ok_or("install_here needs a \"path\" string")?;
+                let hook = lock(&self.install).clone().ok_or(CANT_INSTALL)?;
+                let job = hook(crate::connect_fs::local_file(root, &plain_path(path)?)?)?;
+                Ok(serde_json::json!({ "job": job }))
+            }
             m => Err(format!("unknown method {m}")),
         }
     }
 }
 
-/// `flink://<key_id>/<path>` for a peer's package path: plain `/`-separated names, no `.`,
-/// `..`, `\` or NUL (the peer confines it to its share root again when it is read).
+/// `flink://<key_id>/<path>` for a peer's package path (plain names; the peer confines it too).
 fn peer_package(key_id: &str, path: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(format!(
+        "flink://{key_id}/{}",
+        plain_path(path)?
+    )))
+}
+
+/// A package path as plain `/`-separated names: no `.`, `..`, `\\` or NUL, not empty.
+fn plain_path(path: &str) -> Result<String, String> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     let bad = |p: &&str| *p == "." || *p == ".." || p.contains(['\\', '\0']);
     if parts.is_empty() || parts.iter().any(bad) {
         return Err(format!("install: {path:?} is not a file path"));
     }
-    Ok(PathBuf::from(format!(
-        "flink://{key_id}/{}",
-        parts.join("/")
-    )))
+    Ok(parts.join("/"))
 }
 
 // ---- The share root ----------------------------------------------------------------------------
-//
-// A peer names paths relative to this device's share root (the disk's root); `connect_fs`
-// reads and writes them.
 
-/// What a paired peer may reach on this device (by user request, so a peer browses above the
-/// home folder): `/` on the PS5, macOS and Linux; on Windows the root of the home folder's
-/// drive. ponytail: one drive on Windows; a root listing the drives would reach the others.
+/// `/`, on Windows the root of the home folder's drive.
+/// ponytail: one drive on Windows; a root listing the drives would reach the others.
 pub fn default_share_root() -> Option<PathBuf> {
     if cfg!(windows) {
         let home = std::env::home_dir().filter(|h| h.is_absolute())?;
@@ -1736,9 +1673,8 @@ fn rpc(conn: Conn, method: &str, body: Value) -> io::Result<Value> {
 }
 
 /// `ip:port`, `ip` (FLINK's `PORT`), or a host name with or without a port.
-/// A local network address (by user decision, FLINK pairs and talks only within one): private
-/// and link-local IPv4, 100.64/10 (CGNAT, Tailscale's range), loopback, IPv6 ULA (Tailscale's
-/// fd7a:115c:a1e0::/48 included) and link-local; an IPv4-mapped IPv6 counts as its IPv4.
+/// Private and link-local IPv4, 100.64/10 (Tailscale), loopback, IPv6 ULA and link-local; an
+/// IPv4-mapped IPv6 counts as its IPv4.
 pub fn is_local(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
@@ -1782,31 +1718,27 @@ fn parse_addr(s: &str) -> io::Result<SocketAddr> {
 /// Hosts Discover probes at once (each checks SMB, NFS and FTP at once: `probe::serves`).
 const HOSTS_AT_ONCE: usize = 4;
 
-/// How long after the search a new batch of probes may still start (each takes up to ~3 s), so
-/// many hosts (up to 64 by mDNS and 64 by WS-Discovery) can't keep a search going for minutes.
+/// How long after the search a new probe batch may still start, so many hosts can't keep a
+/// search going for minutes.
 const PROBE_GRACE: Duration = Duration::from_secs(3);
 
-/// The NAS results of the last search.
 #[derive(Default)]
 struct Lan {
     running: AtomicBool,
     stop: AtomicBool,
     nas: Mutex<Vec<crate::mdns::Nas>>,
-    /// Windows PCs by WS-Discovery (`wsd.rs`): hosts to probe, shown by what answers there.
+    /// Windows PCs: hosts to probe, shown by what answers there.
     wsd: Mutex<Vec<crate::mdns::Nas>>,
-    /// What a probe confirmed on each host the searches found (`mdns::merge`).
     probed: Mutex<crate::mdns::Probed>,
     error: Mutex<Option<String>>,
 }
 
 impl Lan {
-    /// The mDNS results plus what the probes confirmed (`mdns::merge`).
     fn found(&self) -> Vec<crate::mdns::Nas> {
         crate::mdns::merge(&lock(&self.nas), &lock(&self.wsd), &lock(&self.probed))
     }
 
-    /// Hosts found and not probed yet, each with the protocols mDNS announced there (trusted
-    /// as announced, so not checked again).
+    /// Hosts not probed yet, each with the protocols mDNS announced there (not checked again).
     fn unprobed(&self) -> Vec<(String, Vec<crate::probe::Kind>)> {
         use crate::probe::Kind;
         let (nas, wsd) = (lock(&self.nas).clone(), lock(&self.wsd).clone());
@@ -1829,9 +1761,8 @@ impl Lan {
         out
     }
 
-    /// Probes each host the searches find, `HOSTS_AT_ONCE` at a time, until the searches have
-    /// ended (`searched`) and every host is done, or Stop, or `PROBE_GRACE` past `until` (a host
-    /// left unprobed then shows as mDNS announced it; a Windows PC not at all).
+    /// Probes each host found, `HOSTS_AT_ONCE` at a time, until the searches ended and every
+    /// host is done, or Stop, or `PROBE_GRACE` past `until`.
     fn confirm_hosts(&self, searched: &AtomicBool, until: Instant) {
         loop {
             // Read before listing, so a host found just before the end is still probed.
@@ -1888,10 +1819,8 @@ pub struct Discovered {
 }
 
 impl Connect {
-    /// Starts a 10 s search for Forge devices and NAS services with empty lists (already
-    /// searching: unchanged); every NAS or Windows PC host found is probed for SMB, NFS and FTP
-    /// meanwhile, so the search may run a few seconds past 10 s. No subnet sweep: only hosts
-    /// that announce themselves. A failure shows in `discovery().error`.
+    /// Starts a 10 s search for Forge devices and NAS services (already searching: unchanged);
+    /// every host found is probed meanwhile, so it may run a few seconds longer.
     pub fn discover_start(&self) {
         let _ = self.discovery.start();
         let mut slot = lock(&self.lan_thread);
@@ -1991,9 +1920,7 @@ impl Connect {
 /// Requests waiting at once (one per address): more are denied unasked.
 const MAX_WAITING: usize = 4;
 
-/// Other devices' pairing requests, waiting for this device's user (the handshake's `Approver`):
-/// the UI lists them (`Connect::pending`) and answers one (`Connect::approve`), which wakes the
-/// handshake waiting for it.
+/// Other devices' pairing requests (the handshake's `Approver`), waiting for this device's user.
 #[derive(Default)]
 pub(crate) struct Approvals {
     waiting: Mutex<Vec<(PairRequest, Option<bool>)>>,
@@ -2061,10 +1988,8 @@ impl Approver for Approvals {
     }
 }
 
-/// This device's pairing request as the UI follows it. `state`: `asking` (connecting),
-/// `waiting` (the other device's user decides; `check` is set), then `paired` (`device`),
-/// `denied`, `timed_out`, `busy`, `already_paired`, `too_many_attempts`, `failed` (`error`) or
-/// `cancelled`.
+/// This device's pairing request. `state`: `asking`, `waiting` (`check` set), then `paired`,
+/// a refusal's code, `failed` (`error`) or `cancelled`.
 #[derive(Debug, Serialize)]
 pub struct Outgoing {
     pub id: u64,
@@ -2120,8 +2045,7 @@ fn code_state(code: &str) -> &'static str {
     }
 }
 
-/// `from` asks `to` (listening at `addr`) to pair; `to`'s user answers `allow` once both show
-/// the same check number. The request's outcome.
+/// `from` asks `to` to pair; `to`'s user answers `allow` once both show the same check number.
 #[cfg(test)]
 impl Connect {
     /// The files peers write here.
@@ -2243,7 +2167,7 @@ mod tests {
         }
         c.shutdown();
         let c = Connect::start_rooted(&dir, 0, None).unwrap();
-        assert_eq!(c.nas_saved()[0].password, "s3cret-pw");
+        assert_eq!(lock(&c.inner.nas).nas[0].password, "s3cret-pw");
         assert!(c.nas_forget(&id).unwrap());
         assert!(c.nas_devices().is_empty());
         c.shutdown();
@@ -2282,9 +2206,8 @@ mod tests {
         );
     }
 
-    /// Handshakes recorded at once from many threads, each from a new address: every one saves
-    /// outside the `peers` lock, and peers.json ends as memory does (never an older snapshot
-    /// written last). A failed save is tried again by the next handshake.
+    /// Concurrent handshakes save outside the `peers` lock; peers.json ends as memory does, and
+    /// a failed save is tried again by the next handshake.
     #[test]
     fn concurrent_records_leave_the_newest_peers_json() {
         let dir = temp_dir("records");
@@ -2332,8 +2255,7 @@ mod tests {
         c.inner.record(&hs(999)).unwrap();
         c.inner.save_peers(&older, v).unwrap();
         assert_eq!(Peers::load(&dir).unwrap(), *lock(&c.inner.peers));
-        // A save that fails (the folder is a file now) is written by the next handshake, even
-        // one that changes nothing.
+        // A failed save (the folder is a file now) is written by the next handshake.
         fs::remove_dir_all(&dir).unwrap();
         fs::write(&dir, b"").unwrap();
         c.inner.record(&hs(1)).unwrap();
@@ -2390,8 +2312,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(b.devices()[0].online);
-        // Asking again while A has B saved: refused unasked (a claimed key id never replaces a
-        // pairing); once A forgot B, pairing again keeps one entry on each side.
+        // Asking again while A has B saved: refused unasked; once A forgot B, one entry each.
         b.pair(&addr_a).unwrap();
         let o = pair_then(&b, Instant::now() + Duration::from_secs(20));
         assert_eq!(o.state, "already_paired", "{o:?}");

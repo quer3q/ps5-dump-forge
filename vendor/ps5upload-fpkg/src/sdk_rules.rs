@@ -47,8 +47,18 @@ const GENERATED_SCE_SYS_FILES: &[&str] = &[
     "origin-relocinfo.dat",
     "target-relocinfo.dat",
 ];
-/// Top-level trees the publishing tools reserve.
-const GENERATED_ROOT_DIRECTORIES: &[&str] = &["sce_suppl", "sce_sc"];
+/// Top-level trees the publishing tools reserve, and the leftovers of other tools: host-side
+/// decryption copies (`decrypted/`), a GP5 generator's generated inputs (`.gp5-assets/`) and the
+/// placeholder per-language payloads it packages (`playgo-languages/`, 1 MiB of zeros each).
+const GENERATED_ROOT_DIRECTORIES: &[&str] = &[
+    "sce_suppl",
+    "sce_sc",
+    "decrypted",
+    ".gp5-assets",
+    "playgo-languages",
+];
+/// Root files a dumper writes beside the content (pfsdump's entitlement records).
+const DUMPER_ROOT_FILES: &[&str] = &["entitlements.txt", "entitlement_key.dat"];
 /// Build-project files that sometimes sit in a game folder.
 const PROJECT_SUFFIXES: &[&str] = &[".gp4", ".gp5", ".esbak"];
 
@@ -62,6 +72,15 @@ pub fn excluded(path: &str) -> Option<&'static str> {
     }
     if PROJECT_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
         return Some("build-project file");
+    }
+    if parts.len() == 1 && DUMPER_ROOT_FILES.contains(&parts[0]) {
+        return Some("dumper entitlement record");
+    }
+    // `*/saved/config/*/*.ini`: an Unreal game's runtime settings, written while it ran.
+    if let Some(at) = lower.find("/saved/config/") {
+        if lower[at + "/saved/config/".len()..].contains('/') && lower.ends_with(".ini") {
+            return Some("runtime settings the game wrote");
+        }
     }
     if lower.ends_with(".playgo-scenario.json") {
         return Some("build-project scenario sidecar");
@@ -78,15 +97,19 @@ pub fn excluded(path: &str) -> Option<&'static str> {
 const MIB: u64 = 1024 * 1024;
 const STANDARD_PACKAGE_LIMIT: u64 = 162_514_599_936;
 const LARGE_PACKAGE_LV1_LIMIT: u64 = 195_878_191_104;
+const LARGE_PACKAGE_LV2_LIMIT: u64 = 260_436_918_272;
 const ADDCONT_MOUNT_LV2_LIMIT: u64 = 97_945_387_008;
+const GIB: u64 = 1 << 30;
 /// The most files a level-2 package may hold.
 pub const LARGE_PACKAGE_LV2_FILE_LIMIT: u64 = 500_000;
 
 /// The size class a title declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizeClass {
-    /// `attributePub`: 0 standard, 1 and 2 the large-package levels.
+    /// `attributePub`: 0 standard, 1 and 2 the large-package levels, 4 level 3.
     pub attribute: u8,
+    /// Level 3's `kernel.appSizeInGib` (256 through 320).
+    pub app_size_gib: Option<u64>,
     /// `kernel.addcontMountLevel` after any adjustment the size forces.
     pub mount_level: u8,
     /// The conservative size estimate the choice was made from.
@@ -113,6 +136,7 @@ pub fn choose_size_class(unpacked: u64, files: u64, mount_level: u8) -> Result<S
     }
     let class = |attribute| SizeClass {
         attribute,
+        app_size_gib: None,
         mount_level: level,
         estimated,
     };
@@ -122,17 +146,148 @@ pub fn choose_size_class(unpacked: u64, files: u64, mount_level: u8) -> Result<S
     if estimated <= LARGE_PACKAGE_LV1_LIMIT {
         return Ok(class(1));
     }
+    if estimated > LARGE_PACKAGE_LV2_LIMIT {
+        // Level 3: `attributePub` 4 with the size declared in whole GiB, 256 through 320 (the
+        // estimate may pass 320 while the compressed package still fits). The mount level is
+        // 0 here: past level 2's limit both lowerings above already ran.
+        // ponytail: not yet seen installing on a console (no game this large was at hand).
+        return Ok(SizeClass {
+            app_size_gib: Some(estimated.div_ceil(GIB).clamp(256, 320)),
+            ..class(4)
+        });
+    }
     if files > LARGE_PACKAGE_LV2_FILE_LIMIT {
         return Err(format!(
             "a package this large holds at most {LARGE_PACKAGE_LV2_FILE_LIMIT} files; this one has {files}"
         ));
     }
-    // Level 2 covers 260,436,918,272 bytes. Past that too, the largest class is still
-    // declared: the estimate is conservative and the real image may yet fit.
     Ok(class(2))
 }
 
+/// `param.json` with `kernel.appSizeInGib` set to `gib`: replaced where it is, else added as
+/// the `kernel` object's first key, else a `kernel` object added.
+fn set_app_size(param_json: &[u8], gib: u64) -> Option<Vec<u8>> {
+    if let Some(out) = set_number(param_json, "\"appSizeInGib\"", gib) {
+        return Some(out);
+    }
+    let text = String::from_utf8_lossy(param_json);
+    let Some(key) = text.find("\"kernel\"") else {
+        let raw = format!("{{\"appSizeInGib\": {gib}}}");
+        return source::insert_raw_field(param_json, "kernel", &raw);
+    };
+    let open = key + text[key..].find('{')?;
+    let empty = text[open + 1..].trim_start().starts_with('}');
+    let field = format!("\"appSizeInGib\": {gib}{}", if empty { "" } else { ", " });
+    let mut out = text[..=open].as_bytes().to_vec();
+    out.extend_from_slice(field.as_bytes());
+    out.extend_from_slice(text[open + 1..].as_bytes());
+    Some(out)
+}
+
 /// The byte span of the number value of the first `key` in `text`.
+/// A PS5 content id: `XX0000-XXXX00000_00-` and 16 letters or digits.
+fn content_id_ok(id: &str) -> bool {
+    let b = id.as_bytes();
+    let all = |r: std::ops::Range<usize>, f: fn(&u8) -> bool| b[r].iter().all(f);
+    b.len() == 36
+        && all(0..2, u8::is_ascii_uppercase)
+        && all(2..6, u8::is_ascii_digit)
+        && b[6] == b'-'
+        && all(7..11, u8::is_ascii_uppercase)
+        && all(11..16, u8::is_ascii_digit)
+        && b[16] == b'_'
+        && all(17..19, u8::is_ascii_digit)
+        && b[19] == b'-'
+        && b[20..]
+            .iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// The PNG color type a presentation image needs: 2 (8-bit RGB) for `icon0`, `pic0` and
+/// `pic1`, 6 (8-bit RGBA) for `pic2`, each also with an `_NN` language suffix.
+fn png_color_needed(name: &str) -> Option<u8> {
+    let stem = name.strip_suffix(".png")?;
+    let base = match stem.split_once('_') {
+        Some((base, nn)) if nn.len() == 2 && nn.bytes().all(|c| c.is_ascii_digit()) => base,
+        Some(_) => return None,
+        None => stem,
+    };
+    match base {
+        "icon0" | "pic0" | "pic1" => Some(2),
+        "pic2" => Some(6),
+        _ => None,
+    }
+}
+
+const UCP_MAGIC: u32 = 0xB228_C60A;
+/// Larger UDS containers are not read for the check.
+const UCP_CHECK_MAX: u64 = 16 << 20;
+
+/// What is wrong with a `sce_sys/uds/udsNN.ucp`, if anything: not a plain UCP container (sealed,
+/// as Sony's packages carry it, or damaged), or a header digest that no longer matches (SHA-1
+/// of the file with its digest field, 0x1C..0x30, zeroed).
+fn ucp_problem(data: &[u8]) -> Option<String> {
+    use sha1::Digest;
+    let be32 = |at: usize| u32::from_be_bytes(data[at..at + 4].try_into().unwrap());
+    if data.len() < 0x60 || be32(0) != UCP_MAGIC || be32(4) != 1 {
+        return Some("is not a plain UCP container (sealed or damaged)".into());
+    }
+    if u64::from_be_bytes(data[8..16].try_into().unwrap()) != data.len() as u64 {
+        return Some("has a size field that differs from the file's".into());
+    }
+    let mut zeroed = data.to_vec();
+    zeroed[0x1C..0x30].fill(0);
+    let digest = sha1::Sha1::digest(&zeroed);
+    (digest[..] != data[0x1C..0x30]).then(|| "has a stale header digest".into())
+}
+
+/// Warnings about the source that don't stop the build: a content id that doesn't follow
+/// the PS5 pattern, a presentation PNG in the wrong color mode, a UDS container the console
+/// may not read; `tree` is the source.
+pub(crate) fn notes(content_id: &str, tree: &mut dyn source::SourceTree) -> Vec<String> {
+    let files = tree.files().to_vec();
+    let mut out = Vec::new();
+    if !content_id_ok(content_id) {
+        out.push(format!(
+            "content id {content_id:?} does not follow the PS5 pattern \
+             (XX0000-XXXX00000_00- and 16 capital letters or digits)"
+        ));
+    }
+    for f in &files {
+        let lower = f.path.to_ascii_lowercase();
+        let Some(name) = lower.strip_prefix("sce_sys/") else {
+            continue;
+        };
+        if let Some(need) = png_color_needed(name) {
+            let head = tree
+                .read_range(&f.path, 0, 26.min(f.size as usize))
+                .unwrap_or_default();
+            let ok = head.len() == 26 && head[..8] == *b"\x89PNG\r\n\x1a\n" && head[24] == 8;
+            if !ok || head[25] != need {
+                let mode = if need == 2 { "RGB" } else { "RGBA" };
+                out.push(format!(
+                    "{} is not an 8-bit {mode} PNG, as the console expects",
+                    f.path
+                ));
+            }
+        }
+        let uds = name
+            .strip_prefix("uds/uds")
+            .and_then(|n| n.strip_suffix(".ucp"))
+            .is_some_and(|n| n.len() == 2 && n.bytes().all(|c| c.is_ascii_digit()));
+        if uds && f.size <= UCP_CHECK_MAX {
+            let why = match tree.read_range(&f.path, 0, f.size as usize) {
+                Ok(data) => ucp_problem(&data),
+                Err(e) => Some(format!("could not be read ({e})")),
+            };
+            if let Some(why) = why {
+                out.push(format!("{} {why}", f.path));
+            }
+        }
+    }
+    out
+}
+
 fn number_value_span(text: &str, key: &str) -> Option<(usize, usize)> {
     let at = text.find(key)? + key.len();
     let colon = at + text[at..].find(':')? + 1;
@@ -160,6 +315,11 @@ pub fn size_class_rewrite(
     unpacked: u64,
     files: u64,
 ) -> Result<Option<(Vec<u8>, String)>, String> {
+    // The text edits below cut the bytes at offsets found in the text: only valid UTF-8 (else
+    // a lossy decode shifts them; left as it is, as upstream's other rewrites do).
+    if std::str::from_utf8(param_json).is_err() {
+        return Ok(None);
+    }
     let Some(json) = source::parse_param_json(param_json) else {
         return Ok(None);
     };
@@ -184,6 +344,16 @@ pub fn size_class_rewrite(
         changes.push(format!("attributePub={}", class.attribute));
     }
     // The level only ever comes down, so a field that is absent (level 0) never needs adding.
+    if let Some(gib) = class.app_size_gib {
+        let now = kernel
+            .and_then(|k| k.get("appSizeInGib"))
+            .and_then(|v| v.as_u64());
+        if now != Some(gib) {
+            out =
+                set_app_size(&out, gib).ok_or("param.json's appSizeInGib could not be written")?;
+            changes.push(format!("kernel.appSizeInGib={gib}"));
+        }
+    }
     if u64::from(class.mount_level) != mount_level {
         out = set_number(&out, "\"addcontMountLevel\"", class.mount_level as u64)
             .ok_or("param.json's addcontMountLevel could not be rewritten")?;
@@ -194,6 +364,28 @@ pub fn size_class_rewrite(
     }
     if changes.is_empty() {
         return Ok(None);
+    }
+    // The text edits above find a key by its name: what they wrote is read back, so one that
+    // landed on another key of that name (a nested or a second `appSizeInGib`) fails the build.
+    let written = source::parse_param_json(&out)
+        .ok_or("param.json does not read after its size class rewrite")?;
+    let kernel = written.get("kernel");
+    let got = (
+        written.get("attributePub").and_then(|v| v.as_u64()),
+        kernel
+            .and_then(|k| k.get("appSizeInGib"))
+            .and_then(|v| v.as_u64()),
+        kernel
+            .and_then(|k| k.get("addcontMountLevel"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    );
+    let size_ok = class.app_size_gib.is_none_or(|gib| got.1 == Some(gib));
+    if got.0 != Some(class.attribute as u64) || !size_ok || got.2 != class.mount_level as u64 {
+        return Err(format!(
+            "param.json's size class could not be rewritten ({}): set it by hand",
+            changes.join(", ")
+        ));
     }
     Ok(Some((
         out,
@@ -220,6 +412,12 @@ mod tests {
             "sce_suppl/x.bin",
             "sce_sc/keys/a",
             "game.gp5",
+            "entitlements.txt",
+            "entitlement_key.dat",
+            "decrypted/eboot.bin",
+            "playgo-languages/01-en-US.bin",
+            ".gp5-assets/x/sce_sys/param.json",
+            "Game/Saved/Config/WindowsNoEditor/Engine.ini",
         ] {
             assert!(excluded(p).is_some(), "{p}");
         }
@@ -239,9 +437,38 @@ mod tests {
             "ampr_emu.index",
             "data/sce_sys/param.sfo",
             "data/ampr_emu.index",
+            "data/entitlements.txt",
+            "Game/Config/DefaultEngine.ini",
+            "Game/Saved/Config/Engine.ini",
+            "dlc_emu.ini",
         ] {
             assert!(excluded(p).is_none(), "{p}");
         }
+    }
+
+    #[test]
+    fn notes_flag_content_id_png_mode_and_ucp_digest() {
+        assert!(content_id_ok("EP1018-PPSA22946_00-HARRYPOTTER17000"));
+        assert!(!content_id_ok("EP1018-PPSA22946_00-harrypotter17000"));
+        assert!(!content_id_ok("EP1018-PPSA2294X_00-HARRYPOTTER17000"));
+        assert_eq!(png_color_needed("pic2_03.png"), Some(6));
+        assert_eq!(png_color_needed("icon0.png"), Some(2));
+        assert_eq!(png_color_needed("save_data.png"), None);
+        // A UCP: header, no members, its digest right, then stale.
+        let mut ucp = vec![0u8; 0x60];
+        ucp[0..4].copy_from_slice(&UCP_MAGIC.to_be_bytes());
+        ucp[4..8].copy_from_slice(&1u32.to_be_bytes());
+        ucp[8..16].copy_from_slice(&0x60u64.to_be_bytes());
+        use sha1::Digest;
+        let d = sha1::Sha1::digest(&ucp);
+        ucp[0x1C..0x30].copy_from_slice(&d);
+        assert_eq!(ucp_problem(&ucp), None);
+        ucp[0x40] = 1;
+        assert_eq!(
+            ucp_problem(&ucp).as_deref(),
+            Some("has a stale header digest")
+        );
+        assert!(ucp_problem(&[0xF3; 0x80]).unwrap().contains("sealed"));
     }
 
     #[test]
@@ -261,6 +488,32 @@ mod tests {
         // Already right: nothing to do.
         let done = b"{\"applicationCategoryType\": 0, \"attributePub\": 0}";
         assert!(size_class_rewrite(done, 1 << 30, 1).unwrap().is_none());
+        // Past level 2: level 3, the size in GiB added to the kernel object (or a new one).
+        let big = b"{\"applicationCategoryType\": 0, \"kernel\": {\"addcontMountLevel\": 0}}";
+        let (out, why) = size_class_rewrite(big, 300 << 30, 10).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let level3 = (
+            v["attributePub"].as_u64(),
+            v["kernel"]["appSizeInGib"].as_u64(),
+        );
+        assert_eq!(level3, (Some(4), Some(304)));
+        assert_eq!(v["kernel"]["addcontMountLevel"], 0);
+        assert!(why.contains("appSizeInGib=304"), "{why}");
+        // A top-level key of the same name isn't the kernel's: refused, never mis-written.
+        let odd = b"{\"applicationCategoryType\": 0, \"appSizeInGib\": 1, \"kernel\": {}}";
+        assert!(size_class_rewrite(odd, 300 << 30, 10).is_err());
+        let bare = b"{\"applicationCategoryType\": 0}";
+        let (out, _) = size_class_rewrite(bare, 400 << 30, 10).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["kernel"]["appSizeInGib"], 320);
+        // Not valid UTF-8: left alone, never cut at a shifted offset.
+        assert!(size_class_rewrite(
+            b"{\"applicationCategoryType\": 0, \"x\": \"\xff\"}",
+            300 << 30,
+            1
+        )
+        .unwrap()
+        .is_none());
         // Not a native game: left alone.
         let app = b"{\"applicationCategoryType\": 65536}";
         assert!(size_class_rewrite(app, 1 << 30, 1).unwrap().is_none());

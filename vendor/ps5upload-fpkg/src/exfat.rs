@@ -45,6 +45,8 @@ pub struct Geometry {
 pub struct ExFatFile {
     pub path: String,
     pub size: u64,
+    /// How far into the stream data was written (ValidDataLength); the rest reads as zeros.
+    valid: u64,
     first_cluster: u32,
     no_fat_chain: bool,
 }
@@ -166,8 +168,20 @@ impl ExFat {
         if offset >= f.size {
             return Ok(Vec::new());
         }
-        let want = len.min((f.size - offset) as usize);
-        self.read_stream(f.first_cluster, f.no_fat_chain, &f.path, offset, want)
+        // Not `as usize`: where that is 32 bits (Android on an older phone) a file with more
+        // than 4 GiB left came back short, and empty with exactly 4 GiB left.
+        let left = |end: u64| usize::try_from(end - offset).unwrap_or(usize::MAX);
+        let want = len.min(left(f.size));
+        // Bytes at and past ValidDataLength were never written: the specification has them
+        // read as zeros, whatever the clusters hold.
+        if offset >= f.valid {
+            return Ok(vec![0u8; want]);
+        }
+        let written = want.min(left(f.valid));
+        let mut out =
+            self.read_stream(f.first_cluster, f.no_fat_chain, &f.path, offset, written)?;
+        out.resize(want, 0);
+        Ok(out)
     }
 
     /// Walks one directory; returns whether anything under it was kept.
@@ -210,6 +224,7 @@ impl ExFat {
                 w.files.push(ExFatFile {
                     path,
                     size: e.size,
+                    valid: e.valid,
                     first_cluster: e.first_cluster,
                     no_fat_chain: e.no_fat_chain,
                 });
@@ -243,10 +258,11 @@ impl ExFat {
             }
             cluster = match self.fat_link(cluster)? {
                 FatLink::Next(next) => next,
-                // A maintained FAT ends the directory here; an unmaintained one says
-                // nothing, so the terminator decides (the next cluster is contiguous).
-                FatLink::End if terminated => return Ok(out),
-                FatLink::End => self.next_contiguous(cluster)?,
+                // A maintained FAT ends the directory here, terminator or not: a root whose
+                // last cluster is exactly full would otherwise read on into whatever
+                // directory sits in the next cluster. An unmaintained FAT says nothing, so
+                // the terminator decides (the next cluster is contiguous).
+                FatLink::End => return Ok(out),
                 FatLink::Unmaintained if terminated => return Ok(out),
                 FatLink::Unmaintained => self.next_contiguous(cluster)?,
             };
@@ -275,7 +291,10 @@ impl ExFat {
         let mut skip = (offset % cluster_size) as usize;
         let mut cluster = self.cluster_at(first, no_fat_chain, path, skip_clusters)?;
         let mut index = skip_clusters;
-        let mut out = Vec::with_capacity(len);
+        // Reserve at most a few MiB up front: `len` comes from the image's own records, and a
+        // damaged one must not make us reserve gigabytes before a byte is read. The vector
+        // still grows to whatever is really there.
+        let mut out = Vec::with_capacity(crate::prealloc(len));
         while out.len() < len {
             // How many clusters from here on are consecutive, up to what is still wanted.
             let want = len - out.len();
@@ -554,7 +573,10 @@ impl SourceTree for ExFatSource {
 /// A parsed directory entry, before it is turned into a file or a directory.
 struct Parsed {
     name: String,
+    /// DataLength: the stream's size.
     size: u64,
+    /// ValidDataLength: how much of it was written; the rest reads as zeros.
+    valid: u64,
     first_cluster: u32,
     no_fat_chain: bool,
     is_dir: bool,
@@ -583,6 +605,7 @@ fn parse_dir(bytes: &[u8], dir: &str) -> Result<Vec<Parsed>> {
                     first_cluster: 0,
                     no_fat_chain: false,
                     size: 0,
+                    valid: 0,
                 });
             }
             0xC0 => {
@@ -592,12 +615,14 @@ fn parse_dir(bytes: &[u8], dir: &str) -> Result<Vec<Parsed>> {
                 p.name_len = chunk[3] as usize;
                 p.no_fat_chain = chunk[1] & 0x02 != 0;
                 p.first_cluster = u32::from_le_bytes(chunk[20..24].try_into().unwrap());
-                // Bytes between the valid length and the allocated length are undefined.
-                p.size = if valid > 0 && valid < data {
-                    valid
-                } else {
-                    data
-                };
+                // DataLength is the size. ValidDataLength says how far data was written; the
+                // specification has reads past it return zeros (read_file does), so a file
+                // extended without being written out keeps its length rather than being cut
+                // at the valid length. Our writer sets the two equal. A zero valid length
+                // is taken as "not set" (as before): some image tools leave it so, and
+                // reading their files as all zeros would be worse than trusting the data.
+                p.size = data;
+                p.valid = if valid == 0 { data } else { valid.min(data) };
             }
             0xC1 => {
                 let Some(p) = pending.as_mut() else { continue };
@@ -635,6 +660,7 @@ fn parse_dir(bytes: &[u8], dir: &str) -> Result<Vec<Parsed>> {
                         out.push(Parsed {
                             name,
                             size: p.size,
+                            valid: p.valid,
                             first_cluster: p.first_cluster,
                             no_fat_chain: p.no_fat_chain,
                             is_dir: p.is_dir,
@@ -655,6 +681,7 @@ struct Pending {
     first_cluster: u32,
     no_fat_chain: bool,
     size: u64,
+    valid: u64,
 }
 
 /// Where the exFAT volume starts inside `file`: the image itself, an MBR partition, or a
@@ -779,6 +806,19 @@ mod tests {
         let entries = parse_dir(&bytes, "").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "keep");
+    }
+
+    #[test]
+    fn the_data_length_is_the_size_and_the_valid_length_is_kept() {
+        let mut bytes = file_bytes("a", 5, 65536);
+        bytes[1][8..16].copy_from_slice(&100u64.to_le_bytes());
+        let parsed = parse_dir(&flat(bytes), "").unwrap();
+        assert_eq!((parsed[0].size, parsed[0].valid), (65536, 100));
+        // A valid length past the data length (a writer that never sets it) is clamped.
+        let mut bytes = file_bytes("b", 5, 10);
+        bytes[1][8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let parsed = parse_dir(&flat(bytes), "").unwrap();
+        assert_eq!((parsed[0].size, parsed[0].valid), (10, 10));
     }
 
     /// A name is taken as it is on disk: an unpaired surrogate, a NUL or a '/' in it is an
@@ -916,6 +956,79 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// A root whose only cluster is exactly full (128 records, no terminator) and whose FAT
+    /// ends it there, while the next cluster holds another directory's records: the root
+    /// ends where the FAT says, never in the neighbour's records.
+    #[test]
+    fn a_root_whose_last_cluster_is_exactly_full_ends_where_the_fat_says() {
+        const SECTOR: usize = 512;
+        const CLUSTER: usize = 4096;
+        const HEAP: usize = 2 * SECTOR;
+        let mut img = synthetic_image();
+        // 40 three-record groups and 2 four-record groups (a name over 15 units takes two
+        // name records) fill the 128 records of the root cluster.
+        let mut root = Vec::new();
+        for i in 0..40 {
+            root.extend(flat(file_bytes(&format!("f{i:02}.bin"), 2, 10)));
+        }
+        for i in 0..2 {
+            let name = format!("a-name-longer-than-fifteen-{i}");
+            root.extend(flat(vec![
+                file_entry(0x20),
+                stream_entry(name.chars().count(), 0x03, 2, 10),
+                name_entry(&name[..15]),
+                name_entry(&name[15..]),
+            ]));
+        }
+        assert_eq!(root.len(), CLUSTER);
+        let root_at = HEAP + (4 - 2) * CLUSTER;
+        img[root_at..root_at + CLUSTER].copy_from_slice(&root);
+        // Cluster 5 follows the root contiguously and opens with a directory's records.
+        let mut ghost = file_bytes("ghost", 7, CLUSTER as u64);
+        ghost[0][4..6].copy_from_slice(&0x10u16.to_le_bytes());
+        let at = HEAP + (5 - 2) * CLUSTER;
+        img[at..at + 96].copy_from_slice(&flat(ghost));
+        let path =
+            std::env::temp_dir().join(format!("fpkg-exfat-{}-full-root", std::process::id()));
+        std::fs::write(&path, img).unwrap();
+        let mut volume = ExFat::open(&path).unwrap();
+        let walked = volume.walk_tree();
+        std::fs::remove_file(&path).ok();
+        let (files, empty) = walked.unwrap();
+        assert_eq!(files.len(), 42);
+        assert!(
+            empty.is_empty(),
+            "the neighbour's `ghost` must not be listed: {empty:?}"
+        );
+    }
+
+    /// Bytes at and past ValidDataLength read as zeros, and the file keeps its DataLength.
+    #[test]
+    fn bytes_past_the_valid_length_read_as_zeros() {
+        const SECTOR: usize = 512;
+        const CLUSTER: usize = 4096;
+        const HEAP: usize = 2 * SECTOR;
+        let mut img = synthetic_image();
+        // big.bin's stream record is the root's second record: valid length 4096 of 8192.
+        let at = HEAP + (4 - 2) * CLUSTER + 32;
+        img[at + 8..at + 16].copy_from_slice(&4096u64.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("fpkg-exfat-{}-valid", std::process::id()));
+        std::fs::write(&path, img).unwrap();
+        let mut volume = ExFat::open(&path).unwrap();
+        let files = volume.walk().unwrap();
+        let big = files.iter().find(|f| f.path == "big.bin").unwrap().clone();
+        assert_eq!(big.size, 8192);
+        let data = volume.read_file(&big, 0, usize::MAX).unwrap();
+        let seam = volume.read_file(&big, 4090, 12).unwrap();
+        let tail = volume.read_file(&big, 5000, 10).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(data.len(), 8192);
+        assert!(data[..4096].iter().all(|b| *b == 0x11));
+        assert!(data[4096..].iter().all(|b| *b == 0));
+        assert_eq!(seam, [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(tail, [0u8; 10]);
+    }
+
     /// [`synthetic_image`] with three more clusters and four directories in its root:
     /// `empty` (cluster 6, no entries), `junk` (cluster 8, only a `.DS_Store`), `nest`
     /// (cluster 9) holding `deeper` (cluster 10, no entries).
@@ -997,6 +1110,7 @@ mod tests {
         let files = volume.walk().unwrap();
         let mut bogus = files[0].clone();
         bogus.size = 64 * 4096; // claims far more than the volume holds
+        bogus.valid = bogus.size;
         let err = volume.read_file(&bogus, 0, usize::MAX).unwrap_err();
         assert!(err.to_string().contains("outside the volume"), "{err}");
         std::fs::remove_file(&path).ok();

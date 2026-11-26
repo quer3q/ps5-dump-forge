@@ -17,6 +17,8 @@ tauri-build = { version = "2", features = [] }
 anyhow.workspace = true
 dunce = "1.0.5"
 ps5-dump-forge-core.workspace = true
+# `bundled_ng_version` (`runtime::NG_VERSION`), shown in Settings.
+ps5-dump-forge-lz4.workspace = true
 # Connect (FLINK, discovery, saved NAS devices): the service only, never its HTTP server.
 # ponytail: the crate's build script also embeds the web bundle; nothing here references it,
 # so the linker drops it.

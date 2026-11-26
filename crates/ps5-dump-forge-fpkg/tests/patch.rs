@@ -14,15 +14,13 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-/// `pkg` as a patch carrying every outer block but `omit`: a 64 KiB header, the FIH block, the
-/// carried blocks in order, the container.
+/// `pkg` as a patch carrying every outer block but `omit`.
 fn patch_of(pkg: &[u8], omit: &[usize]) -> Vec<u8> {
     let (pfs_offset, pfs_size, cnt_offset) = (
         le64(pkg, 0x10) as usize,
         le64(pkg, 0x18) as usize,
         le64(pkg, 0x58) as usize,
     );
-    // The container runs to the image or to the package's end, whichever comes first after it.
     let cnt_end = if cnt_offset < pfs_offset {
         pfs_offset
     } else {
@@ -52,7 +50,7 @@ fn patch_of(pkg: &[u8], omit: &[usize]) -> Vec<u8> {
 #[test]
 fn a_patch_lists_only_the_files_it_carries_whole() {
     // A random stretch of the big file is stored raw, so its bytes are found in the package.
-    let built = build("patch-some", 0, |_| {});
+    let built = build("patch-some", |_| {});
     let pkg = built.package();
     let pfs_offset = le64(&pkg, 0x10) as usize;
     let needle = &built.bytes(BIG)[70_000 + 1000..70_000 + 1064];
@@ -64,8 +62,6 @@ fn a_patch_lists_only_the_files_it_carries_whole() {
     let path = built.path.with_extension("patch.pkg");
     std::fs::write(&path, patch_of(&pkg, &[omit])).unwrap();
 
-    // The block holds other files' bytes too (the image is small): each listed one reads back
-    // whole, and every one left out is counted.
     let mut source = FpkgSource::open(&path, None).unwrap();
     let listed: Vec<String> = source.files().iter().map(|f| f.path.clone()).collect();
     assert!(!listed.iter().any(|p| p == BIG), "{listed:?}");

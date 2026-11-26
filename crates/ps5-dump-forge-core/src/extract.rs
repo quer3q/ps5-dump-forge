@@ -1,6 +1,5 @@
-//! Extraction into a folder. Names come from an image someone else made,
-//! so every path is checked before the first byte is written, and every file is created
-//! exclusively inside our own `.part` folder.
+//! Extraction into a folder: names come from an image someone else made, so every path is
+//! checked first and every file is created exclusively inside our own `.part` folder.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -17,13 +16,12 @@ use crate::finalize::Part;
 use crate::jobs::Ctx;
 use crate::preflight::listing;
 
-/// Bytes read and written per step; also how often cancel is checked.
+/// Bytes per step; also how often cancel is checked.
 pub(crate) const CHUNK: u64 = 4 * 1024 * 1024;
 
-/// macOS (APFS/HFS+) and Windows (NTFS) folders are case-insensitive by default, and APFS
-/// also ignores Unicode normalization.
-// ponytail: assumed per OS, not probed. A case-insensitive Linux destination (vfat,
-// casefold ext4) still cannot lose data: creation is exclusive, so a collision fails the job.
+/// macOS and Windows folders fold case by default (APFS also Unicode normalization).
+// ponytail: assumed per OS, not probed; a folding Linux destination still loses nothing
+// (creation is exclusive, so a collision fails the job).
 pub(crate) const CASE_INSENSITIVE: bool = cfg!(any(target_os = "macos", windows));
 
 /// Why `name` (one path component) cannot be created safely on any desktop OS.
@@ -79,8 +77,7 @@ fn bad_path(path: &str) -> Option<&'static str> {
     path.split('/').find_map(bad_component)
 }
 
-/// Every reason the tree cannot be extracted as is, one line per offending path. Empty
-/// when it can. `case_insensitive` is whether the destination folds case and normalization.
+/// Every reason the tree can't be extracted, one line per path (`case_insensitive`: the destination folds).
 pub fn extraction_findings(
     files: &[String],
     empty_dirs: &[String],
@@ -163,7 +160,6 @@ pub fn extraction_findings(
 pub(crate) struct Dest {
     root: at::Dir,
     created: HashSet<String>,
-    /// The folder the last file was created in, and its handle.
     last: Option<(String, Arc<at::Dir>)>,
 }
 
@@ -181,9 +177,8 @@ impl Dest {
         })
     }
 
-    /// The directory `rel` (`""` is the root), created with its parents as needed. A
-    /// directory this job did not create already being there means two names folded
-    /// together, or something planted: an error either way.
+    /// The directory `rel` (`""` is the root), made with its parents; one already there that
+    /// this job didn't make (two names folded together, or something planted) is an error.
     fn dir(&mut self, rel: &str) -> anyhow::Result<at::Dir> {
         let mut cur = at::clone(&self.root)?;
         if rel.is_empty() {
@@ -209,9 +204,8 @@ impl Dest {
         Ok(cur)
     }
 
-    /// The folder `rel` goes into, created as needed, and its last component. Files come
-    /// grouped by folder: the last one's handle is kept, not opened again component by
-    /// component for every file.
+    /// The folder `rel` goes into, made as needed, and its last component; the last folder's
+    /// handle is kept, as files come grouped by folder.
     fn parent<'p>(&mut self, rel: &'p str) -> anyhow::Result<(Arc<at::Dir>, &'p str)> {
         let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
         if self.last.as_ref().is_none_or(|(at, _)| at != parent) {
@@ -244,8 +238,7 @@ impl Dest {
         at::reopen(&self.root, name)
     }
 
-    /// fsyncs every directory this job created, and the root. The root's sync comes last:
-    /// on macOS its F_FULLFSYNC is the barrier that makes every [`sync_file`] durable.
+    /// fsyncs every directory this job made, then the root: on macOS its F_FULLFSYNC is the barrier.
     pub(crate) fn sync(&mut self, ctx: &Ctx) -> anyhow::Result<()> {
         let dirs: Vec<String> = self.created.iter().cloned().collect();
         for rel in dirs {
@@ -256,15 +249,9 @@ impl Dest {
     }
 }
 
-/// Syncs a file written into the `.part` folder; it is durable once [`Dest::sync`] has run.
-///
-/// macOS: plain fsync(2), which per Apple's man page moves the file's data and metadata to
-/// the drive but may leave them in the drive's volatile cache. F_FULLFSYNC (what `sync_all`
-/// does there) is fsync(2) and then a flush of that whole cache (fcntl(2)): ~5 ms each on an
-/// APFS SSD, 26 s of a 41 s extraction of 5,549 files. `Dest::sync` ends with one
-/// F_FULLFSYNC on the root, after every file here, so one flush gives the same guarantee
-/// before the rename. Elsewhere `sync_all`: Linux fsync and Windows FlushFileBuffers are
-/// already full.
+/// Syncs a file written into the `.part` folder; durable once [`Dest::sync`] has run.
+/// macOS: a plain fsync (the drive may cache it; F_FULLFSYNC per file cost 26 s of a 41 s
+/// extraction of 5,549 files): `Dest::sync`'s one F_FULLFSYNC on the root is the barrier.
 #[cfg(not(target_os = "freebsd"))]
 pub(crate) fn sync_file(file: &File) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]
@@ -357,8 +344,7 @@ mod at {
         Ok(File::from(fd(rc)?))
     }
 
-    /// Renames `from` in `from_dir` to `to` in `to_dir`, never over an entry there. The
-    /// target is in this job's own folder, which nothing else writes: a check, then a rename.
+    /// Renames `from` to `to`, never over an entry: a check, then a rename (our own folder).
     pub(super) fn rename(from_dir: &Dir, from: &str, to_dir: &Dir, to: &str) -> io::Result<()> {
         let (from, to) = (c(from.as_bytes())?, c(to.as_bytes())?);
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -400,8 +386,7 @@ mod at {
 }
 
 // ponytail: elsewhere (Windows) entries are created by path; only the final component is
-// protected (CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT). Handle-relative creation there
-// needs NtCreateFile with a root directory handle.
+// protected (CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT).
 #[cfg(not(unix))]
 mod at {
     use std::fs::File;
@@ -455,8 +440,7 @@ mod at {
     }
 }
 
-/// Copies every file and empty directory of `tree` into the `part` folder. Returns the
-/// bytes written. Names must have passed [`extraction_findings`].
+/// Copies every file and empty directory of `tree` into `part` (names passed [`extraction_findings`]).
 pub(crate) fn write(
     tree: &mut dyn SourceTree,
     part: &Part,
@@ -486,7 +470,6 @@ pub(crate) fn write(
         for _ in 0..WRITERS {
             let recv = Arc::clone(&recv);
             s.spawn(move || {
-                // The lock is held only while waiting for the next file.
                 while let Ok(small) = { recv.lock().expect("not poisoned").recv() } {
                     // After a failure the rest are drained, not written.
                     if failed_ref.lock().expect("not poisoned").is_some() {
@@ -516,10 +499,8 @@ pub(crate) fn write(
     if let Some(e) = failed.into_inner().expect("not poisoned") {
         return Err(e);
     }
-    // Every other file is written and synced and the writers joined: only now do the launch
-    // files get their names, `sce_sys/` first, then `eboot.bin` (`launch_order`).
-    // The sync first, so the other files' directory entries are durable before any launch
-    // name appears.
+    // Every other file written, synced and its writer joined: now the launch files get their
+    // names (`sce_sys/` first, then `eboot.bin`), after a sync so the rest are durable first.
     if !staged.is_empty() || !launch_dirs.is_empty() {
         dest.sync(ctx)?;
     }
@@ -537,15 +518,12 @@ pub(crate) fn write(
     Ok(total)
 }
 
-/// Files up to this size are read whole by [`write`] and created, written, synced and closed
-/// by [`WRITERS`] threads, each file still synced before the folder's final sync. For a few
-/// KiB the create and the sync cost far more than the bytes (macOS APFS ~80 us and ~25 us,
-/// and on the PS5 a fsync per file too), and one at a time a 100k-file game spent its write
-/// stage waiting on them. At most `WRITERS * 3 + 1` such files are held at once (52 MiB).
+/// Files up to this size are read whole and written by [`WRITERS`] threads: for a few KiB the
+/// create and sync cost far more than the bytes (a 100k-file game waited on them one at a
+/// time). At most `WRITERS * 3 + 1` are held at once (52 MiB).
 const SMALL: u64 = CHUNK;
 const WRITERS: usize = 4;
 
-/// A small file for the writers: its folder's handle, its name there, its game path.
 struct Small {
     dir: Arc<at::Dir>,
     name: String,
@@ -553,8 +531,7 @@ struct Small {
     bytes: Vec<u8>,
 }
 
-/// One writer's file: created exclusively, written, synced as [`write`] syncs any file (on
-/// FreeBSD through U4's retries, a retried sync a failure, as `SyncEvery::finish` does).
+/// One writer's file: created exclusively, written, synced as [`write`] syncs (FreeBSD: U4).
 fn write_small(small: Small, cancel: &AtomicBool) -> anyhow::Result<()> {
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         bail!("cancelled");
@@ -576,10 +553,8 @@ fn write_small(small: Small, cancel: &AtomicBool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// [`write`]'s reading side: every file in the tree's order, a small one read whole and handed
-/// to the writers, a larger one streamed into its file here. A launch file (`launch_order`)
-/// goes under a temporary name at the root, pushed to `staged` with its path, for [`write`]
-/// to put in place last. Stops at the first error, here or in a writer (`failed`).
+/// [`write`]'s reading side, in the tree's order: small files to the writers, larger ones
+/// streamed here; a launch file goes under a temporary root name into `staged`.
 #[allow(clippy::too_many_arguments)]
 fn feed(
     tree: &mut dyn SourceTree,
@@ -608,8 +583,7 @@ fn feed(
         staged.push((tmp.clone(), file.path.clone()));
         tmp
     };
-    // The job's one cadence (U5): what one file measured carries over to the next. Each file
-    // is synced when it is complete, so no dirty bytes carry across files.
+    // The job's one cadence (U5), carried across files; each file is synced when complete.
     #[cfg(target_os = "freebsd")]
     let mut cadence = crate::durable::Cadence::new();
     for file in files {
@@ -654,8 +628,7 @@ fn feed(
     Ok(())
 }
 
-/// [`write`] into a folder on a peer: each file through a temporary name, sent, synced,
-/// closed and renamed (a failure removes the one being written).
+/// [`write`] into a folder on a peer, each file through a temporary name.
 pub(crate) fn write_remote(
     tree: &mut dyn SourceTree,
     dest: &mut crate::remote::RemoteDir,
@@ -686,7 +659,6 @@ pub(crate) fn write_remote(
     Ok(total)
 }
 
-/// Streams `file` of `tree` into `out` in chunks, checking cancel between them.
 fn copy(
     tree: &mut dyn SourceTree,
     file: &ps5upload_fpkg::source::SourceFile,
@@ -763,9 +735,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// ShadowMount+ takes a folder with `sce_sys/` and `eboot.bin` for a game.
-    /// The source is read in its own order, the launch files first here, and neither name
-    /// may be in the folder while any file is still being read.
+    /// ShadowMount+ takes a folder with `sce_sys/` and `eboot.bin` for a game: neither name may
+    /// appear while any file is still being read.
     #[test]
     fn launch_files_appear_after_every_other_file() {
         use ps5upload_fpkg::source::SourceFile;

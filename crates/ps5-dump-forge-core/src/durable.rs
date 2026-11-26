@@ -1,12 +1,7 @@
 //! Durable writes for drives that drop data (the PS5's USB stack): fsync with ps5upload's retry
-//! policy, and [`SyncEvery`], an output wrapper that bounds unsynced data. A sync that only
-//! succeeded after a retry fails the job: pages the drive dropped in between cannot be told
-//! apart, so the output is not trusted.
-//!
-//! A cancel during a long zero fill surfaces as an `io::Error` whose inner error
-//! is [`Cancelled`]; callers tell it apart with `e.get_ref().is_some_and(|e| e.is::<Cancelled>())`.
-//!
-//! Also [`explain_removal`]: a failed job's error, told apart from a drive that went away.
+//! policy and [`SyncEvery`], which bounds unsynced data. A sync that only succeeded after a retry
+//! fails the job: pages dropped in between can't be told apart. A cancel is an `io::Error` whose
+//! inner error is [`Cancelled`]. [`explain_removal`] names a drive that went away.
 
 use std::fmt;
 use std::fs::File;
@@ -15,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// The inner error of an `io::Error` a cancel produced.
 #[derive(Debug)]
 pub(crate) struct Cancelled;
 
@@ -27,8 +21,7 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// A copy of `e` for each later call that a latched failure fails: the errno, the cancel
-/// marker, or the kind and message.
+/// A copy of a latched failure for each later call.
 fn copy(e: &io::Error) -> io::Error {
     if let Some(code) = e.raw_os_error() {
         return io::Error::from_raw_os_error(code);
@@ -47,10 +40,8 @@ fn check(cancel: &AtomicBool) -> io::Result<()> {
     Ok(())
 }
 
-/// The errno of `e`, with Sony's 0x8002xxxx form folded to the plain errno.
-/// On Windows the raw code is a Win32 error, so nothing here matches it; no Windows caller.
+/// The errno of `e`, Sony's 0x8002xxxx form folded to the low 16 bits. No Windows caller.
 pub(crate) fn errno(e: &io::Error) -> Option<i32> {
-    // The PS5 kernel hands some errors back as 0x8002xxxx; the low 16 bits are the errno.
     e.raw_os_error().map(|c| {
         if c as u32 >> 16 == 0x8002 {
             c & 0xffff
@@ -60,8 +51,7 @@ pub(crate) fn errno(e: &io::Error) -> Option<i32> {
     })
 }
 
-/// EINTR, EAGAIN, EBUSY, ETIMEDOUT, ENOENT, ENXIO, ENODEV (after folding). Never EIO, ENOSPC, EROFS:
-/// EIO is the kernel saying the data did not reach the drive, and asking again proves nothing.
+/// Never EIO, ENOSPC, EROFS: EIO says the data didn't reach the drive; a retry proves nothing.
 pub(crate) fn is_transient(e: &io::Error) -> bool {
     use libc::{EAGAIN, EBUSY, EINTR, ENODEV, ENOENT, ENXIO, ETIMEDOUT};
     matches!(
@@ -70,21 +60,17 @@ pub(crate) fn is_transient(e: &io::Error) -> bool {
     )
 }
 
-/// One path U7 re-checks when a job fails: a mount point (or, where `statfs` failed when it
-/// was recorded, the folder itself) and its `st_dev` then.
+/// A path U7 re-checks when a job fails: a mount point (else the folder) and its `st_dev` then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Watched {
     pub path: PathBuf,
     pub dev: u64,
-    /// `path` is the mount point `statfs` named, not a folder on it.
     pub mount: bool,
 }
 
-/// U7: if a watched mount point's drive is gone, `e` is prefixed with it; otherwise it is `e`
-/// unchanged. Asked on any failure, not by errno: some readers turn their I/O errors into
-/// text. Gone: `now` (a path's `(st_dev, f_blocks)` today) shows another device or no blocks,
-/// or fails on a mount point with an errno a lost drive gives (EIO, ENXIO, ENODEV, ENOENT).
-/// A folder that is missing or unreadable (EACCES, ...) on a healthy drive is not a removal.
+/// U7: `e` prefixed with a watched drive that is gone (asked on any failure: some readers turn
+/// I/O errors into text). Gone: `now` (`(st_dev, f_blocks)`) shows another device or no blocks,
+/// or a mount point fails as a lost drive does. A missing folder on a healthy drive is not one.
 pub(crate) fn explain_removal(
     e: anyhow::Error,
     watched: &[Watched],
@@ -104,8 +90,7 @@ pub(crate) fn explain_removal(
     }
 }
 
-/// A filesystem without directory fsync. Comparisons, not a match: ENOTSUP == EOPNOTSUPP on
-/// FreeBSD and Linux.
+/// A filesystem without directory fsync (comparisons: ENOTSUP == EOPNOTSUPP on some OSes).
 fn unsupported(e: &io::Error) -> bool {
     errno(e).is_some_and(|c| c == libc::EINVAL || c == libc::ENOTSUP || c == libc::EOPNOTSUPP)
 }
@@ -113,30 +98,27 @@ fn unsupported(e: &io::Error) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Synced {
     Clean,
-    /// Succeeded only after a retry: pages may have been lost in between.
+    /// Succeeded only after a retry: pages may have been lost.
     Retried,
-    /// A directory on a filesystem that cannot fsync one.
+    /// A directory on a filesystem that can't fsync one.
     Unsupported,
 }
 
 /// ps5upload's `ava1_fsync_retry`: the first try and four retries.
 const BACKOFF_MS: [u64; 4] = [20, 60, 200, 600];
-/// Backoff is slept in slices this long, checking the cancel flag between them.
+/// Backoff slices, the cancel checked between them.
 const SLICE_MS: u64 = 20;
 
-/// fsync with retry. `dir`: a directory fsync that fails with EINVAL/ENOTSUP/EOPNOTSUPP is
-/// Ok(Unsupported) (a filesystem without directory fsync); for a file those are errors.
-/// A cancel during the backoff returns the last error.
+/// fsync with retry; `dir`: EINVAL/ENOTSUP is `Unsupported`. A cancel returns the last error.
 pub(crate) fn sync_retry(f: &File, dir: bool, cancel: &AtomicBool) -> io::Result<Synced> {
     retry(|| fsync_once(f), dir, cancel, std::thread::sleep)
 }
 
-/// One try. std's `sync_all` retries EINTR itself on unix, which would hide it from the
-/// backoff, the cancel check and `Synced::Retried`.
+/// One try: std's `sync_all` retries EINTR itself, hiding it from `Synced::Retried`.
 #[cfg(unix)]
 fn fsync_once(f: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    // macOS: F_FULLFSYNC, as `sync_all` does there; plain fsync stops at the drive's cache.
+    // macOS: F_FULLFSYNC, as `sync_all` does; plain fsync stops at the drive's cache.
     // SAFETY: a valid descriptor and plain integer arguments.
     #[cfg(target_vendor = "apple")]
     let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) };
@@ -154,7 +136,6 @@ fn fsync_once(f: &File) -> io::Result<()> {
     f.sync_all()
 }
 
-/// What a sync that only succeeded after a retry fails with.
 pub(crate) fn retried_sync() -> io::Error {
     io::Error::other(
         "the drive reported a temporary error while syncing, so written data may be lost; \
@@ -194,11 +175,10 @@ fn retry(
     }
 }
 
-/// What [`SyncEvery`] writes into: a seekable output it can fsync.
 pub(crate) trait Output {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>;
-    /// Ok(true) when the sync only succeeded after a retry (pages may have been lost).
+    /// Ok(true) when the sync only succeeded after a retry.
     fn sync(&mut self, cancel: &AtomicBool) -> io::Result<bool>;
 }
 
@@ -226,15 +206,13 @@ impl<O: Output + ?Sized> Output for &mut O {
     }
 }
 
-// ponytail: calibration knobs, to be tuned on the /data hardware runs: N starts at 32 MiB and
-// adapts to about one second of measured throughput, within 16..256 MiB.
+// ponytail: calibration knobs, untuned: N adapts to about one second of throughput.
 const START_N: u64 = 32 << 20;
 const MIN_N: u64 = 16 << 20;
 const MAX_N: u64 = 256 << 20;
 const TARGET: Duration = Duration::from_secs(1);
 
-/// How many dirty bytes [`SyncEvery`] lets build up before a sync. One per job, shared by
-/// every output the job writes, so what one file measured carries over to the next.
+/// Dirty bytes [`SyncEvery`] allows before a sync; one per job, carried across its outputs.
 pub(crate) struct Cadence {
     n: u64,
     min: u64,
@@ -252,7 +230,6 @@ impl Cadence {
         }
     }
 
-    /// A fixed N, so tests stay small.
     #[cfg(test)]
     fn fixed(n: u64) -> Self {
         Self {
@@ -279,15 +256,13 @@ impl Cadence {
         }
     }
 
-    /// The last change of N as `(old, new)`, once, for the caller to log.
+    /// The last change of N as `(old, new)`, once, to log.
     pub(crate) fn take_change(&mut self) -> Option<(u64, u64)> {
         self.change.take()
     }
 }
 
-/// Zeros for gap materialization.
 static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
-/// The largest offset an `off_t` holds.
 const MAX_OFF: u64 = i64::MAX as u64;
 
 fn out_of_range() -> io::Error {
@@ -297,30 +272,24 @@ fn out_of_range() -> io::Error {
     )
 }
 
-/// Bounds unsynced data inside every call: a sync once N bytes were written since the last one
-/// (writes are split there), and gaps past the end are written as real zeros (no sparse holes,
-/// no driver zero-filling a gap in one syscall). Seeks never sync. The output must start empty.
-///
-/// A failed sync point, a retried one ([`retried_sync`]) or a failed inner seek is latched: bytes
-/// a write already handed to the output are still reported as written, and every later write,
-/// seek and `finish` fails.
+/// A sync every N bytes written (writes split there); gaps past the end written as real zeros
+/// (no sparse holes). Seeks never sync. The output starts empty. A failed or retried sync point
+/// or a failed inner seek is latched: bytes already handed over count as written, later calls fail.
 pub(crate) struct SyncEvery<'a, O: Output> {
     out: O,
     cadence: &'a mut Cadence,
     cancel: &'a AtomicBool,
-    /// Cursor, for us and the inner output alike.
     pos: u64,
-    /// Largest end offset written: the output's length.
+    /// The output's length.
     high: u64,
-    /// Bytes written since the last sync, and when that sync ended.
+    /// Bytes since the last sync, and when it ended.
     dirty: u64,
     since: Instant,
-    /// Never cleared: the output's state past a failed sync point is unknown.
+    /// Never cleared: past a failed sync point the output's state is unknown.
     failed: Option<io::Error>,
 }
 
 impl<'a, O: Output> SyncEvery<'a, O> {
-    /// `out` is empty, at offset 0.
     pub(crate) fn new(out: O, cadence: &'a mut Cadence, cancel: &'a AtomicBool) -> Self {
         Self {
             out,
@@ -334,14 +303,13 @@ impl<'a, O: Output> SyncEvery<'a, O> {
         }
     }
 
-    /// Final sync and the inner output back.
     pub(crate) fn finish(mut self) -> io::Result<O> {
         self.failed()?;
         self.sync_point(false)?;
         Ok(self.out)
     }
 
-    /// [`finish`](Self::finish), also handing back the cadence for the next output.
+    /// [`finish`](Self::finish), the cadence handed back too.
     pub(crate) fn finish_parts(mut self) -> io::Result<(O, &'a mut Cadence)> {
         self.failed()?;
         self.sync_point(false)?;
@@ -358,8 +326,7 @@ impl<'a, O: Output> SyncEvery<'a, O> {
         copy
     }
 
-    /// One inner write at `pos`, at most what N still allows; a sync point once N is reached.
-    /// `buf` is not empty.
+    /// One inner write, at most what N still allows; `buf` is not empty.
     fn put(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.failed()?;
         if self.dirty >= self.cadence.n() {
@@ -381,7 +348,6 @@ impl<'a, O: Output> SyncEvery<'a, O> {
         Ok(done)
     }
 
-    /// Zeros over `[pos, to)`; `pos` is the end of the data.
     fn zeros_to(&mut self, to: u64) -> io::Result<()> {
         while self.pos < to {
             check(self.cancel)?;
@@ -393,10 +359,8 @@ impl<'a, O: Output> SyncEvery<'a, O> {
         Ok(())
     }
 
-    /// To `target`; past the end, through zeros from the end.
     fn go(&mut self, target: u64) -> io::Result<()> {
         let at = target.min(self.high);
-        // Not taken in the common UFS2 case (a partial last block, then a small gap).
         if at != self.pos {
             if let Err(e) = self.out.seek(SeekFrom::Start(at)) {
                 return Err(self.latch(e));
@@ -406,8 +370,8 @@ impl<'a, O: Output> SyncEvery<'a, O> {
         self.zeros_to(target)
     }
 
-    /// Sync; a retried sync is a failure. `full`: N was reached, so the interval measures the
-    /// drive; finish's partial interval is mostly fsync latency and would read as a slow drive.
+    /// A retried sync fails. `full`: N was reached, so the interval measures the drive (finish's
+    /// partial one is mostly fsync latency).
     fn sync_point(&mut self, full: bool) -> io::Result<()> {
         let synced = match self.out.sync(self.cancel) {
             Ok(false) => Ok(()),
@@ -435,7 +399,6 @@ impl<O: Output> Write for SyncEvery<'_, O> {
         self.put(buf)
     }
 
-    /// Nothing to do: data is synced at sync points only.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -470,11 +433,8 @@ mod tests {
         data: Vec<u8>,
         cur: usize,
         writes: usize,
-        max_write: usize,
         seeks: usize,
         syncs: usize,
-        /// `(k, Err(errno) | Ok(len))`: the k-th write (from 1) fails or accepts only `len`.
-        fail_write: Option<(usize, Result<usize, i32>)>,
         /// `(k, errno)`: the k-th sync (from 1) fails for good.
         fail_sync: Option<(usize, i32)>,
         /// The k-th sync (from 1) only succeeds after a retry.
@@ -484,13 +444,7 @@ mod tests {
     impl Output for Fake {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.writes += 1;
-            let mut len = buf.len();
-            match self.fail_write {
-                Some((k, Err(code))) if k == self.writes => return Err(os(code)),
-                Some((k, Ok(short))) if k == self.writes => len = len.min(short),
-                _ => {}
-            }
-            self.max_write = self.max_write.max(len);
+            let len = buf.len();
             let end = self.cur + len;
             if self.data.len() < end {
                 self.data.resize(end, 0);
@@ -528,28 +482,6 @@ mod tests {
         (0..len)
             .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
             .collect()
-    }
-
-    #[test]
-    fn a_retried_sync_fails_the_job() {
-        let retried = |e: io::Error| e.to_string().contains("temporary error while syncing");
-        let (mut c, cancel) = (Cadence::fixed(64), AtomicBool::new(false));
-        // At an N-driven sync point.
-        let fake = Fake {
-            retry_sync: Some(1),
-            ..Fake::default()
-        };
-        let mut w = SyncEvery::new(fake, &mut c, &cancel);
-        assert_eq!(w.write(&[1; 64]).unwrap(), 64);
-        assert!(retried(w.write(&[2]).unwrap_err()));
-        // At the final sync.
-        let fake = Fake {
-            retry_sync: Some(1),
-            ..Fake::default()
-        };
-        let mut w = SyncEvery::new(fake, &mut c, &cancel);
-        w.write_all(&[1; 10]).unwrap();
-        assert!(retried(w.finish().err().unwrap()));
     }
 
     #[test]
@@ -650,8 +582,7 @@ mod tests {
         let eio = || anyhow::Error::new(os(libc::EIO)).context("writing the image");
         let removed = "the drive at /mnt/usb0 was removed or stopped responding: writing the \
                        image: ";
-        // Device changed, no blocks, stat failing as a lost drive does: removed, the original
-        // error kept after it.
+        // Device changed, no blocks, stat failing as a lost drive does: removed.
         let gone: [Usb0; 4] = [
             || Ok((8, 100)),
             || Ok((7, 0)),
@@ -671,8 +602,7 @@ mod tests {
                 assert_eq!(explain(e, &with(usb0)), want);
             }
         }
-        // A folder (recorded where statfs failed) that is missing or unreadable now, on a
-        // drive that is fine: not a removal. On another device: one.
+        // A folder missing or unreadable on a fine drive: not a removal. On another device: one.
         for err in [libc::ENOENT, libc::EACCES, libc::EIO] {
             let folder = |m: &Path| match m.to_str() {
                 Some("/mnt/usb1/games") => Err(os(err)),

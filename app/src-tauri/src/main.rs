@@ -1,8 +1,4 @@
-//! PS5 Dump Forge: the Tauri shell over `ps5-dump-forge-core`. No settings file: what the UI
-//! remembers lives in memory until the app closes, except its language (WebView localStorage).
-//!
-//! All file access stays in these commands; the webview only gets event listening
-//! and the app's own commands (see `build.rs` and `capabilities/default.json`).
+//! PS5 Dump Forge: the Tauri shell over `ps5-dump-forge-core`; all file access stays in these commands (`build.rs`, `capabilities/default.json`).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::HashMap;
@@ -13,21 +9,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ps5_dump_forge_core::{
     ArchivePassword, ConvertRequest, EditCheck, Event, Format, HostTree, Inspection, JobId, Jobs,
-    LibraryScan, Listing, folder_refusal,
+    Listing, folder_refusal,
 };
 use ps5_dump_forge_server::connect::{self, Connect};
 use ps5_dump_forge_server::payload;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
-/// Emitted to the UI when a close or quit was held back because jobs are running or a paired
-/// device is using files here (payload `{"peer": bool}`, `QuitHeld`). The UI asks the user and
-/// calls `quit_app` on confirmation.
+/// Emitted when a close or quit was held back (payload `{"peer": bool}`); the UI asks, then calls `quit_app`.
 const CLOSE_REQUESTED: &str = "close-requested";
 
-/// Why a close or quit waits for the user's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QuitHeld {
-    /// A paired device is reading or writing files here: quitting cuts its transfer short.
+    /// A paired device is reading or writing files here.
     peer: bool,
 }
 
@@ -38,18 +31,14 @@ const QUIT_MENU_ID: &str = "quit";
 struct AppState {
     /// Created on the first `start_job`, so startup never depends on the job runner.
     jobs: OnceLock<Jobs>,
-    /// Started minus finished jobs (queued ones included). Can dip below zero for a
-    /// moment when a job finishes before `start` returns; only `> 0` matters.
+    /// Started minus finished jobs; can dip below zero for a moment, only `> 0` matters.
     running: Arc<AtomicI64>,
-    /// `true` once the app is quitting. Held while a job is admitted, so admitting and
-    /// deciding to quit never interleave.
+    /// Held while a job is admitted, so admitting and deciding to quit never interleave.
     quitting: Mutex<bool>,
-    /// What each finished job published: the only paths `reveal` will show.
+    /// The only paths `reveal` will show.
     outputs: Arc<Mutex<HashMap<JobId, PathBuf>>>,
-    /// Connect's service (FLINK 9883 + discovery on UDP 8094; no HTTP listener), started at
-    /// setup and shut down at exit; `Err` says why it isn't running.
+    /// Started at setup, shut down at exit; `Err` says why it isn't running.
     connect: Result<Arc<Connect>, String>,
-    /// Whether a paired device is reading or writing files here (`Connect::activity_hook`).
     peers_active: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
@@ -59,7 +48,6 @@ impl AppState {
             let app = app.clone();
             let running = self.running.clone();
             let outputs = self.outputs.clone();
-            // Mirrored to the paired peers a job uses (Connect holds no strong link back).
             let connect = self.connect.as_ref().ok().cloned();
             let jobs = Jobs::new(move |event| {
                 if let Some(c) = &connect {
@@ -79,12 +67,10 @@ impl AppState {
                 };
                 let _ = app.emit(name, &event);
             });
-            // No job starts on what a peer is writing here.
             if let Ok(connect) = &self.connect {
                 jobs.set_external_busy(connect.writing_hook());
             }
-            // An extract or transfer that replaces (the user confirmed it) never takes the home
-            // folder, as Delete and Move keep it.
+            // A confirmed replace never takes the home folder, as Delete and Move keep it.
             jobs.set_protected(Arc::new(|| std::env::home_dir().into_iter().collect()));
             jobs
         })
@@ -95,8 +81,7 @@ impl AppState {
         self.quitting.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Quit when idle (no job of this app's, no paired device using files here): closes
-    /// admission; else what holds it back.
+    /// Quit when idle: closes admission; else what holds it back.
     fn try_quit(&self) -> Result<(), QuitHeld> {
         let mut quitting = self.quitting();
         let peer = (self.peers_active)();
@@ -107,7 +92,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Cancel every job and wait for its cleanup (a no-op before the first job).
     fn stop_jobs(&self) {
         if let Some(jobs) = self.jobs.get() {
             jobs.cancel_all_and_wait();
@@ -115,13 +99,11 @@ impl AppState {
     }
 }
 
-/// A lock that survives a panic elsewhere (the data is a plain map).
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Runs `f` off the main thread. A panic in core (or a slow scan) then fails only this
-/// call instead of the event loop.
+/// Runs `f` off the main thread, so a panic in core (or a slow scan) fails only this call.
 async fn blocking<T: Send + 'static>(
     app: AppHandle,
     f: impl FnOnce(&AppHandle, &AppState) -> Result<T, String> + Send + 'static,
@@ -135,7 +117,6 @@ fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
-/// `password`: for an archive that needs one (else core's `ARCHIVE_PASSWORD_REQUIRED`).
 #[tauri::command]
 async fn inspect(
     app: AppHandle,
@@ -149,17 +130,6 @@ async fn inspect(
     .await
 }
 
-/// The Library: game dumps under the folder the user chose, on any filesystem. Reads only.
-/// System and well-known folders are refused.
-#[tauri::command]
-async fn library_scan(app: AppHandle, root: PathBuf) -> Result<LibraryScan, String> {
-    blocking(app, move |_, _| {
-        ps5_dump_forge_core::scan_library_folder(&root).map_err(err)
-    })
-    .await
-}
-
-/// The Edit tab's preview of a host file or folder the user adds or drops.
 #[tauri::command]
 async fn host_tree(app: AppHandle, path: PathBuf) -> Result<HostTree, String> {
     blocking(app, move |_, _| {
@@ -168,9 +138,24 @@ async fn host_tree(app: AppHandle, path: PathBuf) -> Result<HostTree, String> {
     .await
 }
 
-/// Which way the Edit tab's `request` can be applied, in place or by a rebuild (core's
-/// `Jobs::edit_check`: it settles a leftover undo journal unless a job uses the image, then
-/// only reads). Read errors come back as findings.
+#[tauri::command]
+async fn pack_estimate(
+    app: AppHandle,
+    source: PathBuf,
+    kind: ps5_dump_forge_core::EstimateKind,
+    level: u8,
+    password: Option<ArchivePassword>,
+    unpack: Option<bool>,
+) -> Result<ps5_dump_forge_core::PackEstimate, String> {
+    blocking(app, move |_, _| {
+        let unpack = unpack.unwrap_or(false);
+        ps5_dump_forge_core::pack_estimate(&source, kind, level, password.as_ref(), unpack)
+            .map_err(err)
+    })
+    .await
+}
+
+/// Settles a leftover undo journal unless a job uses the image, then only reads; read errors come back as findings.
 #[tauri::command]
 async fn edit_check(app: AppHandle, request: ConvertRequest) -> Result<EditCheck, String> {
     blocking(app, move |app, state| {
@@ -179,9 +164,6 @@ async fn edit_check(app: AppHandle, request: ConvertRequest) -> Result<EditCheck
     .await
 }
 
-/// An extract's or transfer's targets that exist already (core's `Jobs::existing_targets`:
-/// each selection's, top level, on a peer or NAS too), so the UI asks before it sends
-/// `replace`. Reads only.
 #[tauri::command]
 async fn existing_targets(app: AppHandle, request: ConvertRequest) -> Result<Vec<PathBuf>, String> {
     blocking(app, move |app, state| {
@@ -190,16 +172,6 @@ async fn existing_targets(app: AppHandle, request: ConvertRequest) -> Result<Vec
     .await
 }
 
-/// One Library card's cover: a PNG data URL, or `None`.
-#[tauri::command]
-async fn library_cover(app: AppHandle, path: PathBuf) -> Result<Option<String>, String> {
-    blocking(app, move |_, _| {
-        ps5_dump_forge_core::library_cover(&path).map_err(err)
-    })
-    .await
-}
-
-/// `password`: an archive's, as `inspect` takes it.
 #[tauri::command]
 async fn default_output(
     app: AppHandle,
@@ -215,8 +187,7 @@ async fn default_output(
     .await
 }
 
-/// `password`: an archive's, as `inspect` takes it; `pack`: a Pack job's kind; `naming`: the
-/// name's template (`None`: the default `[{title}]-[{title_id}]`; an invalid one is an error).
+/// `naming`: `None` the default template; an invalid one is an error.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn generated_output(
@@ -245,7 +216,6 @@ async fn generated_output(
     .await
 }
 
-// An edit job's `edits` (and mode) come through as they are; core ignores its `output`.
 #[tauri::command]
 async fn start_job(app: AppHandle, request: ConvertRequest) -> Result<JobId, String> {
     blocking(app, move |app, state| {
@@ -265,15 +235,10 @@ async fn start_job(app: AppHandle, request: ConvertRequest) -> Result<JobId, Str
     .await
 }
 
-/// Deletes a file or folder for good (core's `Jobs::delete_path`; the UI asks first): never a
-/// drive root, the home folder or a folder holding it, nor anything an unfinished job uses,
-/// nor anything in a folder the Library refuses (`folder_refusal`: `~/Library`, the OS's
-/// own folders), which the File explorer could otherwise reach from the home folder.
-/// Under the quit lock.
+/// Under the quit lock; also refuses a refused folder (`folder_refusal`), which the File explorer could reach from home.
 #[tauri::command]
 async fn delete_path(app: AppHandle, path: PathBuf) -> Result<(), String> {
     blocking(app, move |app, state| {
-        // A peer's path (`flink://`) is judged by the peer; a NAS share's is refused by core.
         if !ps5_dump_forge_core::net::is_network(&path)
             && let Some(why) = folder_refusal(&path)
         {
@@ -291,11 +256,7 @@ async fn delete_path(app: AppHandle, path: PathBuf) -> Result<(), String> {
     .await
 }
 
-/// Moves or renames a file or folder on its drive (core's `Jobs::move_path`): `to` never
-/// replaced unless `replace` (the user confirmed it: a file over a file, a folder merged into
-/// a folder, the old file refused as `delete_path` refuses it), `from` refused as
-/// `delete_path` refuses it (the home folder protected), and either in a folder the Library
-/// refuses (`folder_refusal`). Under the quit lock, like `delete_path`.
+/// `to` replaced only with `replace`; refuses as `delete_path` does. Under the quit lock.
 #[tauri::command]
 async fn move_path(
     app: AppHandle,
@@ -324,15 +285,11 @@ async fn move_path(
     .await
 }
 
-/// The Storage tab's file explorer: one folder's entries (core's `list_dir`). Reads only;
-/// `parent` is the folder's own, the UI stops Up at its chosen root. A folder the Library
-/// refuses (`folder_refusal`: `/`, the OS's own folders) is refused here too.
+/// `parent` is the folder's own; the UI stops Up at its root. A refused folder is refused here too.
 #[tauri::command]
 async fn list_dir(app: AppHandle, path: PathBuf) -> Result<Listing, String> {
     blocking(app, move |_, _| {
-        // A NAS share (`smb://`, the NAS source picker) or a peer (`flink://`) has no local
-        // folder to refuse. A filesystem root (`/`, `C:\`) lists too: with no system dialog,
-        // the picker reaches other folders (`/srv`, another drive) through it.
+        // A NAS or peer path has no local folder to refuse; `/` and `C:\` list too (no system dialog, so the picker reaches other folders through them).
         if !ps5_dump_forge_core::net::is_network(&path)
             && path.parent().is_some()
             && let Some(why) = folder_refusal(&path)
@@ -344,17 +301,22 @@ async fn list_dir(app: AppHandle, path: PathBuf) -> Result<Listing, String> {
     .await
 }
 
-/// The File explorer's start before a folder is chosen: the user's home folder, if any.
+#[tauri::command]
+async fn free_space(app: AppHandle, path: PathBuf) -> Result<Option<u64>, String> {
+    blocking(app, move |_, _| Ok(ps5_dump_forge_core::free_space(&path))).await
+}
+
+#[tauri::command]
+fn bundled_ng_version() -> &'static str {
+    ps5_dump_forge_lz4::runtime::NG_VERSION
+}
+
 #[tauri::command]
 fn home_folder() -> Option<PathBuf> {
     std::env::home_dir().map(|h| dunce::simplified(&h).to_path_buf())
 }
 
-/// The picker's volume roots (Windows: drives A: to Z:; Linux: also every mounted disk) that open
-/// and that `list_dir` doesn't refuse, each once at its real path. Existence only: each root is
-/// opened, not read, on a thread of its own, 1.5 s for all,
-/// so a drive that stalls (a stale mapped drive, an empty floppy or optical drive) is left out by
-/// the deadline instead of holding the picker.
+/// Volume roots that open and that `list_dir` doesn't refuse, each once at its real path; a thread each, 1.5 s for all, so a stalled drive is left out.
 // ponytail: a root still stalled at the deadline leaves its thread running.
 #[tauri::command]
 async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
@@ -368,10 +330,7 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
                 .map(PathBuf::from)
                 .into()
         };
-        // Linux: every disk mounted anywhere is a root too (issue #52: `/var/mnt/datos`, `/srv`,
-        // a second disk from fstab), and a folder reached twice through a link (Fedora Atomic's
-        // `/media` -> `/run/media`, `/mnt` -> `/var/mnt`) is listed once, at its real path.
-        // Read lossily: a mount path that isn't UTF-8 then fails to open, the others still list.
+        // Linux: every mounted disk is a root too (issue #52), a folder reached twice through a link listed once; read lossily.
         #[cfg(target_os = "linux")]
         if let Ok(info) = std::fs::read("/proc/self/mountinfo") {
             candidates.extend(disk_mounts(&String::from_utf8_lossy(&info)));
@@ -387,7 +346,6 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
                 quiet_drive_errors();
                 let refused = path.parent().is_some() && folder_refusal(&path).is_some();
                 let opens = !refused && std::fs::read_dir(&path).is_ok();
-                // The real path, resolved here so a stalled mount waits out the deadline too.
                 let real = if cfg!(windows) {
                     path
                 } else {
@@ -396,8 +354,7 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
                 let _ = tx.send((i, opens.then_some(real)));
             });
         }
-        // The home folder is the picker's first root already: a home that is a disk of its own
-        // isn't listed again. Resolved on a thread too, within the same deadline.
+        // A home that is a disk of its own isn't listed again.
         const HOME: usize = usize::MAX;
         if let Some(home) = home_folder() {
             let tx = tx.clone();
@@ -425,9 +382,7 @@ async fn local_roots(app: AppHandle) -> Result<Vec<PathBuf>, String> {
     .await
 }
 
-/// The mount points in `/proc/self/mountinfo` text that are a disk's filesystem: not `/` (a root
-/// of its own) and none of the kernel's, container or package-image filesystems (`proc`, `tmpfs`,
-/// `overlay`, `squashfs`, ...). Mount points are octal-escaped there (`\040` a space).
+/// Mount points in `/proc/self/mountinfo` of disk filesystems: not `/`, no kernel, container or package-image ones.
 #[cfg(target_os = "linux")]
 fn disk_mounts(info: &str) -> Vec<PathBuf> {
     const DISK: [&str; 18] = [
@@ -444,7 +399,6 @@ fn disk_mounts(info: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `mountinfo`'s `\NNN` octal escapes undone (space, tab, newline, backslash).
 #[cfg(target_os = "linux")]
 fn unescape_mount(s: &str) -> String {
     let b = s.as_bytes();
@@ -468,8 +422,7 @@ fn unescape_mount(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// This thread's opens of an empty drive (floppy, card reader, optical) fail at once instead of
-/// asking for a disk (`SEM_FAILCRITICALERRORS`).
+/// Opens of an empty drive fail at once instead of asking for a disk (`SEM_FAILCRITICALERRORS`).
 #[cfg(windows)]
 fn quiet_drive_errors() {
     #[link(name = "kernel32")]
@@ -492,8 +445,6 @@ async fn cancel_job(app: AppHandle, id: JobId) -> Result<(), String> {
     .await
 }
 
-/// Leftover `.part` files and archive staging folders in `dirs` (missing ones skip), each
-/// folder listed once.
 #[tauri::command]
 async fn stale_parts(app: AppHandle, dirs: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
     blocking(app, move |_, _| {
@@ -513,8 +464,7 @@ async fn stale_parts(app: AppHandle, dirs: Vec<PathBuf>) -> Result<Vec<PathBuf>,
     .await
 }
 
-/// Shows a finished job's output in the file manager. The webview names a job, not a path,
-/// so only what this session published can be revealed.
+/// The webview names a job, not a path, so only what this session published can be revealed.
 #[tauri::command]
 async fn reveal(app: AppHandle, id: JobId) -> Result<(), String> {
     blocking(app, move |_, state| {
@@ -530,15 +480,13 @@ async fn reveal(app: AppHandle, id: JobId) -> Result<(), String> {
     .await
 }
 
-/// The header's GitHub button: the project page in the default browser. A fixed URL, so the
-/// webview can't have anything else opened.
+/// A fixed URL, so the webview can't have anything else opened.
 #[tauri::command]
 async fn open_repo() -> Result<(), String> {
     open_url("https://github.com/quer3q/ps5-dump-forge")
 }
 
-/// The running version and this build's release asset suffix (after `ps5-dump-forge-<v>-`),
-/// for the update check (`app/src/update.ts`).
+/// The version and this build's release asset name (`{v}` the version), for `app/src/update.ts`.
 #[tauri::command]
 fn update_target() -> HashMap<&'static str, String> {
     HashMap::from([
@@ -547,8 +495,7 @@ fn update_target() -> HashMap<&'static str, String> {
     ])
 }
 
-/// The update toast's Update button: release `version`'s archive for this build, downloaded by
-/// the default browser. Only a plain `X.Y.Z` makes it into the URL.
+/// Only a plain `X.Y.Z` makes it into the URL.
 #[tauri::command]
 async fn open_update(version: String) -> Result<(), String> {
     let parts: Vec<&str> = version.split('.').collect();
@@ -560,32 +507,27 @@ async fn open_update(version: String) -> Result<(), String> {
         return Err(format!("not a release version: {version}"));
     }
     open_url(&format!(
-        "https://github.com/quer3q/ps5-dump-forge/releases/download/v{version}/\
-         ps5-dump-forge-{version}-{}",
-        release_asset()
+        "https://github.com/quer3q/ps5-dump-forge/releases/download/v{version}/{}",
+        release_asset().replace("{v}", &version)
     ))
 }
 
-/// The release archive this build came from (the release scripts' names).
 fn release_asset() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos-universal.zip"
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "ps5-dump-forge-{v}-macos-arm64.dmg"
+    } else if cfg!(target_os = "macos") {
+        "ps5-dump-forge-{v}-macos-x86-64.dmg"
     } else if cfg!(all(windows, target_arch = "x86_64")) {
-        #[cfg(windows)]
-        if webview2::bundled().is_some() {
-            return "windows-x86-64-webview2.zip";
-        }
-        "windows-x86-64.zip"
+        "ps5-dump-forge-{v}-windows-x86-64.exe"
     } else if cfg!(windows) {
-        "windows-arm64.zip"
+        "ps5-dump-forge-{v}-windows-arm64.exe"
     } else if cfg!(target_arch = "aarch64") {
-        "linux-arm64.tar.gz"
+        "ps5-dump-forge-{v}-linux-arm64.AppImage"
     } else {
-        "linux-x86-64.tar.gz"
+        "ps5-dump-forge-{v}-linux-x86-64.AppImage"
     }
 }
 
-/// `url` in the default browser.
 fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("/usr/bin/open");
@@ -600,8 +542,7 @@ fn open_url(url: &str) -> Result<(), String> {
     run(cmd.arg(url)).map_err(|e| format!("could not open {url}: {e}"))
 }
 
-// macOS (`open -R`) and Windows (Explorer's `/select,`) select the file; Linux has no portable
-// way to, so `xdg-open` opens its folder.
+// Linux has no portable way to select the file, so `xdg-open` opens its folder.
 fn reveal_path(path: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -628,21 +569,37 @@ fn reveal_path(path: &Path) -> std::io::Result<()> {
 
 fn run(cmd: &mut std::process::Command) -> std::io::Result<()> {
     let status = cmd.status()?;
-    // Explorer exits non-zero even when it worked; elsewhere a failure means it didn't show
-    // (e.g. the output was moved or deleted since).
+    // Explorer exits non-zero even when it worked.
     if cfg!(not(target_os = "windows")) && !status.success() {
         return Err(std::io::Error::other(format!("{status}")));
     }
     Ok(())
 }
 
-/// Started by the release's forge.sh from its AppDir (`APPDIR` set), the app inherits library,
-/// GTK and GLib paths into the AppDir, which break host tools (tauri-apps/tauri#10617). forge.sh
-/// names them in `FORGE_HOST_VARS` and keeps each one's earlier value in `FORGE_HOST_<name>`
-/// (absent: it was unset); `cmd` gets those back. Any other run leaves `cmd` as it is.
+/// AppImage (`APPDIR` set): `cmd` gets every variable with an entry under `APPDIR` without those entries, and the ones `appimage_start` saved in `FORGE_HOST_VARS` / `FORGE_HOST_<name>` set back (tauri-apps/tauri#10617).
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn host_env(cmd: &mut std::process::Command) {
-    let Some(vars) = std::env::var_os("APPDIR").and(std::env::var_os("FORGE_HOST_VARS")) else {
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    // shortcut: a variable AppRun's hooks also gave a host entry (XDG_DATA_DIRS gets /usr/share)
+    // keeps that entry; saving every variable before AppRun would need a wrapper, as forge.sh was.
+    for (name, value) in std::env::vars_os() {
+        let all: Vec<_> = std::env::split_paths(&value).collect();
+        let kept: Vec<_> = all.iter().filter(|p| !p.starts_with(&appdir)).collect();
+        if kept.len() == all.len() {
+            continue;
+        }
+        match std::env::join_paths(kept) {
+            Ok(v) if !v.is_empty() => cmd.env(name, v),
+            _ => cmd.env_remove(name),
+        };
+    }
+    // AppRun's GTK hook's theme pick and linuxdeploy's Python switch: not the host's.
+    // ponytail: a GTK_THEME the host had set itself is lost too; AppRun overwrote it already.
+    cmd.env_remove("GTK_THEME")
+        .env_remove("PYTHONDONTWRITEBYTECODE");
+    let Some(vars) = std::env::var_os("FORGE_HOST_VARS") else {
         return;
     };
     for name in vars.to_string_lossy().split_whitespace() {
@@ -656,7 +613,67 @@ fn host_env(cmd: &mut std::process::Command) {
     cmd.env_remove("FORGE_HOST_VARS");
 }
 
-/// The user confirmed closing while jobs run: cancel them, wait for their cleanup, exit.
+/// AppImage: WebKitGTK's DMA-BUF renderer off unless the user set it (blank windows), and on Wayland the host's libwayland-client preloaded by a re-exec (the bundled one can crash against the host's driver stack); `FORGE_HOST_VARS` marks the re-exec'd run.
+#[cfg(target_os = "linux")]
+fn appimage_start() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    let ours = ["WEBKIT_DISABLE_DMABUF_RENDERER", "LD_PRELOAD"];
+    if std::env::var_os("APPDIR").is_none() || std::env::var_os("FORGE_HOST_VARS").is_some() {
+        return;
+    }
+    // SAFETY: the first thing main does, while the process has one thread.
+    unsafe {
+        for name in ours {
+            if let Some(v) = std::env::var_os(name) {
+                std::env::set_var(format!("FORGE_HOST_{name}"), v);
+            }
+        }
+        std::env::set_var("FORGE_HOST_VARS", ours.join(" "));
+        if std::env::var_os(ours[0]).is_none() {
+            std::env::set_var(ours[0], "1");
+        }
+    }
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("XDG_SESSION_TYPE").is_some_and(|v| v == "wayland");
+    let tag = if cfg!(target_arch = "x86_64") {
+        "x86-64"
+    } else {
+        "AArch64"
+    };
+    let ldconfig = |cmd: &str| Command::new(cmd).arg("-p").output();
+    let Some(out) = wayland
+        .then(|| {
+            ldconfig("ldconfig")
+                .or_else(|_| ldconfig("/sbin/ldconfig"))
+                .ok()
+        })
+        .flatten()
+    else {
+        return;
+    };
+    // `\tlibwayland-client.so.0 (libc6,x86-64) => /lib/x86_64-linux-gnu/libwayland-client.so.0`
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lib = text.lines().find_map(|line| {
+        let named = line.split_whitespace().next() == Some("libwayland-client.so.0");
+        let lib = line.rsplit(' ').next()?;
+        (named && line.contains(tag) && Path::new(lib).exists()).then(|| lib.to_string())
+    });
+    let (Some(lib), Ok(exe)) = (lib, std::env::current_exe()) else {
+        return;
+    };
+    let preload = match std::env::var("LD_PRELOAD") {
+        Ok(old) if !old.is_empty() => format!("{lib}:{old}"),
+        _ => lib,
+    };
+    // Returns only when the exec fails: then the app runs on without the preload.
+    let err = Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("LD_PRELOAD", preload)
+        .exec();
+    eprintln!("PS5 Dump Forge: can't restart with the host's libwayland-client: {err}");
+}
+
 #[tauri::command]
 async fn quit_app(app: AppHandle) -> Result<(), String> {
     blocking(app, |app, state| {
@@ -668,7 +685,7 @@ async fn quit_app(app: AppHandle) -> Result<(), String> {
     .await
 }
 
-/// Close, Cmd+Q or last window gone: `true` to quit now (idle), else the UI asks first.
+/// `true` to quit now (idle), else the UI asks first.
 fn request_quit(app: &AppHandle) -> bool {
     match app.try_state::<AppState>().map_or(Ok(()), |s| s.try_quit()) {
         Ok(()) => true,
@@ -679,8 +696,7 @@ fn request_quit(app: &AppHandle) -> bool {
     }
 }
 
-/// The default macOS menu, except that Quit is ours: the predefined one sends
-/// `terminate:`, which exits without asking the app (tauri-apps/tauri#9198).
+/// The default macOS menu, but Quit is ours: the predefined one sends `terminate:`, which exits without asking (tauri-apps/tauri#9198).
 #[cfg(target_os = "macos")]
 fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem as P, Submenu};
@@ -731,9 +747,7 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     Menu::with_items(app, &[&forge, &edit, &window])
 }
 
-/// WebView2 on Windows: the runtime bundled in a `WebView2` folder next to the exe (the
-/// x86-64 `-webview2.zip`), else the installed Evergreen one. Every failure ends in a native
-/// message box and exit code 1: a release build has no console to print to.
+/// WebView2 on Windows: a runtime in a `WebView2` folder next to the exe, else the installed Evergreen one; a failure ends in a message box and exit code 1 (no console).
 #[cfg(windows)]
 mod webview2 {
     use std::os::windows::ffi::OsStrExt;
@@ -745,10 +759,8 @@ mod webview2 {
     use webview2_com::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2BrowserVersionString;
     use webview2_com::{CoTaskMemPWSTR, take_pwstr};
 
-    /// Microsoft's Evergreen bootstrapper.
-    const EVERGREEN: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
-    /// The Windows 10 sandbox fix for fixed runtimes >= 120 (Microsoft's WebView2 distribution
-    /// docs): read/execute for ALL RESTRICTED APPLICATION PACKAGES and ALL APPLICATION PACKAGES.
+    const EVERGREEN: &str = "https://developer.microsoft.com/microsoft-edge/webview2/";
+    /// The Windows 10 sandbox fix for fixed runtimes >= 120: read/execute for ALL RESTRICTED APPLICATION PACKAGES and ALL APPLICATION PACKAGES.
     const GRANTS: [&str; 2] = ["*S-1-15-2-2:(OI)(CI)(RX)", "*S-1-15-2-1:(OI)(CI)(RX)"];
 
     #[link(name = "user32")]
@@ -792,8 +804,7 @@ mod webview2 {
         fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
     }
 
-    /// Runs first in `main`, before Tauri or any other thread: picks the runtime, fixes its
-    /// ACLs on Windows 10, and stops here when no runtime can start.
+    /// Runs first in `main`, before any other thread.
     pub fn prepare() {
         let Some(dir) = bundled() else {
             if !available(None) {
@@ -811,28 +822,25 @@ mod webview2 {
         }
     }
 
-    /// The window (or the app) could not be created even though a runtime was found.
     pub fn startup_failed(err: &dyn std::fmt::Display) -> ! {
         match bundled() {
             Some(dir) => fail(&bundled_broken(&dir, &err.to_string())),
             None if !available(None) => fail(&no_runtime()),
             None => fail(&format!(
                 "PS5 Dump Forge could not open its window:\n\n{err}\n\n\
-                 It keeps its WebView data in the \"data\" folder next to PS5 Dump Forge.exe, so \
-                 that folder must be writable: extract the zip to a folder of your own (not \
-                 Program Files) and start it from there."
+                 It keeps its WebView data in the \"data\" folder next to the app, so that \
+                 folder must be writable: move the app to a folder of your own (not Program \
+                 Files) and start it from there."
             )),
         }
     }
 
-    /// `WebView2` next to the exe. No fallback to Evergreen once it exists: a broken bundled
-    /// runtime is reported, not silently replaced.
+    /// No fallback to Evergreen once it exists: a broken bundled runtime is reported.
     pub fn bundled() -> Option<PathBuf> {
         let dir = std::env::current_exe().ok()?.parent()?.join("WebView2");
         dir.is_dir().then_some(dir)
     }
 
-    /// A runtime is installed (`folder: None`) or `folder` holds one.
     fn available(folder: Option<&Path>) -> bool {
         // An empty string makes a null pointer: "look for an installed runtime".
         let folder = folder.map(|f| f.to_string_lossy()).unwrap_or_default();
@@ -863,10 +871,8 @@ mod webview2 {
         unsafe { RtlGetVersion(&mut info) == 0 && info.major == 10 && info.build < 22000 }
     }
 
-    /// Grants the sandbox read/execute on the bundled runtime: a zip carries no ACLs, and
-    /// without them its processes fail to start on Windows 10.
-    // ponytail: runs on each Windows 10 launch (idempotent, re-applying the same entries);
-    // remembering that it was done would need a marker file.
+    /// A folder unpacked by hand may carry no ACLs, and without them its processes fail to start on Windows 10.
+    // ponytail: runs on each Windows 10 launch (idempotent); skipping it would need a marker file.
     fn grant_sandbox_access(dir: &Path) {
         // FAT32 and exFAT keep no ACLs (icacls fails there), and need none.
         if persistent_acls(dir) == Some(false) {
@@ -907,7 +913,6 @@ mod webview2 {
         ));
     }
 
-    /// Whether `dir`'s volume stores ACLs (`FILE_PERSISTENT_ACLS`); `None` if the query fails.
     fn persistent_acls(dir: &Path) -> Option<bool> {
         const FILE_PERSISTENT_ACLS: u32 = 0x8;
         let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
@@ -932,38 +937,17 @@ mod webview2 {
     }
 
     fn no_runtime() -> String {
-        // Only the x86-64 release has a zip with the runtime in it.
-        let bundled_zip = if cfg!(target_arch = "x86_64") {
-            format!(
-                "\n\nor use ps5-dump-forge-{}-windows-x86-64-webview2.zip instead, which carries \
-                 the runtime in its WebView2 folder.",
-                env!("CARGO_PKG_VERSION")
-            )
-        } else {
-            String::new()
-        };
         format!(
             "PS5 Dump Forge needs the Microsoft Edge WebView2 Runtime, and it is not installed.\n\n\
-             Install it from\n{EVERGREEN}{bundled_zip}"
+             Install the Evergreen WebView2 Runtime from\n{EVERGREEN}"
         )
     }
 
     fn bundled_broken(dir: &Path, detail: &str) -> String {
-        // Only the x86-64 webview2 zip ships the folder; anywhere else it was added by hand.
-        let fix = if cfg!(target_arch = "x86_64") {
-            format!(
-                "Delete the WebView2 folder and extract it again from the zip, or use \
-                 ps5-dump-forge-{}-windows-x86-64.zip with the installed WebView2 Runtime \
-                 ({EVERGREEN}).",
-                env!("CARGO_PKG_VERSION")
-            )
-        } else {
-            format!(
-                "Delete the WebView2 folder to use the installed WebView2 Runtime ({EVERGREEN})."
-            )
-        };
         format!(
-            "The WebView2 runtime bundled in\n{}\nfailed to start:\n\n{detail}\n\n{fix}\n\n\
+            "The WebView2 runtime in\n{}\nfailed to start:\n\n{detail}\n\n\
+             Delete the WebView2 folder to use the installed Evergreen WebView2 Runtime \
+             ({EVERGREEN}).\n\n\
              The app's folder must also be writable (its WebView data lives in the \"data\" folder \
              beside it) and on a local drive.",
             dir.display()
@@ -987,15 +971,13 @@ mod webview2 {
     }
 }
 
-// ---- Connect: the same calls as the server's `/api/connect/*` (snake_case arguments) ------
+// ---- Connect: the same calls as the server's `/api/connect/*` ----
 
-/// Connect's service, or why it isn't running.
 fn connect(state: &AppState) -> Result<&Connect, String> {
     state.connect.as_deref().map_err(Clone::clone)
 }
 
-/// Runs `f` on Connect off the main thread; an error is `connect::error_text` (a refusal's
-/// code, which the UI translates, else the text).
+/// An error is `connect::error_text` (a refusal's code, which the UI translates, else the text).
 async fn connect_call<T: Send + 'static>(
     app: AppHandle,
     f: impl FnOnce(&Connect) -> std::io::Result<T> + Send + 'static,
@@ -1006,27 +988,22 @@ async fn connect_call<T: Send + 'static>(
     .await
 }
 
-/// This device, saved devices and the last search.
 #[tauri::command]
 async fn connect_state(app: AppHandle) -> Result<serde_json::Value, String> {
     connect_call(app, |c| Ok(c.snapshot())).await
 }
 
-/// Asks a paired peer to cancel its job shown here; false when it isn't listed.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_cancel_job(app: AppHandle, key_id: String, job: JobId) -> Result<bool, String> {
     connect_call(app, move |c| Ok(c.cancel_remote_job(&key_id, job))).await
 }
 
-/// Asks the paired PS5 `key_id` to install the `.pkg` at `path` on this computer (read over
-/// FLINK; the job shows here mirrored); the PS5's job id.
 #[tauri::command]
 async fn connect_install(app: AppHandle, key_id: String, path: PathBuf) -> Result<JobId, String> {
     blocking(app, move |_, state| connect(state)?.install(&key_id, &path)).await
 }
 
-/// Times the link to the paired device `key_id`: 256 MiB sent, then fetched, over FLINK's
-/// lanes, nothing written to disk on either side. `run` is the UI's id for this test.
+/// 128 MiB each way over FLINK's lanes, nothing written to disk; `run` is the UI's id for this test.
 #[tauri::command]
 async fn connect_speed_test(
     app: AppHandle,
@@ -1039,8 +1016,7 @@ async fn connect_speed_test(
     .await
 }
 
-/// Stops the speed test `run` with the paired device `key_id` (it ends `cancelled`; a run not
-/// started yet ends so as it starts).
+/// A run not started yet ends `cancelled` as it starts.
 #[tauri::command]
 async fn connect_speed_test_cancel(
     app: AppHandle,
@@ -1054,13 +1030,11 @@ async fn connect_speed_test_cancel(
     .await
 }
 
-/// Asks the device at `address` to pair; `connect_state`'s `outgoing` follows it.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_pair(app: AppHandle, address: String) -> Result<(), String> {
     connect_call(app, move |c| c.pair(&address)).await
 }
 
-/// What answers at `address` (Forge, SMB, NFS or FTP): Pair by address decides by it.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_probe(
     app: AppHandle,
@@ -1069,9 +1043,7 @@ async fn connect_probe(
     connect_call(app, move |c| c.probe(&address)).await
 }
 
-/// Install on PS5: v`version`'s PS5 ELF downloaded from its GitHub release into memory here and
-/// streamed to elfldr at `address` (port 9021 by default), which starts it; the console needs no
-/// internet.
+/// The ELF downloaded into memory here and streamed to elfldr; the console needs no internet.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_payload_install(
     app: AppHandle,
@@ -1087,8 +1059,6 @@ async fn connect_payload_install(
     .await
 }
 
-/// Send a payload: the ELF file at `path` streamed to elfldr at `address` (port 9021 by
-/// default); the bytes sent.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_payload_send(
     app: AppHandle,
@@ -1111,8 +1081,7 @@ async fn connect_pair_cancel(app: AppHandle) -> Result<(), String> {
     .await
 }
 
-/// This device's user answers another device's pairing request `id` (only here, in its own
-/// window: the app has no HTTP listener).
+/// Only here, in its own window: the app has no HTTP listener.
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_approve(app: AppHandle, id: String, allow: bool) -> Result<bool, String> {
     connect_call(app, move |c| Ok(c.approve(&id, allow))).await
@@ -1141,9 +1110,7 @@ async fn connect_discover_stop(app: AppHandle) -> Result<(), String> {
     .await
 }
 
-/// Saves a NAS (one entry per host + port, updated in place; `id`: the entry an edit
-/// changes); its id. `user`/`password` omitted keep the saved ones.
-// Tauri takes the request's fields as the command's arguments.
+/// `user`/`password` omitted keep the saved ones.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command(rename_all = "snake_case")]
 async fn connect_nas_save(
@@ -1174,6 +1141,8 @@ async fn connect_nas_forget(app: AppHandle, id: String) -> Result<bool, String> 
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    appimage_start();
     #[cfg(windows)]
     webview2::prepare();
     let builder = tauri::Builder::default();
@@ -1204,16 +1173,14 @@ fn main() {
                 }
                 Err(e) => Err(format!("Connect couldn't start: no app data folder: {e}")),
             };
-            // A peer's writes never land in what this device's unfinished jobs use (none
-            // before the first job creates the runner).
+            // A peer's writes never land in what this device's unfinished jobs use.
             if let Ok(connect) = &connect {
                 let handle = app.handle().clone();
                 connect.set_busy(Arc::new(move |path| {
                     (handle.try_state::<AppState>())
                         .is_some_and(|s| s.jobs.get().is_some_and(|jobs| jobs.uses(path)))
                 }));
-                // A peer's replacing rename is refused as a job's replace is (the home folder
-                // kept): the runner is made if none is yet, which sets what it protects.
+                // A peer's replacing rename is refused as a job's replace is; the runner is made if none is yet.
                 let handle = app.handle().clone();
                 connect.set_replace_check(Arc::new(move |path| {
                     match handle.try_state::<AppState>() {
@@ -1221,8 +1188,7 @@ fn main() {
                         None => Err("PS5 Dump Forge is starting; try again".to_string()),
                     }
                 }));
-                // A peer's Delete and Move to here are this device's own (the home folder
-                // kept), refused while quitting.
+                // A peer's Delete and Move to here are this device's own, refused while quitting.
                 use ps5_dump_forge_core::DeleteError;
                 let keep = || -> Vec<PathBuf> { std::env::home_dir().into_iter().collect() };
                 let starting = || DeleteError::Refused("PS5 Dump Forge is starting".into());
@@ -1233,7 +1199,6 @@ fn main() {
                     if *quitting {
                         return Err(DeleteError::Refused("PS5 Dump Forge is quitting".into()));
                     }
-                    // The folders this app's own Delete refuses (`~/Library`, the OS's), too.
                     if let Some(why) = folder_refusal(path) {
                         return Err(DeleteError::Refused(why));
                     }
@@ -1253,7 +1218,6 @@ fn main() {
                         state.jobs(&handle).move_path(from, to, replace, &keep())
                     });
                 connect.set_delete_move(delete, move_);
-                // A peer shown one of this device's jobs may cancel it.
                 let handle = app.handle().clone();
                 connect.set_cancel(Arc::new(move |id| {
                     if let Some(state) = handle.try_state::<AppState>()
@@ -1276,22 +1240,18 @@ fn main() {
                 peers_active,
             });
 
-            // The drag and drop handler stays on (Tauri 2's default): the Edit tab hears
-            // drops of host files through `onDragDropEvent` (`core:event:allow-listen`).
+            // Tauri 2's drag and drop handler stays on: Edit hears host files through `onDragDropEvent`.
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                // The web build's page title says the same (vite.config.ts).
                 .title(concat!("PS5 Dump Forge v", env!("CARGO_PKG_VERSION")))
                 .inner_size(1200.0, 820.0)
                 .min_inner_size(900.0, 620.0);
-            // WebView data (the UI language's localStorage) goes to `<app dir>/data/webview`,
-            // except on macOS where WKWebView storage can't be moved: WebKit's own per-app store.
+            // WebView data goes to `<app dir>/data/webview`, except on macOS (WebKit's own per-app store).
             #[cfg(not(target_os = "macos"))]
             let window = match webview_dir {
                 Some(dir) => window.data_directory(dir),
                 None => window,
             };
-            // Tauri runs this hook from its event loop and would only panic on an error,
-            // which a Windows release build never shows.
+            // Tauri would only panic on an error here, which a Windows release build never shows.
             #[cfg(windows)]
             if let Err(err) = window.build() {
                 webview2::startup_failed(&err);
@@ -1309,9 +1269,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             inspect,
-            library_scan,
-            library_cover,
             host_tree,
+            pack_estimate,
             edit_check,
             existing_targets,
             default_output,
@@ -1322,7 +1281,9 @@ fn main() {
             delete_path,
             move_path,
             list_dir,
+            free_space,
             home_folder,
+            bundled_ng_version,
             local_roots,
             reveal,
             open_repo,
@@ -1379,7 +1340,6 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The quit check hears the peers' hook as it hears this app's jobs.
     #[test]
     fn a_peer_using_files_here_holds_a_quit_back() {
         let busy = Arc::new(AtomicBool::new(true));

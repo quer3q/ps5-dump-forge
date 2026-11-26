@@ -1,13 +1,8 @@
-//! Reading PFS images (`.ffpfs`, and the outer image of a `.ffpfsc`) and the image inside a
-//! `.ffpfsc`.
+//! Reading PFS images (`.ffpfs`, a `.ffpfsc`'s outer image) and the image inside a `.ffpfsc`.
 //!
-//! Every length and pointer comes from the file, so nothing is trusted: counts are capped
-//! before anything is allocated from them, each node's pointers must be the one layout the
-//! writers make (validated, not assumed), names are decoded strictly, and a damaged or hostile
-//! image is an error, never a panic or a silent skip. A compressed file is read through its
-//! PFSC container one 64 KiB block at a time, with a bounded inflate. The console looks files
-//! up through the flat path table, so it (and the collision resolver) must be exactly what the
-//! walked tree encodes to.
+//! Nothing is trusted: counts capped before allocating, pointers must be the writers' one layout,
+//! names decoded strictly; damage is an error, never a panic or a skip. The flat path table and
+//! resolver must be exactly what the walked tree encodes to (the console looks files up there).
 //! ponytail: contiguous nodes only (`db[0]` plus a run, no indirect blocks): what MkPFS and this
 //! crate write; anything else is refused as an unsupported layout.
 
@@ -29,35 +24,30 @@ use crate::image::{
 use crate::wrap::{PFSC_HEADER_LEN, PFSC_MAGIC, PFSC_TABLE_AT};
 use crate::{BLOCK, err, le16, le32, le64};
 
-/// The most files and directories an image may list, as the vendored exFAT/UFS2 readers.
 const MAX_ENTRIES: u64 = 1_000_000;
-/// Inodes the table may declare: the entries plus the internal ones.
 const MAX_INODES: u64 = MAX_ENTRIES + 16;
 const MAX_DEPTH: u32 = 32;
 const MAX_PATH_BYTES: u64 = 256 << 20;
-/// Decoded PFSC blocks kept per file: a sequential read needs one, a directory walk a few.
 const CACHE_BLOCKS: usize = 8;
 /// The most blocks one read decodes together (16 MiB).
 const MANY_BLOCKS: u64 = 256;
 
-/// The header's facts, for verification and inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PfsHeader {
     /// 1 (PS4) or 2 (PS5).
     pub version: u64,
-    /// Mode bits; this reader takes only case-sensitivity (0x8).
+    /// Mode bits (0x8 case-insensitive).
     pub mode: u16,
-    /// Bytes; a power of two, 4 KiB..64 KiB. The console misreads anything but 64 KiB.
+    /// 4 KiB..64 KiB; the console misreads anything but 64 KiB.
     pub block_size: u32,
     pub inodes: u64,
     pub inode_blocks: u64,
-    /// The image's length in blocks, as the header declares it.
+    /// As the header declares it.
     pub ndblock: u64,
     /// The bytes actually there.
     pub image_len: u64,
 }
 
-/// One inode, as much of it as the walk needs.
 #[derive(Debug, Clone, Copy)]
 struct Inode {
     mode: u16,
@@ -66,17 +56,14 @@ struct Inode {
     size_compressed: u64,
     blocks: u64,
     db0: i64,
-    /// What every one of `db[1..12]` holds when they all agree and every `ib` is 0: -1 for a
-    /// contiguous run from `db0`, 0 for the super-root.
+    /// `db[1..12]`'s one value when they agree and every `ib` is 0 (-1 a run, 0 the super-root).
     fill: Option<i32>,
 }
 
-/// Where a file's bytes are, by absolute offset.
 #[derive(Debug, Clone, Copy)]
 struct Extent {
     at: u64,
     stored: u64,
-    /// Logical length.
     len: u64,
     compressed: bool,
 }
@@ -89,7 +76,6 @@ pub struct PfsSource {
     files: Vec<SourceFile>,
     empty_dirs: Vec<String>,
     index: HashMap<String, Extent>,
-    /// The compressed file read last, with its decoded blocks.
     pfsc: Option<(String, Pfsc)>,
 }
 
@@ -99,7 +85,7 @@ impl PfsSource {
         Self::from_reader(Box::new(file), path.display().to_string())
     }
 
-    /// Parses the header and walks the whole tree; `label` prefixes every error.
+    /// `label` prefixes every error.
     pub fn from_reader(mut r: Box<dyn ReadSeek>, label: String) -> Result<Self> {
         let walked = walk(&mut *r).map_err(|e| prefix(&label, e))?;
         Ok(Self {
@@ -117,7 +103,6 @@ impl PfsSource {
         &self.header
     }
 
-    /// The file at `path` as its own `Read + Seek`, decoded if it is compressed.
     fn into_reader(mut self, path: &str) -> Result<Window> {
         let e = self.extent(path)?;
         let pfsc = if e.compressed {
@@ -170,7 +155,6 @@ impl SourceTree for PfsSource {
             self.r.read_exact(&mut buf)?;
             return Ok(buf);
         }
-        // The container is checked before its logical length sizes anything.
         if self.pfsc.as_ref().is_none_or(|(p, _)| p != path) {
             let pfsc = Pfsc::open(&mut *self.r, e).map_err(|x| prefix(&self.label, x))?;
             self.pfsc = Some((path.to_string(), pfsc));
@@ -181,9 +165,13 @@ impl SourceTree for PfsSource {
         };
         let mut done = 0;
         while done < n {
-            let got = pfsc
-                .read_at(&mut *self.r, offset + done as u64, &mut buf[done..])
-                .map_err(|x| prefix(&self.label, x))?;
+            let pos = offset + done as u64;
+            let got = if pos % BLOCK + (n - done) as u64 > 2 * BLOCK {
+                pfsc.read_many(&mut *self.r, pos, &mut buf[done..])
+            } else {
+                pfsc.read_at(&mut *self.r, pos, &mut buf[done..])
+            }
+            .map_err(|x| prefix(&self.label, x))?;
             done += got;
         }
         Ok(buf)
@@ -194,7 +182,6 @@ impl SourceTree for PfsSource {
     }
 }
 
-/// What the walk found.
 struct Walked {
     header: PfsHeader,
     files: Vec<SourceFile>,
@@ -202,7 +189,6 @@ struct Walked {
     index: HashMap<String, Extent>,
 }
 
-/// The header, checked.
 fn read_header(r: &mut dyn ReadSeek) -> Result<PfsHeader> {
     let image_len = r.seek(SeekFrom::End(0))?;
     let mut h = [0u8; 0x400];
@@ -252,7 +238,6 @@ fn read_header(r: &mut dyn ReadSeek) -> Result<PfsHeader> {
     })
 }
 
-/// The inode table, read a block at a time.
 fn read_inodes(r: &mut dyn ReadSeek, h: &PfsHeader) -> Result<Vec<Inode>> {
     let bs = u64::from(h.block_size);
     let per_block = bs / INODE_LEN as u64;
@@ -280,8 +265,7 @@ fn read_inodes(r: &mut dyn ReadSeek, h: &PfsHeader) -> Result<Vec<Inode>> {
     Ok(inodes)
 }
 
-/// Where node `n`'s bytes are: `(offset, stored length, logical length, compressed)`.
-/// Refuses any layout but one contiguous run inside the image.
+/// Where node `n`'s bytes are; any layout but one contiguous run inside the image is refused.
 fn extent(h: &PfsHeader, inodes: &[Inode], n: u32, what: &str) -> Result<Extent> {
     let bad = |why: &str| err(format!("{what} (inode {n}): {why}"));
     let ino = inodes
@@ -300,9 +284,7 @@ fn extent(h: &PfsHeader, inodes: &[Inode], n: u32, what: &str) -> Result<Extent>
         return Err(bad("size out of range"));
     }
     let bs = u64::from(h.block_size);
-    // The run is inside the header's blocks, and its bytes inside the file. The last block may
-    // be short: a third-party writer ends the file at its last data byte (issue #65), and only
-    // `stored` bytes are ever read.
+    // The last block may be short: a third-party writer ends at its last data byte (issue #65).
     let in_image = ino.db0 > 0
         && (ino.db0 as u64)
             .checked_add(ino.blocks)
@@ -320,8 +302,7 @@ fn extent(h: &PfsHeader, inodes: &[Inode], n: u32, what: &str) -> Result<Extent>
     })
 }
 
-/// One directory's entries, streamed from its run, checked: `(inode, type, name)`. More than
-/// `budget` of them (plus `.` and `..`) is an error before they are all held.
+/// One directory's `(inode, type, name)`s; more than `budget` (plus `.`, `..`) is an error.
 fn dir_entries(
     r: &mut dyn ReadSeek,
     e: Extent,
@@ -524,12 +505,10 @@ fn walk(r: &mut dyn ReadSeek) -> Result<Walked> {
     })
 }
 
-/// Why the path table matters, for its errors.
 const CONSOLE: &str = "the console looks files up through it";
 
-/// The flat path table and collision resolver must be byte for byte what the writer (and
-/// MkPFS) encode for the walked tree; the resolver exists iff two paths share a hash. Each is
-/// read only when its length is the expected one, so the expected length bounds the read.
+/// The path table and resolver must be byte for byte what the writer encodes; each is read only
+/// at its expected length, which bounds the read.
 fn check_path_table(
     r: &mut dyn ReadSeek,
     h: &PfsHeader,
@@ -572,10 +551,8 @@ fn check_path_table(
     Ok(())
 }
 
-/// A PFSC container inside a file's extent. Its offset table is read lazily, the two entries
-/// a block needs at a time, and checked as it is read; decoded blocks are cached.
+/// A PFSC container inside a file's extent; its offset table is read lazily and checked as read.
 struct Pfsc {
-    /// The container's start, its stored length and the logical length.
     at: u64,
     stored: u64,
     len: u64,
@@ -586,7 +563,6 @@ struct Pfsc {
 }
 
 impl Pfsc {
-    /// Checks the header and both ends of the table against the extent.
     fn open(r: &mut dyn ReadSeek, e: Extent) -> Result<Self> {
         let bad = |why: &str| err(format!("damaged PFSC container: {why}"));
         if e.stored < PFSC_HEADER_LEN as u64 {
@@ -631,7 +607,6 @@ impl Pfsc {
         Ok(u64::from_le_bytes(b))
     }
 
-    /// Block `n`'s stored span, checked.
     fn span(&self, r: &mut dyn ReadSeek, n: u64) -> Result<(u64, u64)> {
         let mut b = [0u8; 16];
         r.seek(SeekFrom::Start(self.at + PFSC_TABLE_AT + n * 8))?;
@@ -645,8 +620,7 @@ impl Pfsc {
         Ok((start, end))
     }
 
-    /// Every span, read in one pass: the count of compressed blocks, and the level class the
-    /// first one's zlib header records (`FLEVEL`: 0 fastest, 1 fast, 2 default, 3 maximum).
+    /// Every span in one pass: the compressed block count and the first one's zlib `FLEVEL`.
     fn compressed_blocks(&self, r: &mut dyn ReadSeek) -> Result<(u64, Option<u8>)> {
         r.seek(SeekFrom::Start(self.at + PFSC_TABLE_AT))?;
         let mut t = BufReader::with_capacity(BLOCK as usize, &mut *r);
@@ -682,15 +656,12 @@ impl Pfsc {
         Ok((n, hint))
     }
 
-    /// Up to `buf.len()` logical bytes at `pos` across blocks `pos / BLOCK` on: their table
-    /// entries and stored bytes read in one pass each, inflated on every core. The last block
-    /// is cached for the next read, which usually starts in it.
+    /// Up to `buf.len()` logical bytes at `pos` over up to `MANY_BLOCKS`, inflated on every core;
+    /// the last block is cached for the next read.
     fn read_many(&mut self, r: &mut dyn ReadSeek, pos: u64, buf: &mut [u8]) -> Result<usize> {
-        // The rest of a cached block first (the last call's), so it is not inflated again.
         if self.cache.iter().any(|(b, _)| *b == pos / BLOCK) {
             return self.read_at(r, pos, buf);
         }
-        // At most MANY_BLOCKS per call (a short read is a read), so memory stays bounded.
         let room = MANY_BLOCKS * BLOCK - pos % BLOCK;
         let want = (buf.len() as u64)
             .min(self.len.saturating_sub(pos))
@@ -757,7 +728,7 @@ impl Pfsc {
         Ok(want)
     }
 
-    /// Decoded block `n`: a 64 KiB span is raw, a shorter one inflates to exactly 64 KiB.
+    /// A 64 KiB span is raw, a shorter one inflates to exactly 64 KiB.
     fn block(&mut self, r: &mut dyn ReadSeek, n: u64) -> Result<&[u8]> {
         if let Some(i) = self.cache.iter().position(|(b, _)| *b == n) {
             let hit = self.cache.remove(i);
@@ -789,7 +760,6 @@ impl Pfsc {
         Ok(self.cache.last().map_or(&[][..], |(_, b)| &b[..]))
     }
 
-    /// Up to `buf.len()` logical bytes at `pos`, within one block.
     fn read_at(&mut self, r: &mut dyn ReadSeek, pos: u64, buf: &mut [u8]) -> Result<usize> {
         if pos >= self.len || buf.is_empty() {
             return Ok(0);
@@ -804,8 +774,7 @@ impl Pfsc {
     }
 }
 
-/// A stored block into its 64 KiB: a full-length span is raw, a shorter one must inflate to
-/// exactly 64 KiB (as [`Pfsc::block`] requires; bytes after the zlib stream are ignored there too).
+/// As [`Pfsc::block`], into `out`.
 fn inflate_into(stored: &[u8], out: &mut [u8]) -> bool {
     if stored.len() == out.len() {
         out.copy_from_slice(stored);
@@ -818,7 +787,7 @@ fn inflate_into(stored: &[u8], out: &mut [u8]) -> bool {
     ) && z.total_out() == out.len() as u64
 }
 
-/// One file of an image as its own bytes: a window into the image, decoded if compressed.
+/// One file of an image as its own bytes, decoded if compressed.
 struct Window {
     r: Box<dyn ReadSeek>,
     at: u64,
@@ -832,7 +801,6 @@ impl Read for Window {
         if self.pos >= self.len || buf.is_empty() {
             return Ok(0);
         }
-        // A read over three blocks or more decodes them together, on every core.
         let many = |p: &Pfsc, pos: u64| {
             let end = (pos + buf.len() as u64).min(p.len);
             end.div_ceil(BLOCK).saturating_sub(pos / BLOCK) >= 3
@@ -873,25 +841,19 @@ impl Seek for Window {
     }
 }
 
-/// The container side of a `.ffpfsc`, for checks and inspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfpfscInfo {
     /// The nested image's name (`PPSA01234.exfat`), which picks its filesystem.
     pub inner_name: String,
-    /// The nested image's length.
     pub raw_size: u64,
-    /// Its bytes as stored: the PFSC container, or the image itself when not compressed.
+    /// The PFSC container's, or the image's when not compressed.
     pub stored_size: u64,
     pub compressed: bool,
     /// PFSC blocks (64 KiB of the nested image each); 0 when not compressed.
     pub blocks: u64,
-    /// Of those, the ones stored compressed.
     pub compressed_blocks: u64,
-    /// The level class the first compressed block's zlib header records (`FLEVEL`: 0 fastest,
-    /// 1 fast, 2 default, 3 maximum; this app's writer gives levels 1, 2–3, 4–8 and 9
-    /// those classes; level 0 writes no zlib stream); `None` with none compressed.
+    /// The first compressed block's zlib `FLEVEL` (0 fastest..3 maximum; levels 1, 2–3, 4–8, 9).
     pub zlib_level_class: Option<u8>,
-    /// The outer PFS image.
     pub outer: PfsHeader,
 }
 
@@ -904,9 +866,7 @@ fn is_nested_image(name: &str) -> bool {
         || lower == "pfs_image.dat"
 }
 
-/// Opens the image inside a `.ffpfsc`: the outer PFS must hold exactly one nested image in
-/// its root; that image's filesystem is picked by its name (exFAT, UFS2 or PFS) and read
-/// through the vendored readers or [`PfsSource`].
+/// Opens the image inside a `.ffpfsc` (exactly one in its root, its filesystem by its name).
 pub fn open_ffpfsc(
     reader: Box<dyn ReadSeek>,
     label: &str,

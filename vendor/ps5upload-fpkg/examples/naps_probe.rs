@@ -3,7 +3,7 @@
 //!
 //! `cargo run -p ps5upload-fpkg --example naps_probe -- <pkg> [ublocks-from-the-end]`
 
-use ps5upload_fpkg::{cnt, crypto, fih, naps, outer, PkgFile};
+use ps5upload_fpkg::{crypto, fih, kraken_image, naps, pkg_source, PkgFile};
 
 fn main() -> ps5upload_fpkg::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -12,18 +12,9 @@ fn main() -> ps5upload_fpkg::Result<()> {
 
     let mut pkg = PkgFile::open(std::path::Path::new(&path))?;
     let head = pkg.read_at(0, fih::HEADER_LEN)?;
-    let parsed = fih::parse(&head)?;
-    let container = cnt::read(&mut pkg, parsed.cnt_offset)?;
-    let image = outer::open(&mut pkg, &parsed, &container, crypto::DEFAULT_PASSCODE)?;
-    let nodes = image.dinodes();
-    let uroot = nodes.get(2).unwrap();
-    let mut blob = None;
-    for d in image.dirents(uroot) {
-        if d.name == "naps_pkg_layout.dat" {
-            blob = Some(image.file_data(&nodes[d.ino as usize]));
-        }
-    }
-    let blob = blob.expect("no naps_pkg_layout.dat in uroot");
+    // Streamed through the outer image: a 40 GB package is read a few blocks at a time.
+    let blob =
+        pkg_source::layout_descriptor(std::path::Path::new(&path), crypto::DEFAULT_PASSCODE)?;
     if std::env::var("NAPS_HEX").is_ok() {
         // The section strides are validated by subtraction, which hides an off-by-N inside a
         // wrong stride; small descriptors are small enough to read directly.
@@ -33,16 +24,10 @@ fn main() -> ps5upload_fpkg::Result<()> {
         }
         return Ok(());
     }
-    for (i, n) in nodes.iter().enumerate() {
-        println!(
-            "  dinode {i}: flags={:#x} size={} size_compressed={} blocks={}",
-            n.flags, n.size, n.size_compressed, n.blocks
-        );
+    match kraken_image::describe(&blob) {
+        Ok(blocks) => println!("  block layout: {} blocks", blocks.len()),
+        Err(e) => println!("  not the block layout: {e}"),
     }
-    if std::env::var("NAPS_DINODES").is_ok() {
-        return Ok(());
-    }
-    let stored = image.file_data(&nodes[3]);
     println!(
         "  FIH 0x50={} 0x60={:#x} 0x90={} 0x94={} 0xA0={} 0xA8={}",
         u32::from_le_bytes(head[0x50..0x54].try_into().unwrap()),
@@ -74,12 +59,7 @@ fn main() -> ps5upload_fpkg::Result<()> {
     };
 
     println!("{path}");
-    println!(
-        "  blob {} bytes; stored image {} bytes = {} ublocks",
-        blob.len(),
-        stored.len(),
-        stored.len() as u64 / naps::UBLOCK
-    );
+    println!("  blob {} bytes", blob.len());
     println!(
         "  num_files={} compType={} num_keys={} num_shuffle={}",
         layout.num_files, layout.compression_type, layout.num_keys, layout.num_shuffle

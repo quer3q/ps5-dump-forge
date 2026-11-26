@@ -1,6 +1,4 @@
-//! The routes. Each mirrors a Tauri command in `app/src-tauri/src/main.rs`: the same core
-//! call on the paths as given and the same `format!("{e:#}")` error text. The server adds
-//! only limits: on jobs, concurrent inspections and listing sizes.
+//! The routes, each mirroring a Tauri command (same core call, same `{e:#}` error text) plus limits.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, Write};
@@ -19,86 +17,71 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::http::{self, Head, Response};
-use crate::paths::{Roots, Storage};
+use crate::paths::Roots;
 use crate::table::{self, Table};
 use crate::{Options, Platform, random_hex};
 
 include!(concat!(env!("OUT_DIR"), "/assets.rs"));
 
 const MAX_JOBS: i64 = 8;
-/// Inspecting or naming reads a source's metadata (a whole image's, for an inspection); more
-/// at once only slows the console down.
 const MAX_INSPECTIONS: usize = 2;
-/// How long a read waits for one of those slots before its 429: picking a source starts its
-/// inspection and its naming together, and an archive's take a while. At most [`MAX_WAITING`]
-/// wait at once (a 429 at once past that), so waiting reads never hold the handlers that
-/// Cancel and Stop need.
+/// Bounded so waiting reads never hold the handlers Cancel and Stop need.
 const MAX_WAITING: usize = 4;
 const SLOT_WAIT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(100)
 } else {
     std::time::Duration::from_secs(30)
 };
-/// How long `quit {"if_idle": true}` waits for admission before answering busy.
 const IDLE_WAIT: Duration = Duration::from_secs(1);
-/// How long an upload may wait for its next bytes (no limit on the whole: a GiB takes minutes).
+/// Per read, not for the whole body: a GiB takes minutes.
 const UPLOAD_IDLE: Duration = Duration::from_secs(30);
 const STALE_MAX: usize = 1_000;
 
 type Reply = Result<Response, Response>;
 
+/// Pure reads: identical bodies share one run and its reply.
+const SHARED_READS: [&str; 7] = [
+    "inspect",
+    "default_output",
+    "generated_output",
+    "package_scan",
+    "host_tree",
+    "pack_estimate",
+    "edit_check",
+];
+
 pub(crate) struct Server {
     pub opts: Options,
-    /// `http://<address>:<port>` as shown to the user.
     pub url: String,
-    /// Shared with the jobs' [`keep_list`] hook (what an extract or transfer never replaces).
     roots: Arc<Roots>,
     instance: String,
-    /// Shared weakly with Connect's cancel hook (a peer cancels a job of this device).
     jobs: Arc<Jobs>,
     table: Arc<Mutex<Table>>,
     /// Admitted minus finished jobs; only raised under `admission`, lowered by `Done`.
     running: Arc<AtomicI64>,
-    /// Held from the admission checks until the job is in the table, so admitting and
-    /// stopping never interleave.
+    /// Held from the admission checks until the job is in the table.
     admission: Mutex<()>,
     stopping: AtomicBool,
-    /// Deletes and moves admitted and still running: their I/O runs without `admission`
-    /// (a big or remote delete never holds up `quit`, a signal or `self_update`); `finish`
-    /// waits for them, and `quit {"if_idle"}` and `self_update` answer busy meanwhile.
+    /// Deletes and moves running outside `admission`; `finish` waits for them.
     deleting: AtomicUsize,
     inspecting: AtomicUsize,
-    /// Reads waiting in [`Server::capped`] for a slot.
     waiting: AtomicUsize,
-    /// A `self_update` is waiting on elfldr.
+    reads: crate::shared::Reads,
     updating: AtomicBool,
-    /// Staged files being uploaded (`edit_upload`): one upload per file at a time, and no
-    /// discard of a staging folder with one in flight.
+    /// Staged files being uploaded: one per file, and no discard of their folder meanwhile.
     uploads: Mutex<HashSet<PathBuf>>,
     cores: usize,
-    /// Connect's service (FLINK, discovery, remote files), started with the server and shut down
-    /// in `finish`; `Err` names why it isn't running (no data folder, unreadable peers file).
+    /// `Err` names why Connect isn't running.
     connect: Result<Arc<crate::connect::Connect>, String>,
-    /// The console's notice when a conversion, LZ4 job or transfer ends, and its setting.
     notices: Arc<crate::notice::JobNotices>,
     /// Tests widen the gap between `Jobs::start` returning and the table admitting the job.
     #[cfg(test)]
     admit_pause: std::time::Duration,
 }
 
-/// `POST /api/library_scan`'s reply: core's scan, plus `storage` on the PS5 only.
-#[derive(serde::Serialize)]
-struct ScanReply<'a> {
-    #[serde(flatten)]
-    scan: &'a ps5_dump_forge_core::LibraryScan,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    storage: Option<Storage>,
-}
-
 /// Cores a default job leaves to the server (and on the PS5, the console's browser).
 const SPARE_CORES: usize = if cfg!(target_env = "ps5") { 2 } else { 1 };
 
-/// A lock that survives a panic elsewhere (the data stays consistent per call).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -107,14 +90,11 @@ fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(body).map_err(|e| Response::error(400, format!("bad request: {e}")))
 }
 
-/// Core's `anyhow` error with its causes, as the Tauri commands return it.
 fn core(e: impl std::fmt::Display) -> Response {
     Response::error(500, format!("{e:#}"))
 }
 
-/// What an inspection or a naming request may read: a folder or a regular file, symlinks
-/// followed. A FIFO or device would block its handler (or a job, and quit with it) on open.
-/// Anything missing is left for core to report.
+/// A folder or regular file (links followed): a FIFO or device would block its handler on open.
 // ponytail: checked by path, then opened by core by path; swapping in a FIFO between the
 // two needs write access to the storage.
 fn readable(path: &Path) -> Result<(), Response> {
@@ -127,7 +107,6 @@ fn readable(path: &Path) -> Result<(), Response> {
     }
 }
 
-/// Core's delete refusal as its status: 400, 404, 409 or 500.
 fn deleted(e: DeleteError) -> Response {
     let status = match e {
         DeleteError::Refused(_) => 400,
@@ -138,10 +117,8 @@ fn deleted(e: DeleteError) -> Response {
     Response::error(status, e.to_string())
 }
 
-/// A game path's components: relative, `/`-separated, no empty, `.` or `..` component, no `\`
-/// or NUL (and on Windows no `:`, which `PathBuf::push` would read as a drive).
-// ponytail: core's `Edit` path rule, restated (core keeps its check private); kept in step by
-// hand, and core checks the edit job's paths again anyway.
+/// No empty, `.` or `..` component, no `\` or NUL (on Windows no `:`: `push` reads a drive).
+// ponytail: core's `Edit` path rule restated by hand; core checks the job's paths again anyway.
 fn game_path(path: &str) -> Result<Vec<&str>, Response> {
     let parts: Vec<&str> = path.split('/').collect();
     let bad = |c: &str| {
@@ -155,8 +132,7 @@ fn game_path(path: &str) -> Result<Vec<&str>, Response> {
     }
 }
 
-/// `<source>.forge-upload-<pid>.part` beside an absolute source: a `.part`, so `stale_parts`
-/// lists a leftover and the Library skips it.
+/// `<source>.forge-upload-<pid>.part`: a `.part`, so `stale_parts` lists a leftover.
 fn staging_dir(source: &Path) -> Result<PathBuf, Response> {
     let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
         return Err(Response::error(
@@ -175,7 +151,6 @@ fn staging_dir(source: &Path) -> Result<PathBuf, Response> {
     Ok(parent.join(name))
 }
 
-/// One folder of the staging tree, made unless it is there (0777 on the PS5).
 fn make_dir(dir: &Path) -> Result<(), Response> {
     match std::fs::create_dir(dir) {
         // By path: opening a folder fails on Windows (and is only needed on FreeBSD).
@@ -200,8 +175,7 @@ fn make_dir(dir: &Path) -> Result<(), Response> {
     .map_err(|e| core(format!("{}: {e}", dir.display())))
 }
 
-/// CE-107750-0: what the game reads on the PS5 is 0777, set explicitly (the create mode is
-/// masked by the umask), as core's `finalize::open_up`. A no-op off FreeBSD.
+/// CE-107750-0: the game needs 0777, set explicitly past the umask. A no-op off FreeBSD.
 fn open_up(file: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_os = "freebsd")]
     {
@@ -212,8 +186,7 @@ fn open_up(file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Exactly `length` bytes of `body` into `file`. A client that ends early or stalls (any read
-/// error) is `UnexpectedEof` (a 400); a failed write keeps its own kind (a 500).
+/// A client that ends early or stalls is `UnexpectedEof` (a 400); a write error keeps its kind.
 fn copy_body(body: &mut dyn Read, file: &mut std::fs::File, length: u64) -> std::io::Result<()> {
     let eof = |text: String| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, text);
     let mut buf = vec![0u8; 1024 * 1024];
@@ -232,7 +205,6 @@ fn copy_body(body: &mut dyn Read, file: &mut std::fs::File, length: u64) -> std:
     Ok(())
 }
 
-/// One upload in [`Server::uploads`]; frees its file when dropped, also on unwind.
 struct Uploading<'a>(&'a Mutex<HashSet<PathBuf>>, PathBuf);
 
 impl Drop for Uploading<'_> {
@@ -241,18 +213,14 @@ impl Drop for Uploading<'_> {
     }
 }
 
-/// Makes each upload's temporary name unique within this process.
 static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A phone upload sent in chunks on parallel requests (`id=&offset=&size=`), by the client's id:
-/// one `.part` all chunks write into at their offsets, renamed into place once `size` bytes came.
-/// One idle for `CHUNK_IDLE` (a phone gone mid-way) is dropped with its `.part` when the next
-/// chunk of any upload comes. ponytail: a server exit mid-upload leaves its `.part` behind.
+/// A chunked upload by client id: one `.part`, renamed once `size` bytes came; one idle for
+/// `CHUNK_IDLE` is dropped by the next chunk. ponytail: a server exit leaves its `.part` behind.
 struct Chunked {
     part: PathBuf,
     target: PathBuf,
     size: u64,
-    /// `replace=1` on the chunk that started it: the finished file goes over one at `target`.
     replace: bool,
     offsets: HashSet<u64>,
     got: u64,
@@ -261,15 +229,13 @@ struct Chunked {
 
 static CHUNKED: std::sync::LazyLock<Mutex<HashMap<String, Chunked>>> =
     std::sync::LazyLock::new(Mutex::default);
-/// Ids of uploads dropped (cancelled, failed, idle), so a chunk still in flight doesn't start a
-/// new `.part` for one. ponytail: the last 256 only.
+/// Ended ids, so a chunk still in flight doesn't start a new `.part`. ponytail: the last 256.
 static CHUNK_ENDED: Mutex<std::collections::VecDeque<String>> =
     Mutex::new(std::collections::VecDeque::new());
-/// The web build's chunk size (`CHUNK` in http-client.ts): every chunk is one, the last shorter.
+/// `CHUNK` in http-client.ts.
 const UPLOAD_CHUNK: u64 = 8 << 20;
 const CHUNK_IDLE: Duration = Duration::from_secs(600);
 
-/// Drops the upload `id` (its `.part` too) and remembers it ended.
 fn end_chunked(all: &mut HashMap<String, Chunked>, id: &str) {
     if let Some(c) = all.remove(id) {
         let _ = std::fs::remove_file(c.part);
@@ -283,7 +249,6 @@ fn end_chunked(all: &mut HashMap<String, Chunked>, id: &str) {
     }
 }
 
-/// One running inspection; frees its place even when core panics.
 struct Inspecting<'a>(&'a AtomicUsize);
 
 impl Drop for Inspecting<'_> {
@@ -292,10 +257,8 @@ impl Drop for Inspecting<'_> {
     }
 }
 
-/// Clears its flag when dropped, also when the handler unwinds.
 struct Flag<'a>(&'a AtomicBool);
 
-/// One delete or move in flight ([`Server::deleting`]), uncounted when it returns.
 struct Deleting<'a>(&'a AtomicUsize);
 
 impl Drop for Deleting<'_> {
@@ -310,8 +273,7 @@ impl Drop for Flag<'_> {
     }
 }
 
-/// The browse roots and the notes about candidates left out; an error on a computer with no
-/// usable `--root` (also checked before a takeover, so a bad start never stops a good server).
+/// Checked before a takeover too, so a bad start never stops a good server.
 pub(crate) fn usable_roots(opts: &Options) -> std::io::Result<(Roots, Vec<String>)> {
     let (roots, notes) = Roots::new(opts.platform, &opts.roots);
     if opts.platform == Platform::Host && roots.current().is_empty() {
@@ -320,9 +282,7 @@ pub(crate) fn usable_roots(opts: &Options) -> std::io::Result<(Roots, Vec<String
     Ok((roots, notes))
 }
 
-/// What delete, move, discard and a replacing upload, extract or transfer never touch, nor
-/// any folder holding it: the browse roots, `configured` and current, and on the PS5 Forge's
-/// own files (the self copy launch-on-open starts, its lock, the tile's owner record).
+/// Never deleted, moved or replaced, nor a folder holding it: the roots and, on the PS5, Forge's files.
 fn keep_list(roots: &Roots, configured: &[PathBuf]) -> Vec<PathBuf> {
     let mut keep = roots.current();
     keep.extend(configured.iter().cloned());
@@ -338,25 +298,11 @@ fn keep_list(roots: &Roots, configured: &[PathBuf]) -> Vec<PathBuf> {
     keep
 }
 
-/// A JSON object whose optional `root` is a string (else 400).
-fn optional_root(body: &[u8]) -> Result<Option<PathBuf>, Response> {
-    match parse::<serde_json::Value>(body)? {
-        serde_json::Value::Object(o) => match o.get("root") {
-            None => Ok(None),
-            Some(serde_json::Value::String(s)) => Ok(Some(PathBuf::from(s))),
-            Some(_) => Err(Response::error(400, "bad request: root must be a string")),
-        },
-        _ => Err(Response::error(400, "bad request: expected a JSON object")),
-    }
-}
-
 #[derive(Deserialize)]
 struct PathArg {
     path: PathBuf,
 }
 
-/// `/api/move_path`: `from` moved or renamed to `to`; `replace` (the user confirmed it) takes
-/// over what is at `to`.
 #[derive(Deserialize)]
 struct MoveArg {
     from: PathBuf,
@@ -365,7 +311,6 @@ struct MoveArg {
     replace: bool,
 }
 
-/// `/api/inspect`: `password` for an archive that needs one (never logged or echoed).
 #[derive(Deserialize)]
 struct InspectArg {
     path: PathBuf,
@@ -373,10 +318,19 @@ struct InspectArg {
     password: Option<ArchivePassword>,
 }
 
-/// `/api/default_output`, `/api/generated_output`: `password` for an archive that needs one
-/// (never logged or echoed); `pack` (`"zstd"`/`"lz4"`, generated names only) for a Pack job,
-/// absent for anything else; `naming` (generated names only) the name's template
-/// (`[{title}]-[{title_id}]` when absent; one `naming_problem` refuses is a 400).
+#[derive(Deserialize)]
+struct PackEstimateArg {
+    source: PathBuf,
+    kind: ps5_dump_forge_core::EstimateKind,
+    level: u8,
+    #[serde(default)]
+    password: Option<ArchivePassword>,
+    /// Kraken or zlib of a packed game whose packs the build decodes.
+    #[serde(default)]
+    unpack: bool,
+}
+
+/// `pack` and `naming` for generated names only (`naming` absent: the default template).
 #[derive(Deserialize)]
 struct OutputArg {
     source: PathBuf,
@@ -421,7 +375,7 @@ struct DirsArg {
 struct ListArg {
     #[serde(default)]
     path: Option<String>,
-    /// The Storage explorer: core's `list_explorer` (on the PS5 mounted images are marked).
+    /// The Storage explorer: core's `list_explorer`.
     #[serde(default)]
     explorer: bool,
 }
@@ -452,7 +406,6 @@ impl Server {
         ));
         let jobs = {
             let (table, running, notices) = (table.clone(), running.clone(), notices.clone());
-            // Weak: Connect holds the jobs' hooks.
             let connect = connect.as_ref().ok().map(Arc::downgrade);
             Arc::new(Jobs::new(move |event| {
                 if let Event::Done { .. } = event {
@@ -465,25 +418,19 @@ impl Server {
                 }
             }))
         };
-        // An extract or transfer that replaces (the user confirmed it) never takes what Delete
-        // keeps.
         {
             let (roots, configured) = (roots.clone(), opts.roots.clone());
             jobs.set_protected(Arc::new(move || keep_list(&roots, &configured)));
         }
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        // A peer's writes never land in what this device's unfinished jobs use, and no job
-        // starts on what a peer is writing here.
         if let Ok(connect) = &connect {
             connect.set_busy(jobs.uses_hook());
             jobs.set_external_busy(connect.writing_hook());
-            // A peer's replacing rename is refused as a job's replace is (holds the jobs weakly).
             let weak = Arc::downgrade(&jobs);
             connect.set_replace_check(Arc::new(move |path| match weak.upgrade() {
                 Some(jobs) => jobs.replace_check(path).map_err(|e| e.to_string()),
                 None => Err("Dump Forge is stopping".to_string()),
             }));
-            // A peer shown one of this device's jobs may cancel it.
             let weak = Arc::downgrade(&jobs);
             connect.set_cancel(Arc::new(move |id| {
                 if let Some(jobs) = weak.upgrade() {
@@ -503,6 +450,7 @@ impl Server {
             deleting: AtomicUsize::new(0),
             inspecting: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
+            reads: Default::default(),
             updating: AtomicBool::new(false),
             uploads: Mutex::new(HashSet::new()),
             cores,
@@ -534,7 +482,7 @@ impl Server {
             Err(r) => return r,
         };
         if head.method == "POST" && head.path == http::CONNECT_UPLOAD {
-            // U8: auto rest mode waits while a browser's upload streams in.
+            // U8: auto rest mode waits while an upload streams in.
             let _awake = ps5_dump_forge_core::awake();
             let length = head.header("content-length").map(|_| head.length as u64);
             let query = head.query.clone();
@@ -575,41 +523,9 @@ impl Server {
             (false, "session") => Ok(self.session()),
             (false, "qr") => self.qr(&head.query),
             (false, "elfldr") => self.elfldr(),
-            (true, "inspect") => self.inspect(body),
-            (true, "default_output") => {
-                let arg: OutputArg = parse(body)?;
-                readable(&arg.source)?;
-                let password = arg.password.as_ref().map(ArchivePassword::as_str);
-                let out = self.capped(|| {
-                    ps5_dump_forge_core::default_output_with(
-                        &arg.source,
-                        arg.format,
-                        &arg.dir,
-                        password,
-                    )
-                })?;
-                Ok(Response::json(&out))
-            }
-            (true, "generated_output") => {
-                let arg: OutputArg = parse(body)?;
-                let naming = arg.naming.as_deref();
-                if let Some(why) = naming.and_then(ps5_dump_forge_core::naming_problem) {
-                    return Err(Response::error(400, why));
-                }
-                readable(&arg.source)?;
-                let password = arg.password.as_ref().map(ArchivePassword::as_str);
-                let out = self.capped(|| {
-                    ps5_dump_forge_core::generated_output_with(
-                        &arg.source,
-                        arg.format,
-                        &arg.dir,
-                        &arg.taken,
-                        password,
-                        arg.pack,
-                        naming,
-                    )
-                })?;
-                Ok(Response::json(&out))
+            (true, api) if SHARED_READS.contains(&api) => {
+                let retry = head.query.split('&').any(|q| q == "retry=1");
+                (self.reads).run(api, body, retry, &self.stopping, || self.read(api, body))
             }
             (true, "start_job") => self.start_job(body),
             (true, "cancel_job") => {
@@ -621,28 +537,13 @@ impl Server {
             (true, "delete_path") => self.delete_path(body),
             (true, "move_path") => self.move_path(body),
             (true, "edit_discard") => self.edit_discard(body),
-            (true, "library_scan") => self.library_scan(body),
-            (true, "package_scan") => self.package_scan(body),
-            (true, "library_cover") => self.library_cover(body),
-            // The PS5's internal storage (`/data`) `{free, total}` in bytes for the Storage tab's
-            // heads; `null` on a computer or when `statfs` fails.
             (true, "storage") => Ok(Response::json(&self.roots.storage())),
-            (true, "host_tree") => self.host_tree(body),
-            (true, "edit_check") => self.edit_check(body),
-            (true, "existing_targets") => self.existing_targets(body),
-            #[cfg(target_env = "ps5")]
-            (true, "debug_bench") if crate::debug::ENABLED => {
-                #[derive(Deserialize)]
-                struct Q {
-                    source: String,
-                    dir: String,
-                    mib: u64,
-                }
-                let q: Q = parse(body)?;
-                Ok(Response::json(&crate::debug::bench(
-                    &q.source, &q.dir, q.mib,
-                )))
+            (true, "free_space") => {
+                let path = parse::<PathArg>(body)?.path;
+                (self.roots.confine(&path)).map_err(|e| Response::error(400, e))?;
+                Ok(Response::json(&ps5_dump_forge_core::free_space(&path)))
             }
+            (true, "existing_targets") => self.existing_targets(body),
             #[cfg(target_env = "ps5")]
             (true, "debug_input") if crate::debug::ENABLED => {
                 crate::debug::input_push(body);
@@ -706,22 +607,20 @@ impl Server {
             "instance": self.instance,
             "stopping": self.stopping.load(Ordering::SeqCst),
             "self_copy": crate::self_copy_status(),
-            // It takes `quit {"if_idle": true}`: a newer copy started later takes over from it.
             "handover": true,
-            // The page joins and splits paths with it ("\\" on a Windows host).
+            "bundled_ng_version": ps5_dump_forge_lz4::runtime::NG_VERSION,
+            "cli_asset": match self.opts.platform {
+                Platform::Ps5 => None,
+                Platform::Host => ps5_dump_forge_updater::cli_asset(),
+            },
             "separator": std::path::MAIN_SEPARATOR_STR,
-            // The page shows it: the console's own page is on 127.0.0.1.
             "url": self.url,
-            // A phone opens it (Connect's QR): this server's page on the Connect tab.
             "connect_url": format!("{}/#connect", self.url),
-            // A bring-up build (`FORGE_DEBUG_API`): the page links its `/probe`.
             "debug": cfg!(target_env = "ps5") && option_env!("FORGE_DEBUG_API").is_some(),
-            // A console notice when a conversion, LZ4 job or transfer ends (the PS5 only).
             "notifications": self.notices.on(),
         }))
     }
 
-    /// `POST /api/notifications {"on": bool}`: job-end notices on or off, kept on the console.
     fn set_notifications(&self, body: &[u8]) -> Reply {
         #[derive(Deserialize)]
         struct Arg {
@@ -732,9 +631,7 @@ impl Server {
         Ok(Response::json(&json!({ "on": self.notices.on() })))
     }
 
-    /// `GET /api/qr`: the session's `url` as a QR code (SVG) for a phone to open. 404 when the
-    /// server couldn't tell its IP (its url then names it in words). `?connect=1`: the Connect
-    /// tab's address (`<url>/#connect`).
+    /// 404 when the server couldn't tell its IP (its url then names it in words).
     fn qr(&self, query: &str) -> Reply {
         if self.url.contains(' ') {
             return Err(Response::error(404, "no address to show"));
@@ -746,6 +643,52 @@ impl Server {
         let code = qrcode::QrCode::with_error_correction_level(&url, qrcode::EcLevel::L)
             .map_err(|e| Response::error(500, format!("internal error: {e}")))?;
         Ok(Response::svg(qr_svg(&code)))
+    }
+
+    fn read(&self, api: &str, body: &[u8]) -> Reply {
+        match api {
+            "inspect" => self.inspect(body),
+            "default_output" => {
+                let arg: OutputArg = parse(body)?;
+                readable(&arg.source)?;
+                let password = arg.password.as_ref().map(ArchivePassword::as_str);
+                let out = self.capped(|| {
+                    ps5_dump_forge_core::default_output_with(
+                        &arg.source,
+                        arg.format,
+                        &arg.dir,
+                        password,
+                    )
+                })?;
+                Ok(Response::json(&out))
+            }
+            "generated_output" => {
+                let arg: OutputArg = parse(body)?;
+                let naming = arg.naming.as_deref();
+                if let Some(why) = naming.and_then(ps5_dump_forge_core::naming_problem) {
+                    return Err(Response::error(400, why));
+                }
+                readable(&arg.source)?;
+                let password = arg.password.as_ref().map(ArchivePassword::as_str);
+                let out = self.capped(|| {
+                    ps5_dump_forge_core::generated_output_with(
+                        &arg.source,
+                        arg.format,
+                        &arg.dir,
+                        &arg.taken,
+                        password,
+                        arg.pack,
+                        naming,
+                    )
+                })?;
+                Ok(Response::json(&out))
+            }
+            "package_scan" => self.package_scan(body),
+            "host_tree" => self.host_tree(body),
+            "pack_estimate" => self.pack_estimate(body),
+            "edit_check" => self.edit_check(body),
+            _ => Err(Response::error(404, "unknown route")),
+        }
     }
 
     fn inspect(&self, body: &[u8]) -> Reply {
@@ -763,31 +706,6 @@ impl Server {
         Ok(())
     }
 
-    /// The Library scan: the body's `root`, or on the PS5 the configured current roots. Capped
-    /// like an inspection, and refused once stopping. On the PS5 the reply also carries the
-    /// internal storage's free space (`storage`); a computer's has no such field.
-    // ponytail: the request deadline covers receiving the request, not core's work.
-    fn library_scan(&self, body: &[u8]) -> Reply {
-        let root = optional_root(body)?;
-        self.refuse_if_stopping()?;
-        if root.is_none() && self.opts.platform == Platform::Host {
-            return Err(Response::error(400, "choose a folder to scan"));
-        }
-        if let Some(r) = &root {
-            self.roots.confine(r).map_err(|e| Response::error(400, e))?;
-        }
-        let found = self.capped(|| match &root {
-            Some(r) => ps5_dump_forge_core::scan_library_folder(r),
-            None => ps5_dump_forge_core::scan_library(&self.roots.current()),
-        })?;
-        Ok(Response::json(&ScanReply {
-            scan: &found,
-            storage: self.roots.storage(),
-        }))
-    }
-
-    /// `{}`: every `.pkg` under the PS5's current roots (core's `scan_packages`, a
-    /// `PackageScan`), capped like an inspection, refused once stopping; 400 on a computer.
     fn package_scan(&self, body: &[u8]) -> Reply {
         parse::<serde_json::Map<String, serde_json::Value>>(body)?;
         self.refuse_if_stopping()?;
@@ -798,17 +716,7 @@ impl Server {
         Ok(Response::json(&found))
     }
 
-    /// One Library cover, capped like an inspection, and refused once stopping.
-    fn library_cover(&self, body: &[u8]) -> Reply {
-        let arg: PathArg = parse(body)?;
-        self.refuse_if_stopping()?;
-        let cover = self.capped(|| ps5_dump_forge_core::library_cover(&arg.path))?;
-        Ok(Response::json(&cover))
-    }
-
-    /// The Edit tab's preview of a host file or folder: core's listing, capped like an
-    /// inspection. 404 when nothing is at `path` (checked by core's own read, so a path gone
-    /// while waiting for a slot is a 404 too); stopping cancels a scan under way.
+    /// 404 by core's own read, so a path gone while waiting for a slot is a 404 too.
     fn host_tree(&self, body: &[u8]) -> Reply {
         let arg: PathArg = parse(body)?;
         self.roots
@@ -833,13 +741,25 @@ impl Server {
         })
     }
 
-    /// `{request}`: which way the Edit tab's request can be applied, in place or by a rebuild
-    /// (core's `Jobs::edit_check`, an `EditCheck`; read errors are findings in it). It reads
-    /// the image, so it is capped like an inspection. 400 for a source or added file that is
-    /// a FIFO or device.
+    fn pack_estimate(&self, body: &[u8]) -> Reply {
+        let arg: PackEstimateArg = parse(body)?;
+        readable(&arg.source)?;
+        let found = self.capped(|| {
+            Ok::<_, std::convert::Infallible>(ps5_dump_forge_core::pack_estimate(
+                &arg.source,
+                arg.kind,
+                arg.level,
+                arg.password.as_ref(),
+                arg.unpack,
+            ))
+        })?;
+        found
+            .map(|e| Response::json(&e))
+            .map_err(|e| Response::error(400, format!("{e:#}")))
+    }
+
     fn edit_check(&self, body: &[u8]) -> Reply {
         let request = parse::<StartArg>(body)?.request;
-        // A FIFO or device would block core's open, holding a read slot for good.
         readable(&request.source)?;
         for edit in &request.edits {
             if let ps5_dump_forge_core::Edit::Add { from, .. } = edit {
@@ -851,10 +771,7 @@ impl Server {
         Ok(Response::json(&check))
     }
 
-    /// `{request}`: an extract's or transfer's targets that exist already (core's
-    /// `Jobs::existing_targets`, at the top level, on another device too), so the page asks
-    /// before it sends `replace`; an array of paths. It may ask a peer or a NAS, so it is
-    /// capped like an inspection. 400 for a request that is neither.
+    /// Capped: it may ask a peer or a NAS.
     fn existing_targets(&self, body: &[u8]) -> Reply {
         let request = parse::<StartArg>(body)?.request;
         if request.extract.is_empty() && request.transfer.is_empty() {
@@ -867,9 +784,7 @@ impl Server {
         Ok(Response::json(&targets))
     }
 
-    /// Runs a core call that reads a source, at most [`MAX_INSPECTIONS`] at once; the rest
-    /// wait for a slot (at most [`MAX_WAITING`] of them), up to [`SLOT_WAIT`], then get a 429.
-    /// A 409 once stopping, before and after taking the slot.
+    /// At most [`MAX_INSPECTIONS`] at once, [`MAX_WAITING`] waiting up to [`SLOT_WAIT`], else 429.
     // ponytail: waiters poll, not a queue, so a newcomer can take a freed slot first; FIFO with
     // a Condvar if waits show up unfair on the console.
     fn capped<T, E: std::fmt::Display>(
@@ -906,15 +821,12 @@ impl Server {
         Ok(Response::json(&id))
     }
 
-    /// Admits and starts `request` (`start_job`, a peer's `install`): its id.
     fn start(&self, mut request: ConvertRequest) -> Result<JobId, Response> {
         readable(&request.source)?;
         for p in request.transfer.iter().chain(&request.install) {
             readable(p)?;
         }
-        // Below the core count by default, so the server stays responsive; on the PS5 by two,
-        // since its browser shares the payload's 5 CPUs (3 workers made a `.pkg` 4% slower
-        // than 4, with the page usable again).
+        // PS5: two cores left, its browser shares the payload's 5 CPUs.
         request.compression_threads = Some(match request.compression_threads {
             None => self.cores.saturating_sub(SPARE_CORES).max(1),
             Some(n) => n.clamp(1, self.cores),
@@ -939,22 +851,19 @@ impl Server {
             })?;
         #[cfg(test)]
         std::thread::sleep(self.admit_pause);
-        // The job has the password; the table (the page's job list) keeps none.
+        // The table (the page's job list) keeps no password.
         request.archive_password = None;
         if let Ok(connect) = &self.connect {
             connect.job_started(id, &request);
         }
-        // Done may have come first: the notice is sent once, here or by the event callback,
-        // after admission is released (a slow toast holds up no other start).
+        // Done may have come first: the notice goes once, here or from the callback.
         let ended = lock(&self.table).admit(id, request);
         drop(_admission);
         self.notices.send(ended);
         Ok(id)
     }
 
-    /// A paired peer's Delete and Move to here are this server's own routes' (its keep list,
-    /// refused once stopping, counted in `deleting` as the local routes are); on the PS5 its `install {path}` starts an
-    /// install job of its package (read over FLINK) as `start_job` would. Holds the server weakly.
+    /// A peer's Delete, Move to and (PS5) `install` run as this server's own routes do.
     pub(crate) fn wire_install(self: &Arc<Self>) {
         let Ok(connect) = &self.connect else { return };
         let gone = || DeleteError::Refused("Dump Forge is stopping".to_string());
@@ -985,14 +894,10 @@ impl Server {
         }));
     }
 
-    /// [`keep_list`] of this server's roots.
     fn keep(&self) -> Vec<PathBuf> {
         keep_list(&self.roots, &self.opts.roots)
     }
 
-    /// Deletes a file or folder for good (core's `Jobs::delete_path`; the page asks first).
-    /// Never a browse root or a folder holding one, configured or mounted now, nor anything an
-    /// unfinished job uses. Counted in `deleting`, so no quit cuts it short.
     fn delete_path(&self, body: &[u8]) -> Reply {
         let arg: PathArg = parse(body)?;
         let _deleting = self.admit_delete()?;
@@ -1001,11 +906,6 @@ impl Server {
         Ok(Response::json(&()))
     }
 
-    /// Moves or renames a file or folder on its volume (core's `Jobs::move_path`): `to` never
-    /// replaced unless `replace` (a file over a file, a folder merged into a folder, the old
-    /// file refused as `delete_path` refuses it), `from` refused as `delete_path` refuses it
-    /// (same `keep` list). Core holds its job table from the check to the rename, so no job
-    /// lands between them; counted in `deleting`, so no quit cuts it short.
     fn move_path(&self, body: &[u8]) -> Reply {
         let arg: MoveArg = parse(body)?;
         let _deleting = self.admit_delete()?;
@@ -1016,7 +916,6 @@ impl Server {
         Ok(Response::json(&()))
     }
 
-    /// A delete or move admitted (refused once stopping) and counted until the guard drops.
     fn admit_delete(&self) -> Result<Deleting<'_>, Response> {
         let _admission = lock(&self.admission);
         if self.stopping.load(Ordering::SeqCst) {
@@ -1026,7 +925,7 @@ impl Server {
         Ok(Deleting(&self.deleting))
     }
 
-    /// 409 while a delete or move runs (under admission: none starts meanwhile).
+    /// Call under admission, so none starts meanwhile.
     fn idle_of_deletes(&self) -> Result<(), Response> {
         if self.deleting.load(Ordering::SeqCst) > 0 {
             return Err(Response::error(
@@ -1037,12 +936,8 @@ impl Server {
         Ok(())
     }
 
-    /// `POST ?source=<abs source>&path=<game path>` (both percent-encoded), the raw file as the
-    /// body (`Content-Length` required, no size limit): streamed into the source's staging
-    /// folder `<source>.forge-upload-<pid>.part/<path>` (made on first use, 0777 on the PS5),
-    /// replacing a file staged there before only once the whole body is in (a failed upload
-    /// changes nothing). `{"path": <the staged file>}`, an edit's `Add.from`. 409 while
-    /// another upload of the same file is in flight; refused once stopping.
+    /// `?source=&path=`: the body staged at `<staging>/<path>`, replacing an earlier one only
+    /// once the whole body is in; `{"path"}`, an edit's `Add.from`.
     // ponytail: checked by path, then created by path; a link swapped into the staging folder
     // between the two needs write access to the storage.
     fn edit_upload(&self, query: &str, length: Option<u64>, body: &mut dyn Read) -> Reply {
@@ -1061,8 +956,7 @@ impl Server {
         let path = arg("path")?;
         let parts = game_path(&path)?;
         staging_dir(&source)?;
-        // Every key and the staging folder come from the canonical source, so two spellings
-        // of one source (a linked parent, macOS `/tmp`) share one staging tree.
+        // Canonical, so two spellings of one source share one staging tree.
         let Ok(source) = source.canonicalize() else {
             let text = format!("{}: no such file or folder", source.display());
             return Err(Response::error(404, text));
@@ -1074,7 +968,6 @@ impl Server {
             .iter()
             .fold(dir.clone(), |d, p| d.join(p))
             .join(name);
-        // Claimed before any folder is made, so a discard waits for it or goes first.
         let _uploading = {
             let mut uploads = lock(&self.uploads);
             if !uploads.insert(staged.clone()) {
@@ -1083,11 +976,8 @@ impl Server {
             }
             Uploading(&self.uploads, staged.clone())
         };
-        // Not a file an unfinished job uses (an edit's added file, by identity: a case alias
-        // or a linked parent counts), nor a new file inside a folder an unfinished edit adds
-        // (core's check matches a path not there yet only by spelling): replacing it would
-        // fail that job, or change what a queued one adds. Under admission, so a job that has
-        // started is in both tables.
+        // Not a file a job uses, nor one inside a folder an unfinished edit adds (core matches
+        // a path not there yet only by spelling). Under admission: a started job is in both.
         // ponytail: checked once, before the body; a job started while the body streams in
         // that adds this file sees it replaced (its unchanged-file check fails it).
         let used = {
@@ -1111,8 +1001,6 @@ impl Server {
             let text = format!("{path}: something other than a file is staged there");
             return Err(Response::error(409, text));
         }
-        // Into an exclusive temporary name, renamed over the staged file once the whole body
-        // is in, so a failed replacement keeps the file uploaded before.
         let seq = UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
         // Short and apart from the target's name, so a 255-byte name still fits.
         let temp = dir.join(format!(".forge-upload-{}-{seq}.tmp", std::process::id()));
@@ -1137,14 +1025,10 @@ impl Server {
         Ok(Response::json(&json!({ "path": staged })))
     }
 
-    /// `{source}`: deletes the source's staging folder (`edit_upload`), as `delete_path`
-    /// deletes (refused while an unfinished job uses it), 409 while an upload into it is in
-    /// flight; `null`, also when there is none.
     fn edit_discard(&self, body: &[u8]) -> Reply {
         let arg: SourceArg = parse(body)?;
         staging_dir(&arg.source)?;
-        // As `edit_upload` names it: from the canonical source, or a gone source's canonical
-        // folder; with neither there is nothing to remove.
+        // As `edit_upload` names it; a gone source by its canonical folder.
         let source = arg.source.canonicalize().ok().or_else(|| {
             let parent = arg.source.parent()?.canonicalize().ok()?;
             Some(parent.join(arg.source.file_name()?))
@@ -1168,11 +1052,8 @@ impl Server {
         }
     }
 
-    /// Leftover `.part` files in `dirs` (missing ones skip), each
-    /// folder listed once, without the ones unfinished jobs are writing; the first 1,000 by
-    /// path. Matches as core's `stale_parts` does, but keeps only what it returns while listing.
+    /// Core's `stale_parts` match, keeping only the first 1,000 by path while listing.
     fn stale_parts(&self, body: &[u8]) -> Reply {
-        // Room for the `.part`s of every unfinished job, taken out below.
         let keep = STALE_MAX + MAX_JOBS as usize;
         let mut seen = Vec::new();
         let mut found = BTreeSet::new();
@@ -1199,16 +1080,14 @@ impl Server {
             }
             seen.push(key);
         }
-        // After the listing and under admission: a job whose `.part` was listed was started
-        // before this, so it is in the table by now.
+        // After the listing and under admission: a job whose `.part` was listed is in the table.
         let (running, adds) = {
             let _admission = lock(&self.admission);
             let table = lock(&self.table);
             (table.unfinished(), table.adds())
         };
         let theirs = table::running_parts(&running);
-        // A staging folder (`edit_upload`) is a `.part` too: not stale while an unfinished
-        // edit job adds from it or an upload into it is in flight.
+        // A staging folder is not stale while an edit adds from it or an upload is in flight.
         let mut busy: Vec<PathBuf> = (adds.into_iter())
             .map(|a| a.canonicalize().unwrap_or(a))
             .collect();
@@ -1221,10 +1100,7 @@ impl Server {
         Ok(Response::json(&parts))
     }
 
-    /// Any folder (core's `list_dir`, `parent` `null` at a root); `null` lists the roots. At
-    /// most 10,000 entries (`truncated` says so). On the PS5 (by user request) only a folder at
-    /// or inside a root, `/data` or a drive plugged in (else 400). With `explorer` the folder is
-    /// listed by core's `list_explorer` (on the PS5 mounted images are marked).
+    /// `null` lists the roots; on the PS5 only a folder at or inside a root (else 400).
     fn list_dir(&self, body: &[u8]) -> Reply {
         let arg = parse::<ListArg>(body)?;
         let roots = self.roots.current();
@@ -1255,8 +1131,7 @@ impl Server {
             false => ps5_dump_forge_core::list_dir,
         };
         let mut listing = list(Path::new(&path)).map_err(failed)?;
-        // A link's entry carries its target's path: one resolving outside the roots (the PS5's
-        // system folders) is left out, as the roots are the only places shown.
+        // A link's entry carries its target's path: one outside the roots is left out.
         (listing.entries).retain(|e| !e.link || self.roots.confine(&e.path).is_ok());
         if roots.contains(&listing.path) {
             listing.parent = None;
@@ -1264,8 +1139,7 @@ impl Server {
         Ok(Response::json(&listing))
     }
 
-    /// Closes admission at once; once `{}` is sent, cancels every job, waits for its
-    /// cleanup and exits. Repeated: `{}` and nothing more.
+    /// Once `{}` is sent, cancels every job, waits for its cleanup and exits.
     fn quit(self: &Arc<Self>) -> Response {
         let mut response = Response::json(&json!({}));
         if self.stop() {
@@ -1275,13 +1149,7 @@ impl Server {
         response
     }
 
-    /// `quit {"if_idle": true}` (a newer copy taking over): quits as `quit` does, but only when
-    /// no job is queued or running and no paired device is
-    /// reading or writing files here; else 409.
-    /// Admission within `IDLE_WAIT`, else a 409: a start waiting on core's job table behind a
-    /// delete holds it for long, and a
-    /// late yes would act after the asker gave up (the newer copy's 3 s request, the page's
-    /// minute).
+    /// Admission within `IDLE_WAIT`, else a 409: a late yes would act after the asker gave up.
     fn admission_soon(&self) -> Result<MutexGuard<'_, ()>, Response> {
         let start = Instant::now();
         loop {
@@ -1314,7 +1182,6 @@ impl Server {
                     "Dump Forge is busy: a conversion is queued or running",
                 ));
             }
-            // A paired device's transfer reading or writing here would end mid-way.
             if self.connect.as_ref().is_ok_and(|c| c.peers_active()) {
                 return Err(Response::error(
                     409,
@@ -1329,8 +1196,6 @@ impl Server {
         Ok(response)
     }
 
-    /// `GET /api/elfldr` (PS5 only): `{"up": bool}`, whether elfldr accepts a connection, so the
-    /// page offers an update only when it can be installed.
     // ponytail: connect and close; elfldr writes "Unknown payload format" to its own log, nothing on screen.
     fn elfldr(&self) -> Reply {
         if self.opts.platform != Platform::Ps5 {
@@ -1340,13 +1205,8 @@ impl Server {
         Ok(Response::json(&json!({ "up": up })))
     }
 
-    /// `{"version": "X.Y.Z"}` (PS5 only): Forge downloads that release's PS5 ELF over HTTPS
-    /// (elfldr can't follow GitHub's redirect), keeps it in memory or, when memory can't hold
-    /// it, saves it over the self copy first, then streams it to elfldr, which starts it; this
-    /// server keeps serving, and the new one takes over once it is idle (`serve`). Refused for
-    /// a version not newer than this one, while a job is queued or running, once stopping and
-    /// while another update is waiting. Blocks while it downloads and sends (its own handler
-    /// thread).
+    /// Downloads the release ELF here (elfldr can't follow GitHub's redirect) and streams it to
+    /// elfldr; this server keeps serving until the new one takes over.
     fn self_update(&self, body: &[u8]) -> Reply {
         if self.opts.platform != Platform::Ps5 {
             return Err(Response::error(404, "unknown route"));
@@ -1398,16 +1258,15 @@ impl Server {
         Ok(Response::json(&json!({})))
     }
 
-    /// `true` for the call that closed admission. Once it returns, every admitted job is
-    /// in the table and no delete or move is admitted (those running are `finish`'s wait).
+    /// `true` for the call that closed admission; every admitted job is in the table by then.
     pub fn stop(&self) -> bool {
         let _admission = lock(&self.admission);
         !self.stopping.swap(true, Ordering::SeqCst)
     }
 
     pub fn finish(&self) {
-        // A delete or move admitted before the stop ends first: cut short, a folder would be
-        // left half gone. ponytail: no bound; a peer's delete ends at FLINK's silence limit.
+        // Cut short, a folder would be left half gone.
+        // ponytail: no bound; a peer's delete ends at FLINK's silence limit.
         while self.deleting.load(Ordering::SeqCst) > 0 {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1422,29 +1281,23 @@ impl Server {
     }
 }
 
-// ---- Connect: the Connect tab's routes (`/api/connect/...`) --------------------------------
-
-/// `/api/connect/*` bodies; one struct, each route reads the fields it needs.
+/// `/api/connect/*` bodies: each route reads the fields it needs.
 #[derive(Deserialize)]
 struct ConnectArg {
     #[serde(default)]
     address: String,
     #[serde(default)]
     key_id: String,
-    /// `approve`: a pending request's id, and the answer.
     #[serde(default)]
     id: String,
     #[serde(default)]
     allow: bool,
-    /// `install`: a `.pkg` on this device.
     #[serde(default)]
     path: PathBuf,
-    /// `speed_test`, `speed_test_cancel`: the UI's id for one test.
     #[serde(default)]
     run: String,
 }
 
-/// `cancel_job`: a peer's job shown here.
 #[derive(Deserialize)]
 struct RemoteJobArg {
     key_id: String,
@@ -1456,7 +1309,6 @@ struct NasId {
     id: String,
 }
 
-/// A plain file name for an upload: no separator, not `.`/`..`, no NUL.
 fn plain_name(name: &str) -> bool {
     !(name.is_empty()
         || name == "."
@@ -1470,8 +1322,7 @@ impl Server {
         self.connect.as_ref().map_err(|e| Response::error(503, e))
     }
 
-    /// `POST /api/connect/<route>`: Connect's service as the Tauri `connect_*` commands call
-    /// it. A failed call is 400 with `connect::error_text` (a refusal's code, else the text).
+    /// A failed call is 400 with `connect::error_text` (a refusal's code, else the text).
     fn connect_route(&self, route: &str, body: &[u8]) -> Reply {
         let c = self.connect()?;
         let failed = |e: std::io::Error| Response::error(400, crate::connect::error_text(&e));
@@ -1486,7 +1337,6 @@ impl Server {
                 let a: NasId = parse(body)?;
                 return Ok(Response::json(&c.nas_forget(&a.id).map_err(failed)?));
             }
-            // Asks a paired peer to cancel its job shown here; false when it isn't listed.
             "cancel_job" => {
                 let a: RemoteJobArg = parse(body)?;
                 return Ok(Response::json(&c.cancel_remote_job(&a.key_id, a.job)));
@@ -1495,30 +1345,23 @@ impl Server {
         }
         let a: ConnectArg = parse(body)?;
         match route {
-            // Asks the device to pair; `state.outgoing` follows it.
             "pair" => {
                 c.pair(&a.address).map_err(failed)?;
                 Ok(Response::json(&()))
             }
-            // What answers at the address (Forge, SMB, NFS or FTP; about 3 s at most).
             "probe" => Ok(Response::json(&c.probe(&a.address).map_err(failed)?)),
             "pair_cancel" => {
                 c.pair_cancel();
                 Ok(Response::json(&()))
             }
-            // This device's user answers another device's pairing request.
             "approve" => Ok(Response::json(&c.approve(&a.id, a.allow))),
             "forget" => Ok(Response::json(&c.forget(&a.key_id).map_err(failed)?)),
-            // The paired PS5 `key_id` installs this device's package `path`; `{job}` there.
             "install" => {
                 let job = c.install(&a.key_id, &a.path);
                 Ok(Response::json(
                     &json!({ "job": job.map_err(|e| Response::error(400, e))? }),
                 ))
             }
-            // Times the link to the paired device `key_id` (256 MiB each way over FLINK's
-            // lanes, nothing on disk): `{up_bytes_per_s, down_bytes_per_s, bytes}`. `run` is
-            // the UI's id for it, the one `speed_test_cancel` names.
             "speed_test" => {
                 self.refuse_if_stopping()?;
                 let got = c
@@ -1526,8 +1369,6 @@ impl Server {
                     .map_err(|e| Response::error(400, e))?;
                 Ok(Response::json(&got))
             }
-            // Stops the speed test `run` with `key_id` (it answers 400 `cancelled`); a run not
-            // started yet ends `cancelled` as it starts.
             "speed_test_cancel" => {
                 c.speed_test_cancel(&a.key_id, &a.run);
                 Ok(Response::json(&()))
@@ -1544,11 +1385,8 @@ impl Server {
         }
     }
 
-    /// `POST /api/connect/upload?dir=&name=` (percent-encoded; a phone's file): the raw body,
-    /// exactly `Content-Length` bytes, as `<dir>/<name>` in an existing folder, through an
-    /// exclusive `.part` beside it and a rename that never replaces; `{path}`. 409 for a name
-    /// that exists; refused once stopping. With `replace=1` (the user confirmed it) a file at
-    /// that name is replaced ([`Self::replaceable`], [`Self::place_replacing`]).
+    /// `?dir=&name=`: the body as `<dir>/<name>` through a `.part` and a no-replace rename
+    /// (with `replace=1` over a file: [`Self::place_replacing`]); `id=` sends it in chunks.
     fn connect_upload(&self, query: &str, length: Option<u64>, body: &mut dyn Read) -> Reply {
         let Some(length) = length else {
             return Err(Response::error(411, "bad request: needs Content-Length"));
@@ -1619,10 +1457,8 @@ impl Server {
         Ok(Response::json(&json!({ "path": target })))
     }
 
-    /// What a replacing upload (`replace=1`) is refused before its body is read: a link,
-    /// folder or special file at `target` (only a file goes over a file; 400), or a file an
-    /// unfinished job uses (409). Nothing there is fine: it becomes a new file. Core checks
-    /// again, with the rest of what Delete refuses, at the rename ([`Self::place_replacing`]).
+    /// Refused before the body is read: only a file goes over a file (400), not one a job uses
+    /// (409). Core checks again at the rename.
     fn replaceable(&self, target: &Path) -> Result<(), Response> {
         let Ok(meta) = std::fs::symlink_metadata(target) else {
             return Ok(());
@@ -1644,11 +1480,8 @@ impl Server {
         Err(Response::error(400, why))
     }
 
-    /// Puts a replacing upload's synced `.part` at `target`: core's `Jobs::move_path` with
-    /// replace and the same `keep` list, so a file there is replaced only as Delete would
-    /// delete it (not one a job uses, a kept path, on the PS5 a mounted image, a link, folder
-    /// or special file), in one rename, both folders synced. The `.part` is removed when it
-    /// fails; admission is held, so no job or quit lands between the check and the rename.
+    /// Core's `move_path` with replace: refused as Delete refuses; under admission, so no job
+    /// or quit lands between the check and the rename. The `.part` goes when it fails.
     fn place_replacing(&self, part: &Path, target: &Path) -> Result<(), Response> {
         let placed = {
             let _admission = lock(&self.admission);
@@ -1660,11 +1493,7 @@ impl Server {
         })
     }
 
-    /// One chunk of a parallel phone upload: `id` (the client's, 1–32 letters/digits), `offset`,
-    /// `size` (the whole file's); `{done: false}`, or `{path, done: true}` for the chunk that
-    /// completed it. `cancel=1` (empty body) drops the upload and its `.part`. A chunk that
-    /// fails drops the whole upload. `replace` on the first chunk: the finished file replaces
-    /// one at `target` ([`Self::place_replacing`]).
+    /// One chunk at `offset` of `size`; a chunk that fails drops the whole upload.
     fn connect_upload_chunk(
         &self,
         id: &str,
@@ -1694,8 +1523,7 @@ impl Server {
                 "{length} bytes at {offset} pass the size {size}"
             )));
         }
-        // Whole chunks at their places: overlapping or gapped ones could otherwise reach `size`
-        // with a hole left in the file.
+        // Overlapping or gapped chunks could reach `size` with a hole left in the file.
         if !offset.is_multiple_of(UPLOAD_CHUNK) || length != UPLOAD_CHUNK.min(size - offset) {
             return Err(bad(format!(
                 "a chunk is {UPLOAD_CHUNK} bytes at a multiple of it (the last one shorter)"
@@ -1811,8 +1639,7 @@ impl Server {
         Ok(Response::json(&json!({ "path": c.target, "done": true })))
     }
 
-    /// `GET /api/connect/download?path=` (percent-encoded): a file to the browser, streamed
-    /// with `Content-Disposition: attachment`. A file that shrinks meanwhile ends short.
+    /// A file that shrinks meanwhile ends short.
     fn connect_download(&self, query: &str) -> Reply {
         let Some(path) = http::query_value(query, "path").filter(|v| !v.is_empty()) else {
             return Err(Response::error(
@@ -1822,13 +1649,12 @@ impl Server {
         };
         let path = PathBuf::from(path);
         let not_a_file = || Response::error(400, format!("{}: not a file", path.display()));
-        let file = std::fs::File::open(&path).map_err(|e| {
-            // Windows doesn't open a folder ("Access is denied"): the same answer as elsewhere.
-            if path.is_dir() {
-                return not_a_file();
-            }
-            Response::error(404, format!("{}: {e}", path.display()))
-        })?;
+        // Before the open: a FIFO would block it, and Windows can't open a folder.
+        if std::fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
+            return Err(not_a_file());
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|e| Response::error(404, format!("{}: {e}", path.display())))?;
         let meta = file.metadata().map_err(core)?;
         if !meta.is_file() {
             return Err(not_a_file());
@@ -1838,7 +1664,7 @@ impl Server {
             .map_or("download".into(), |n| n.to_string_lossy());
         let len = meta.len();
         let body = Box::new(move |out: &mut dyn Write| {
-            // U8: auto rest mode waits while the browser downloads it.
+            // U8
             let _awake = ps5_dump_forge_core::awake();
             std::io::copy(&mut file.take(len), out).map(|_| ())
         });
@@ -1851,8 +1677,7 @@ impl Server {
     }
 }
 
-/// Dark modules on white with a 2-module quiet zone (the page pads it further); one path,
-/// crisp edges, scaled by CSS.
+/// A 2-module quiet zone (the page pads it further), one path, scaled by CSS.
 fn qr_svg(code: &qrcode::QrCode) -> String {
     let (w, q) = (code.width(), 2);
     let mut d = String::new();
@@ -1873,7 +1698,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Every byte but the unreserved ones as `%XX`, as the UI encodes a query.
     fn percent_encode(text: &str) -> String {
         text.bytes()
             .map(|b| match b {
@@ -1898,8 +1722,7 @@ mod tests {
             .unwrap_or_else(|r| r)
     }
 
-    /// Until a `start_job` on another thread holds admission (in its test pause). A fixed sleep
-    /// raced it on a loaded CI runner: the thread could still be on its way in, or past it.
+    /// Until a `start_job` on another thread holds admission (a fixed sleep raced on CI).
     fn wait_admitting(server: &Server) {
         let start = Instant::now();
         while !matches!(
@@ -1926,13 +1749,11 @@ mod tests {
         Arc::new(Server::new(opts, "127.0.0.1:1".parse().unwrap()).unwrap())
     }
 
-    /// The PS5 (by user request): listings, `host_tree` and a Library folder only at or inside
-    /// a root (`/data`, a link here, or a drive plugged in), else one 400 line; a root's
-    /// `parent` is `null`. Another device's path still goes to core. A computer is unchanged.
+    /// The PS5: listings and `host_tree` only at or inside a root, else 400; a computer unchanged.
     #[cfg(unix)]
     #[test]
     fn a_ps5_lists_only_its_roots() {
-        // Under the build folder: a macOS temp dir is a refused system folder for a scan.
+        // Not the temp dir: on macOS it is a refused system folder.
         let tmp = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
             .join(format!("forge-api-reach-{}", std::process::id()));
@@ -1942,7 +1763,6 @@ mod tests {
         let tmp = tmp.canonicalize().unwrap();
         let (data, real) = (tmp.join("data"), tmp.join("user/data"));
         std::os::unix::fs::symlink(&real, &data).unwrap();
-        // A link out to a system folder is left out of a listing; one inside the roots stays.
         std::os::unix::fs::symlink(tmp.join("system"), real.join("out")).unwrap();
         std::os::unix::fs::symlink(real.join("games"), real.join("in")).unwrap();
         let opts = Options::new(0, vec![data.clone()], Platform::Ps5, |_: &str| {});
@@ -1986,15 +1806,6 @@ mod tests {
         assert_eq!(post(&server, "host_tree", outside).status, 400);
         let r = post(&server, "host_tree", json!({ "path": data.join("games") }));
         assert_eq!(r.status, 200, "{}", r.text());
-        let r = post(
-            &server,
-            "library_scan",
-            json!({ "root": tmp.join("system") }),
-        );
-        assert_eq!(r.status, 400, "{}", r.text());
-        let r = post(&server, "library_scan", json!({ "root": data }));
-        assert_eq!(r.status, 200, "{}", r.text());
-        // Another device's path is not this console's to judge (no such peer: core's 500).
         assert_ne!(list(Path::new("flink://00ff"), false).status, 400);
 
         let server = library_server(&real);
@@ -2003,8 +1814,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
-    /// `quit {"if_idle": true}`: 409 while a job is queued or running or once stopping; else `{}`, stopping, and quitting after the reply. A plain
-    /// `quit` is unchanged.
     #[test]
     fn quit_if_idle() {
         let server = Arc::new(server());
@@ -2031,13 +1840,10 @@ mod tests {
         let r = post(&server, "quit", idle);
         assert_eq!(r.status, 409);
         assert!(r.text().contains("stopping"), "{}", r.text());
-        // A plain quit once stopping: `{}` and nothing more.
         let r = post(&server, "quit", json!({}));
         assert_eq!((r.status, r.after.is_none()), (200, true));
     }
 
-    /// `quit {"if_idle": true}` while a paired device writes a file here: 409 (a newer copy
-    /// then says jobs are running), not stopping; `{}` once the file is finished (renamed).
     #[test]
     fn quit_if_idle_waits_for_a_peer_writing_here() {
         let tmp = std::env::temp_dir().join(format!("forge-api-peer-quit-{}", std::process::id()));
@@ -2082,8 +1888,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `self_update`: the PS5's only; a newer `X.Y.Z` only; never while a job is queued or
-    /// running, another update waits or the server is stopping (all before elfldr is asked).
+    /// Every refusal comes before elfldr is asked.
     #[test]
     fn self_update_refusals() {
         let r = post(
@@ -2094,8 +1899,7 @@ mod tests {
         assert_eq!((r.status, r.text().contains("unknown route")), (404, true));
 
         let mut opts = Options::new(0, vec![], Platform::Ps5, |_: &str| {});
-        // A closed port, in case a check below lets a request through (it would download from
-        // GitHub first: every case here must be refused before that).
+        // A closed port, in case a check below lets a request through.
         opts.elfldr = "127.0.0.1:1".parse().unwrap();
         let server = Arc::new(Server::new(opts, "127.0.0.1:1".parse().unwrap()).unwrap());
         let current = env!("CARGO_PKG_VERSION");
@@ -2146,7 +1950,6 @@ mod tests {
         let r = post(&server, "self_update", newer.clone());
         assert_eq!(r.status, 409);
         assert!(r.text().contains("already in progress"), "{}", r.text());
-        // The refusal leaves the other update's flag alone.
         assert!(server.updating.load(Ordering::SeqCst));
         server.updating.store(false, Ordering::SeqCst);
         assert!(server.stop());
@@ -2156,7 +1959,6 @@ mod tests {
         assert!(!server.updating.load(Ordering::SeqCst));
     }
 
-    /// One request over a real socket, through `handle`; the raw reply.
     fn over_tcp(server: &Arc<Server>, request: &[u8]) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2179,14 +1981,12 @@ mod tests {
         (server.edit_upload(&query, Some(body.len() as u64), &mut &body[..])).unwrap_or_else(|r| r)
     }
 
-    /// Upload (over the socket past `BODY_MAX`, and directly), replacing, refusals, the
-    /// staging folder as a stale `.part`, and discard (twice: the second is a no-op).
+    /// Over the socket past `BODY_MAX`, replacing, refusals, stale `.part`, discard twice.
     #[test]
     fn edit_upload_and_discard() {
         let root = std::env::temp_dir().join(format!("forge-api-upload-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        // Canonical, as the reply's paths are (a macOS temp dir is under a link).
         let root = root.canonicalize().unwrap();
         let source = root.join("game.ffpkg");
         std::fs::write(&source, b"image").unwrap();
@@ -2276,7 +2076,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The same without a blocked queue: a job whose `Done` came before `start` returned.
+    /// A job whose `Done` came before `start` returned.
     #[test]
     fn stop_sees_every_admitted_job() {
         let mut server = server();
@@ -2299,8 +2099,7 @@ mod tests {
         assert!(starter.join().unwrap());
     }
 
-    /// Once `quit` starts stopping, no job, delete or move is admitted: each a 409 "Dump Forge
-    /// is stopping", nothing touched.
+    /// Once stopping, no job, delete or move is admitted, nothing touched.
     #[test]
     fn quit_closes_admission() {
         let root = dir("quit-closes");
@@ -2333,8 +2132,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Connect over HTTP: the state with the service on (temporary data folder, any port), a
-    /// phone's upload over the socket past `BODY_MAX` and its download back, refusals.
+    /// A phone's upload past `BODY_MAX` and its download back, refusals.
     #[test]
     fn phone_uploads_refuse_mounted_games_before_reading_the_body() {
         struct Unread;
@@ -2379,25 +2177,11 @@ mod tests {
         };
         let state = get("/api/connect/state");
         assert!(state.starts_with("HTTP/1.1 200"), "{state}");
-        // Pairing is approved on the device: no code anywhere, the requests waiting listed.
+        // Pairing is approved on the device: no code in the state.
         assert!(
-            state.contains("\"pending\"")
-                && !state.contains("\"code\"")
-                && !state.contains("\"transfers\""),
+            state.contains("\"pending\"") && !state.contains("\"code\""),
             "{state}"
         );
-        // The old transfer engine's routes are gone (transfers are jobs now).
-        for route in ["send", "fetch", "cancel", "remote_list"] {
-            let r = over_tcp(
-                &server,
-                format!(
-                    "POST /api/connect/{route} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{{}}"
-                )
-                .as_bytes(),
-            );
-            assert!(r.starts_with("HTTP/1.1 404"), "{route}: {r}");
-        }
-        // A peer's jobs shown here (none yet), and cancelling one of them.
         assert!(state.contains("\"remote_jobs\":[]"), "{state}");
         let post = |route: &str, body: &str| {
             over_tcp(
@@ -2467,7 +2251,6 @@ mod tests {
         );
 
         let path = percent_encode(&root.join("a b.bin").to_string_lossy());
-        // Binary, so not through `over_tcp` (a String).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let s = server.clone();
@@ -2494,8 +2277,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// `move_path`: an existing `to` refused without `replace` (nothing changed), taken over
-    /// with it: a file over a file, a folder merged into a folder.
+    /// Without `replace` nothing changes; with it a file goes over a file, a folder merges.
     #[test]
     fn move_path_replaces_only_when_asked() {
         let root = dir("move-replace");
@@ -2535,9 +2317,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A phone upload with `replace=1`, single and chunked: a file there is replaced, a
-    /// missing one made; a folder or a link is refused (nothing left behind); without it
-    /// today's 409.
+    /// Single and chunked: a file replaced, a missing one made, a folder or link refused.
     #[test]
     fn phone_uploads_replace_a_file_only_when_asked() {
         let root = dir("upload-replace");
@@ -2558,7 +2338,6 @@ mod tests {
             409
         );
         assert_eq!(read("x.bin"), b"old");
-        // Single.
         let r = send("x.bin", "&replace=1", b"new");
         assert_eq!(r.status, 200, "{}", r.text());
         assert_eq!(read("x.bin"), b"new");

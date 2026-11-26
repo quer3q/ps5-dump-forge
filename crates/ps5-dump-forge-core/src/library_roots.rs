@@ -1,12 +1,9 @@
-//! Which folders the Library may enter: the PS5's `statfs` classifier (network, FUSE and
-//! unknown filesystems are refused, failing closed), the walker's name and app-data
-//! exclusions, and the refusal of system folders as a chosen Library folder.
-//! Reads only.
+//! Which folders the package walk may enter (the PS5's `statfs` classifier, failing closed,
+//! and the walker's name and app-data exclusions) and the desktop's refused system folders.
 
 use std::path::{Component, Path, PathBuf};
 
-/// Directory names the walker never enters, at any depth (ASCII case-insensitive). The
-/// walker also skips `scan::is_junk` names and `.part` entries.
+/// Directory names the walker never enters, at any depth (ASCII case-insensitive).
 const SKIP_DIRS: [&str; 12] = [
     ".git",
     ".svn",
@@ -27,7 +24,7 @@ pub(crate) fn skip_dir_name(name: &str) -> bool {
     SKIP_DIRS.iter().any(|skip| skip.eq_ignore_ascii_case(name))
 }
 
-/// ShadowMountPlus's mounts of images the Library already lists by their files.
+/// ShadowMountPlus's mounts of images the walk already lists by their files.
 const SHADOWMNT: &str = "/mnt/shadowmnt";
 
 /// Whether `path` is `/mnt/shadowmnt` or inside it: never walked, supplied or discovered.
@@ -35,9 +32,8 @@ pub(crate) fn shadowmnt(path: &Path) -> bool {
     path.starts_with(SHADOWMNT)
 }
 
-/// Whether the walker leaves out the folder `path`: the user's per-user application data
-/// (macOS `~/Library`, Windows `~/AppData`), so choosing a home does not spend the budget
-/// there. Never applied to a root itself.
+/// Whether the walker leaves out the folder `path`: per-user application data (macOS
+/// `~/Library`, Windows `~/AppData`). Never applied to a root itself.
 pub(crate) fn system_dir(path: &Path, home: Option<&Path>) -> bool {
     let name = match Os::HOST {
         Some(Os::Mac) => "Library",
@@ -57,16 +53,14 @@ pub(crate) fn home() -> Option<PathBuf> {
     std::env::home_dir().filter(|h| h.is_absolute())
 }
 
-/// Filesystems the PS5 Library may enter; anything else (network, FUSE, pseudo, unknown) is
-/// refused.
+/// Filesystems the PS5 walk may enter; anything else (network, FUSE, unknown) is refused.
 #[cfg(target_os = "freebsd")]
 const FREEBSD_FS: [&str; 9] = [
     "ufs", "msdosfs", "exfat", "exfatfs", "bfs", "nullfs", "cd9660", "udf", "zfs",
 ];
 
-/// `Ok` when the PS5 Library may enumerate `path`: an absolute path without `..`, outside
-/// `/mnt/shadowmnt`, on a local disk filesystem. `Err` says why not, for a warning. Fails
-/// closed.
+/// `Ok` when the PS5 walk may enumerate `path`: absolute, no `..`, outside `/mnt/shadowmnt`,
+/// on a local disk filesystem; fails closed.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn ps5_classify(path: &Path) -> Result<(), String> {
     if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
@@ -86,8 +80,7 @@ mod os {
 
     use super::FREEBSD_FS;
 
-    /// `statfs` of the folder itself, so a root and a mount point are classified alike. On
-    /// the PS5 this is `statfs@FBSD_1.0`, forwarded by ps5/compat.c (as in `dest.rs`).
+    /// `statfs` of the folder itself; on the PS5 `statfs@FBSD_1.0` via ps5/compat.c.
     #[allow(clippy::unnecessary_cast)] // f_flags' width differs between FreeBSD versions
     pub(super) fn check(path: &Path) -> Result<(), String> {
         let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| "NUL in path")?;
@@ -160,8 +153,7 @@ const WINDOWS_SYSTEM: [&str; 7] = [
     "$recycle.bin",
     "system volume information",
 ];
-/// A path as (Windows drive letter or UNC `\\server\share`, normal components) for comparison;
-/// lower-cased when `lower`.
+/// A path as (Windows drive or UNC share, normal components), lower-cased when `lower`.
 fn key(path: &Path, lower: bool) -> (Option<String>, Vec<String>) {
     let mut drive = None;
     let mut parts = Vec::new();
@@ -207,9 +199,7 @@ fn is_drive(drive: &Option<String>, letter: char) -> bool {
     drive.as_deref() == Some(letter.to_ascii_uppercase().to_string().as_str())
 }
 
-/// Why `path` (canonical) cannot be a chosen Library folder, or `None`. Pure: `home` and the
-/// Windows system drive (`sys_drive`, default `C`) are passed in. ASCII case-insensitive on
-/// macOS and Windows; exact on Linux.
+/// Why `path` (canonical) is a refused folder, or `None`; `home` and `sys_drive` passed in.
 pub(crate) fn refusal(path: &Path, home: Option<&Path>, os: Os, sys_drive: char) -> Option<String> {
     // Linux compares exactly; the other two ignore case (the lists are lower-case).
     let fold = |p: &Path| key(p, os != Os::Linux);
@@ -229,8 +219,8 @@ pub(crate) fn refusal(path: &Path, home: Option<&Path>, os: Os, sys_drive: char)
     }
     if let Some(home) = home {
         let (hd, hp) = fold(home);
-        // Per-user application data is refused. Anything else at or inside the home is allowed
-        // before the system list (Linux homes under `/var/home` or `/root`).
+        // Per-user application data is refused; anything else in the home is allowed before
+        // the system list (homes under `/var/home` or `/root`).
         let app_data = match os {
             Os::Mac => "library",
             Os::Windows => "appdata",

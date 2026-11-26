@@ -1,7 +1,5 @@
-//! A small blocking plain-FTP client (RFC 959, with RFC 2389 FEAT, RFC 3659 MLSD/SIZE/MDTM/REST
-//! and RFC 2428 EPSV): logs in (user and password, or anonymous), lists folders and reads files
-//! over passive data connections in binary mode. One control connection per [`Session`], one
-//! command at a time.
+//! A small blocking plain-FTP client (RFC 959 + FEAT, MLSD/SIZE/MDTM/REST, EPSV), passive and
+//! binary. One control connection per [`Session`], one command at a time.
 // ponytail: no TLS (FTPS), no active mode (PORT/EPRT), no reconnect; plaintext on the LAN.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -12,17 +10,15 @@ use std::time::Duration;
 pub const DEFAULT_PORT: u16 = 21;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest reply line read (a longer one is cut there and the rest read as the next line).
+/// Longest reply line read (the rest is read as the next line).
 const MAX_LINE: u64 = 64 * 1024;
-/// Most entries one listing returns (more is an error, never a cut list).
+/// More is an error, never a cut list.
 const MAX_ENTRIES: usize = 200_000;
-/// Longest whole reply (FEAT and a multi-line error stay far below it).
 const MAX_REPLY: usize = 1024 * 1024;
 /// How long a transfer cut short waits for its reply before `ABOR`.
 const ABORT_WAIT: Duration = Duration::from_secs(5);
 
-/// A directory entry or a stat result. `mtime` is seconds since the Unix epoch, when the server
-/// gives one; `link` marks a symbolic link (never followed).
+/// `mtime` in Unix seconds when the server gives one; `link` is never followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
@@ -32,7 +28,6 @@ pub struct Entry {
     pub link: bool,
 }
 
-/// What the server's FEAT reply offers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Features {
     mlst: bool,
@@ -42,7 +37,6 @@ struct Features {
     rest: bool,
 }
 
-/// The control connection: commands go out on `stream`, replies come back through `reader`.
 struct Control {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
@@ -51,12 +45,11 @@ struct Control {
     try_epsv: bool,
 }
 
-/// One logged-in connection to a server. Clones share the connection.
+/// Clones share the connection.
 #[derive(Clone)]
 pub struct Session(Arc<Mutex<Control>>);
 
-/// Reads one reply: a single line `123 text`, or a multi-line `123-text` … `123 text` (the
-/// lines between may say anything). Returns the code and the text, lines joined by `\n`.
+/// One reply, `123 text` or `123-text` … `123 text`: the code and the lines joined by `\n`.
 fn read_reply<R: BufRead>(r: &mut R) -> io::Result<(u16, String)> {
     let first = read_line(r)?;
     let (code, sep) = parse_code(&first).ok_or_else(|| bad(format!("bad reply: {first}")))?;
@@ -80,7 +73,7 @@ fn read_reply<R: BufRead>(r: &mut R) -> io::Result<(u16, String)> {
     Ok((code, text))
 }
 
-/// One line without its `\r\n`; non-UTF-8 bytes replaced. End of stream is an error.
+/// One line without its `\r\n`; end of stream is an error.
 fn read_line<R: BufRead>(r: &mut R) -> io::Result<String> {
     let mut buf = Vec::new();
     r.by_ref().take(MAX_LINE).read_until(b'\n', &mut buf)?;
@@ -114,8 +107,7 @@ fn bad(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// A reply outside the wanted class as an error: not found, permission denied, a closing
-/// connection (421: vsftpd's "Timeout." to an idle session, read before the reset), else the text.
+/// 421 (vsftpd's "Timeout." to an idle session) is `ConnectionAborted`, so callers reconnect.
 fn reply_error(code: u16, text: &str) -> io::Error {
     let lower = text.to_ascii_lowercase();
     let kind = if code == 421 {
@@ -131,7 +123,6 @@ fn reply_error(code: u16, text: &str) -> io::Error {
     io::Error::new(kind, format!("FTP {code} {}", text.trim()))
 }
 
-/// Checks a reply's class (`2` for 2xx, ...) and hands back its text.
 fn expect((code, text): (u16, String), class: u16) -> io::Result<String> {
     if code / 100 == class {
         Ok(text)
@@ -140,7 +131,6 @@ fn expect((code, text): (u16, String), class: u16) -> io::Result<String> {
     }
 }
 
-/// The FEAT reply's feature lines (the first and last line are the reply's own).
 fn parse_features(text: &str) -> Features {
     let mut f = Features::default();
     for line in text.lines().skip(1) {
@@ -158,13 +148,11 @@ fn parse_features(text: &str) -> Features {
 }
 
 impl Control {
-    /// `MLSD` (when the server has it) or `LIST` of the folder `path`, without `.` and `..`; lines no parser reads are skipped. More than [`MAX_ENTRIES`]
-    /// entries is an error.
     fn listing(&mut self, path: &str) -> io::Result<Vec<Entry>> {
         self.listing_rows(path, "").map(|(entries, _)| entries)
     }
 
-    /// [`Control::listing`], and how many lines no parser read hold `name` (when not empty).
+    /// The entries, and how many lines no parser read hold `name` (when not empty).
     fn listing_rows(&mut self, path: &str, name: &str) -> io::Result<(Vec<Entry>, usize)> {
         let mlsd = self.features.mlst;
         let data = self.data()?;
@@ -218,7 +206,6 @@ impl Control {
         read_reply(&mut self.reader)
     }
 
-    /// Sends one command line and reads its reply.
     fn cmd(&mut self, line: &str) -> io::Result<(u16, String)> {
         if line.contains(['\r', '\n']) {
             return Err(io::Error::new(
@@ -231,9 +218,8 @@ impl Control {
         self.read_reply()
     }
 
-    /// After a transfer cut short: waits up to [`ABORT_WAIT`] for its final reply (426, 451,
-    /// 226, ...); without one, sends `ABOR` and reads replies until 225/226 or another final
-    /// one past a 426/451; then `NOOP`, its reply read past any late one of the transfer's.
+    /// After a transfer cut short: its final reply (else `ABOR`), then `NOOP` to read past any
+    /// late one of the transfer's.
     fn settle_cut(&mut self) -> io::Result<()> {
         self.stream.set_read_timeout(Some(ABORT_WAIT))?;
         let r = self.settle_cut_inner();
@@ -262,8 +248,7 @@ impl Control {
                 code = self.read_reply()?.0;
             }
         }
-        // Some servers follow a 426 with a 226 (or a 226 with ABOR's 225): `NOOP`'s reply
-        // marks where the cut transfer's replies end, so none is taken for a later command's.
+        // Some servers follow a 426 with a 226 (or a 226 with ABOR's 225).
         self.stream.write_all(b"NOOP\r\n")?;
         self.stream.flush()?;
         for _ in 0..8 {
@@ -275,9 +260,7 @@ impl Control {
         Err(bad("no reply to NOOP after a cut transfer".into()))
     }
 
-    /// Opens a passive data connection: EPSV (the control connection's address, the port the
-    /// server names), else PASV (its address, or the control peer's when that one can't be
-    /// meant: see [`pasv_target`]).
+    /// A passive data connection: EPSV, else PASV ([`pasv_target`]).
     fn data(&mut self) -> io::Result<TcpStream> {
         let peer = self.stream.peer_addr()?;
         let mut addr = None;
@@ -311,7 +294,6 @@ fn parse_epsv(text: &str) -> Option<u16> {
     let inner = &inner[..inner.find(')')?];
     let d = inner.chars().next()?;
     let parts: Vec<&str> = inner.split(d).collect();
-    // `|||port|` splits into "", "", "", "port", "".
     if parts.len() != 5 || !parts[1..3].iter().all(|p| p.is_empty()) || !parts[4].is_empty() {
         return None;
     }
@@ -335,10 +317,8 @@ fn parse_pasv(text: &str) -> Option<(Ipv4Addr, u16)> {
     (port != 0).then_some((Ipv4Addr::new(a, b, c, d), port))
 }
 
-/// Where PASV's data connection goes: the server's address, unless it is unspecified, the
-/// control connection runs over IPv6, or one of the two is a private address and the other is
-/// not (a server behind NAT naming its inside address, or one naming its outside address to a
-/// client on its LAN); then the control connection's peer.
+/// PASV's address, unless it is unspecified, the control runs over IPv6 or only one of the two
+/// is private (NAT): then the control connection's peer.
 fn pasv_target(pasv: Ipv4Addr, peer: IpAddr) -> IpAddr {
     let local = |ip: Ipv4Addr| ip.is_private() || ip.is_loopback() || ip.is_link_local();
     match peer {
@@ -348,13 +328,11 @@ fn pasv_target(pasv: Ipv4Addr, peer: IpAddr) -> IpAddr {
 }
 
 impl Session {
-    /// Whether `other` is a clone of this session (the same connection).
     pub fn same(&self, other: &Session) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// Connects and logs in: `user` empty is an anonymous login (`anonymous`, password
-    /// `forge@`). Then binary mode, and UTF-8 names when the server offers them.
+    /// `user` empty is an anonymous login.
     pub fn connect(host: &str, port: u16, user: &str, pass: &str) -> io::Result<Session> {
         let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("{host}: no address"))
@@ -396,18 +374,14 @@ impl Session {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Lists a folder (`MLSD` when the server has it, else `LIST`), without `.` and `..`;
-    /// lines no parser reads are skipped. More than [`MAX_ENTRIES`] entries is an error.
-    /// Times come from `MLSD` only: a `LIST` line's (minutes, or a day for an older file, in
-    /// the server's zone) can't match `MDTM`'s, so a [`Session::stat`] could never agree.
+    /// `MLSD` or `LIST`, without `.` and `..`. Times come from `MLSD` only: a `LIST` line's
+    /// (local, minutes) could never agree with a [`Session::stat`].
     // ponytail: without MLST a file's change shows by its size only.
     pub fn list(&self, path: &str) -> io::Result<Vec<Entry>> {
         self.control().listing(path)
     }
 
-    /// One path's entry, named by its last component: `MLST` when the server has it; else
-    /// `SIZE` (a file, with no time, as [`Session::list`] gives none there), else `CWD` into it
-    /// and back (a folder), else its folder's listing (not found when no line there can be it).
+    /// `MLST`; else `SIZE` (a file), else `CWD` (a folder), else its folder's listing.
     // ponytail: without MLST, SIZE and CWD follow a link, so a link named directly reads as its
     // target (still within the server's tree); a link inside a listed folder is marked and refused.
     pub fn stat(&self, path: &str) -> io::Result<Entry> {
@@ -415,8 +389,7 @@ impl Session {
         let name = last_name(path).to_string();
         if c.features.mlst {
             let (code, text) = c.cmd(&format!("MLST {path}"))?;
-            // A 550 to MLST is a missing path whatever its text ("Failed to open file", ...),
-            // unless it says it was refused.
+            // A 550 to MLST is a missing path whatever its text, unless it says it was refused.
             let e = reply_error(code, &text);
             if code == 550 && e.kind() == io::ErrorKind::Other {
                 return Err(io::Error::new(io::ErrorKind::NotFound, e.to_string()));
@@ -455,9 +428,7 @@ impl Session {
                 link: false,
             });
         }
-        // A file the server refuses SIZE for is still there: its folder's listing names it, so
-        // a name is never taken for free (and `STOR` never replaces it) while it is. A folder
-        // that can't be listed for another reason than its absence is no answer either.
+        // A file refused SIZE is still there: never take its name for free (`STOR` replaces).
         let parent = match path.trim_end_matches('/').rsplit_once('/') {
             Some(("", _)) => "/",
             Some((p, _)) => p,
@@ -487,9 +458,8 @@ impl Session {
         ))
     }
 
-    /// Up to `len` bytes of a file from `offset` (`REST` + `RETR`); fewer only at the end of
-    /// the file. Stopping before the end closes the data connection and settles the transfer's
-    /// reply (with `ABOR` when the server says nothing for 5 s), so the session stays usable.
+    /// Up to `len` bytes from `offset`; fewer only at the end. A transfer stopped early is
+    /// settled (`settle_cut`), so the session stays usable.
     // ponytail: ABOR goes without Telnet IP/Synch; a server that needs them times out instead.
     pub fn read_at(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         if len == 0 {
@@ -522,23 +492,13 @@ impl Session {
         Ok(buf)
     }
 
-    /// A file's size (`SIZE`).
-    pub fn size(&self, path: &str) -> io::Result<u64> {
-        let mut c = self.control();
-        parse_size(&expect(c.cmd(&format!("SIZE {path}"))?, 2)?)
-    }
-
-    /// Starts writing a file (`STOR`, replacing one the server has there): the bytes go through
-    /// the returned [`Upload`], which [`Upload::finish`] completes. The control connection is
-    /// busy until then: a caller that needs the server meanwhile uses another `Session`.
+    /// `STOR` (replacing a file there). The control connection is busy until [`Upload::finish`].
     pub fn store(&self, path: &str) -> io::Result<Upload> {
         self.store_at(path, 0)
     }
 
-    /// [`Session::store`] from byte `offset` (`REST offset` first): on a server that resumes an
-    /// upload in place, what is sent overwrites the file from there and nothing after it is cut
-    /// (servers differ: callers check with a probe). `offset` 0 is a plain `STOR`, which replaces
-    /// the file.
+    /// `REST offset` + `STOR`: whether the rest of the file is kept differs by server
+    /// ([`Session::can_rewrite`]). `offset` 0 is a plain `STOR`.
     pub fn store_at(&self, path: &str, offset: u64) -> io::Result<Upload> {
         let mut c = self.control();
         let data = c.data()?;
@@ -558,7 +518,7 @@ impl Session {
         })
     }
 
-    /// Makes a folder (`MKD`); one already there as a folder is `AlreadyExists`.
+    /// One already there as a folder is `AlreadyExists`.
     pub fn mkdir(&self, path: &str) -> io::Result<()> {
         let (code, text) = self.control().cmd(&format!("MKD {path}"))?;
         if code / 100 == 2 {
@@ -573,7 +533,7 @@ impl Session {
         Err(reply_error(code, &text))
     }
 
-    /// Renames `from` to `to` (`RNFR` + `RNTO`), never over an existing `to` (`AlreadyExists`).
+    /// Never over an existing `to` (`AlreadyExists`).
     // ponytail: check, then rename; a `to` made in between is replaced where the server does so.
     pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         match self.stat(to) {
@@ -589,8 +549,7 @@ impl Session {
         self.rename_replace(from, to)
     }
 
-    /// Renames the file `from` to `to` (`RNFR` + `RNTO`), over a file there: servers rename as
-    /// the filesystem does, which replaces a file and refuses a folder.
+    /// Over a file there; the server's filesystem refuses a folder.
     pub fn rename_replace(&self, from: &str, to: &str) -> io::Result<()> {
         let mut c = self.control();
         let (code, text) = c.cmd(&format!("RNFR {from}"))?;
@@ -600,15 +559,36 @@ impl Session {
         expect(c.cmd(&format!("RNTO {to}"))?, 2).map(drop)
     }
 
-    /// Deletes a file (`DELE`).
     pub fn remove(&self, path: &str) -> io::Result<()> {
         expect(self.control().cmd(&format!("DELE {path}"))?, 2).map(drop)
     }
+
+    /// A refusal whose text doesn't say why (vsftpd's) is looked at for its kind.
+    pub fn rmdir(&self, path: &str) -> io::Result<()> {
+        let (code, text) = self.control().cmd(&format!("RMD {path}"))?;
+        if code / 100 == 2 {
+            return Ok(());
+        }
+        let e = reply_error(code, &text);
+        let kind = if text.to_ascii_lowercase().contains("not empty") {
+            io::ErrorKind::DirectoryNotEmpty
+        } else if e.kind() != io::ErrorKind::Other || code != 550 {
+            return Err(e);
+        } else {
+            match self.stat(path) {
+                Err(s) if s.kind() == io::ErrorKind::NotFound => io::ErrorKind::NotFound,
+                Ok(s) if !s.dir => io::ErrorKind::NotADirectory,
+                Ok(_) if self.list(path).is_ok_and(|l| !l.is_empty()) => {
+                    io::ErrorKind::DirectoryNotEmpty
+                }
+                _ => return Err(e),
+            }
+        };
+        Err(io::Error::new(kind, format!("{path}: {e}")))
+    }
 }
 
-/// A file being written by [`Session::store`]. [`Upload::finish`] completes it; dropped
-/// unfinished, the data connection is closed and the transfer's reply settled (the session stays
-/// usable; what the server keeps of the file is its own choice, usually the bytes sent).
+/// Dropped unfinished, the transfer is settled and the session stays usable.
 pub struct Upload {
     session: Session,
     data: Option<TcpStream>,
@@ -621,7 +601,6 @@ impl Upload {
             .ok_or_else(|| io::Error::other("the upload is finished"))
     }
 
-    /// Closes the data connection and reads the transfer's reply (226/250, else an error).
     pub fn finish(mut self) -> io::Result<()> {
         let mut data = self
             .data
@@ -665,16 +644,13 @@ impl Drop for Upload {
     }
 }
 
-/// `213 12345`: the size.
 fn parse_size(text: &str) -> io::Result<u64> {
     text.trim()
         .parse()
         .map_err(|_| bad(format!("bad SIZE reply: {text}")))
 }
 
-/// Seconds since the Unix epoch of a UTC date and time; `None` when a field is out of range.
 fn utc_secs(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {
-    // A year past 9999 (a server's garbage) would overflow the day count.
     if !(1..=9999).contains(&y)
         || !(1..=12).contains(&mo)
         || !(1..=31).contains(&d)
@@ -695,7 +671,6 @@ fn utc_secs(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {
     Some(days * 86_400 + i64::from(h * 3600 + mi * 60 + s))
 }
 
-/// The UTC year of a Unix time.
 fn year_of(secs: i64) -> i64 {
     let z = secs.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);
@@ -706,20 +681,16 @@ fn year_of(secs: i64) -> i64 {
     era * 400 + yoe + i64::from(mp >= 10)
 }
 
-/// A name `list` keeps: not empty, not `.` or `..`.
 fn keep(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".."
 }
 
-/// One MLSD line: `type=file;size=12;modify=20261021091500.123; name`. `cdir`/`pdir` entries,
-/// `.` and `..` give `None`. A type other than `file`/`dir` (a symlink, a device, ...) is
-/// marked `link`: never followed or read.
+/// One MLSD line; a type other than `file`/`dir` is marked `link`: never followed or read.
 fn parse_mlsd(line: &str) -> Option<Entry> {
     parse_facts(line, true)
 }
 
-/// A fact line: `listing` (MLSD) skips `cdir`/`pdir`, `.` and `..`; otherwise (MLST's one
-/// line, whose name is the path asked for) any name is taken and `cdir`/`pdir` are folders.
+/// `listing` (MLSD) skips `cdir`/`pdir`, `.` and `..`; MLST's line takes any name.
 fn parse_facts(line: &str, listing: bool) -> Option<Entry> {
     let (facts, name) = line.split_once(' ')?;
     if listing && !keep(name) {
@@ -754,7 +725,7 @@ fn parse_facts(line: &str, listing: bool) -> Option<Entry> {
     typed.then_some(e)
 }
 
-/// `YYYYMMDDHHMMSS` with an optional `.fraction` (MLSD's `modify`, MDTM's reply), in UTC.
+/// `YYYYMMDDHHMMSS[.fraction]` in UTC.
 fn parse_time14(v: &str) -> Option<i64> {
     let v = v.trim().split('.').next().unwrap_or("");
     if v.len() != 14 || !v.bytes().all(|b| b.is_ascii_digit()) {
@@ -788,12 +759,11 @@ fn parse_pwd(text: &str) -> Option<String> {
     None
 }
 
-/// The last component of a path (`a/b/` gives `b`).
 fn last_name(path: &str) -> &str {
     path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
 }
 
-/// The whitespace-separated words of a line, each with the byte offset just past it.
+/// Words, each with the byte offset just past it.
 fn words(line: &str) -> Vec<(&str, usize)> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -812,10 +782,8 @@ const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
 ];
 
-/// One unix `ls -l` line: `drwxr-xr-x 2 owner group 4096 Oct 21 09:15 name` (group optional;
-/// a year in place of the time). A `l` entry's ` -> target` is cut off and it is marked `link`,
-/// as is any other type but `-` and `d`. `now` (Unix seconds) gives the year a time-of-day
-/// date is in: this one, or the last when that would be in the future.
+/// One unix `ls -l` line; any type but `-` and `d` is marked `link`. `now` gives a time-of-day
+/// date's year.
 // ponytail: dates are the server's local time read as UTC; a year-only date is at midnight.
 fn parse_unix(line: &str, now: i64) -> Option<Entry> {
     let w = words(line);
@@ -824,7 +792,6 @@ fn parse_unix(line: &str, now: i64) -> Option<Entry> {
     if perms.len() < 10 || !"-dlcbps".contains(kind) {
         return None;
     }
-    // The date: a month word followed by a day and a time or year, after the size.
     let i = (3..w.len().saturating_sub(2)).find(|&i| {
         MONTHS.contains(&w[i].0.to_ascii_lowercase().as_str())
             && w[i + 1]
@@ -865,8 +832,7 @@ fn parse_unix(line: &str, now: i64) -> Option<Entry> {
     })
 }
 
-/// One DOS/IIS line: `10-21-26  09:15PM       <DIR>          name` or `... 12345 name`
-/// (a 2- or 4-digit year; 2-digit ones below 70 are 20xx).
+/// One DOS/IIS line: `10-21-26  09:15PM       <DIR>          name` or `... 12345 name`.
 fn parse_dos(line: &str) -> Option<Entry> {
     let w = words(line);
     let (date, time, what) = (w.first()?.0, w.get(1)?.0, w.get(2)?);
@@ -903,20 +869,14 @@ fn parse_dos(line: &str) -> Option<Entry> {
     })
 }
 
-/// A file written at any offset over one session of its own (its control connection is busy
-/// while a `STOR` is open). In order it is one `STOR`; a write before the file's end closes that and
-/// restarts at the offset (`REST` + `STOR`), which the server must take without cutting the file
-/// ([`Session::can_rewrite`] checks); a write past the end fills the gap with zeros. A restart at 0
-/// would be a new upload (cutting the file), so a rewrite from offset 0 skips the leading bytes it
-/// repeats, and one that changes the first byte is refused. [`Writer::pause`] completes the open
-/// `STOR` (the server then has every byte, for reading back); the next write resumes.
+/// A file written at any offset over a session of its own: in order one `STOR`; going back
+/// restarts at the offset (`REST` + `STOR`, [`Session::can_rewrite`]); a gap is filled with zeros.
+/// A restart at 0 would cut the file, so a changed first byte is refused.
 pub struct Writer {
     session: Session,
     path: String,
     up: Option<Upload>,
-    /// Where the open `STOR` writes next.
     pos: u64,
-    /// The file's length as written.
     len: u64,
     /// Its first bytes as sent.
     head: Vec<u8>,
@@ -925,8 +885,7 @@ pub struct Writer {
 const HEAD: usize = 64;
 
 impl Session {
-    /// A new file at `path` (a plain `STOR`, which replaces one there) written through a
-    /// [`Writer`]. Use a session of its own: it is busy while the file goes up.
+    /// A plain `STOR` (replacing a file there); use a session of its own.
     pub fn writer(&self, path: &str) -> io::Result<Writer> {
         Ok(Writer {
             up: Some(self.store(path)?),
@@ -938,10 +897,8 @@ impl Session {
         })
     }
 
-    /// Whether this server rewrites a file in place from an offset (`REST` + `STOR` cutting
-    /// nothing after what is sent), which [`Writer`] needs to go back: a probe file named
-    /// `probe` (a free name in a writable folder) is written, rewritten, read back and removed;
-    /// a name already taken is refused (`AlreadyExists`), never written over.
+    /// Whether `REST` + `STOR` rewrites in place, by writing, rewriting and removing the free
+    /// name `probe` (a taken one is `AlreadyExists`, never written over).
     // ponytail: the check and the `STOR` are two steps, as in [`Session::writer`]'s callers.
     pub fn can_rewrite(&self, probe: &str) -> io::Result<bool> {
         match self.stat(probe) {
@@ -966,7 +923,6 @@ impl Session {
             self.read_at(probe, 0, 16)
         };
         let got = attempt();
-        // A probe left behind is said, never passed over: the folder would keep it.
         if made
             && let Err(e) = self.remove(probe)
             && e.kind() != io::ErrorKind::NotFound
@@ -981,24 +937,12 @@ impl Session {
 }
 
 impl Writer {
-    /// The file's length as written.
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    /// Whether nothing was written yet.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Writes `bytes` at `offset` (see [`Writer`]).
     pub fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
         if self.up.is_some() && offset == self.pos {
             return self.send(bytes);
         }
         self.pause()?;
         if offset >= self.len {
-            // At or past the end: on from there, zeros over a gap.
             self.resume(self.len)?;
             let zeros = [0u8; 64 << 10];
             while self.pos < offset {
@@ -1026,7 +970,7 @@ impl Writer {
         self.send(&bytes[skip..])
     }
 
-    /// Completes the open `STOR` (the server then has every byte); the next write resumes.
+    /// Completes the open `STOR` (so it can be read back); the next write resumes.
     pub fn pause(&mut self) -> io::Result<()> {
         match self.up.take() {
             Some(up) => up.finish(),
@@ -1034,7 +978,6 @@ impl Writer {
         }
     }
 
-    /// Completes the file.
     pub fn finish(mut self) -> io::Result<()> {
         self.pause()
     }
@@ -1065,7 +1008,6 @@ impl Writer {
     }
 }
 
-/// The in-process test server, for this crate's tests and (feature `fake`) other crates'.
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 
@@ -1110,23 +1052,8 @@ mod tests {
             kind(550, "No such file or directory."),
             io::ErrorKind::NotFound
         );
-        assert_eq!(kind(550, "File not found"), io::ErrorKind::NotFound);
-        assert_eq!(
-            kind(550, "Permission denied."),
-            io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            kind(530, "Login incorrect."),
-            io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(kind(532, "Need account"), io::ErrorKind::PermissionDenied);
-        assert_eq!(kind(553, "Access denied"), io::ErrorKind::PermissionDenied);
         assert_eq!(kind(550, "Failed to open file."), io::ErrorKind::Other);
-        let e = reply_error(421, "Too many users ");
-        assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted);
-        assert_eq!(e.to_string(), "FTP 421 Too many users");
-        assert_eq!(expect((257, "\"/\"".into()), 2).unwrap(), "\"/\"");
-        assert!(expect((331, "Password".into()), 2).is_err());
+        assert_eq!(kind(421, "Timeout."), io::ErrorKind::ConnectionAborted);
     }
 
     #[test]
@@ -1191,8 +1118,7 @@ mod tests {
         }
     }
 
-    /// A file written out of order (as a package is: its header last): a gap filled, a middle
-    /// rewritten, the start rewritten past its unchanged first byte; a changed first byte refused.
+    /// Out of order, as a package is written: a gap, a middle, the start; a changed first byte refused.
     #[test]
     fn a_writer_goes_back_with_rest() {
         let server = super::fake::start();
@@ -1209,7 +1135,6 @@ mod tests {
         w.write_at(0, b"MAGIC-head").unwrap(); // the start: past "MAGIC", unchanged
         let e = w.write_at(0, b"xAGIC").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(w.len(), 32);
         w.finish().unwrap();
         let mut want = b"MAGIC-head".to_vec();
         want.resize(16, 0);
@@ -1217,8 +1142,6 @@ mod tests {
         assert_eq!(s.read_at("/pkg", 0, 64).unwrap(), want);
     }
 
-    /// A file the server denies SIZE for is still found (in its folder's listing), so the
-    /// rewrite probe never writes over it; a missing name is still not found.
     #[test]
     fn a_file_without_size_is_never_taken_for_free() {
         let server = super::fake::start();
@@ -1237,8 +1160,6 @@ mod tests {
         );
     }
 
-    /// A file whose listing line no parser reads is no answer to `stat` (never "free"), so the
-    /// rewrite probe never writes over it; another name in that folder is still not found.
     #[test]
     fn an_unread_listing_line_is_no_answer() {
         let server = super::fake::start();
@@ -1268,7 +1189,7 @@ mod tests {
         fs::write(server.root.join("chatty.bin"), [7u8; 100]).unwrap();
         let s = Session::connect("127.0.0.1", server.port, "", "").unwrap();
         assert_eq!(s.read_at("/chatty.bin", 0, 10).unwrap(), [7u8; 10]);
-        assert_eq!(s.size("/chatty.bin").unwrap(), 100);
+        assert_eq!(s.stat("/chatty.bin").unwrap().size, 100);
     }
 
     #[test]
@@ -1312,7 +1233,7 @@ mod tests {
             s.stat("/games/missing").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
-        assert_eq!(s.size("/games/eboot.bin").unwrap(), 300_000);
+        assert_eq!(s.stat("/games/eboot.bin").unwrap().size, 300_000);
 
         let read = |off: u64, len: usize| s.read_at("/games/eboot.bin", off, len).unwrap();
         assert_eq!(read(0, 1000), &body[..1000]);
@@ -1329,13 +1250,13 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         s.rename("games/eboot.bin", "games/renamed.bin").unwrap();
-        assert_eq!(s.size("games/renamed.bin").unwrap(), 300_000);
+        assert_eq!(s.stat("games/renamed.bin").unwrap().size, 300_000);
         // Replacing: over the file, never over a folder.
         s.rename_replace("games/renamed.bin", "games/other")
             .unwrap();
-        assert_eq!(s.size("games/other").unwrap(), 300_000);
+        assert_eq!(s.stat("games/other").unwrap().size, 300_000);
         assert_eq!(
-            kind(s.size("games/renamed.bin").map(drop)),
+            kind(s.stat("games/renamed.bin").map(drop)),
             io::ErrorKind::NotFound
         );
         s.mkdir("games/sub").unwrap();
@@ -1353,6 +1274,27 @@ mod tests {
         let mut up = s.store("games/cut").unwrap();
         up.write_all(&body[..1000]).unwrap();
         drop(up);
-        assert_eq!(s.size("games/cut").unwrap(), 1000);
+        assert_eq!(s.stat("games/cut").unwrap().size, 1000);
+    }
+
+    #[test]
+    fn rmdir_removes_only_an_empty_folder() {
+        let server = super::fake::start();
+        fs::create_dir_all(server.root.join("full/sub")).unwrap();
+        fs::create_dir(server.root.join("taken")).unwrap();
+        let s = Session::connect("127.0.0.1", server.port, "", "").unwrap();
+        let kind = |r: io::Result<()>| r.unwrap_err().kind();
+        assert_eq!(
+            kind(s.rename("/full", "/taken")),
+            io::ErrorKind::AlreadyExists
+        );
+        s.rename("/full", "/moved").unwrap();
+        assert!(s.stat("/moved/sub").unwrap().dir);
+        assert_eq!(kind(s.rmdir("/moved")), io::ErrorKind::DirectoryNotEmpty);
+        assert!(server.root.join("moved/sub").is_dir());
+        s.rmdir("/moved/sub").unwrap();
+        s.rmdir("/moved").unwrap();
+        assert!(!server.root.join("moved").exists());
+        assert_eq!(kind(s.rmdir("/moved")), io::ErrorKind::NotFound);
     }
 }

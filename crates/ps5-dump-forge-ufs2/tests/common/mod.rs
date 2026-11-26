@@ -1,7 +1,5 @@
-//! Test helpers: a synthetic source tree, an image builder, and a small independent fsck.
-//!
-//! The checker reads the raw bytes with its own parser (offsets from FreeBSD fs.h /
-//! dinode.h / dir.h), not the writer's code, so the two can't share a misreading.
+//! Test helpers: a synthetic source tree, an image builder, and a small fsck with its own
+//! parser (not the writer's code, so the two can't share a misreading).
 
 #![allow(dead_code)]
 
@@ -15,8 +13,7 @@ use ps5_dump_forge_ufs2::{Layout, Options, Report};
 use ps5upload_fpkg::Result;
 use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
-/// Files whose bytes are computed from (file index, offset): no disk needed, and a block
-/// written to the wrong place shows up as wrong bytes.
+/// Files whose bytes are computed from (file index, offset), so a misplaced block shows.
 pub struct Synth {
     pub files: Vec<SourceFile>,
     pub empty: Vec<String>,
@@ -174,8 +171,8 @@ struct Ino {
     ib: [u64; 3],
 }
 
-/// A small fsck: superblock and backups, cylinder groups and their maps, the summary area
-/// and totals, every block referenced once, link counts, directory records, di_blocks.
+/// A small fsck: superblocks, groups and maps, summary and totals, block ownership, links,
+/// directory records, di_blocks.
 pub fn fsck(image: &Path) -> Fsck {
     let mut f = File::open(image).unwrap();
     let len = f.metadata().unwrap().len();
@@ -302,7 +299,6 @@ pub fn fsck(image: &Path) -> Fsck {
         claim(&mut used, b, "summary", &mut r);
     }
 
-    // Inodes.
     let mut inodes: BTreeMap<u64, Ino> = BTreeMap::new();
     let mut cgs = Vec::new();
     for c in 0..ncg {

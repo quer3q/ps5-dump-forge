@@ -1,7 +1,4 @@
-// The game card's glow, tinted after its cover: the cover's one or two most saturated hues,
-// dimmed until the card's brightest point keeps every text on it >= 4.5:1. Computed once per
-// cover (a 24x24 canvas) and cached: the last 16 covers (a key is the whole data: URL, up to
-// ~700 KB each, so the cache can't keep every cover of a long session on the PS5).
+// The game card's glow, tinted after its cover's most saturated hues, dimmed so text on it keeps >= 4.5:1; the last 16 covers cached (a key is a whole data: URL).
 
 import { useEffect, useReducer, useRef, type CSSProperties } from "react";
 
@@ -24,17 +21,11 @@ function remember(cover: string, g: CSSProperties | null) {
 }
 
 export interface Glow {
-  /** `--glow-1` / `--glow-2`; undefined: the brand colours. */
   style?: CSSProperties;
-  /** False while the cover is unknown or still being read: the glow stays faded out. */
   ready: boolean;
 }
 
-/**
- * `cover`: a data: URL, null for no cover (brand glow), undefined while the source is still
- * being read. While not ready the last colours are kept, so the glow fades out in them
- * instead of flashing the brand colours.
- */
+/** `cover` undefined while the source is read: the last colours are kept, so the glow fades out in them. */
 export function useCoverGlow(cover: string | null | undefined): Glow {
   const [, bump] = useReducer((n: number) => n + 1, 0);
   const last = useRef<CSSProperties | undefined>(undefined);
@@ -87,7 +78,7 @@ async function coverGlow(src: string): Promise<CSSProperties | null> {
     ctx.drawImage(img, 0, 0, SIZE, SIZE);
     const hues = dominant(ctx.getImageData(0, 0, SIZE, SIZE).data);
     if (!hues) return null;
-    let [a1, a2] = [0.18, 0.11];
+    let [a1, a2] = [0.54, 0.33]; // 3x the old start; the cap below still bounds the brightest point
     const [c1, c2] = hues.map(tame);
     // Both glows overlap at the corner: dim them until that point is no brighter than the
     // brand glow's.
@@ -133,7 +124,6 @@ function dominant(px: Uint8ClampedArray): [Rgb, Rgb] | null {
   return [mean(first), mean(second)];
 }
 
-/** A glow colour: vivid but not neon, mid lightness. */
 function tame(c: Rgb): Rgb {
   const [h, s, l] = toHsl(c);
   return fromHsl(h, Math.min(0.95, Math.max(0.6, s)), Math.min(0.58, Math.max(0.45, l)));

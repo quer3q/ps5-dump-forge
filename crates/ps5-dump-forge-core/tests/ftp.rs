@@ -1,5 +1,4 @@
-//! Outputs on an FTP server (the ftp crate's in-process one): an fpkg goes back over what it
-//! wrote, which the server's rewrite probe allows.
+//! Outputs on the ftp crate's in-process FTP server (an fpkg rewrites what it wrote).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -52,12 +51,15 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         zstd_unpack: false,
         lz4_level: 0,
         lz4_runtime: Default::default(),
+        replace_ampr_emu: true,
         edits: Vec::new(),
         extract: Vec::new(),
         transfer: Vec::new(),
         replace: false,
         edit_rebuild: false,
         install: None,
+        recover_metadata: None,
+        restore_metadata: false,
         delete_source: false,
         pack_profile: None,
         archive_password: None,
@@ -104,4 +106,31 @@ fn a_session_the_server_closed_is_replaced_on_the_next_call() {
     // The cached session dies as an idle one does; the call logs in again instead of failing.
     server.kick();
     assert_eq!(ps5_dump_forge_core::list_dir(&at).unwrap().entries.len(), 1);
+}
+
+#[test]
+fn a_folder_on_an_ftp_server_is_moved_and_deleted() {
+    let server = fake::start();
+    write(&server.root, "game/eboot.bin", b"x");
+    write(&server.root, "game/data/a/b.bin", b"yy");
+    std::fs::create_dir_all(server.root.join("game/empty")).unwrap();
+    write(&server.root, "other.bin", b"z");
+    let at = |p: &str| PathBuf::from(format!("ftp://127.0.0.1:{}/{p}", server.port));
+    let jobs = Jobs::new(|_| {});
+    // The server root itself is never deleted; a name there is not replaced unasked.
+    assert!(jobs.delete_path(&at(""), &[]).is_err());
+    let e = jobs.move_path(&at("other.bin"), &at("game/eboot.bin"), false, &[]);
+    assert!(e.unwrap_err().to_string().contains("nothing is replaced"));
+    let e = jobs.move_path(&at("game/data"), &at("game/empty"), true, &[]);
+    assert!(e.unwrap_err().to_string().contains("not merged"));
+    jobs.move_path(&at("other.bin"), &at("game/eboot.bin"), true, &[])
+        .unwrap();
+    assert_eq!(
+        std::fs::read(server.root.join("game/eboot.bin")).unwrap(),
+        b"z"
+    );
+    jobs.move_path(&at("game"), &at("Game"), false, &[])
+        .unwrap();
+    jobs.delete_path(&at("Game"), &[]).unwrap();
+    assert_eq!(std::fs::read_dir(&server.root).unwrap().count(), 0);
 }

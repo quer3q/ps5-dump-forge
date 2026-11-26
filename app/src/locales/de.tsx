@@ -13,17 +13,13 @@ const de: Messages = {
   // App.tsx
   app: {
     screens: "Bereiche",
-    convert: "Konvertieren",
     active: (n) => `, ${num(n)} aktiv`,
     edit: "Bearbeiten",
-    pack: "Packen",
     storage: "Speicher",
     connect: "Verbinden",
     disconnected: "Nicht verbunden",
-    connected: (n: number) => plural(n, { one: `Verbunden (${num(n)} Gerät)`, other: `Verbunden (${num(n)} Geräte)` }),
+    connected: (n: number) => plural(n, { one: `${num(n)} Gerät`, other: `${num(n)} Geräte` }),
     about: "Info",
-    prevTab: "Vorheriger Tab (L2)",
-    nextTab: "Nächster Tab (R2)",
     offline: "Offline, neuer Versuch…",
     stop: "Beenden",
     stillRunning: (n) => (n === 1 ? "Ein Auftrag läuft noch" : `${num(n)} Aufträge laufen noch`),
@@ -50,37 +46,17 @@ const de: Messages = {
     queued: "in der Warteschlange",
     progress: (percent, left) => `${percent} % fertig${left ? `, noch ${left}` : ""}`,
   },
-  // Convert.tsx
+  // build/ (Build's convert settings and checks)
   convert: {
-    target: "Ziel",
-    targetFormat: "Zielformat",
+    targetFormat: "Format",
     alreadyFolder: "die Quelle ist bereits ein Ordner",
-    lz4Backport:
-      "Die Assets dieses Spiels sind LZ4-gepackt und sein LZ4-Manifest enthält den Backport: Entpacken Sie es zuerst im Tab „Packen“ und entfernen Sie dann hier den Backport.",
-    zstdBackport:
-      "Die Assets dieses Spiels sind zstd-gepackt und sein zstd-Index enthält den Backport: Entpacken Sie es zuerst im Tab „Packen“ und entfernen Sie dann hier den Backport.",
-    unreadable: "Erstellen nicht möglich: Diese Quelle konnte nicht gelesen werden (siehe „Quelle“).",
     patchBlocked: "Erstellen nicht möglich: Das ist ein Patch-Paket, das nur enthält, was das Update geändert hat. Öffne es unter „Bearbeiten“, um seine Dateien zu extrahieren.",
     openInEdit: "Unter „Bearbeiten“ öffnen",
-    noContentId: "Erstellen als fpkg nicht möglich: Die param.json dieses Spiels hat keine Content-ID, die ein Paket braucht.",
+    noContentId: "Erstellen als FPKG nicht möglich: Die param.json dieses Spiels hat keine Content-ID, die ein Paket braucht.",
     blocked: (first, more) =>
       `Erstellen nicht möglich: ${first}${more > 0 ? ` (und ${num(more)} weitere, siehe „Quelle“)` : ""}.`,
-    amprZstdRuntime: "Diese Konvertierung installiert ampr-emu-ng unter fakelib/libSceAmpr.sprx, das diese Pakete brauchen.",
-    amprNgReplaced: (version) => `Ersetzt das ampr-emu-ng dieses Spiels durch ampr_emu ${version}.`,
-    amprRuntime: (a, own, version) => {
-      if (a === "install") return `Dieses Spiel nutzt AMPR, hat aber kein ampr_emu: Die Konvertierung installiert das mitgelieferte ampr_emu ${version}.`;
-      if (a === "trace") return `Die Konvertierung ersetzt das ampr_emu dieses Spiels durch das mitgelieferte ampr_emu ${version}.`;
-      if (a === "replace")
-        return own
-          ? `Die Konvertierung ersetzt das ampr_emu ${own} dieses Spiels durch das mitgelieferte ampr_emu ${version}.`
-          : `Die Konvertierung ersetzt das ampr_emu dieses Spiels, das keine Version nennt, durch das mitgelieferte ampr_emu ${version}.`;
-      return own
-        ? `Das ampr_emu ${own} dieses Spiels ist so neu wie das mitgelieferte ${version} oder neuer: Die Konvertierung behält es.`
-        : `Dieses Spiel hat bereits das mitgelieferte ampr_emu ${version}: Die Konvertierung behält es.`;
-    },
     amprIndex: (state: "stale" | "damaged" | "missing") =>
       `${state === "stale" ? "ampr_emu.index listet nicht die Dateien dieses Spiels" : state === "damaged" ? "ampr_emu.index ist nicht lesbar" : "Dieses Spiel hat keine ampr_emu.index"}: Die Konvertierung schreibt eine neue.`,
-    amprPkgIndex: "Das Paket erhält eine neue ampr_emu.index aus seinen Dateien.",
     removeBackport: "Backport entfernen",
     removeHint: (libs, emulators, other) =>
       `Lässt ${num(libs)} ${plural(libs, { one: "Backport-Bibliothek", other: "Backport-Bibliotheken" })} aus fakelib/ weg` +
@@ -113,9 +89,9 @@ const de: Messages = {
         tagline: "Am besten, wenn Ihre Firmware es erlaubt",
         cells: ["Nativ, volles Tempo", "30–60 % kleiner, je nach Spiel"],
       },
-      zstd: { tagline: "Mit ampr-emu-ng", cells: ["Bis zu 80 % schnelleres Laden", "Bis zu halb so groß wie das Spiel"] },
+      zstd: { tagline: "Mit ampr-emu-ng", cells: ["Schnelleres Laden", "Bis zu halb so groß wie das Spiel"] },
       lz4: {
-        tagline: "Mit ampr-emu-ng oder ampr_emu",
+        tagline: "Mit ampr-emu-ng",
         cells: ["30–40 % schnelleres Laden, laut den Autoren", "Etwa halb so groß wie das Spiel, laut den Autoren"],
       },
       ffpkg: { tagline: "Empfohlen für ShadowMountPlus", cells: ["Volles Image-Tempo", FLAT] },
@@ -127,34 +103,22 @@ const de: Messages = {
       },
       folder: { tagline: "Normale Spieldateien", cells: ["Volles Laufwerkstempo", FLAT] },
     },
-    features: [
-      ["Konvertieren", "zwischen Ordner, ffpkg, exfat, ffpfs, ffpfsc und fpkg, in beide Richtungen."],
-      ["Übertragen", "von Dateien und Konvertieren von Spielen zwischen Ihrer PS5, Computern und einem NAS über SMB, FTP oder NFS."],
-      ["Bearbeiten", "der Dateien eines Spiels wie in einem Ordner, dazu Cover, Firmware, Backport, DLC und Probleme mit Dateinamen vor dem Erstellen."],
-      ["Gestreamt", "von jeder Quelle zu jedem Ziel: ohne temporäre Kopie, auch für das Image in einem ffpfsc oder ein Spiel in einem Archiv."],
-      ["Archive", "ein .zip, .7z oder .rar mit einem Spiel wird wie ein Ordner durchsucht, konvertiert oder gepackt."],
-      ["USB und SD-Karten", "geschrieben auf Sticks und Karten mit exFAT oder FAT32."],
-      ["Packen", "Asset-Pakete mit zstd oder LZ4 und intelligenter Reparatur."],
-      ["Speicher", "eine Bibliothek Ihrer Spiele und ein Datei-Explorer zum Umbenennen, Verschieben und Löschen."],
-      ["Sicher", "Ihr Spiel wird nie verändert, außer Sie wünschen es; Müll-Dateien werden übersprungen, ungültige Dateinamen vorab gemeldet."],
-    ],
-    about: "Info",
     compare: "Formate vergleichen",
     compareLabel: "Formatvergleich",
     format: "Format",
     credits: "Danksagungen",
-    upstream: (app) =>
-      `Angaben der Autoren: was die Autoren von ampr_emu und Lazy_AMPR berichten, nicht von ${app} gemessen; die Werte schwanken je nach Spiel. ampr_emu 0.4.2.1 ist ein Test-Build der Autoren; bekanntes Problem: Manche Spiele stürzen beim Speichern ab.`,
-    bundled: "LZ4-gepackte Ordner laufen mit ampr_emu 0.4.2.1 von drakmor (GPL-3.0), unverändert mitgeliefert. Quellcode:",
+    upstream: (app: string) =>
+      `Angaben der Autoren: was die Autoren von ampr_emu und Lazy_AMPR berichten, nicht von ${app} gemessen; die Werte schwanken je nach Spiel.`,
+    bundled: "ampr_emu von drakmor (GPL-3.0), ein Fork davon ist ampr-emu-ng. Forge liefert es nicht mehr mit: Es ersetzt das ampr_emu eines Spiels durch ampr-emu-ng, sofern die Einstellungen es nicht behalten. Quellcode:",
     lazy: "Die Packstrategie baut auf Lazy_AMPR von Nazky auf:",
-    ng: "zstd- und LZ4-Pakete laufen auf ampr-emu-ng. Quelle:",
+    ng: "ZSTD- und LZ4-Pakete laufen auf ampr-emu-ng (GPL-3.0-or-later), der einzigen mitgelieferten AMPR-Runtime, unverändert. Quellcode:",
     logo: "Das Logo stammt von Xxcco:",
     unrar:
       ".rar-Archive werden mit der mitgelieferten UnRAR-Bibliothek von Alexander Roshal gelesen (nur Extrahieren, unter der UnRAR-Lizenz).",
     language: "Sprache",
     system: "System",
     notifications: "Nach Abschluss eines Auftrags benachrichtigen",
-    notificationsHint: "Wird auf der Konsole für Konvertierungs-, Pack- und Übertragungsaufträge angezeigt.",
+    notificationsHint: "Wird auf der Konsole angezeigt, wenn ein Erstell-, Pack- oder Übertragungsauftrag endet.",
     notificationsFailed: "Benachrichtigungen konnten nicht geändert werden.",
   },
   // Edit.tsx
@@ -179,11 +143,9 @@ const de: Messages = {
     leftoversNote: (app) =>
       `Unfertige Ausgaben, meist von abgebrochenen Aufträgen. Entfernen Sie nur die, die Sie kennen, und nur, wenn kein Auftrag läuft; ${app} löscht sie nie selbst.`,
     checked: (n) => `Geprüfte Ordner (${num(n)})`,
-    /** Edit's folds under the game card. */
     facts: "Spieldaten",
     explorer: "Spieldateien",
     howTitle: "So funktioniert es",
-    /** The empty state's paragraphs. */
     how: (app) => [
       "Öffnen Sie einen **Spielordner** oder ein **Image** und ändern Sie es wie einen Ordner auf einem USB-Stick: **Dateien hinzufügen und ersetzen** (hineinziehen oder „Hinzufügen“ verwenden), **umbenennen und löschen**.",
       `Nichts ändert sich, **bis Sie auf „Anwenden“ klicken**: Ihre Änderungen sammeln sich hier, dann schreibt ${app} sie in einem Durchgang direkt in das Image oder den Ordner und prüft das Ergebnis. Es ist **kein eingebundenes Laufwerk**: ${app} merkt sich Ihre Änderungen und wendet sie selbst an.`,
@@ -203,11 +165,14 @@ const de: Messages = {
     matches: (n) => `${num(n)} ${plural(n, { one: "Treffer", other: "Treffer" })}`,
     emptyFolder: "Dieser Ordner ist leer.",
     open: (name) => `${name} öffnen`,
-    archiveNote: "Archive können durchsucht, aber nicht bearbeitet werden. Um es zu ändern, konvertieren Sie es zuerst in einen Ordner oder ein Image.",
-    nasNote: "Spiele auf einem NAS lassen sich durchsuchen und extrahieren, aber nicht bearbeiten. Konvertiere oder extrahiere das Spiel zuerst auf dieses Gerät, um es zu ändern.",
+    archiveNote: "Archive können durchsucht, aber nicht bearbeitet werden. Um es zu ändern, erstellen Sie zuerst einen Ordner oder ein Image daraus.",
+    rebuildTimePkg: (t) => `Neu erstellen komprimiert das ganze Spiel erneut: etwa ${t} bei ~26 MB/s auf einer PS5 (auf einem Computer schneller). Bearbeiten Sie stattdessen eine entpackte Kopie, um das zu vermeiden.`,
+    rebuildTimePs5: (t) => `Neu erstellen schreibt das ganze Image erneut (etwa ${t} auf dieser PS5).`,
+    rebuildTimeHost: (t) => `Neu erstellen schreibt das ganze Image erneut (etwa ${t} auf diesem Computer).`,
+    rebuildTimeAny: (t) => `Neu erstellen schreibt das ganze Image erneut (etwa ${t} auf einer PS5).`,
+    nasNote: "Spiele auf einem NAS lassen sich durchsuchen und extrahieren, aber nicht bearbeiten. Erstelle oder extrahiere das Spiel zuerst auf dieses Gerät, um es zu ändern.",
     patchNote: "Das ist ein Patch-Paket: Es enthält nur, was das Update geändert hat. Aufgeführt sind die Dateien, die es vollständig enthält; sie lassen sich durchsuchen und extrahieren, aber nicht bearbeiten.",
-    peerNote: "Spiele auf einem anderen Forge lassen sich durchsuchen und extrahieren, aber nicht bearbeiten. Konvertiere oder extrahiere das Spiel zuerst auf dieses Gerät, um es zu ändern.",
-    /** The explorer's changes: none is made until Apply. */
+    peerNote: "Spiele auf einem anderen Forge lassen sich durchsuchen und extrahieren, aber nicht bearbeiten. Erstelle oder extrahiere das Spiel zuerst auf dieses Gerät, um es zu ändern.",
     addFiles: "Dateien hinzufügen",
     addFolder: "Ordner hinzufügen",
     pickAddFiles: "Dateien zum Hinzufügen wählen",
@@ -218,7 +183,6 @@ const de: Messages = {
     renameTip: "Umbenennen (F2)",
     removeTip: "Löschen (Entf-Taste)",
     removeTipMac: "Löschen (fn+Rückschritttaste)",
-    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
     extractItem: (name: string) => `${name} extrahieren`,
     extractTip: "In einen gewählten Ordner kopieren",
     extractFolder: "Ordner extrahieren",
@@ -273,7 +237,6 @@ const de: Messages = {
     replace: "Ersetzen",
     skip: "Überspringen",
     cancel: "Abbrechen",
-    /** How the changes go in (the pending bar), from core's check before Apply. */
     modeLabel: "Art der Anwendung",
     checking: "Prüfe, wie sich die Änderungen anwenden lassen",
     nothingToChange: "Nichts zu ändern: Das Spiel bleibt, wie es ist.",
@@ -288,7 +251,7 @@ const de: Messages = {
     inPlaceText: "Wird in das Image geschrieben.",
     inPlaceNeeds: (need: string, free: string) => `Wird in das Image geschrieben; braucht ${need} der ${free}, die darin frei sind.`,
     noRoom: (need: string, free: string) => `Die Änderungen brauchen ${need}, im Image sind ${free} frei.`,
-    alwaysRebuilt: "Images im Format ffpfsc und fpkg werden immer neu erstellt.",
+    alwaysRebuilt: "Images im Format ffpfsc und FPKG werden immer neu erstellt.",
     rebuildText: "Daneben wird ein neues Image geschrieben, das es nach der Prüfung ersetzt.",
     rebuildNeeds: (need: string, free: string) =>
       `Daneben wird ein neues Image geschrieben (etwa ${need} freier Platz nötig, ${free} frei), das es nach der Prüfung ersetzt.`,
@@ -318,11 +281,9 @@ const de: Messages = {
     uploading: (i: number, n: number, sent: string, total: string) => `Datei ${num(i)} von ${num(n)} wird hochgeladen: ${sent} von ${total}`,
     uploadLabel: "Hochladen",
     uploadCancelled: "Hochladen abgebrochen. Am Spiel hat sich nichts geändert.",
-    applyRunning: "Die Änderungen werden angewendet. Bearbeiten ist wieder möglich, wenn der Auftrag unten beendet ist.",
+    applyRunning: "Die Änderungen werden angewendet. Bearbeiten ist wieder möglich, wenn der Auftrag beendet ist (siehe „Warteschlange“).",
     applyFailed: "Die Änderungen wurden nicht angewendet:",
     applyRefused: "Die Änderungen lassen sich so nicht anwenden:",
-    applyCancelled: "Der Auftrag wurde abgebrochen. Ihre Änderungen stehen weiterhin hier.",
-    folderPartly: "Ein Teil davon ist vielleicht schon im Ordner: Die angezeigten Dateien sind sein aktueller Inhalt.",
     interrupted: "Eine frühere Bearbeitung dieses Images wurde unterbrochen. Das Image wird wiederhergestellt, wie es war, bevor Ihre nächsten Änderungen geprüft oder angewendet werden.",
   },
   // JobList.tsx
@@ -358,6 +319,7 @@ const de: Messages = {
     },
     stepsLabel: "Schritte",
     stepDone: (s) => `${s}: erledigt`,
+    stepFailed: (s) => `${s}: fehlgeschlagen`,
     stepLater: (s) => `${s}: noch nicht begonnen`,
     packingWriting: "Packen und Schreiben",
     rate: { read: "Lesen", compress: "Komprimieren", pack: "Packen", write: "Schreiben" },
@@ -368,12 +330,11 @@ const de: Messages = {
     packTag: {
       lz4Pack: (level: string) => `LZ4 packen · ${level}`,
       lz4Unpack: "LZ4 entpacken",
-      zstdPack: (level: string) => `zstd packen · ${level}`,
+      zstdPack: (level: string) => `ZSTD packen · ${level}`,
       level: (n: number) => `Stufe ${num(n)}`,
-      zstdUnpack: "zstd entpacken",
+      zstdUnpack: "ZSTD entpacken",
       withRules: (tag) => `${tag} · eigene Regeln`,
     },
-    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Bearbeiten",
     editRebuild: "Bearbeiten · neu erstellt",
     transfer: "Übertragung",
@@ -395,7 +356,6 @@ const de: Messages = {
     from: "aus ",
     left: (d) => `noch ${d}`,
     inStep: (time) => `${time} in diesem Schritt`,
-    result: (bytes, n) => `${bytes}, ${num(n)} ${plural(n, FILES)} →`,
     outputPath: "Ausgabepfad",
     sourceDeleted: (v) => `Quelle gelöscht: ${v}`,
     sourceKept: (v) => `Quelle behalten: ${v}`,
@@ -418,60 +378,27 @@ const de: Messages = {
     log: (n) => `Log (${num(n)})`,
     logLabel: "Log",
   },
-  // Library.tsx
+  // Storage text shared by Files.tsx, Packages.tsx, Edit.tsx and common.tsx (FreeSpace)
   library: {
-    pickTitle: "Ordner für die Bibliothek wählen",
-    scanningIn: (name) => `${name} wird durchsucht`,
-    scanning: "Wird durchsucht",
-    cantScanFolder: "Dieser Ordner kann nicht durchsucht werden",
-    chooseAnother: "Anderen Ordner wählen",
-    pickPrompt: "Wählen Sie einen Ordner mit Ihrer Bibliothek zum Durchsuchen",
-    choose: "Ordner wählen",
-    cantScan: "Die Bibliothek kann nicht durchsucht werden:",
     cantDelete: "Löschen nicht möglich:",
     deleted: (path) => `Gelöscht: ${path}`,
-    truncated: "Suchlimit erreicht. Diese Liste ist eventuell unvollständig.",
-    limits: "Die Suche geht höchstens sechs Ordnerebenen tief und endet nach etwa 15 Sekunden.",
-    noRoots: "Keine Ordner zum Durchsuchen verfügbar.",
-    none: "Keine Spiele gefunden. Die Suche geht bis zu sechs Ebenen tief und überspringt Systemordner. Andere Quellen können Sie weiterhin unter „Bearbeiten“ oder „Konvertieren“ wählen.",
-    skipped: "Übersprungene Orte und Dateien",
-    library: "Bibliothek",
     storageTip: "Freier Speicher im internen Speicher der Konsole (/data)",
     free: (free, total) => (
       <>
         <b>{free}</b> von {total} frei
       </>
     ),
-    refresh: "Aktualisieren",
     cards: "Kachelansicht",
     list: "Listenansicht",
-    games: "Spiele",
-    edit: (n) => `${n} bearbeiten`,
-    convert: (n) => `${n} konvertieren`,
     remove: (n) => `${n} löschen`,
     deleting: (n) => `${n} wird gelöscht`,
-    lz4Tip: "LZ4-Asset-Pakete",
-    zstdTip: "zstd-Asset-Pakete",
     showAs: "Anzeigen als",
-    kinds: "Art anzeigen",
-    all: "Alle",
-    lz4Chip: "LZ4",
-    zstdChip: "zstd",
-    countIn: (n, path) => (
-      <>
-        <b>{num(n)}</b> {plural(n, { one: "Spiel in", other: "Spiele in" })} {path}
-      </>
-    ),
   },
-  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  // Storage.tsx, Files.tsx: the Storage tab (File explorer | Package installer)
   storage: {
     views: "Speicheransicht",
-    library: "Bibliothek",
     files: "Datei-Explorer",
     title: "Datei-Explorer",
-    pickTitle: "Ordner zum Durchsuchen wählen",
-    pickPrompt: "Wählen Sie einen Ordner, um seine Dateien anzuzeigen",
-    choose: "Ordner wählen",
     roots: "Laufwerke",
     location: "Ort",
     folders: "Ordner",
@@ -515,49 +442,32 @@ const de: Messages = {
     moved: (path) => `Verschoben nach ${path}`,
     devices: "Geräte",
     thisDevice: "Dieses Gerät",
-    otherDevice: "„Verschieben“ bleibt auf einem Gerät: Ziehen Sie es auf den Tab eines anderen Geräts, um es dorthin zu kopieren.",
-    dropCopy: (folder) => `Loslassen, um nach ${folder} zu kopieren`,
+    otherDevice: "„Verschieben“ bleibt auf einem Gerät: Der Bildschirm „Übertragung“ kopiert zwischen Geräten.",
+    loadingDevices: "Geräte werden geladen",
+    noDevice: "Kein Gerät verbunden",
+    noDeviceHint: "Koppeln Sie eine PS5 oder einen Computer oder fügen Sie ein NAS hinzu, um seine Dateien hier zu verwalten.",
+    openConnect: "„Verbinden“ öffnen",
     dropMove: (folder) => `Loslassen, um nach ${folder} zu verschieben`,
     cantCopy: "Kopieren nicht möglich:",
     copyNoFolder: "Öffnen Sie zuerst einen Ordner auf jenem Gerät.",
-    copyOne: (name, to) => `${name} wird nach ${to} kopiert. Die Übertragung steht unter „Verbinden“.`,
-    copyMany: (n, to) =>
+    copyOne: (name: string, to: string) => `${name} wird nach ${to} kopiert. Die Übertragung steht in der „Warteschlange“.`,
+    copyMany: (n: number, to: string) =>
       plural(n, {
-        one: `${num(n)} Element wird nach ${to} kopiert. Die Übertragung steht unter „Verbinden“.`,
-        other: `${num(n)} Elemente werden nach ${to} kopiert. Die Übertragung steht unter „Verbinden“.`,
+        one: `${num(n)} Element wird nach ${to} kopiert. Die Übertragung steht in der „Warteschlange“.`,
+        other: `${num(n)} Elemente werden nach ${to} kopiert. Die Übertragung steht in der „Warteschlange“.`,
       }),
-    openConnect: "„Verbinden“ öffnen",
   },
-  // Pack.tsx
+  // build/ (Build's pack settings and checks), JobList.tsx's pack tags
   pack: {
-    title: "Packen",
     help: "So funktioniert Packen",
-    engine: "Art der Pakete",
-    engines: { zstd: "zstd", lz4: "LZ4" },
-    actions: { pack: "Packen", unpack: "Entpacken" },
-    info: (e, packed) =>
-      e === "zstd"
-        ? packed
-          ? "Schreibt die zstd-Pakete als normale Dateien zurück."
-          : "Packt die Assets des Spiels in zstd-Volumes."
-        : packed
-          ? "Schreibt die LZ4-Pakete als normale Dateien zurück."
-          : "Manche Spiele starten eventuell nicht. Packt die Assets des Spiels in LZ4-Volumes.",
-    noAmprRuntime: "Dieses Spiel hat keine AMPR-Laufzeit: Pack fügt ampr-emu-ng ein.",
-    strategy: (s) => `Packstrategie: ${s === "everything" ? "alles außer Systemdateien packen" : "kompatible LZ4-Strategie"}.`,
     patch: "Ein Patch-Paket lässt sich nicht packen.",
     additionalContent: "Zusatzinhalte (ohne eboot.bin) lassen sich nicht packen.",
-    unreadable: "Start nicht möglich: Die Quelle konnte nicht gelesen werden (siehe „Quelle“).",
-    blocked: (a, first, more) =>
-      `${a === "pack" ? "Packen" : "Entpacken"} nicht möglich: ${first}${more > 0 ? ` (und ${num(more)} weitere, siehe „Quelle“)` : ""}.`,
-    target: "Ziel",
-    packFolder: (e) => `Empfohlen. Am schnellsten, geringste Latenz: ein neuer Spielordner, seine Assets in ${e === "zstd" ? "zstd" : "LZ4"}-Paketen.`,
     levels: { fast: "Schnell", medium: "Mittel", max: "Maximal" },
     levelNotes: {
       zstd: {
-        fast: { tone: "good", text: "Empfohlen. zstd 5: schnell, gute Größe." },
-        medium: { text: "zstd 9: kleiner, langsamer." },
-        max: { text: "zstd 19: am kleinsten; viel langsamer, mehr Speicher." },
+        fast: { tone: "good", text: "Empfohlen. ZSTD 5: schnell, gute Größe." },
+        medium: { text: "ZSTD 9: kleiner, langsamer." },
+        max: { text: "ZSTD 19: am kleinsten; viel langsamer, mehr Speicher." },
       },
       lz4: {
         fast: { tone: "good", text: "Empfohlen. LZ4-Standard: am schnellsten." },
@@ -565,36 +475,8 @@ const de: Messages = {
         max: { text: "LZ4 HC 12: am kleinsten, am langsamsten." },
       },
     },
-    runtime: "Runtime",
-    runtimeNotes: {
-      ng: { tone: "good", text: "Empfohlen. Liest zstd- und LZ4-Pakete." },
-      ampr_emu: { text: "Das Original-ampr_emu." },
-    },
-    ngNote: "Braucht ampr-emu-ng: „Packen“ installiert es in fakelib/. Schalten Sie das fakelib-Update von ShadowMount+ aus, sonst ersetzt es die Runtime.",
-    installsRuntime: (version) => `Hier ist kein ampr_emu: „Packen“ installiert ampr_emu ${version}.`,
-    freshIndex: (state) =>
-      `${state === "stale" ? "ampr_emu.index ist veraltet" : state === "damaged" ? "ampr_emu.index ist beschädigt" : "Keine ampr_emu.index"}: „Packen“ schreibt eine neue.`,
-    direct: "Packt direkt in das Image; das Spiel wird zweimal gelesen.",
-    unpackFolder: "Ein neuer Spielordner mit normalen Dateien.",
-    unpackHint: (n) =>
-      `${n === null ? "Schreibt die gepackten Dateien als normale Dateien zurück" : `Schreibt ${plural(n, { one: `${num(n)} gepackte Datei als normale Datei`, other: `${num(n)} gepackte Dateien als normale Dateien` })} zurück`}.`,
-    likelyFail: (fmt) => <>
-      Als <b>{fmt}</b> wahrscheinlich nicht möglich: Das Format lehnt Dateinamen ab, die unter „Quelle“ aufgeführt sind.
-    </>,
-    collides: (a, folder) => {
-      const what = folder ? "diesen Ordner" : "diese Datei";
-      return a === "pack"
-        ? `Ein Auftrag schreibt bereits ${what}: Packen braucht einen anderen Namen.`
-        : `Ein Auftrag schreibt bereits ${what}: Entpacken braucht einen anderen Namen.`;
-    },
-    already: (a, fmt) => a === "pack"
-      ? <>
-        Dieses Spiel wird bereits als <b>{fmt}</b> geschrieben; erneutes Packen erzeugt eine zweite Kopie.
-      </>
-      : <>
-        Dieses Spiel wird bereits als <b>{fmt}</b> geschrieben; erneutes Entpacken erzeugt eine zweite Kopie.
-      </>,
-    source: "Quelle",
+    freshIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "ampr_emu.index ist veraltet" : state === "damaged" ? "ampr_emu.index ist beschädigt" : "Keine ampr_emu.index"}: Das Packen schreibt eine neue.`,
     rules: {
       title: "Eigene Regeln (TOML)",
       titleWith: (name) => `Eigene Regeln (TOML): ${name}`,
@@ -610,32 +492,32 @@ const de: Messages = {
     close: "Schließen",
     body: () => (
       <>
-        <h3>zstd</h3>
+        <h3>ZSTD</h3>
         <ol>
-          <li>Packt die Assets des Spiels in zstd-Volumes, in einen Ordner oder ein Image.</li>
-          <li><b>Schnell</b> (zstd 5) ist flott; <b>Mittel</b> (9) und <b>Maximal</b> (19) sind kleiner, aber langsamer.</li>
-          <li>Ein gepacktes Spiel zeigt <b>Entpacken</b>: Die normalen Dateien kommen zurück.</li>
+          <li>Packt die Assets des Spiels in ZSTD-Volumes, in einen Ordner oder ein Image.</li>
+          <li><b>Schnell</b> (ZSTD 5) ist flott; <b>Mittel</b> (9) und <b>Maximal</b> (19) sind kleiner, aber langsamer.</li>
+          <li>Bei einem ZSTD-gepackten Spiel entpackt <b>Keine</b> es: Die normalen Dateien kommen zurück.</li>
         </ol>
 
         <h3>LZ4</h3>
         <ol>
           <li><b>Manche Spiele starten eventuell nicht.</b> Bewahren Sie eine Kopie auf.</li>
           <li>Packt in LZ4-Volumes, in einen Ordner oder ein Image: <b>Schnell</b> (LZ4), <b>Mittel</b> (HC 9), <b>Maximal</b> (HC 12).</li>
-          <li>Runtime: <b>ampr-emu-ng</b> (Standard) oder das Original-<b>ampr_emu</b>.</li>
-          <li>Ein gepacktes Spiel zeigt <b>Entpacken</b>.</li>
+          <li>Läuft auf ampr-emu-ng, wie ZSTD-Pakete.</li>
+          <li>Bei einem LZ4-gepackten Spiel entpackt <b>Keine</b> es.</li>
         </ol>
 
         <h3>ampr-emu-ng</h3>
         <ol>
-          <li>Liest zstd- und LZ4-Pakete; „Packen“ installiert es in fakelib/.</li>
+          <li>Die einzige AMPR-Runtime, die Forge mitliefert. Sie liest ZSTD- und LZ4-Pakete; das Packen installiert sie in fakelib/.</li>
+          <li>Das Erstellen ersetzt das ampr_emu eines Spiels durch sie, sofern die Einstellungen ampr_emu nicht behalten. Ein FPKG enthält keine Runtime: Der Loader der Konsole stellt sie bereit.</li>
           <li>Schalten Sie das fakelib-Update von ShadowMount+ aus, sonst ersetzt es die Runtime und das Spiel kann seine Pakete nicht lesen.</li>
         </ol>
 
         <h3>Packstrategie</h3>
         <ol>
-          <li><b>Alles außer Systemdateien packen</b> (zstd, und LZ4 mit ampr-emu-ng): jede Datei außer eboot.bin, Programmen und Modulen, sce_sys, sce_module, fakelib und .ini-Dateien (dlc_emu.ini bleibt bearbeitbar); ampr-emu-ng liefert den Rest, Audio und Video eingeschlossen.</li>
-          <li><b>Kompatible LZ4-Strategie</b> (LZ4 mit ampr_emu): Konfigurationen, Medien und andere Dateien, die ein Spiel direkt liest, bleiben einzeln.</li>
-          <li>Nur beim Packen: Wählen Sie unter <b>Eigene Regeln (TOML)</b> ein Profil im Format von ampr_pack.py und Lazy_AMPR, auf diesem oder einem anderen Gerät.</li>
+          <li><b>Alles außer Systemdateien packen</b> (ZSTD und LZ4): jede Datei außer eboot.bin, Programmen und Modulen, sce_sys, sce_module, fakelib und .ini-Dateien (dlc_emu.ini bleibt bearbeitbar); ampr-emu-ng liefert den Rest, Audio und Video eingeschlossen.</li>
+          <li>Beim Packen: Wählen Sie unter <b>Eigene Regeln (TOML)</b> ein Profil im Format von ampr_pack.py und Lazy_AMPR, auf diesem oder einem anderen Gerät.</li>
           <li>Die letzte passende Regel gilt; Systemdateien bleiben immer einzeln. Falsche Regeln können ein Spiel hinterlassen, das nicht startet.</li>
         </ol>
       </>
@@ -663,12 +545,21 @@ const de: Messages = {
     cantList: "Dieser Ordner kann nicht geöffnet werden:",
     cancel: "Abbrechen",
     chooseFolder: "Diesen Ordner wählen",
-    netOnlyHere: "Archive und fpkg nur von diesem Gerät.",
-    shortcuts: "Verknüpfungen",
-    addShortcut: "Verknüpfung hinzufügen",
-    removeShortcut: "Verknüpfung entfernen",
-    shortcutsFull: "Höchstens 9 Verknüpfungen: entferne zuerst eine.",
-    removeShortcutNamed: (name: string) => `Verknüpfung ${name} entfernen`,
+    netOnlyHere: "Archive und FPKG nur von diesem Gerät.",
+  },
+  // bookmarks.tsx: the bookmarked folders (Transfer and the File explorer)
+  bookmarks: {
+    label: "Lesezeichen",
+    add: "Lesezeichen für diesen Ordner hinzufügen",
+    remove: "Lesezeichen entfernen",
+    removeNamed: (name: string) => `Lesezeichen ${name} entfernen`,
+    full: "Höchstens 9 Lesezeichen",
+  },
+  // DeviceTabs.tsx
+  deviceTabs: {
+    add: "Gerät hinzufügen",
+    offline: "Offline",
+    offlineNamed: (name: string) => `${name} · Offline`,
   },
   // common.tsx
   common: {
@@ -708,7 +599,7 @@ const de: Messages = {
     traceRuntime: "Alte LZ4-Trace-Runtime",
     noRuntime: "Keine Runtime",
     packed: (kind) => `Gepackt (${kind})`,
-    zstdKept: "zstd-Asset-Pakete: Eine Konvertierung behält sie",
+    zstdKept: "ZSTD-Asset-Pakete: Eine Konvertierung behält sie",
     damaged: "Beschädigte Pakete",
     unpacked: "Ungepackt",
     packedDetail: (files, volumes, percent) =>
@@ -719,12 +610,14 @@ const de: Messages = {
       damaged: "ampr_emu.index beschädigt: Eine Konvertierung schreibt sie neu",
       missing: "keine ampr_emu.index: Eine Konvertierung schreibt eine",
     },
-    runtimeAction: (a, version) =>
+    runtimeAction: (a: "install" | "replace" | "keep" | "keepIfPacks") =>
       a === "install"
-        ? `eine Konvertierung installiert das mitgelieferte ampr_emu ${version}`
+        ? "eine Konvertierung installiert das mitgelieferte ampr-emu-ng"
         : a === "replace"
-          ? `eine Konvertierung ersetzt die Runtime durch das mitgelieferte ampr_emu ${version}`
-          : `eine Konvertierung behält es`,
+          ? "eine Konvertierung ersetzt die Runtime durch das mitgelieferte ampr-emu-ng"
+          : a === "keep"
+            ? "eine Konvertierung behält es (Einstellungen)"
+            : "eine Konvertierung behält es, wenn es LZ4-Pakete liest, sonst ersetzt sie es durch ampr-emu-ng",
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/, allein eingebunden" : "fakelib/"}, ${num(n)} ${plural(n, { one: "Backport-Bibliothek", other: "Backport-Bibliotheken" })}`,
     findings: "Befunde der Vorabprüfung",
@@ -777,11 +670,11 @@ const de: Messages = {
   password: {
     title: "Dieses Archiv braucht ein Passwort",
     text: "Geben Sie sein Passwort ein, um es zu öffnen.",
-    wrong: "Das Passwort ist nicht korrekt.",
+    wrong: "Das Passwort ist nicht korrekt. Prüfen Sie es und versuchen Sie es erneut.",
     label: "Passwort",
     cancel: "Abbrechen",
     unlock: "Entsperren",
-    checking: "Wird geprüft…",
+    checking: "Prüfung",
   },
   // main-http.tsx
   launch: {
@@ -811,38 +704,6 @@ const de: Messages = {
   },
   // target.tsx
   target: {
-    format: {
-      folder: { text: "Ein Image oder Paket zurück in einen normalen Spielordner entpacken." },
-      exfat: {
-        text: "Für Spiele, die als ffpkg Probleme machen und nur wie Inhalte von einem externen Laufwerk laufen. Lässt sich auch auf Mac oder PC öffnen.",
-      },
-      ffpkg: {
-        text: "Das eigene Dateisystem der PS5 (UFS2). Beschreibbares Einbinden möglich.",
-      },
-      ffpfs: {
-        text: "Das PFS-Dateisystem der PS5, unkomprimiert. Dateinamen müssen reines ASCII sein.",
-      },
-      ffpfsc: {
-        text: "Am kleinsten: ein komprimierter Container um ein Image, immer schreibgeschützt eingebunden.",
-      },
-      pkg: { tone: "good", text: "Empfohlen. Läuft wie ein natives Spiel, aber nur, wenn Ihre Firmware es zulässt." },
-      lz4: {
-        text: "Ein Spielordner, dessen Assets in LZ4-Volumes gepackt sind, die der mitgelieferte AMPR-Emulator (ampr_emu) während des Spiels entpackt.",
-      },
-    },
-    innerFfpkg: { text: "Das eigene Dateisystem der PS5 (UFS2)." },
-    innerExfat: { tone: "good", text: "Empfohlen. Das stabilste Image in einem komprimierten Container." },
-    level0: { text: "Keine Kompression: Jeder Block wird unverändert gespeichert. Die Datei ist so groß wie das Image." },
-    levelDefault: {
-      tone: "good",
-      text: "Empfohlen: die Standardstufe von zlib. Mit Stufe 1 dauert das Erstellen etwa ein Drittel so lange; die Datei wird dabei etwa 3 % größer. Mit Stufe 9 wird sie kaum kleiner.",
-    },
-    levelLow: {
-      text: "Das Erstellen dauert weniger lange als mit Stufe 6 (mit Stufe 1 etwa ein Drittel so lange); die Datei wird größer (mit Stufe 1 etwa 3 % größer).",
-    },
-    levelHigh: {
-      text: "Kaum kleiner als 6 (Stufe 9 um 0,04 %), aber die Kompression dauert länger (Stufe 9 etwa 25 %), und alle Kerne sind durchgehend ausgelastet.",
-    },
     kraken: {
       fast: { label: "Schnell", note: { tone: "good", text: "Empfohlen. Die kürzeste Erstellungszeit." } },
       balanced: {
@@ -879,7 +740,7 @@ const de: Messages = {
       folder
         ? `Zu lang: ${bytes} Byte, höchstens ${max} (UTF-8).`
         : `Zu lang: ${bytes} Byte vor der Endung, höchstens ${max} (UTF-8).`,
-    pkgExt: (ext) => `Endet auf .${ext}, aber fpkg wird als .pkg gespeichert: Die Endung bestimmt den Treiber.`,
+    pkgExt: (ext) => `Endet auf .${ext}, aber FPKG wird als .pkg gespeichert: Die Endung bestimmt den Treiber.`,
     otherExt: (ext, target) =>
       `Endet auf .${ext}, aber das Ziel ist ${target}: Die Endung bestimmt den Treiber.`,
     extractInto: "In diesen Ordner entpacken",
@@ -909,7 +770,6 @@ const de: Messages = {
     versionOut: "Die Version entfällt, um Platz zu schaffen.",
     cut: "Der Name wird bei 63 Bytes abgeschnitten.",
     idOnly: "Der Text der Vorlage füllt die 63 Bytes, deshalb benennt die Titel-ID die Ausgabe.",
-    limit: "ShadowMount+ kann kein Image einhängen, dessen Name länger als 63 Bytes ist (58 bei ffpfsc), daher wird bei einem längeren Namen zuerst der Titel gekürzt.",
     errors: {
       long: (max: number) => `Eine Vorlage hat höchstens ${max} Bytes.`,
       open: "Zu einer { fehlt die schließende }.",
@@ -930,7 +790,8 @@ const de: Messages = {
     later: "Später",
     updating: "Wird aktualisiert…",
     updatingNote: "Die neue Version wird heruntergeladen. Diese Seite lädt sie danach von selbst neu.",
-    downloading: "Der Download läuft im Browser: Entpacken Sie das Archiv und ersetzen Sie diese Kopie damit.",
+    downloading: "Der Download öffnet sich im Browser: Ersetzen Sie diese Kopie durch die heruntergeladene Datei (auf dem Mac ziehen Sie die App aus der .dmg in „Programme“).",
+    downloadingCli: "Der Download öffnet sich im Browser: Ersetzen Sie die ps5-dump-forge-CLI durch die heruntergeladene Datei oder führen Sie ps5-dump-forge update --install auf dem Computer aus, auf dem sie läuft.",
     failed: (v) => `Aktualisierung auf v${v} fehlgeschlagen`,
     timeout: (v) => `v${v} ist nicht innerhalb einer Minute gestartet. Wenn sie heruntergeladen wurde, beenden Sie Dump Forge und öffnen Sie es erneut, um das Update abzuschließen.`,
     retry: "Erneut versuchen",
@@ -961,7 +822,6 @@ const de: Messages = {
     all: "Alle",
     onlineOf: (n, total) => `${num(n)} von ${num(total)} online`,
     sendFilesTo: (name) => `Dateien an ${name} senden`,
-    details: (name) => `Details zu ${name}`,
     userIs: (user) => `Benutzer ${user}`,
     nearby: "In der Nähe",
     nearbyNone: "Keine neuen Geräte gefunden",
@@ -1026,12 +886,7 @@ const de: Messages = {
     passwordNone: "Keins",
     edit: "Bearbeiten",
     nasForgetNote: "Vergessen entfernt dieses NAS und sein gespeichertes Passwort von diesem Gerät.",
-    pickSendFiles: "Zu sendende Dateien",
-    pickSendFolder: "Zu sendender Ordner",
-    pickSaveTo: "Speicherort",
     thisBrowser: "Dieser Browser",
-    browserHint: "Dateien von diesem Telefon oder Computer kommen in einen Ordner auf diesem Gerät, und eine Datei von diesem Gerät speichert dieser Browser.",
-    uploadTo: "Zielordner für den Upload",
     uploadPick: "Dateien zum Hochladen wählen",
     uploading: (name, i, n) => `${name} wird hochgeladen (${num(i)} von ${num(n)})`,
     uploaded: "Upload abgeschlossen",
@@ -1041,29 +896,16 @@ const de: Messages = {
         one: `${num(done)} von ${num(n)} Dateien wurde hochgeladen und bleibt auf diesem Gerät.`,
         other: `${num(done)} von ${num(n)} Dateien wurden hochgeladen und bleiben auf diesem Gerät.`,
       }),
-    cantStart: "Die Übertragung kann nicht gestartet werden:",
     cantUpload: "Hochladen nicht möglich:",
-    pickDownload: "Herunterzuladende Datei",
-    transferIntro: "Senden Sie Dateien oder einen Ordner von einem beliebigen Gerät in einen Ordner hier, auf einem gekoppelten Gerät oder auf einem NAS. Die Übertragung läuft als Auftrag in der Auftragsliste.",
     send: "Senden",
-    sendWhat: "Was gesendet wird",
-    sendTo: "Senden an",
-    sendNeedsDevice: "Verbinden Sie zuerst ein anderes Gerät: Koppeln Sie ein Forge oder fügen Sie ein NAS hinzu.",
-    nothingChosen: "Noch nichts ausgewählt",
-    chooseFiles: "Dateien wählen",
-    chooseFolder: "Ordner wählen",
-    startTransfer: "Starten",
-    uploadHere: "Auf dieses Gerät hochladen",
     downloadHere: "Von diesem Gerät herunterladen",
-    consoleNoFiles: "Der Browser der Konsole kann keine Dateien auswählen: Öffnen Sie diese Seite auf einem Telefon oder Computer.",
     wholeRoot: "Ein ganzes Gerät, eine Freigabe oder ein Laufwerk kann nicht gesendet werden: Wählen Sie einen Ordner darin.",
-    helpPhone: "Scannen Sie den QR-Code, um diese Seite auf einem Telefon zu öffnen. Dort übertragen „Auf dieses Gerät hochladen“ und „Von diesem Gerät herunterladen“ in „Dateiübertragung“ die Dateien des Telefons.",
-    /** How to connect: short paragraphs, in order (no headings). */
+    helpPhone: "Scannen Sie den QR-Code, um diese Seite auf einem Telefon zu öffnen. Dort lädt „Übertragung“ die Dateien des Telefons auf dieses Gerät hoch und die Dateien dieses Geräts auf das Telefon herunter.",
     help: [
       "Verbinden verknüpft Dump Forge auf Ihrer PS5 und Ihren Computern im selben Netzwerk.",
       "Zum Koppeln starten Sie die „Automatische Suche“ und wählen „Koppeln“ unter „In der Nähe“ oder geben eine Adresse unter „Gerät hinzufügen“ ein und erlauben es dann auf dem anderen Gerät. Erlauben Sie es nur, wenn beide Bildschirme dieselbe Prüfnummer zeigen.",
       "Ein NAS (SMB, FTP, NFS) wird genauso hinzugefügt. Gekoppelte Geräte und NAS sind Spielquellen und Ziele; ihre Spiele werden dort nicht bearbeitet.",
-      "„Dateiübertragung“ kopiert Dateien und Ordner zwischen ihnen. Ein Name, der dort schon existiert, wird erst nach Ihrer Bestätigung ersetzt.",
+      "„Übertragung“ im Seitenmenü kopiert Dateien und Ordner zwischen ihnen. Ein Name, der dort schon existiert, wird erst nach Ihrer Bestätigung ersetzt.",
     ],
     helpSecurity: "Nichts, was zwischen Geräten gesendet wird, ist verschlüsselt: Jeder in Ihrem Netzwerk kann es mitlesen. Ein gespeichertes NAS-Passwort liegt unverschlüsselt auf diesem Gerät. Nutzen Sie Verbinden nur im Heimnetz.",
     helpSpeed: "„Geschwindigkeitstest“ in der Zeile eines gekoppelten Geräts oder in seinen Details sendet 128 MiB dorthin und holt 128 MiB zurück, ohne etwas auf die Festplatte zu schreiben, und zeigt die Netzwerkgeschwindigkeit in beide Richtungen.",
@@ -1104,7 +946,7 @@ const de: Messages = {
     content: { game: "Spiel", patch: "Patch", additional_content: "Zusatzinhalt", unknown: "Unbekannt" },
     install: "Installieren",
     installName: (name) => `${name} installieren`,
-    started: (name) => `${name} wird installiert. Der Auftrag steht unten in der Liste.`,
+    started: (name: string) => `${name} wird installiert. Der Auftrag steht in der „Warteschlange“.`,
     tag: "Installation",
     title: "Dieses Paket installieren?",
     titleOn: (device) => `Dieses Paket auf ${device} installieren?`,
@@ -1120,7 +962,263 @@ const de: Messages = {
     installPkg: "pkg installieren",
     installPkgOn: (device) => `Ein Paket auf ${device} installieren`,
     pickTitle: "Paket zum Installieren wählen",
-    sent: (device) => `${device} installiert das Paket. Der Auftrag steht unten in der Liste.`,
+    sent: (device: string) => `${device} installiert das Paket. Der Auftrag steht in der „Warteschlange“.`,
+  },
+  // Build's and Edit's Restore metadata online switch (build/options.tsx, Edit.tsx)
+  metadata: {
+    tag: "Metadaten",
+    cant: "Metadaten nicht wiederhergestellt:",
+    label: "Metadaten online wiederherstellen",
+    buildHint: "Lädt vor dem Build param.json, Bilder, Ton und PlayGo-Tabellen dieser Version von Sonys Update-Server und legt sie dort in die Ausgabe, wo sie abweichen. Das Spiel selbst bleibt unverändert. Braucht Internet; ohne läuft der Build so weiter.",
+    buildSummary: "Legt Sonys Metadaten in die Ausgabe (das Spiel bleibt unverändert)",
+    editHint: "Wendet param.json, Bilder, Ton und PlayGo-Tabellen dieser Version von Sonys Update-Server mit deinen Änderungen auf dieses Spiel an, wo sie abweichen: ein Ordner wird direkt geändert, ein exfat oder ffpkg an Ort und Stelle, ein ffpfs, ffpfsc oder FPKG neu gebaut. Braucht Internet; schlägt der Download fehl, bleibt alles unverändert.",
+    editOnly: "Sonys Metadaten für diese Version, auf dieses Spiel angewendet",
+    editAlso: "Sonys Metadaten für diese Version werden auch angewendet, vorher heruntergeladen.",
+    editConfirm: "Sonys Metadaten anwenden?",
+    editConfirmText: "Die Metadaten werden zuerst heruntergeladen; schlägt das fehl, bleibt alles unverändert.",
+  },
+  // App.tsx: the side rail
+  rail: {
+    build: "Erstellen",
+    settings: "Einstellungen",
+    queue: "Warteschlange",
+    transfer: "Übertragung",
+    collapse: "Menü einklappen",
+    expand: "Menü ausklappen",
+  },
+  // Queue.tsx
+  queue: {
+    empty: "Noch keine Aufträge. Erstellungen, Bearbeitungen, Übertragungen und Installationen erscheinen hier.",
+    counts: (running: number, queued: number, failed: number, done: number): string =>
+      [
+        running && `${num(running)} laufen`,
+        queued && `${num(queued)} warten`,
+        failed && `${num(failed)} fehlgeschlagen`,
+        done && `${num(done)} fertig`,
+      ]
+        .filter(Boolean)
+        .join(", ") || "Nichts anzuzeigen",
+    retryFailed: (n: number): string => (n > 0 ? `Fehlgeschlagene wiederholen (${num(n)})` : "Fehlgeschlagene wiederholen"),
+    retrying: (i: number, n: number) => `Wiederhole ${num(i)} von ${num(n)}`,
+    clearFinished: "Beendete entfernen",
+    filters: { all: "Alle", running: "Laufend", failed: "Fehlgeschlagen", done: "Fertig" },
+    filterLabel: "Anzeigen",
+    noneShown: "Keine Aufträge passen zu diesem Filter.",
+  },
+  // Settings.tsx
+  settings: {
+    appearance: "Darstellung",
+    theme: "Design",
+    themeHint: "Dunkel passt zum Fernseher, hell zu einem hellen Raum.",
+    dark: "Dunkel",
+    light: "Hell",
+    scheme: "Farbschema",
+    schemeHint: "Die Akzentfarbe in der ganzen App.",
+    schemes: { abyss: "Tiefsee", ember: "Glut", moss: "Moos", cobalt: "Kobalt", dusk: "Dämmerung", rose: "Rose", sand: "Sand", volt: "Volt", mono: "Mono" },
+    advanced: "Erweiterte Optionen",
+    advancedOpen: "Erweiterte Optionen immer anzeigen",
+    advancedHint:
+      "Zeigt alle Pakete und Formate ohne „Mehr“ und hält alle eingeklappten Bereiche offen. Schalten Sie es aus, damit Erstellen kurz bleibt.",
+    bundled: (version: string) => `${version} (mitgeliefert)`,
+    replaceAmprEmu: "ampr_emu durch ampr-emu-ng ersetzen",
+    languageHint: "Die Sprachen des Systems, bis Sie eine wählen.",
+    notificationsGroup: "PS5",
+  },
+  // JobList.tsx: a finished job's result
+  result: {
+    file: "Ausgabe",
+    type: "Typ",
+    size: "Größe",
+    files: "Dateien",
+    time: "Dauer",
+    verified: "Geprüft",
+    verifiedFast: "Geprüft (schnell)",
+    verifiedFull: "Geprüft (vollständig)",
+    notVerified: "Keine Prüfung gemeldet",
+    checks: "Prüfungen:",
+    copy: "Details kopieren",
+    copied: "Kopiert",
+    copyFailed: "Hier nicht kopierbar",
+    ofSource: (pct: number) => `${num(pct, 1)} % der Spieldateien`,
+    filesN: (n: number) => `${num(n)} ${plural(n, FILES)}`,
+    to: "geschrieben nach",
+    took: (d: string) => `dauerte ${d}`,
+    kinds: {
+      pkg: "FPKG: auf einer PS5 mit FPKG-Unterstützung installierbar",
+      exfat: "exfat-Image: ShadowMount+ bindet es beschreibbar ein",
+      ffpkg: "ffpkg-Image (UFS2): ShadowMount+ bindet es beschreibbar ein",
+      ffpfs: "ffpfs-Image (PFS): ShadowMount+ bindet es ein",
+      ffpfsc: "ffpfsc-Image (komprimiertes PFS): ShadowMount+ bindet es schreibgeschützt ein",
+      folder: "Spielordner",
+    } as Record<string, string | undefined>,
+    zstdFolder: "Ordner mit ZSTD-Paketen",
+    lz4Folder: "Ordner mit LZ4-Paketen",
+    withPacks: (image: string, kind: string) => `${image}, Dateien in ${kind}-Paketen`,
+    edited: (what: string) => `${what}, direkt geändert`,
+    rebuilt: (what: string) => `${what}, neu erstellt`,
+    extracted: "Extrahierte Dateien",
+    transferred: "Kopierte Dateien",
+    installed: "Paket an den Installer der PS5 übergeben",
+  },
+  // JobList.tsx: the log panel
+  log: {
+    lines: (n: number, of?: number): string =>
+      of === undefined
+        ? `${num(n)} ${plural(n, { one: "Zeile", other: "Zeilen" })}`
+        : `${num(n)} von ${num(of)} ${plural(of, { one: "Zeile", other: "Zeilen" })}`,
+    filter: "Filter",
+    follow: "Automatisch scrollen",
+    copy: "Kopieren",
+    copied: "Kopiert",
+    copyFailed: "Kopieren fehlgeschlagen",
+    save: "Speichern",
+    clear: "Leeren",
+    cleared: "Geleert",
+  },
+  // common.tsx: the source card's fact chips
+  sourceChips: {
+    sdk: (v: string) => `SDK ${v}`,
+    firmware: (v: string) => `Firmware ${v}+`,
+  },
+  // prefs.tsx: Advanced's badge
+  advanced: {
+    changed: "Geändert",
+    defaults: "Standard",
+  },
+  // build/*: the Build screen
+  build: {
+    summary: "Zusammenfassung",
+    addToQueue: "Zur Warteschlange hinzufügen",
+    queued: "Zur Warteschlange hinzugefügt",
+    openQueue: "Warteschlange öffnen",
+    space: (free: string, dir: string, needed: string) => (
+      <>
+        {free} frei in <span className="path">{dir}</span>, etwa {needed} nötig
+      </>
+    ),
+    needed: (needed: string) => `Etwa ${needed} nötig`,
+    spaceRaw: "Der Platz wird wie ohne Kompression geprüft.",
+    estimate: "Schätzung",
+    advanced: "Erweiterte Optionen",
+    options: "Optionen",
+    fastVerify: "Schnelle Prüfung: Jede Struktur wird geprüft, eine Stichprobe der Daten zurückgelesen.",
+    fullVerify: "Vollständige Prüfung: Jedes Byte wird zurückgelesen.",
+    deleted: "Die Quelle wird nach einer erfolgreichen Erstellung gelöscht. Kein Rückgängig.",
+    zstdBackport:
+      "Die Assets dieses Spiels sind mit ZSTD gepackt und sein ZSTD-Index listet den Backport: Erstellen Sie es zuerst einmal mit „Pakete: Keine“ und entfernen Sie dann den Backport.",
+    lz4Backport:
+      "Die Assets dieses Spiels sind mit LZ4 gepackt und sein LZ4-Manifest listet den Backport: Erstellen Sie es zuerst einmal mit „Pakete: Keine“ und entfernen Sie dann den Backport.",
+    backportLeftOut: (n: number) =>
+      plural(n, {
+        one: `${num(n)} Backport-Bibliothek bleibt aus fakelib/ heraus.`,
+        other: `${num(n)} Backport-Bibliotheken bleiben aus fakelib/ heraus.`,
+      }),
+    packsTitle: "Ziel",
+    packs: "Pakete",
+    more: "Mehr",
+    moreTip: "Weitere Formate",
+    cards: {
+      folder: "Normale Dateien, überallhin kopierbar, ShadowMount+ startet es",
+      pkg: "Wird auf der PS5 wie ein Spielpaket installiert",
+      exfat: "Wird von ShadowMount+ eingebunden und öffnet sich am PC",
+      ffpkg: "UFS2-Image für ShadowMount+, beschreibbares Einbinden möglich",
+      ffpfs: "PFS-Image, unkomprimiert, nur ASCII-Dateinamen",
+      ffpfsc: "Kleinstes Image: komprimiert, immer schreibgeschützt eingebunden",
+      lz4: "Assets mit LZ4 gepackt, normaler Ordner",
+    },
+    zstdFolderCard: "Assets mit ZSTD gepackt, normaler Ordner",
+    packCards: {
+      nonePlain: "Die Dateien des Spiels, wie sie sind",
+      unpack: "Schreibt die Pakete als normale Dateien zurück",
+      keepZstd: "Die ZSTD-Pakete bleiben Byte für Byte erhalten",
+      keepLz4: "Die LZ4-Pakete bleiben Byte für Byte erhalten",
+      zstd: "Kleineres Spiel, schnelleres Laden, mit ampr-emu-ng",
+      repackZstd: "Entpackt die LZ4-Pakete und packt neu mit ZSTD",
+      lz4: "Packt Assets mit LZ4, mit ampr-emu-ng",
+      repackLz4: "Entpackt die ZSTD-Pakete und packt neu mit LZ4",
+    },
+    naming: "Ausgabe: Der Name wird erzeugt",
+    output: (name: string, dir: string) => (
+      <>
+        Ausgabe: <b className="path">{name}</b> in <span className="path">{dir}</span>
+      </>
+    ),
+    choices: { none: "Keine", zstd: "ZSTD", lz4: "LZ4" },
+    levelLabel: (level: string, engine: string, n: number) => `${level}, ${engine} ${n}`,
+    levelTip: (engine: string, n: number, note: string) => `${engine} ${n}. ${note}`,
+    sumKeepZstd: "Die ZSTD-Pakete bleiben Byte für Byte erhalten.",
+    sumKeepLz4: "Die LZ4-Pakete bleiben Byte für Byte erhalten.",
+    sumKeepPlain: "Es werden keine Pakete erstellt: Die Dateien des Spiels werden konvertiert, wie sie sind.",
+    sumUnpack: (engine: string) => `Die ${engine}-Pakete werden als normale Dateien zurückgeschrieben.`,
+    sumPack: (engine: string, level: string) => `Die Dateien des Spiels werden in ${engine}-Volumes gepackt (${level}).`,
+    sumRepack: (from: string, to: string, level: string) => `Die ${from}-Pakete werden entpackt und mit ${to} neu gepackt (${level}).`,
+    sumRules: (name: string) => `Die eigenen Regeln ${name} legen fest, welche Dateien gepackt werden.`,
+    sumInside: (format: string, level: number) => `Innen: ${format}, zlib-Stufe ${level}.`,
+    ngInstalled: "ampr-emu-ng wird unter fakelib/libSceAmpr.sprx installiert.",
+    ngReplaced: (old: string) => `${old} des Spiels wird durch ampr-emu-ng ersetzt.`,
+    ngReplacedTrace: "Die alte Trace-Runtime des Spiels wird durch ampr-emu-ng ersetzt.",
+    ngKept: (old: string) => `${old} des Spiels bleibt erhalten.`,
+    ngUpdated: (v: string) => `ampr-emu-ng${v} des Spiels wird durch die mitgelieferte ersetzt.`,
+    ngSame: (v: string) => `ampr-emu-ng${v} des Spiels bleibt erhalten.`,
+    pkgNoRuntime: "Die AMPR-Runtime bleibt aus dem FPKG heraus: Der Loader der Konsole stellt sie bereit.",
+    recommended: "Empfohlen",
+    resultTitle: "Etwa, nach dem Erstellen",
+    resultNow: "Spiel jetzt",
+    resultCustomRules: "eigene Regeln: keine Schätzung",
+    backportTitle: "Backport",
+    backportNone: "Dieses Spiel hat keinen Backport.",
+    backportPlain: "Nur bei einer einfachen Konvertierung: ohne Packen oder Entpacken.",
+  },
+  // TransferPane.tsx: one device's pane of the Transfer screen
+  transfer: {
+    pane: (device) => `Dateien auf ${device}`,
+    roots: "Laufwerke",
+    location: "Ort",
+    up: "Nach oben",
+    upTip: "Einen Ordner nach oben",
+    refresh: "Aktualisieren",
+    filter: "Nach Name filtern",
+    filterLabel: "Diesen Ordner nach Name filtern",
+    inFolder: (dirs, files) =>
+      `${num(dirs)} ${plural(dirs, { one: "Ordner", other: "Ordner" })}, ${num(files)} ${plural(files, FILES)}`,
+    matches: (n) => plural(n, { one: `${num(n)} Treffer`, other: `${num(n)} Treffer` }),
+    firstOf: (max, n) => `erste ${num(max)} von ${num(n)}`,
+    truncated: "Dieser Ordner enthält mehr als 10.000 Einträge: Nur die ersten 10.000 werden angezeigt.",
+    name: "Name",
+    size: "Größe",
+    select: (name) => `${name} auswählen`,
+    open: (name) => `${name} öffnen`,
+    selected: (n) => plural(n, { one: `${num(n)} Element ausgewählt`, other: `${num(n)} Elemente ausgewählt` }),
+    clear: "Aufheben",
+    clearTip: "Auswahl aufheben",
+    dragItems: (n) => plural(n, { one: `${num(n)} Element`, other: `${num(n)} Elemente` }),
+    dropHere: (path) => `Ablegen, um es nach ${path} zu senden`,
+    notHere: "Öffnen Sie einen Ordner, um Dateien hierher zu senden.",
+    emptyFolder: "Dieser Ordner ist leer.",
+    noMatch: (f) => `Hier passt nichts zu „${f}“.`,
+    noRoots: "Keine Laufwerke zum Durchsuchen verfügbar.",
+    cantList: "Dieser Ordner kann nicht geöffnet werden:",
+    loading: "Wird geladen",
+    link: "Link",
+    linkTip: "Ein Link: Er lässt sich öffnen, aber nicht auswählen",
+    mounted: "Eingehängt",
+    mountedTip: "Von ShadowMount+ eingehängt: Beenden Sie das Spiel und schalten Sie ShadowMount+ aus, um es auszuwählen",
+    withTitle: "Übertragen mit",
+    loadingDevices: "Geräte werden geladen",
+    noneTitle: "Kein Gerät für eine Übertragung",
+    noneHint: "Koppeln Sie unter „Verbinden“ ein weiteres Dump Forge oder fügen Sie ein NAS hinzu, oder schalten Sie ein gespeichertes ein.",
+    openConnect: "„Verbinden“ öffnen",
+    deviceOffline: (device) => `${device} ist offline. Seine Dateien erscheinen wieder, sobald es zurück ist.`,
+    copyTo: (n, device) =>
+      plural(n, { one: `${num(n)} Element nach ${device} kopieren`, other: `${num(n)} Elemente nach ${device} kopieren` }),
+    copyNoFolder: (device) => `Öffnen Sie einen Ordner auf ${device}, in den kopiert werden soll.`,
+    installOn: (device) => `Auf ${device} installieren`,
+    dropFiles: "Dateien hier ablegen, um sie hochzuladen",
+    uploadInto: (folder) => `Sie landen in ${folder}, dem Ordner, der auf diesem Gerät angezeigt wird.`,
+    uploadNoFolder: "Öffnen Sie einen Ordner auf diesem Gerät, in den hochgeladen werden soll.",
+    foldersLeftOut: (names) => `Ordner werden nicht hochgeladen, nur Dateien: ${names}.`,
+    downloadFiles: (n) => plural(n, { one: `${num(n)} Datei herunterladen`, other: `${num(n)} Dateien herunterladen` }),
+    downloadNone: "Wählen Sie Dateien auf diesem Gerät aus, um sie herunterzuladen (Ordner werden nicht heruntergeladen).",
   },
   duration: { s: (s) => `${s} s`, ms: (m, s) => `${m} min ${s} s`, hm: (h, m) => `${h} h ${m} min` },
 };

@@ -1,0 +1,355 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index 972d6a615ab675cd2e6db43446f8e0c2b8acf2f4..5da506f322b8cd678b673a334f863a728017f652 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -1123,18 +1123,22 @@ fn prepare_with(
+ pub fn write_package(
+     prepared: &Prepared,
+     tree: &mut dyn source::SourceTree,
+-    out: &mut std::fs::File,
++    out: &mut dyn crate::PkgOut,
+     out_path: &Path,
+     progress: &mut dyn FnMut(&str),
+     control: &mut BuildControl,
+ ) -> Result<BuildReport> {
+     check_cancel(control)?;
+-    if out.metadata()?.len() != 0 {
++    if out.out_len()? != 0 {
+         return format_err(format!(
+             "{} is not empty; the package is written into a new file",
+             out_path.display()
+         ));
+     }
++    // The header's magic first: an output written once front to back (an FTP upload) can then
++    // take the header, written last, without going back over its first byte.
++    out.write_all(&crate::fih::MAGIC.to_be_bytes())?;
++    out.seek(std::io::SeekFrom::Start(0))?;
+     let written = write_mode(
+         prepared,
+         tree,
+@@ -1145,7 +1149,7 @@ pub fn write_package(
+         Mode::Streaming,
+     )?;
+     let report = verify_written(prepared, out, progress, control)?;
+-    let size = out.metadata()?.len();
++    let size = out.out_len()?;
+     if size != written {
+         return format_err(format!(
+             "{} is {size} bytes where the writer wrote {written}",
+@@ -1251,12 +1255,12 @@ fn build_mode(
+ /// check to pass.
+ fn verify_written(
+     prepared: &Prepared,
+-    out: &std::fs::File,
++    out: &dyn crate::PkgOut,
+     progress: &mut dyn FnMut(&str),
+     control: &mut BuildControl,
+ ) -> Result<crate::verify::Report> {
+     enter(control, Stage::Verify);
+-    let file = crate::PkgFile::from_reader(Box::new(out.try_clone()?), out.metadata()?.len());
++    let file = crate::PkgFile::from_reader(Box::new(out.try_clone_out()?), out.out_len()?);
+     match control.sample {
+         Some(seed) => progress(&format!(
+             "verifying (fast: sampled blocks, seed {seed}, policy {})",
+@@ -1292,7 +1296,7 @@ fn verify_written(
+ fn write_mode(
+     prepared: &Prepared,
+     tree: &mut dyn source::SourceTree,
+-    out: &mut std::fs::File,
++    out: &mut dyn crate::PkgOut,
+     out_path: &Path,
+     progress: &mut dyn FnMut(&str),
+     control: &mut BuildControl,
+@@ -1514,13 +1518,12 @@ fn write_mode(
+ 
+             progress("writing the package");
+             {
+-                use std::io::{Seek, Write};
+                 out.seek(std::io::SeekFrom::Start(0))?;
+                 out.write_all(&fih)?;
+                 out.write_all(&outer.image)?;
+                 out.write_all(&cnt.bytes)?;
+                 out.write_all(&si)?;
+-                out.sync_all()?;
++                out.sync_out()?;
+             }
+             cnt_offset + cnt.bytes.len() as u64 + si.len() as u64
+         }
+diff --git a/ps5upload-fpkg/src/fih.rs b/ps5upload-fpkg/src/fih.rs
+index c57937003e67a539761b875da139efb2bb6e9ae3..fce27732d4eef46e4f04b443838aa06d2e8ac67a 100644
+--- a/ps5upload-fpkg/src/fih.rs
++++ b/ps5upload-fpkg/src/fih.rs
+@@ -3,7 +3,7 @@
+ use crate::{format_err, le16, le64, Result};
+ 
+ pub const HEADER_LEN: usize = 0x100;
+-const MAGIC: u32 = 0x7F46_4948;
++pub(crate) const MAGIC: u32 = 0x7F46_4948;
+ 
+ pub struct Fih {
+     pub signed_byte: u8,
+diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
+index 51c0f59fa01817c6331a3042b624a3b23205689d..ec84f4f44e69691316ddd595067412ece784ab12 100644
+--- a/ps5upload-fpkg/src/kraken_image.rs
++++ b/ps5upload-fpkg/src/kraken_image.rs
+@@ -12,7 +12,6 @@
+ //! the console could not read back. The compressed image goes to a spool file first, because
+ //! the outer image's geometry depends on its final length.
+ 
+-use std::fs::File;
+ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+ use std::sync::atomic::AtomicBool;
+ 
+@@ -258,7 +257,7 @@ pub fn compress(
+     metadata: &[u8],
+     keystone: &[u8],
+     read: SourceRead<'_>,
+-    spool: File,
++    spool: impl Write + Seek,
+     base: u64,
+     threads: usize,
+     level: kraken::Level,
+@@ -417,7 +416,12 @@ pub fn compress(
+ }
+ 
+ /// Read the spooled image back one 64 KiB block at a time; it starts at byte `base`.
+-pub fn spool_block(spool: &mut File, base: u64, index: u64, buf: &mut [u8]) -> Result<()> {
++pub fn spool_block(
++    spool: &mut (impl Read + Seek + ?Sized),
++    base: u64,
++    index: u64,
++    buf: &mut [u8],
++) -> Result<()> {
+     spool.seek(SeekFrom::Start(base + index * crate::BLOCK))?;
+     spool.read_exact(buf)?;
+     Ok(())
+@@ -2014,7 +2018,7 @@ mod tests {
+         let keystone: Vec<u8> = (0..plan::KEYSTONE_LEN).map(|i| i as u8).collect();
+         let metadata = vec![0u8; (plan.ndblock * crate::BLOCK - plan.meta_base) as usize];
+         let path = std::env::temp_dir().join(format!("kraken-digests-{}", std::process::id()));
+-        let spool = File::options()
++        let spool = std::fs::File::options()
+             .read(true)
+             .write(true)
+             .create(true)
+diff --git a/ps5upload-fpkg/src/lib.rs b/ps5upload-fpkg/src/lib.rs
+index 11ca9360c7c6b368e6dbcada09fec46b47ef5115..a06ac767f339fc7d987c58cefff4a796e5ac3241 100644
+--- a/ps5upload-fpkg/src/lib.rs
++++ b/ps5upload-fpkg/src/lib.rs
+@@ -146,6 +146,30 @@ pub(crate) fn format_err<T>(msg: impl Into<String>) -> Result<T> {
+ pub trait ReadSeek: Read + Seek + Send {}
+ impl<T: Read + Seek + Send> ReadSeek for T {}
+ 
++/// Where [`build::write_package`] writes a package: a local file, or anything that reads back
++/// what was written to it (a file on another device). The builder seeks before every read and
++/// write, so a clone may keep a position of its own.
++pub trait PkgOut: Read + std::io::Write + Seek + Send {
++    /// Another handle on the same output: the in-place Kraken spool, the self-check's reader.
++    fn try_clone_out(&self) -> std::io::Result<Box<dyn PkgOut>>;
++    /// Its length now.
++    fn out_len(&self) -> std::io::Result<u64>;
++    /// Makes what was written durable.
++    fn sync_out(&self) -> std::io::Result<()>;
++}
++
++impl PkgOut for std::fs::File {
++    fn try_clone_out(&self) -> std::io::Result<Box<dyn PkgOut>> {
++        Ok(Box::new(self.try_clone()?))
++    }
++    fn out_len(&self) -> std::io::Result<u64> {
++        Ok(self.metadata()?.len())
++    }
++    fn sync_out(&self) -> std::io::Result<()> {
++        self.sync_all()
++    }
++}
++
+ /// A package or image, read by offset.
+ pub struct PkgFile {
+     file: Box<dyn ReadSeek>,
+diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
+index 758e529a4e657f9ad2ae9454e4aed20b4124c37b..1291ca2d32365ad1e728d183d3fe1565cdd239cf 100644
+--- a/ps5upload-fpkg/src/stream.rs
++++ b/ps5upload-fpkg/src/stream.rs
+@@ -10,7 +10,7 @@
+ //! digests) — never by the size of the game.
+ 
+ use std::fs::File;
+-use std::io::{Read, Seek, SeekFrom, Write};
++use std::io::{Read, Seek, SeekFrom};
+ use std::sync::atomic::AtomicBool;
+ 
+ use crate::cnt_write::{self, CntParams};
+@@ -151,16 +151,18 @@ pub enum KrakenSpool {
+     File(std::path::PathBuf),
+ }
+ 
+-fn spool_file(out: &File, spool: &KrakenSpool) -> Result<File> {
++fn spool_file(out: &dyn crate::PkgOut, spool: &KrakenSpool) -> Result<Box<dyn crate::PkgOut>> {
+     Ok(match spool {
+-        KrakenSpool::InPlace => out.try_clone()?,
++        KrakenSpool::InPlace => out.try_clone_out()?,
+         // Never truncate a spool another build is writing.
+-        KrakenSpool::File(path) => std::fs::OpenOptions::new()
+-            .read(true)
+-            .write(true)
+-            .create_new(true)
+-            .open(path)
+-            .map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?,
++        KrakenSpool::File(path) => Box::new(
++            std::fs::OpenOptions::new()
++                .read(true)
++                .write(true)
++                .create_new(true)
++                .open(path)
++                .map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?,
++        ),
+     })
+ }
+ 
+@@ -230,7 +232,7 @@ fn cancelled() -> crate::Error {
+ 
+ /// Write the whole package to `out`, which must be empty and seekable.
+ pub fn write_package(
+-    out: &mut File,
++    out: &mut dyn crate::PkgOut,
+     request: &StreamRequest,
+     read: RangeRead,
+     progress: &mut Progress,
+@@ -305,8 +307,10 @@ pub fn write_package(
+     // place, where it already sits, or its separate spool file.
+     let in_place = matches!(request.kraken_spool, Some(KrakenSpool::InPlace));
+     let mut spool = match &request.kraken_spool {
+-        Some(KrakenSpool::InPlace) if kraken.is_some() => Some(out.try_clone()?),
+-        Some(KrakenSpool::File(path)) if kraken.is_some() => Some(File::open(path)?),
++        Some(KrakenSpool::InPlace) if kraken.is_some() => Some(out.try_clone_out()?),
++        Some(KrakenSpool::File(path)) if kraken.is_some() => {
++            Some(Box::new(File::open(path)?) as Box<dyn crate::PkgOut>)
++        }
+         _ => None,
+     };
+     let spool_at = request.kraken_spool.as_ref().map_or(0, spool_base);
+@@ -598,7 +602,7 @@ pub fn write_package(
+     if crate::workshop::checkpoint(cancel) {
+         return Err(cancelled());
+     }
+-    out.sync_all()?;
++    out.sync_out()?;
+ 
+     let size = cnt_offset + cnt.bytes.len() as u64 + si.len() as u64;
+     (progress.bytes)(outer_size, outer_size);
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index f4dc76e20a059f46124ee71263c0186a43aed2e7..e20d0ee561a4173f240fc613bd9eafcd7f264c66 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -925,3 +925,110 @@ fn the_written_handle_is_what_gets_verified() {
+     assert_eq!(report.path, path);
+     assert_eq!(report.size, std::fs::metadata(&moved).unwrap().len());
+ }
++
++/// An output that is not a file (Forge writes onto another device): clones share one buffer,
++/// each with a position of its own. The package is the one a file gets, byte for byte, and its
++/// self-check (and the in-place Kraken spool) reads it back through clones.
++#[test]
++fn a_package_is_written_into_any_pkg_out() {
++    use std::io::{Read, Seek, SeekFrom, Write};
++    use std::sync::{Arc, Mutex};
++
++    struct Mem {
++        data: Arc<Mutex<Vec<u8>>>,
++        pos: u64,
++    }
++    impl Read for Mem {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            let data = self.data.lock().unwrap();
++            let at = (self.pos as usize).min(data.len());
++            let n = buf.len().min(data.len() - at);
++            buf[..n].copy_from_slice(&data[at..at + n]);
++            self.pos += n as u64;
++            Ok(n)
++        }
++    }
++    impl Write for Mem {
++        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++            let mut data = self.data.lock().unwrap();
++            let end = self.pos as usize + buf.len();
++            if data.len() < end {
++                data.resize(end, 0);
++            }
++            data[self.pos as usize..end].copy_from_slice(buf);
++            self.pos = end as u64;
++            Ok(buf.len())
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++    impl Seek for Mem {
++        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
++            let len = self.data.lock().unwrap().len() as i64;
++            self.pos = match to {
++                SeekFrom::Start(p) => p as i64,
++                SeekFrom::End(d) => len + d,
++                SeekFrom::Current(d) => self.pos as i64 + d,
++            } as u64;
++            Ok(self.pos)
++        }
++    }
++    impl ps5upload_fpkg::PkgOut for Mem {
++        fn try_clone_out(&self) -> std::io::Result<Box<dyn ps5upload_fpkg::PkgOut>> {
++            Ok(Box::new(Mem {
++                data: self.data.clone(),
++                pos: 0,
++            }))
++        }
++        fn out_len(&self) -> std::io::Result<u64> {
++            Ok(self.data.lock().unwrap().len() as u64)
++        }
++        fn sync_out(&self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    let src = TempDir::new("pkgout-src");
++    let out = TempDir::new("pkgout-out");
++    write_tree(src.path());
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let prepared = build::prepare(
++        &mut tree,
++        &request(src.path()),
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let path = out.path().join("file.part");
++    let mut file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create_new(true)
++        .open(&path)
++        .unwrap();
++    let on_file = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut file,
++        &path,
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    let mut mem = Mem {
++        data: Arc::new(Mutex::new(Vec::new())),
++        pos: 0,
++    };
++    let in_mem = build::write_package(
++        &prepared,
++        &mut tree,
++        &mut mem,
++        Path::new("mem.part"),
++        &mut |_| {},
++        &mut BuildControl::default(),
++    )
++    .unwrap();
++    assert!(in_mem.verify.ok(), "{}", in_mem.verify);
++    assert_eq!(in_mem.size, on_file.size);
++    assert!(*mem.data.lock().unwrap() == std::fs::read(&path).unwrap());
++}

@@ -5,6 +5,7 @@
 import { useSyncExternalStore } from "react";
 
 import { reloadForUpdate } from "./appcache";
+import { assetName } from "./update";
 import {
   call,
   connectCall,
@@ -98,9 +99,20 @@ export const transport: Transport = {
   notifications: serverNotifications,
   setNotifications: setServerNotifications,
   updateTarget: serverUpdateTarget,
-  // The new version serves a new bundle: AppCache swaps it in and reloads (appcache.ts, when no
-  // dialog is open); otherwise the page just reloads.
+  // The PS5: the new version serves a new bundle: AppCache swaps it in and reloads (appcache.ts,
+  // when no dialog is open); otherwise the page just reloads. A computer: the CLI's file opens
+  // in a new tab, as the app opens its own.
   startUpdate: async (version) => {
+    if ((await serverPlatform()) !== "ps5") {
+      const t = await serverUpdateTarget();
+      if (!t) throw new Error("This server offers no update");
+      const url = `https://github.com/quer3q/ps5-dump-forge/releases/download/v${version}/${assetName(version, t.asset)}`;
+      // Not "noopener": with it window.open always returns null, and a blocked popup must show.
+      const w = window.open(url, "_blank");
+      if (!w) throw new Error(`The browser blocked the download: open ${url}`);
+      w.opener = null;
+      return;
+    }
     await selfUpdate(version);
     reloadForUpdate();
   },

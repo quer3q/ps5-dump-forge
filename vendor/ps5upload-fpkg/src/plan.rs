@@ -372,6 +372,31 @@ pub fn build_tree(input: &[SourceFile], empty_dirs: &[String], spread: bool) -> 
     if files.is_empty() {
         return format_err("the source tree has no files");
     }
+    // The flat path table keys every path by its upper-cased hash and the image writers
+    // refuse two names that differ only by case: say so here, naming both, before any
+    // inode is numbered. Every path prefix counts (`Data/a` and `data/b` share a folder).
+    let mut by_case: BTreeMap<String, &str> = BTreeMap::new();
+    for path in files
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain(empty_dirs.iter().map(|d| d.trim_matches('/')))
+    {
+        let mut end = path.len();
+        loop {
+            let prefix = &path[..end];
+            if let Some(other) = by_case.insert(prefix.to_ascii_uppercase(), prefix) {
+                if other != prefix {
+                    return format_err(format!(
+                        "{other:?} and {prefix:?} differ only by letter case, which the image cannot tell apart"
+                    ));
+                }
+            }
+            match path[..end].rfind('/') {
+                Some(cut) => end = cut,
+                None => break,
+            }
+        }
+    }
 
     // Directory tree.
     let mut dirs: Vec<DirNode> = vec![DirNode {
@@ -1027,6 +1052,48 @@ mod afid_tests {
             .any(|(n, i, k)| n == "shaders" && *i == shaders.inode && *k == DIRENT_DIR));
         let hash = flt::hash_path("data/shaders");
         assert!(plan.flt_inode.iter().any(|(h, _)| *h == hash));
+    }
+
+    /// Two paths that differ only by letter case cannot both live in the image (one flat
+    /// path table key, one case-insensitive directory): the plan refuses them, naming both.
+    #[test]
+    fn paths_that_differ_only_by_case_are_refused_together() {
+        let tree = |paths: &[&str]| -> Vec<SourceFile> {
+            paths
+                .iter()
+                .map(|p| SourceFile {
+                    path: (*p).to_string(),
+                    size: 10,
+                })
+                .collect()
+        };
+        let err = build_tree(&tree(&["eboot.bin", "x.bin", "X.BIN"]), &[], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"X.BIN\"") && err.contains("\"x.bin\""),
+            "{err}"
+        );
+        // A folder spelt two ways by two files.
+        let err = build_tree(
+            &tree(&["Data/a.bin", "data/b.bin", "eboot.bin"]),
+            &[],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("\"Data\"") && err.contains("\"data\""),
+            "{err}"
+        );
+        // An empty directory counts too; same-case repeats are fine.
+        assert!(build_tree(&tree(&["data/a.bin"]), &["DATA/x".to_string()], false).is_err());
+        build_tree(
+            &tree(&["data/a.bin", "data/b.bin"]),
+            &["data/x".to_string()],
+            false,
+        )
+        .unwrap();
     }
 
     /// The afid table leads with its entry count. Many directories push the first file inode

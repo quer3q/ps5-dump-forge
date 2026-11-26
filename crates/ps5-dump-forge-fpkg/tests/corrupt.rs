@@ -11,8 +11,7 @@ use ps5upload_fpkg::source::SourceTree;
 
 const BLOCK: usize = 0x10000;
 
-/// Open the bytes and read every file; any outcome but a panic is fine. True when all of it
-/// read without an error.
+/// Open and read every file; true when all of it read without an error.
 fn exercise(bytes: Vec<u8>) -> bool {
     let Ok(mut source) = open_bytes(bytes, None) else {
         return false;
@@ -27,7 +26,6 @@ fn exercise(bytes: Vec<u8>) -> bool {
     ok
 }
 
-/// A built plaintext package and where its parts are.
 struct Target {
     bytes: Vec<u8>,
     cnt_offset: usize,
@@ -67,8 +65,7 @@ impl Target {
         }
     }
 
-    /// Set image byte `at` (an offset into `pfs_image.dat`, or past it into the descriptor's
-    /// blocks) and rewrite that block's `imagedigs` entry so the change gets past the digest.
+    /// Set image byte `at` and rewrite that block's `imagedigs` entry to match.
     fn patch(&self, bytes: &mut [u8], at: usize, value: u8) {
         let block = at / BLOCK;
         bytes[BLOCK + at] = value;
@@ -80,8 +77,7 @@ impl Target {
     }
 }
 
-/// Mutate `t` `rounds` times, `pick` choosing the damage; returns (rounds that read cleanly,
-/// rounds that failed). A panic in any round fails the test.
+/// Mutate `t` `rounds` times; (clean, failed) rounds. A panic fails the test.
 fn fuzz(
     t: &Target,
     rounds: u64,
@@ -107,11 +103,10 @@ fn fuzz(
     (clean, failed)
 }
 
-/// Damage nothing digests on the way in: truncations, and bytes of the header and of the
-/// container's header and entry table; plus random flips anywhere.
+/// Undigested damage (truncations, header and container bytes) plus random flips.
 #[test]
 fn damaged_headers_and_truncations_fail_without_panicking() {
-    let t = Target::new(build("fuzz-head", 0, |_| {}).package());
+    let t = Target::new(build("fuzz-head", |_| {}).package());
     assert!(exercise(t.bytes.clone()), "the pristine package reads");
     let (_, failed) = fuzz(&t, 150, 1, |t, rng, bytes| match rng.below(4) {
         0 => bytes.truncate(rng.below(bytes.len() as u64) as usize),
@@ -135,11 +130,10 @@ fn damaged_headers_and_truncations_fail_without_panicking() {
     assert!(failed > 50, "only {failed} of 150 failed");
 }
 
-/// Damage behind a rewritten digest, so it reaches the descriptor walk and the Kraken decoder:
-/// bytes of the layout descriptor, and of the stored LZ halves.
+/// Damage behind a rewritten digest, reaching the descriptor walk and the Kraken decoder.
 #[test]
 fn damaged_descriptors_and_kraken_blocks_fail_without_panicking() {
-    let t = Target::new(build("fuzz-kraken", 0, |_| {}).package());
+    let t = Target::new(build("fuzz-kraken", |_| {}).package());
     assert!(!t.lz.is_empty(), "the package has compressed blocks");
     let descriptor = fuzz(&t, 120, 2, |t, rng, bytes| {
         for _ in 0..1 + rng.below(3) {

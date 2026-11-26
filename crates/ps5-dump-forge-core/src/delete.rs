@@ -1,9 +1,5 @@
-//! Deleting and moving what the user picked and confirmed ([`crate::Jobs::delete_path`],
-//! [`crate::Jobs::move_path`]), both refused by one `check`: a file or a folder, never a link,
-//! a special file, a filesystem root, a protected root or anything holding one, an interrupted
-//! edit's undo journal while its image is there, nothing an unfinished job reads or writes,
-//! and on the PS5 nothing at or in ShadowMount+'s mount folder, no image it has mounted and no
-//! folder holding one (fails closed). Called with the job table locked, so no job is admitted
+//! Delete and move of what the user confirmed, both refused by one `check` (AGENTS.md, Never
+//! touch the source, exception 1). Called with the job table locked, so no job is admitted
 //! between the check and the change.
 
 use std::io;
@@ -13,14 +9,11 @@ use ps5upload_fpkg::source::SourceTree;
 
 use crate::finalize::{FileId, followed_id, fsync_dir, path_id};
 
-/// Why a delete did not happen, or did not finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteError {
-    /// Not something Forge deletes: an empty path, a link, a special file, a root.
     Refused(String),
-    /// Nothing at the path.
     Missing(String),
-    /// An unfinished job reads or writes it, or a peer is writing it (inside or around it too).
+    /// An unfinished job or a peer uses it (inside or around it too).
     Busy(String),
     /// The removal or the folder sync failed; a folder may be partly deleted.
     Failed(String),
@@ -35,22 +28,18 @@ impl std::fmt::Display for DeleteError {
 
 impl std::error::Error for DeleteError {}
 
-/// What a delete or move source names, once [`check`] passed it.
 struct Checked {
     /// As typed, rebuilt from its components.
     path: PathBuf,
-    /// Canonical.
     real: PathBuf,
     id: FileId,
     kind: std::fs::FileType,
-    /// ShadowMount+'s mount points before its checks, for [`smp_unchanged`] (PS5).
     #[cfg(target_os = "freebsd")]
     smp: Vec<PathBuf>,
 }
 
-/// Refuses `path` as something to `verb` ("delete", "move") unless it is a file or folder
-/// that is no filesystem root, is not and holds none of `protected` and overlaps no path of
-/// `guarded` (unfinished jobs' sources, outputs, `.part`s and inputs).
+/// Refuses `path` unless a file or folder, no filesystem root, none of `protected` (or holding
+/// one) and overlapping no path of `guarded` (unfinished jobs' paths).
 fn check<'a>(
     path: &Path,
     verb: &str,
@@ -60,8 +49,7 @@ fn check<'a>(
     if path.as_os_str().is_empty() {
         return Err(DeleteError::Refused(format!("no path to {verb}")));
     }
-    // To the OS `link/` and `link/.` name the link's target, which the link check below would
-    // never see; rebuilt from its components (no trailing `/` or `.`) the path names the link.
+    // `link/` and `link/.` name the target to the OS; rebuilt from components it names the link.
     let path = path.components().collect::<PathBuf>();
     let shown = path.display();
     let (id, kind) = match path_id(&path) {
@@ -83,8 +71,7 @@ fn check<'a>(
     }
     let failed = |e: io::Error| DeleteError::Failed(format!("resolving {shown}: {e}"));
     let real = path.canonicalize().map_err(failed)?;
-    // Gone or elsewhere, the journal could never restore its image (or would be replayed into
-    // another one); Edit's open settles it.
+    // Gone or elsewhere, the journal could never restore its image; Edit's open settles it.
     if let Some(image) =
         journal_image(&real).filter(|i| kind.is_file() && i.symlink_metadata().is_ok())
     {
@@ -94,8 +81,7 @@ fn check<'a>(
             image.display()
         )));
     }
-    // Taken before the checks below: SMP mounts on its own, so what it mounts after this is
-    // caught by `smp_unchanged` just before the change.
+    // Taken first: what SMP mounts after this is caught by `smp_unchanged` before the change.
     #[cfg(target_os = "freebsd")]
     let smp = smp_snapshot(
         &mut crate::edit_job::smp_list,
@@ -151,8 +137,6 @@ fn check<'a>(
     })
 }
 
-/// Deletes `path` unless it overlaps a path of `guarded` (unfinished jobs' sources, outputs,
-/// `.part`s and inputs) or is, or holds, a filesystem root or one of `protected`.
 pub(crate) fn delete<'a>(
     path: &Path,
     protected: &[PathBuf],
@@ -164,7 +148,6 @@ pub(crate) fn delete<'a>(
     remove(ready(path, protected, guarded)?).map_err(|(e, _)| e)
 }
 
-/// [`delete`]'s checks, all done before anything is removed.
 fn ready<'a>(
     path: &Path,
     protected: &[PathBuf],
@@ -197,8 +180,7 @@ fn ready<'a>(
             "{shown} changed while it was checked; nothing deleted"
         )));
     }
-    // ponytail: an image SMP mounts while remove_dir_all runs is not caught; SMP has no lock
-    // to hold it off.
+    // ponytail: an image SMP mounts while remove_dir_all runs is not caught (SMP has no lock).
     #[cfg(target_os = "freebsd")]
     smp_unchanged(
         &checked.smp,
@@ -230,8 +212,7 @@ fn remove(checked: Checked) -> Result<(), (DeleteError, Option<String>)> {
     } else {
         std::fs::remove_file(&real)
             .map_err(|e| (DeleteError::Failed(format!("deleting {shown}: {e}")), None))?;
-        // An interrupted edit's undo journal goes with its image: left behind, it would be
-        // replayed into a later image of the same name.
+        // The undo journal goes with its image: left, it would replay into a later one.
         let journal = ps5_dump_forge_patch::journal_path(&real);
         if std::fs::symlink_metadata(&journal).is_ok_and(|m| !m.is_dir()) {
             std::fs::remove_file(&journal).map_err(|e| {
@@ -261,15 +242,13 @@ fn remove(checked: Checked) -> Result<(), (DeleteError, Option<String>)> {
 
 /// What a conversion read of its source, kept for [`delete_source`].
 pub(crate) enum ReadSource {
-    /// An image or an archive: its stamp, an archive's every part (as opened) with it.
+    /// An image or an archive (every part as opened).
     File(crate::convert::SourceStamp),
-    /// A folder, here or on a peer, and what the job converted of it.
     Folder(PathBuf, FolderListing),
 }
 
 impl ReadSource {
-    /// What [`delete_source`] deletes: the folder, the image, or an archive's every part
-    /// stamped when the job opened it (the first one first).
+    /// What [`delete_source`] deletes, an archive's first part first.
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         match self {
             Self::File(stamp) => stamp.paths(),
@@ -278,7 +257,7 @@ impl ReadSource {
     }
 }
 
-/// One file of a [`FolderListing`]: path, size, modification time and, here, its identity.
+/// (path, size, mtime, identity here).
 type Listed = (
     String,
     u64,
@@ -286,18 +265,16 @@ type Listed = (
     Option<crate::finalize::FileId>,
 );
 
-/// A folder as the scanner kept it (junk left out): every file's (path, size, modification
-/// time, identity), every empty folder and, here, the folder's own identity.
+/// A folder as the scanner kept it (junk left out).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FolderListing {
     pub(crate) files: Vec<Listed>,
     pub(crate) empty_dirs: Vec<String>,
-    /// The folder's identity, so an empty folder replaced by another reads as a change.
+    /// So an empty folder replaced by another reads as a change.
     pub(crate) root: Option<crate::finalize::FileId>,
 }
 
-/// The identity of the file (or, `dir`, the folder) at `path` (a link not followed), so a
-/// same-size, same-time replacement reads as a change. An entry of another kind is an error.
+/// The identity at `path` (link not followed); an entry of another kind is an error.
 #[cfg(any(unix, windows))]
 fn listed_id(path: &Path, dir: bool) -> io::Result<Option<crate::finalize::FileId>> {
     let (id, kind) = crate::finalize::path_id(path)?;
@@ -319,7 +296,7 @@ fn listed_id(_: &Path, _: bool) -> io::Result<Option<crate::finalize::FileId>> {
 }
 
 impl FolderListing {
-    /// The folder at `path` (here or on another device) scanned as a source, with its listing.
+    /// The folder at `path` (here or on another device) scanned as a source.
     pub(crate) fn open(
         path: &Path,
         cancel: &std::sync::atomic::AtomicBool,
@@ -328,8 +305,7 @@ impl FolderListing {
             let at = crate::remote::FlinkPath::parse(path)?;
             let remote = crate::remote::get_for(&at)?;
             let tree = crate::remote::RemoteTree::open(remote, &at, cancel)?;
-            // ponytail: a peer tells no file identities, so there a replacement keeping size
-            // and time goes unseen.
+            // ponytail: a peer tells no identities: a same-size, same-time replacement is unseen.
             let files = (tree.files().iter())
                 .map(|f| (f.path.clone(), f.size, tree.mtime(&f.path), None))
                 .collect();
@@ -362,21 +338,15 @@ impl FolderListing {
     }
 }
 
-/// Why [`delete_source`] stopped: nothing of the source deleted, or some of it gone (what,
-/// then the error).
+/// Why [`delete_source`] stopped: nothing deleted, or some of it gone (what, then the error).
 #[derive(Debug)]
 pub(crate) enum SourceKept {
     Kept(DeleteError),
     Partly(String, DeleteError),
 }
 
-/// A finished job's source ([`crate::ConvertRequest::delete_source`]), deleted as [`delete`]
-/// deletes it, only while it is what the job read: a folder scanned again (the job's rules)
-/// must list exactly the files, sizes, times and empty folders it converted (skipped junk may
-/// go with it); an image or an archive's every part must keep its stamp. An archive's parts
-/// are the ones stamped when it was opened, each checked before the first goes.
-// ponytail: a file added between the rescan and the removal (or on a peer, before the peer's
-// delete) goes with the folder.
+/// A finished job's source, deleted as [`delete`] does, only while it is what the job read.
+// ponytail: a file added between the rescan and the removal goes with the folder.
 #[cfg(test)]
 pub(crate) fn delete_source(
     read: &ReadSource,
@@ -387,17 +357,19 @@ pub(crate) fn delete_source(
     remove_source(read, protected, guarded)
 }
 
-/// [`delete_source`]'s first half: refused unless `read` is still what the job read. A
-/// source on a NAS or a server is refused at once (deleted there, never here), before a
-/// rescan. Reads only, so the job table need not be locked (a folder's rescan may be a long
-/// listing over the network).
+/// [`delete_source`]'s first half, reads only (no job-table lock: a rescan may be long). A NAS
+/// or server source is kept at once.
 pub(crate) fn source_unchanged(read: &ReadSource) -> Result<(), SourceKept> {
     use crate::remote::{FlinkPath, Scheme};
     for part in read.paths() {
         if let Ok(at) = FlinkPath::parse(&part)
             && at.scheme != Scheme::Flink
         {
-            return Err(SourceKept::Kept(not_here(&at)));
+            return Err(SourceKept::Kept(DeleteError::Refused(format!(
+                "{}: a source on a NAS or server is never deleted after a job; delete it in the \
+                 File explorer",
+                at.shown()
+            ))));
         }
     }
     let changed = |path: &Path, why: String| {
@@ -411,7 +383,7 @@ pub(crate) fn source_unchanged(read: &ReadSource) -> Result<(), SourceKept> {
             return Err(changed(stamp.path(), String::new()));
         }
         ReadSource::File(_) => {}
-        // A fresh flag: the job is done, so its cancel no longer applies.
+        // A fresh flag: the job's cancel no longer applies.
         ReadSource::Folder(path, listing) => {
             match FolderListing::open(path, &std::sync::atomic::AtomicBool::new(false)) {
                 Ok((_, now)) if now == *listing => {}
@@ -423,8 +395,7 @@ pub(crate) fn source_unchanged(read: &ReadSource) -> Result<(), SourceKept> {
     Ok(())
 }
 
-/// [`delete_source`]'s second half, run with the job table locked: every part checked against
-/// `protected` and the `guarded` paths of unfinished jobs, then removed.
+/// [`delete_source`]'s second half, with the job table locked: every part checked, then removed.
 pub(crate) fn remove_source(
     read: &ReadSource,
     protected: &[PathBuf],
@@ -456,11 +427,8 @@ pub(crate) fn remove_source(
     Ok(())
 }
 
-/// [`delete_remote`] for [`delete_source`]: a refusal or a busy path is the peer's answer
-/// before it deleted anything; any other failure may come after part of it went (the peer
-/// removing entries, or syncing its folder), so it is reported as partly gone. So is a missing
-/// one: the rescan just found it, so a retried request whose first reply was lost reads as
-/// missing after the peer deleted it.
+/// [`delete_remote`] for [`delete_source`]: refused or busy means nothing went; any other failure
+/// is partly gone, a missing one too (the rescan just found it: a retry whose reply was lost).
 fn source_on_peer(path: &Path, guarded: &[&PathBuf]) -> Result<(), (DeleteError, Option<String>)> {
     let at = remote_at(path).map_err(|e| (e, None))?;
     if in_use(path, guarded.iter().copied()) {
@@ -475,27 +443,257 @@ fn source_on_peer(path: &Path, guarded: &[&PathBuf]) -> Result<(), (DeleteError,
     }
 }
 
-/// What [`crate::remote::Remote::delete_path`] and `move_path` answer by default: a NAS share
-/// or a server is read only here.
+/// [`crate::remote::Remote::delete_path`]'s and `move_path`'s default answer.
 pub(crate) fn not_here(at: &crate::remote::FlinkPath) -> DeleteError {
-    use crate::remote::Scheme;
-    DeleteError::Refused(match at.scheme {
-        Scheme::Smb | Scheme::Nfs => format!(
-            "{}: a NAS share is read only here; delete or move it on the NAS itself",
-            at.shown()
-        ),
-        _ => format!(
-            "{}: a file on another device is deleted or moved on that device itself",
-            at.shown()
-        ),
-    })
+    DeleteError::Refused(format!(
+        "{}: a file on another device is deleted or moved on that device itself",
+        at.shown()
+    ))
 }
 
-/// A path on another device: refused while one of this device's unfinished jobs uses it, then
-/// handed to that device ([`crate::remote::Remote::delete_path`]: a paired Forge deletes it
-/// under its own rules, a NAS refuses).
-// ponytail: called with the job table locked, so a slow device holds off this device's jobs
-// until it answers (as a large local folder does).
+/// A NAS share, export or server root: never deleted or moved.
+pub(crate) fn nas_root(at: &crate::remote::FlinkPath) -> DeleteError {
+    DeleteError::Refused(format!(
+        "{}: a share, export or server itself is not deleted or moved",
+        at.shown()
+    ))
+}
+
+pub(crate) fn nas_other_share(
+    from: &crate::remote::FlinkPath,
+    to: &crate::remote::FlinkPath,
+) -> DeleteError {
+    DeleteError::Refused(format!(
+        "{} and {} are on different shares: a move stays on one share",
+        from.shown(),
+        to.shown()
+    ))
+}
+
+const NAS_DELETE_MAX: usize = 1_000_000;
+
+/// Deletes `at` on a NAS (the adapter refused its roots): a folder listed all the way down first
+/// (any failure refuses before anything goes; links never entered), then removed bottom-up.
+// ponytail: a server presenting a link as a folder (Samba following it, FTP without MLSD types)
+// has it entered; a change between the listing and the removal isn't seen.
+pub(crate) fn nas_delete<R: crate::remote::Remote + ?Sized>(
+    r: &R,
+    at: &crate::remote::FlinkPath,
+) -> Result<(), DeleteError> {
+    let shown = at.shown();
+    let (enter, is_dir) = nas_kind(r, at)?;
+    // A filesystem boundary (an NFSv4 export root, a mount inside a share) is never crossed.
+    let fs = r.fs_id(at).map_err(|e| nas_error(&shown, "reading", e))?;
+    if let (Some(fs), Some(up)) = (fs, at.parent()) {
+        let above = r
+            .fs_id(&up)
+            .map_err(|e| nas_error(&up.shown(), "reading", e))?;
+        if above.is_some_and(|a| a != fs) {
+            return Err(nas_boundary(at));
+        }
+    }
+    // (path, entered, removed as a folder): an SMB junction is removed as a folder, never entered.
+    let mut plan = vec![(at.clone(), enter, is_dir)];
+    let mut i = 0;
+    while i < plan.len() {
+        let (dir, enter, _) = plan[i].clone();
+        i += 1;
+        if !enter {
+            continue;
+        }
+        if i > 1
+            && let Some(fs) = fs
+            && r.fs_id(&dir)
+                .map_err(|e| nas_error(&dir.shown(), "reading", e))?
+                != Some(fs)
+        {
+            return Err(nas_boundary(&dir));
+        }
+        let entries = r.list(&dir).map_err(|e| {
+            DeleteError::Failed(format!("listing {}: {e}; nothing deleted", dir.shown()))
+        })?;
+        for e in entries {
+            if e.bad_name || !crate::remote::addressable(&e.name) {
+                return Err(DeleteError::Refused(format!(
+                    "{} holds {:?}, a name that can't be reached from here; nothing deleted",
+                    dir.shown(),
+                    e.name
+                )));
+            }
+            plan.push((dir.join(&e.name), e.dir && !e.link && !e.special, e.dir));
+            if plan.len() > NAS_DELETE_MAX {
+                return Err(DeleteError::Refused(format!(
+                    "{shown} holds more than {NAS_DELETE_MAX} entries; nothing deleted"
+                )));
+            }
+        }
+    }
+    // Every entry comes after its folder: backwards, each folder is empty when it goes.
+    let total = plan.len();
+    for (n, (p, _, dir)) in plan.iter().rev().enumerate() {
+        let done = if *dir { r.rmdir(p) } else { r.remove(p) };
+        if let Err(e) = done {
+            return Err(DeleteError::Failed(match n {
+                0 => format!("deleting {shown}: {e}; nothing deleted"),
+                _ => format!(
+                    "deleting {shown}: {e}; {n} of {total} entries were deleted before it, so \
+                     {shown} is partly deleted"
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// (entered, removed as a folder), as `at`'s folder lists it (SMB and FTP stats follow links).
+fn nas_kind<R: crate::remote::Remote + ?Sized>(
+    r: &R,
+    at: &crate::remote::FlinkPath,
+) -> Result<(bool, bool), DeleteError> {
+    let shown = at.shown();
+    let s = r.stat(at).map_err(|e| nas_error(&shown, "reading", e))?;
+    let (link, dir, special) = nas_listed(r, at, &s)?;
+    Ok((dir && !link && !special, dir))
+}
+
+/// `at`'s (link, folder, special) as its folder lists it: its own spelling first, else an ASCII
+/// case-folded one (SMB). Not listed: refused.
+fn nas_listed<R: crate::remote::Remote + ?Sized>(
+    r: &R,
+    at: &crate::remote::FlinkPath,
+    s: &crate::remote::RemoteStat,
+) -> Result<(bool, bool, bool), DeleteError> {
+    let Some(up) = at.parent() else {
+        return Err(nas_root(at));
+    };
+    let leaf = at.path.rsplit('/').next().unwrap_or_default();
+    let listed = r
+        .list(&up)
+        .map_err(|e| DeleteError::Failed(format!("listing {}: {e}; nothing done", up.shown())))?;
+    let e = (listed.iter().find(|e| e.name == leaf))
+        .or_else(|| listed.iter().find(|e| e.name.eq_ignore_ascii_case(leaf)))
+        .ok_or_else(|| {
+            DeleteError::Refused(format!(
+                "{} is not listed in {}; nothing done",
+                at.shown(),
+                up.shown()
+            ))
+        })?;
+    Ok((s.link || e.link, e.dir, e.special))
+}
+
+fn nas_boundary(at: &crate::remote::FlinkPath) -> DeleteError {
+    DeleteError::Refused(format!(
+        "{}: an export or a filesystem mounted there is not deleted or moved; nothing deleted",
+        at.shown()
+    ))
+}
+
+fn nas_error(shown: &str, doing: &str, e: io::Error) -> DeleteError {
+    match e.kind() {
+        io::ErrorKind::NotFound => DeleteError::Missing(format!("{shown} does not exist")),
+        _ => DeleteError::Failed(format!("{doing} {shown}: {e}")),
+    }
+}
+
+/// Moves `from` to `to` on one NAS share (the adapter refused roots and other shares): never
+/// replacing unless `replace`, then only a file over a file. A case-only rename goes via a temp name.
+pub(crate) fn nas_move<R: crate::remote::Remote + ?Sized>(
+    r: &R,
+    from: &crate::remote::FlinkPath,
+    to: &crate::remote::FlinkPath,
+    replace: bool,
+) -> Result<(), DeleteError> {
+    let (a, b) = (from.shown(), to.shown());
+    let refused = |m: String| Err(DeleteError::Refused(m));
+    let (Some(up), Some(up_to)) = (from.parent(), to.parent()) else {
+        return Err(nas_root(if from.path.is_empty() { from } else { to }));
+    };
+    let name = to.path.rsplit('/').next().unwrap_or_default();
+    let recased =
+        up.path == up_to.path && from.path != to.path && from.path.eq_ignore_ascii_case(&to.path);
+    if !recased && to.within(from) {
+        return refused(format!("{a} can't be moved into itself ({b})"));
+    }
+    let s = r.stat(from).map_err(|e| nas_error(&a, "reading", e))?;
+    if let Some(fs) = r.fs_id(from).map_err(|e| nas_error(&a, "reading", e))?
+        && r.fs_id(&up)
+            .map_err(|e| nas_error(&up.shown(), "reading", e))?
+            .is_some_and(|u| u != fs)
+    {
+        return Err(nas_boundary(from));
+    }
+    match r.stat(&up_to) {
+        Ok(p) if p.dir => {}
+        Ok(_) => return refused(format!("{} is not a folder", up_to.shown())),
+        Err(e) => return Err(nas_error(&up_to.shown(), "reading", e)),
+    }
+    let there = match r.stat(to) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(nas_error(&b, "reading", e)),
+        Ok(t) => Some(t),
+    };
+    let renamed = |e: io::Error| match e.kind() {
+        io::ErrorKind::NotFound => DeleteError::Missing(format!("{a} does not exist")),
+        io::ErrorKind::AlreadyExists => {
+            DeleteError::Refused(format!("{b} already exists; nothing is replaced"))
+        }
+        io::ErrorKind::CrossesDevices => nas_other_share(from, to),
+        _ => DeleteError::Failed(format!("moving {a} to {b}: {e}")),
+    };
+    let Some(t) = there else {
+        return r.rename_no_replace(from, to).map_err(renamed);
+    };
+    // A case-insensitive server finds `from` at `to`: unless listed apart, a rename of `from`.
+    if recased {
+        let listed = r
+            .list(&up)
+            .map_err(|e| nas_error(&up.shown(), "listing", e))?;
+        if !listed.iter().any(|e| e.name == name) {
+            return nas_recase(r, from, to).map_err(renamed);
+        }
+    }
+    if !replace {
+        return refused(format!("{b} already exists; nothing is replaced"));
+    }
+    // As the folder lists it: an SMB stat follows a link.
+    let (t_link, t_dir, _) = nas_listed(r, to, &t)?;
+    match (s.dir, t_dir, t_link) {
+        (_, _, true) => refused(format!("{b} is a link: nothing is put in its place")),
+        (false, false, _) => r.rename_replace(from, to).map_err(renamed),
+        (true, true, _) => refused(format!(
+            "{b} is a folder: folders are not merged on a NAS; delete it first or choose another name"
+        )),
+        (true, false, _) => refused(format!("{b} is a file: a folder is not put in its place")),
+        (false, true, _) => refused(format!("{b} is a folder: a file is not put in its place")),
+    }
+}
+
+/// A case-only rename through a temporary name; put back where the second rename fails.
+fn nas_recase<R: crate::remote::Remote + ?Sized>(
+    r: &R,
+    from: &crate::remote::FlinkPath,
+    to: &crate::remote::FlinkPath,
+) -> io::Result<()> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = from
+        .parent()
+        .unwrap_or_else(|| from.clone())
+        .join(&format!(".forge-move-{}-{n}", std::process::id()));
+    r.rename_no_replace(from, &tmp)?;
+    r.rename_no_replace(&tmp, to)
+        .map_err(|e| match r.rename_no_replace(&tmp, from) {
+            Ok(()) => e,
+            Err(_) => io::Error::new(
+                e.kind(),
+                format!("{e}; {} is left as {}", from.shown(), tmp.shown()),
+            ),
+        })
+}
+
+/// A path on another device: refused while this device's jobs use it, else handed to it.
+// ponytail: under the job-table lock, so a slow device holds off this device's jobs.
 fn delete_remote<'a>(
     path: &Path,
     guarded: impl IntoIterator<Item = &'a PathBuf>,
@@ -507,8 +705,6 @@ fn delete_remote<'a>(
     remote_of(&at)?.delete_path(&at)
 }
 
-/// [`delete_remote`] for a move: `from` and `to` on one device, neither used by an unfinished
-/// job of this device; the device moves it.
 fn move_remote<'a>(
     from: &Path,
     to: &Path,
@@ -556,14 +752,10 @@ fn busy(path: &Path) -> DeleteError {
     ))
 }
 
-/// Why a job must not replace `path` with a file of its own (an extract's or transfer's
-/// [`crate::ConvertRequest::replace`]; `dir`: a folder it merges into, which stays). A file is
-/// deleted in effect, so it is refused as [`delete`] refuses it, and so is an image with an
-/// interrupted edit's undo journal beside it (the journal would be replayed into the new
-/// one). A folder is refused only at, in or above a path of `guarded`. On a peer or a NAS
-/// only that is checked here, for a file too: the device judges the rest (a peer refuses, at
-/// the rename, a link, a folder, a path its own jobs use and on the PS5 `/mnt/shadowmnt`).
-// ponytail: checked at preflight; what changes between the check and the rename isn't seen.
+/// Why a job must not replace `path` (`dir`: a folder merged into). A file is deleted in effect,
+/// so refused as [`delete`] refuses it, or with an undo journal beside it; a folder (and anything
+/// remote: the device judges the rest) only by `guarded`.
+// ponytail: checked at preflight; a change between the check and the rename isn't seen.
 pub(crate) fn replace_refusal<'a>(
     path: &Path,
     dir: bool,
@@ -602,12 +794,9 @@ pub(crate) fn replace_refusal<'a>(
     Ok(())
 }
 
-/// Moves or renames `from` to `to` (a new name in an existing folder, never replacing
-/// anything unless `replace`), refused as [`delete`] refuses `from`, and for a `to` inside
-/// `from`, on another volume or at, in or above a path of `guarded`. An image with an
-/// interrupted edit's undo journal beside it stays where its journal is. With `replace` and
-/// `to` there, a file goes over a file (refused as [`replace_refusal`] refuses it) and a
-/// folder merges into a folder ([`plan_merge`]): every check first, then the moves.
+/// Moves `from` to `to` (a new name in an existing folder), refused as [`delete`] refuses `from`,
+/// and for a `to` inside it, on another volume or used by a job. With `replace`, a file goes over
+/// a file and a folder merges ([`plan_merge`]): every check first, then the moves.
 pub(crate) fn move_<'a>(
     from: &Path,
     to: &Path,
@@ -628,7 +817,7 @@ pub(crate) fn move_<'a>(
         smp,
     } = check(from, "move", protected, guarded.iter().copied())?;
     let shown = path.display();
-    // A volume mounted inside would move with it (or fail half way); delete refuses it too.
+    // A volume mounted inside would move with it (or fail half way).
     #[cfg(unix)]
     if kind.is_dir() {
         let failed = |e: io::Error| DeleteError::Failed(format!("reading {shown}: {e}"));
@@ -691,9 +880,8 @@ pub(crate) fn move_<'a>(
         ));
     }
     let target = real_parent.join(name);
-    // A case-only rename on a case-insensitive volume finds `from` itself at `to`; on a
-    // case-sensitive one `to` can be another name (a hard link) of the same file, which the
-    // folder then lists as its own entry: that one already exists.
+    // A case-only rename finds `from` at `to`; on a case-sensitive volume `to` may be a hard
+    // link of the same file, listed as its own entry: that one exists.
     let recased = path_id(&target).is_ok_and(|(t, _)| t == id)
         && real.parent() == Some(&*real_parent)
         && real.file_name().is_some_and(|old| {
@@ -716,8 +904,7 @@ pub(crate) fn move_<'a>(
             )));
         }
     }
-    // Left behind, the journal would be replayed into a later image of the old name; found at
-    // the new one, into this image.
+    // Left behind, the journal would be replayed into a later image of the old name.
     let journal = ps5_dump_forge_patch::journal_path(&real);
     let journal_to = ps5_dump_forge_patch::journal_path(&target);
     if kind.is_file() && journal.symlink_metadata().is_ok() {
@@ -742,7 +929,6 @@ pub(crate) fn move_<'a>(
     } else {
         None
     };
-    // The checks above looked at what `from` named then; it must still be that.
     if !path_id(&real).is_ok_and(|(now, k)| now == id && k.is_dir() == kind.is_dir()) {
         return Err(DeleteError::Failed(format!(
             "{shown} changed while it was checked; nothing moved"
@@ -788,10 +974,8 @@ pub(crate) fn move_<'a>(
             .iter()
             .flat_map(|m| m.into.iter().map(PathBuf::as_path)),
     );
-    // A merge that failed part way: what moved before it is synced all the same (best
-    // effort; the failure is the error).
+    // A merge that failed part way: what moved is synced all the same (best effort).
     if let Err(e) = merged {
-        // The source folders steps moved entries out of are still there: synced too.
         let left = merge
             .iter()
             .flat_map(|m| m.emptied.iter().map(PathBuf::as_path));
@@ -811,14 +995,12 @@ pub(crate) fn move_<'a>(
     Ok(())
 }
 
-/// One rename of a move with replace: over a file at `to` when `over`, else to a new name.
 struct Step {
     from: PathBuf,
     to: PathBuf,
     over: bool,
 }
 
-/// What a move with replace does, all decided before the first rename.
 #[derive(Default)]
 struct Merge {
     steps: Vec<Step>,
@@ -828,10 +1010,8 @@ struct Merge {
     into: Vec<PathBuf>,
 }
 
-/// Plans moving `from` (canonical, `kind`, `id`) onto `to`, which exists: a file over a file,
-/// a folder merged into a folder. Every kind mismatch, replaced file [`replace_refusal`]
-/// refuses and undo journal clash refuses before anything moves. `to`'s own use by a job is
-/// [`move_`]'s check.
+/// Plans moving `from` onto an existing `to`: a file over a file, a folder merged. Every
+/// refusal comes before anything moves; `to`'s use by a job is [`move_`]'s check.
 fn plan_merge(
     from: &Path,
     kind: std::fs::FileType,
@@ -875,8 +1055,7 @@ fn plan_merge(
     Ok(merge)
 }
 
-/// Why `from` (`kind`) can't go over `to` (`to_kind`): only a file over a file and a folder
-/// into a folder, never a link or special file on either side.
+/// Only a file over a file and a folder into a folder, never a link or special file.
 fn clash(
     from: &Path,
     kind: std::fs::FileType,
@@ -900,8 +1079,7 @@ fn clash(
     Some(DeleteError::Refused(why))
 }
 
-/// [`plan_merge`] for folder `from` into folder `to` (both on volume `dev`), recursing into
-/// folders both hold. Links are moved as they are, never followed.
+/// [`plan_merge`] for folders, recursing into folders both hold; links moved, never followed.
 fn merge_dirs(
     from: &Path,
     to: &Path,
@@ -920,8 +1098,7 @@ fn merge_dirs(
             from.display()
         ));
     }
-    // Each folder merged into, nested ones too, as a replace refuses it (on the PS5 never
-    // ShadowMount+'s mount folder found further down).
+    // Each folder merged into, nested ones too, as a replace refuses it.
     replace_refusal(to, true, protected, guarded.iter().copied())?;
     merge.into.push(to.to_path_buf());
     let mut entries = Vec::new();
@@ -974,7 +1151,6 @@ fn merge_dirs(
     Ok(())
 }
 
-/// An undo journal a merge would move away from its image or next to another one.
 fn journal_clash(from: &Path, kind: std::fs::FileType, to: &Path) -> Option<String> {
     if !kind.is_file() {
         return None;
@@ -1039,8 +1215,7 @@ fn run_merge(
     Ok(())
 }
 
-/// Refuses `path` (as typed and resolved, `real`) at or inside ShadowMount+'s mount folder
-/// (PS5 only): what is there is a mounted game, not files.
+/// (PS5) Refuses a path at or inside ShadowMount+'s mount folder: a mounted game, not files.
 #[cfg(any(target_os = "freebsd", test))]
 fn smp_folder(path: &Path, real: &Path) -> Option<DeleteError> {
     use crate::library_roots::shadowmnt;
@@ -1052,15 +1227,11 @@ fn smp_folder(path: &Path, real: &Path) -> Option<DeleteError> {
     })
 }
 
-/// Looks under a folder for a file whose name the filter accepts ([`find_image`]).
 #[cfg(any(target_os = "freebsd", test))]
 type FindImage<'a> = dyn FnMut(&Path, &dyn Fn(&str) -> bool) -> io::Result<Option<PathBuf>> + 'a;
 
-/// ShadowMount+'s part of [`check`] (PS5 only): nothing at or inside its mount folder
-/// ([`smp_folder`]), no image it has mounted (`list`/`is_mount`:
-/// [`crate::edit_job::smp_mounts`]) and, while it has any mounted, no folder holding an image
-/// of a mounted stem (`find` walks the folder for one). Fails closed: what can't be read
-/// refuses.
+/// ShadowMount+'s part of [`check`] (PS5): nothing in its mount folder, no image it mounted and
+/// no folder holding an image of a mounted stem. Fails closed.
 #[cfg(any(target_os = "freebsd", test))]
 fn smp_refusal(
     path: &Path,
@@ -1134,7 +1305,7 @@ fn smp_refusal(
     }
 }
 
-/// ShadowMount+'s mount points now (all stems); a listing error refuses (fails closed).
+/// ShadowMount+'s mount points now; a listing error refuses.
 #[cfg(any(target_os = "freebsd", test))]
 fn smp_snapshot(
     list: &mut dyn FnMut(&Path) -> io::Result<Vec<String>>,
@@ -1149,8 +1320,7 @@ fn smp_snapshot(
     }
 }
 
-/// Refuses when ShadowMount+ mounted something since `before` ([`smp_snapshot`]): the checks
-/// in between could not have seen it. `done`: "deleted", "moved".
+/// Refuses when ShadowMount+ mounted something since `before`; `done`: "deleted", "moved".
 #[cfg(any(target_os = "freebsd", test))]
 fn smp_unchanged(
     before: &[PathBuf],
@@ -1170,11 +1340,10 @@ fn smp_unchanged(
     }
 }
 
-/// At most this many entries [`find_image`] looks through before it gives up (an error).
 #[cfg(any(target_os = "freebsd", test))]
 const FIND_MAX: usize = 200_000;
 
-/// The first file under `dir` (links not followed) whose name `wanted` accepts.
+/// The first file under `dir` (links not followed) `wanted` accepts.
 #[cfg(any(target_os = "freebsd", test))]
 fn find_image(dir: &Path, wanted: &dyn Fn(&str) -> bool) -> io::Result<Option<PathBuf>> {
     let mut todo = vec![dir.to_path_buf()];
@@ -1217,11 +1386,8 @@ fn resolved(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Whether `path` is at, in or above one of `guarded`, compared as [`delete`] compares them
-/// (by identity, links on the typed path included); a path that doesn't exist yet as
-/// [`new_in_use`] judges it. A path on a peer or a NAS is compared with the guarded paths on
-/// that device as [`FlinkPath::within`] compares them (the device judges identity there),
-/// never with local ones.
+/// Whether `path` is at, in or above one of `guarded`, by identity (links on the typed path
+/// included); a remote path only against that device's guarded paths ([`FlinkPath::within`]).
 pub(crate) fn in_use<'a>(path: &Path, guarded: impl IntoIterator<Item = &'a PathBuf>) -> bool {
     use crate::remote::FlinkPath;
     if crate::remote::is_remote(path) {
@@ -1238,16 +1404,13 @@ pub(crate) fn in_use<'a>(path: &Path, guarded: impl IntoIterator<Item = &'a Path
     let Ok((id, _)) = path_id(path) else {
         return new_in_use(path, guarded);
     };
-    // A peer's or a NAS's path is never this computer's.
     let mut guarded = guarded.filter(|g| !crate::net::is_network(g));
     let chain = (path.canonicalize().and_then(|real| ids_up(&real))).unwrap_or_default();
     guarded.any(|used| followed_id(used).is_ok_and(|g| chain.contains(&g)) || holds(id, used))
 }
 
-/// [`in_use`] for a path that doesn't exist yet (a file or folder about to be made): at, in or
-/// above a guarded path as spelled or with existing folders resolved (a link to a queued job's
-/// output folder), or inside one by the identity of its nearest existing folder (a new file
-/// in a job's source folder or `.part`).
+/// [`in_use`] for a path not made yet: at, in or above a guarded path as spelled or resolved,
+/// or inside one by its nearest existing folder's identity.
 fn new_in_use<'a>(path: &Path, mut guarded: impl Iterator<Item = &'a PathBuf>) -> bool {
     let real = resolved(path);
     let chain = (path.ancestors().skip(1))
@@ -1276,12 +1439,11 @@ fn journal_image(path: &Path) -> Option<PathBuf> {
     (!name.is_empty()).then(|| path.with_file_name(name))
 }
 
-/// The identities of `real` (canonical) and every folder above it.
 fn ids_up(real: &Path) -> io::Result<Vec<FileId>> {
     real.ancestors().map(followed_id).collect()
 }
 
-/// The first folder under `dir` (links not followed) on another volume than `dev`.
+/// The first folder under `dir` (links not followed) on another volume.
 #[cfg(unix)]
 fn mount_inside(dir: &Path, dev: u64) -> io::Result<Option<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
@@ -1301,9 +1463,8 @@ fn mount_inside(dir: &Path, dev: u64) -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Whether `id` is `path` or a folder above it, as written (a link on the way counts, not
-/// only what it points at) or resolved. A path that does not exist yet (a job's output) is
-/// judged by its existing folders.
+/// Whether `id` is `path` or above it, as written (a link on the way counts) or resolved; a
+/// path not made yet is judged by its existing folders.
 fn holds(id: FileId, path: &Path) -> bool {
     let mut found = false;
     for real in path
@@ -1510,8 +1671,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A kind mismatch at any level, or a replaced file a job uses, refuses before anything
-    /// moves.
+    /// A kind mismatch at any level, or a replaced file a job uses, refuses before anything moves.
     #[test]
     fn move_with_replace_checks_everything_first() {
         let dir = crate::test_dir("move-replace-refused");
@@ -1582,8 +1742,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Nothing an unfinished job uses is moved, nor anything around it, and nothing is moved
-    /// to where a job reads or writes.
+    /// Nothing a job uses is moved, nor anything around it, nor anything to where a job writes.
     #[test]
     fn move_leaves_what_unfinished_jobs_use() {
         let dir = crate::test_dir("move-busy");
@@ -1626,8 +1785,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// An image with an interrupted edit's journal stays with it, and no image is moved to a
-    /// name a journal is left at.
+    /// An image stays with its undo journal; nothing is moved to a journal's name.
     #[test]
     fn move_keeps_an_image_with_its_undo_journal() {
         let dir = crate::test_dir("move-journal");
@@ -1668,8 +1826,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// What ShadowMount+ mounts between the checks and the change refuses; what was already
-    /// mounted (and passed the checks) does not, and an unreadable mount folder fails closed.
+    /// A mount made between the checks and the change refuses; an unreadable mount folder too.
     #[test]
     fn a_mount_made_while_checking_refuses() {
         let listing = |names: &'static [&'static str]| {
@@ -1842,8 +1999,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A queued job's output doesn't exist yet: [`new_in_use`] judges it through its folders,
-    /// links included.
+    /// A queued job's output doesn't exist yet: judged through its folders, links included.
     #[cfg(unix)]
     #[test]
     fn a_new_path_is_judged_by_its_folders() {
@@ -1876,10 +2032,30 @@ mod tests {
             let Err(SourceKept::Kept(DeleteError::Refused(e))) = source_unchanged(&read) else {
                 panic!("{at}: not refused");
             };
-            assert!(
-                e.contains("deleted or moved on") || e.contains("read only here"),
-                "{e}"
-            );
+            assert!(e.contains("never deleted after a job"), "{e}");
         }
+    }
+
+    /// NAS roots are never deleted; a NAS path a job uses is busy (SMB case-folded).
+    #[test]
+    fn nas_roots_and_paths_in_use_are_refused() {
+        let none: [&PathBuf; 0] = [];
+        for root in ["smb://nas", "smb://nas/share", "nfs://nas", "ftp://nas"] {
+            let r = delete(Path::new(root), &[], none);
+            assert!(matches!(r, Err(DeleteError::Refused(_))), "{root}: {r:?}");
+        }
+        let job = [PathBuf::from("smb://NAS/share/Game")];
+        for used in ["smb://nas/Share/game/x.bin", "smb://nas/share", "smb://nas"] {
+            let r = delete(Path::new(used), &[], &job);
+            assert!(matches!(r, Err(DeleteError::Busy(_))), "{used}: {r:?}");
+        }
+        let r = move_(
+            Path::new("smb://nas/share/x"),
+            Path::new("smb://nas/share/game/x"),
+            false,
+            &[],
+            &job,
+        );
+        assert!(matches!(r, Err(DeleteError::Busy(_))), "{r:?}");
     }
 }

@@ -1,8 +1,4 @@
-//! The firmware a game's executables ask for: the PS5 SDK version in each one's process or
-//! module param (`PT_SCE_PROCPARAM`, `PT_SCE_MODULE_PARAM`), which the console checks
-//! against its own. A backport lowers it in every executable it patches, so the highest
-//! one left is the lowest firmware the game runs on. Layout as backport tools patch it
-//! (`ps5_backport.c`: magic first, or after an 8-byte size; the PS5 SDK at +0xC).
+//! The firmware a game's executables ask for: the PS5 SDK in each one's process or module param, which a backport lowers; layout as `ps5_backport.c` patches it (magic first, or after an 8-byte size; SDK at +0xC).
 
 use ps5upload_fpkg::source::SourceTree;
 
@@ -15,24 +11,20 @@ pub(crate) const MODULE_PARAM_MAGIC: u32 = 0x3C13_F4BF;
 /// The PS5 SDK word, from the param's magic.
 const PS5_SDK_AT: usize = 0xC;
 pub(crate) const ELF: [u8; 4] = [0x7F, b'E', b'L', b'F'];
-/// Fake-signed SELFs, PS5 and PS4: the ELF header and program headers follow the segment
-/// table, and each segment's data sits where its table entry says.
+/// Fake-signed SELFs: the ELF and program headers follow the segment table.
 const SELF_PS5: [u8; 4] = [0x54, 0x14, 0xF5, 0xEE];
 const SELF_PS4: [u8; 4] = [0x4F, 0x15, 0x3D, 0x1D];
 /// Headers are read from the first 64 KiB; real ones take a few hundred bytes.
 const HEAD: usize = 0x1_0000;
 /// Executables by extension, as backport tools pick them.
 const EXTENSIONS: &[&str] = &["bin", "elf", "self", "prx", "sprx"];
-/// ponytail: the first this many files with an ELF or SELF magic are parsed (a game has a
-/// few dozen); data `.bin` files are passed over by a 4-byte read and do not count.
+/// ponytail: only the first this many ELF/SELF files are parsed; data `.bin` files are passed over by a 4-byte read.
 pub(crate) const MAX_EXECUTABLES: usize = 4096;
 /// SELF entry properties: its data is encrypted or compressed, so not readable in place.
 const SELF_ENCRYPTED: u64 = 1 << 1;
 const SELF_COMPRESSED: u64 = 1 << 3;
 
-/// The lowest firmware the game's executables allow, as `7.00`: their highest PS5 SDK.
-/// The backport's own `fakelib`/`fakelib2` libraries are left out: they come from the
-/// newer firmware they stand in for. `None` when no executable carries a readable param.
+/// The lowest firmware the executables allow, as `7.00` (`fakelib*` left out); `None` without a readable param.
 pub(crate) fn lowest_firmware(tree: &mut dyn SourceTree) -> Option<String> {
     firmware(highest_sdk(tree)?)
 }
@@ -81,8 +73,7 @@ pub(crate) fn le<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
     bytes.get(at..at.checked_add(N)?)?.try_into().ok()
 }
 
-/// The PS5 SDK word of one executable, `None` when it is not a readable ELF or fSELF with
-/// a process or module param.
+/// One executable's PS5 SDK word, `None` without a readable ELF or fSELF param.
 pub(crate) fn ps5_sdk(tree: &mut dyn SourceTree, path: &str) -> Option<u32> {
     let head = tree.read_range(path, 0, HEAD).ok()?;
     let u16_at = |at: usize| le::<2>(&head, at).map(u16::from_le_bytes);
@@ -122,9 +113,7 @@ pub(crate) fn ps5_sdk(tree: &mut dyn SourceTree, path: &str) -> Option<u32> {
     let at = if segments == 0 {
         param
     } else {
-        // In a fSELF each ELF segment's data sits where its table entry `{props, offset,
-        // stored size, memory size}` says (segment `props >> 20`), when stored plainly. The
-        // param is read through any segment that holds it: its own, a PT_LOAD, a RELRO.
+        // In a fSELF a plainly stored segment's data sits where its `{props, offset, stored, memory}` entry says; the param is read through any segment holding it.
         let entry = |seg: usize, size: u64| {
             (0..segments).find_map(|k| {
                 let at = 0x20 + k * 0x20;
@@ -154,8 +143,7 @@ pub(crate) fn ps5_sdk(tree: &mut dyn SourceTree, path: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-/// A minimal ELF: one PT_LOAD, and a param of `kind` inside it at 0x200 (with the
-/// 8-byte size first when `sized`).
+/// A minimal ELF: one PT_LOAD with a `kind` param at 0x200 (the 8-byte size first when `sized`).
 pub(crate) fn test_elf(kind: u32, magic: u32, sdk: u32, sized: bool) -> Vec<u8> {
     let mut f = vec![0u8; 0x300];
     f[..4].copy_from_slice(&ELF);

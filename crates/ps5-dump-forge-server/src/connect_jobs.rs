@@ -1,9 +1,6 @@
-//! Jobs mirrored to the peers they use: a job on this device whose paths name a paired peer
-//! (`flink://<key_id>`) is shown on that peer too, read only, where its user may only cancel
-//! it. Every `PUSH_EVERY` this device sends each such peer a `jobs` RPC with its jobs (paths in
-//! this device's share root spelled `flink://<this key_id>/...`); the peer keeps the list for
-//! `KEEP_RECEIVED`, spells its own paths back as local ones, and answers with the ids its user
-//! asked to cancel. ponytail: a fresh control conn per push, as the prober does.
+//! Jobs mirrored to the peers they use: every `PUSH_EVERY` each peer a job names gets a `jobs`
+//! RPC with them, and answers with the ids its user asked to cancel.
+//! ponytail: a fresh control conn per push, as the prober does.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,31 +13,24 @@ use serde_json::{Value, json};
 
 use crate::table::Table;
 
-/// How often this device's jobs are pushed to the peers they use.
 pub(crate) const PUSH_EVERY: Duration = Duration::from_secs(2);
 /// A finished job stays on the peer this long.
 const KEEP_FINISHED: Duration = Duration::from_secs(30);
 /// A peer's list is dropped when not refreshed this long.
 const KEEP_RECEIVED: Duration = Duration::from_secs(10);
-/// Jobs kept per peer.
 const MAX_RECEIVED: usize = 32;
-/// Log lines sent per job.
 const LOG_LINES: usize = 50;
 
-/// Cancels one of this device's jobs (core's `Jobs::cancel`).
 pub type CancelHook = Arc<dyn Fn(JobId) + Send + Sync>;
 
-/// Both sides: this device's jobs and what it pushed, and the peers' lists.
 #[derive(Default)]
 pub(crate) struct Mirror {
     table: Mutex<Table>,
-    /// The peers sent a non-empty list last time, so one whose last job left gets one empty
-    /// push.
+    /// The peers sent a non-empty list last time (one whose last job left gets one empty push).
     pushed: Mutex<HashSet<String>>,
     cancel: Mutex<Option<CancelHook>>,
     /// The peers a push to is still going (one at a time per peer).
     going: Mutex<HashSet<String>>,
-    /// Peer key id → its jobs here.
     received: Mutex<HashMap<String, Received>>,
 }
 
@@ -53,8 +43,7 @@ struct Received {
     cancel: HashSet<JobId>,
 }
 
-/// One push: the peer, the RPC body and the unfinished jobs in it (the only ones its reply
-/// may cancel).
+/// One push; `live`'s unfinished jobs are the only ones its reply may cancel.
 pub(crate) struct Push {
     pub key_id: String,
     pub body: Value,
@@ -65,8 +54,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// This run of the process, in every push: job ids start at 1 each run, so the peer tells a
-/// new job 1 from the last run's.
+/// This run of the process: job ids start at 1 each run, so the peer tells runs apart.
 fn instance() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
@@ -79,9 +67,8 @@ fn instance() -> &'static str {
     })
 }
 
-/// The path strings a job names, as `f` may rewrite them: `request`'s source, output,
-/// transfer, added files (`edits[].from`, op `add`), and the done
-/// report's output.
+/// The path strings a job names (source, output, transfer, added files, the report's output),
+/// as `f` may rewrite them.
 fn map_paths(job: &mut Value, f: &mut dyn FnMut(&str) -> Option<String>) {
     let mut each = |v: &mut Value| {
         if let Some(new) = v.as_str().and_then(&mut *f) {
@@ -139,8 +126,7 @@ fn to_flink(me: &str, root: &Path, s: &str) -> Option<String> {
     })
 }
 
-/// A local absolute path inside `root` as `/`-joined names relative to it (`""` for `root`
-/// itself); `None` outside it or for a name that isn't UTF-8.
+/// A path inside `root` as `/`-joined names relative to it; `None` outside it or not UTF-8.
 pub(crate) fn relative(root: &Path, s: &str) -> Option<String> {
     let p = Path::new(s);
     if !p.is_absolute() {
@@ -197,9 +183,8 @@ impl Mirror {
         *lock(&self.cancel) = Some(cancel);
     }
 
-    /// The pushes due now: each peer `paired` says is paired gets the jobs that use it
-    /// (unfinished or finished less than `KEEP_FINISHED` ago), paths in `root` spelled as
-    /// `flink://<me>/...`; a peer sent some last time and none now gets an empty list.
+    /// The pushes due now: each paired peer gets the jobs that use it (finished ones for
+    /// `KEEP_FINISHED`), paths in `root` spelled as `flink://<me>/...`.
     pub fn due(&self, me: &str, root: Option<&Path>, paired: &dyn Fn(&str) -> bool) -> Vec<Push> {
         let jobs = lock(&self.table).recent(KEEP_FINISHED);
         let mut by_peer: HashMap<String, Push> = HashMap::new();
@@ -249,8 +234,7 @@ impl Mirror {
         pushes
     }
 
-    /// Whether a push to `key_id` may start now (none to it is still going); then
-    /// [`Self::end_push`] when it ends.
+    /// Whether a push to `key_id` may start now; then [`Self::end_push`] when it ends.
     pub fn begin_push(&self, key_id: &str) -> bool {
         lock(&self.going).insert(key_id.to_string())
     }
@@ -272,8 +256,7 @@ impl Mirror {
         }
     }
 
-    /// A peer's `jobs` RPC: its list replaces the last one (at most `MAX_RECEIVED`), this
-    /// device's `flink://<me>/...` paths spelled as paths in `root`. The ids to cancel.
+    /// A peer's `jobs` RPC: its list replaces the last one; returns the ids to cancel.
     pub fn received(
         &self,
         key_id: &str,
@@ -335,8 +318,7 @@ impl Mirror {
         lock(&self.pushed).remove(key_id);
     }
 
-    /// The peers' jobs here, by peer key id, each with its saved `name` (a peer without one
-    /// is left out).
+    /// The peers' jobs here, each with its saved `name` (a peer without one left out).
     pub fn remote_jobs(&self, name_of: &dyn Fn(&str) -> Option<String>) -> Vec<Value> {
         let mut all = lock(&self.received);
         all.retain(|_, r| r.at.elapsed() < KEEP_RECEIVED);
@@ -404,6 +386,10 @@ mod tests {
             stage: "write".into(),
             done: 1,
             total: 2,
+            stage_done: 1,
+            stage_total: 2,
+            bytes_per_s: None,
+            stage_started_ms: 0,
         });
         let out = dirs[2].join("out").to_string_lossy().into_owned();
         a.job_started(2, &request(&dirs[2].join("other"), &out));

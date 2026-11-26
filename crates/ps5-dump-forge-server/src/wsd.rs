@@ -1,8 +1,6 @@
-//! Windows PCs (and Samba boxes running wsdd) by WS-Discovery: a SOAP Probe for `wsdp:Device` to
-//! 239.255.255.250:3702 from an ephemeral port (responders answer us directly), keeping the
-//! matches whose Types name `pub:Computer`; a match without XAddrs gets a Resolve. Each one's
-//! name comes from one WS-Transfer Get to its XAddr (`http://<ip>:5357/<uuid>`, `pub:Computer`
-//! `DESKTOP-AB12/Workgroup:WORKGROUP` → `DESKTOP-AB12`), else its IP. Listed as an SMB NAS on 445.
+//! Windows PCs (and wsdd) by WS-Discovery: a Probe for `wsdp:Device` to 239.255.255.250:3702,
+//! the `pub:Computer` matches kept (Resolve when no XAddrs), each named by one WS-Transfer Get
+//! to its XAddr, else its IP.
 use crate::mdns::Nas;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
@@ -17,7 +15,6 @@ const GET_TIMEOUT: Duration = Duration::from_secs(2);
 const ENVELOPE: &str = r#"<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof">"#;
 const DISCOVERY: &str = "http://schemas.xmlsoap.org/ws/2005/04/discovery";
 
-/// One ProbeMatch or ResolveMatch.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Match {
     pub endpoint: String,
@@ -33,7 +30,6 @@ pub struct XAddr {
     pub path: String,
 }
 
-/// A fresh `urn:uuid:` (v4).
 fn message_id() -> io::Result<String> {
     let mut b = [0u8; 16];
     getrandom::fill(&mut b).map_err(io::Error::other)?;
@@ -99,8 +95,7 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// The text inside each `<prefix:local …>…</prefix:local>` (any prefix), in order. A tiny
-/// extractor, not a parser: no CDATA, and a same-named element inside another ends it early.
+/// The text inside each `<prefix:local …>…</prefix:local>`, in order; no CDATA or nesting.
 pub fn elements<'a>(xml: &'a str, local: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut rest = xml;
@@ -201,8 +196,7 @@ pub fn computer_name(xml: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// One WS-Transfer Get to `at`, done by `deadline` (a peer dripping its reply can't hold the
-/// search past it) and at most 64 KiB read.
+/// One WS-Transfer Get to `at`, done by `deadline`, at most 64 KiB read.
 /// ponytail: a chunked reply is searched as it came; a chunk line inside the element would hide it.
 fn get_name(at: &XAddr, endpoint: &str, deadline: Instant) -> Option<String> {
     let body = message(
@@ -212,8 +206,7 @@ fn get_name(at: &XAddr, endpoint: &str, deadline: Instant) -> Option<String> {
         "",
     );
     let addr = SocketAddr::from((at.host, at.port));
-    // Connect and send within what is left too: a host dropping the connection silently can't
-    // hold the search (a reply may list 64 of them) past `deadline`.
+    // Connect and send within what is left too: a silent host can't hold the search.
     let left = || Some(deadline.saturating_duration_since(Instant::now())).filter(|d| !d.is_zero());
     let mut s = TcpStream::connect_timeout(&addr, left()?).ok()?;
     s.set_write_timeout(Some(left()?)).ok()?;
@@ -247,8 +240,7 @@ fn get_name(at: &XAddr, endpoint: &str, deadline: Instant) -> Option<String> {
     computer_name(reply.split_once("\r\n\r\n")?.1)
 }
 
-/// Probes until `until` (again every `RESEND`) or `stop`, calling `found` with the whole list
-/// each time it grows.
+/// Probes until `until` or `stop`, calling `found` with the whole list each time it grows.
 pub fn search(until: Instant, stop: &AtomicBool, found: &dyn Fn(Vec<Nas>)) -> io::Result<()> {
     search_on(GROUP, until, stop, found)
 }
@@ -426,7 +418,6 @@ mod tests {
             .send_to(reply(&rid, "ResolveMatches", &body).as_bytes(), from)
             .unwrap();
 
-        // The Get.
         let (mut conn, _) = http.accept().unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut req = Vec::new();

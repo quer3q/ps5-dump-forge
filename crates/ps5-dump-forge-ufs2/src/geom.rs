@@ -9,21 +9,16 @@
 
 use ps5upload_fpkg::{Error, Result};
 
-/// Block size = fragment size: one fragment per block, so every allocation is a whole block
-/// and the fragment maps never hold partial blocks.
+/// Block size = fragment size: every allocation is a whole block.
 pub const BSIZE: u64 = 65536;
-/// `fs_sblkno`/`fs_cblkno`/`fs_iblkno` for this geometry: superblock copy in block 2, the
-/// cylinder group header in block 3, inodes from block 4 (`roundup(howmany(65536 + 8192,
-/// 65536), 1)` and so on, exactly as newfs computes them).
+/// `fs_sblkno`/`fs_cblkno`/`fs_iblkno` as newfs computes them for this geometry.
 pub const SBLKNO: u64 = 2;
 pub const CBLKNO: u64 = 3;
 pub const IBLKNO: u64 = 4;
 /// 256-byte UFS2 inodes, 256 to a block.
 pub const INOPB: u64 = BSIZE / 256;
-/// Block pointers per indirect block.
 pub const NINDIR: u64 = BSIZE / 8;
-/// `fs_contigsumsize`: newfs takes `MIN(maxcontig, FS_MAXCONTIG)` with maxcontig =
-/// MAXPHYS (1 MiB on FreeBSD 13+) / bsize = 16.
+/// `fs_contigsumsize`: `MIN(MAXPHYS / bsize, FS_MAXCONTIG)` = 16.
 pub const CONTIGSUMSIZE: u64 = 16;
 /// `sizeof(struct cg)`.
 pub const CG_HDR: u64 = 168;
@@ -35,9 +30,7 @@ pub const CSUM_SIZE: u64 = 16;
 /// One fixed layout: everything that follows from the size and the inode density.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geom {
-    /// `fs_size`, in blocks (= fragments).
     pub size: u64,
-    /// Bytes per inode the layout was built with (`-i`).
     pub density: u64,
     pub fpg: u64,
     pub ipg: u64,
@@ -58,8 +51,7 @@ fn ipg_for(fpg: u64, fpi: u64) -> u64 {
 }
 
 impl Geom {
-    /// newfs's choice of fpg/ipg for `size` blocks at `density` bytes per inode, then our own
-    /// stricter last-group rule. Errors when the size cannot hold a single group.
+    /// newfs's fpg/ipg for `size` blocks at `density`; errors when no group fits.
     pub fn new(size: u64, density: u64) -> Result<Geom> {
         if size < 8 {
             return Err(Error::Format(format!(
@@ -81,17 +73,13 @@ impl Geom {
         fpg = (IBLKNO + ipg / INOPB).max(minfpg);
         ipg = ipg_for(fpg, fpi);
         if cgsize(fpg, ipg) >= BSIZE - CGSIZEFUDGE {
-            // newfs lowers the density until the minimal group fits; with -i >= 64 KiB and
-            // 64 KiB blocks the minimal group is always tiny, so this cannot happen.
+            // With -i >= 64 KiB and 64 KiB blocks the minimal group always fits.
             return Err(Error::Format(format!(
                 "no UFS2 group fits density {density}"
             )));
         }
-        // newfs grows the group one block at a time until its map fills a block, or until
-        // there would be fewer than MINCYLGRPS groups (MAXBLKSPERCG = "infinity"). The map
-        // only grows with the group, so both stops are found directly: `few` is the first
-        // group size leaving fewer than MINCYLGRPS groups, `full` the first whose map
-        // reaches the limit; whichever newfs meets first wins (`few` on a tie).
+        // newfs grows the group a block at a time until its map fills a block or fewer than
+        // MINCYLGRPS groups remain: `few` and `full` find both stops directly, `few` on a tie.
         let limit = BSIZE - CGSIZEFUDGE;
         let few = (size / MINCYLGRPS + 1).max(fpg);
         let (mut lo, mut hi) = (fpg, few);
@@ -149,20 +137,16 @@ impl Geom {
         (self.size - c * self.fpg).min(self.fpg)
     }
 
-    /// Our rule on top of newfs's: every group, the last included, holds all of its
-    /// metadata *and* at least one data block, and group 0 also fits the summary area plus
-    /// a data block (FreeBSD's `validate_sblock` wants the summary to end inside group 0).
-    /// UFS2Tool v4.1 laid out a last group shorter than its own metadata and wrote past
-    /// `fs_size`; `plan` grows the image until this holds.
+    /// Our rule on top of newfs's: every group holds its metadata and a data block, group 0
+    /// the summary area too (`validate_sblock`); UFS2Tool v4.1 wrote past `fs_size` without it.
     pub fn last_group_ok(&self) -> bool {
         let first = self.cg_blocks(0);
         let last = self.cg_blocks(self.ncg - 1);
         first > self.dblkno + self.csblocks && last > self.dblkno
     }
 
-    /// Data blocks this writer can allocate: every group's blocks past `dblkno`, minus the
-    /// summary area. ponytail: the two free blocks in front of each backup superblock
-    /// (groups 1..) stay free instead of holding data; 128 KiB per group, ~0.001%.
+    /// Data blocks this writer can allocate. ponytail: the two blocks in front of each backup
+    /// superblock stay free; 128 KiB per group, ~0.001%.
     pub fn data_capacity(&self) -> u64 {
         self.size - self.ncg * self.dblkno - self.csblocks
     }
@@ -183,8 +167,7 @@ impl Geom {
         c * self.fpg + self.dblkno + extra
     }
 
-    /// Physical block of data index `g` (the g-th allocatable block), and how many
-    /// allocatable blocks follow it contiguously in the same group (itself included).
+    /// Physical block of data index `g`, and how many allocatable blocks follow it in its group.
     pub fn locate(&self, g: u64) -> (u64, u64) {
         let d0 = self.cg_data(0);
         if g < d0 {
@@ -213,11 +196,8 @@ impl Geom {
     }
 }
 
-/// `-i` as SMP recommends and the user's known-good `ffpkg.sh` computes it: the image size
-/// over (files + dirs + 2048), rounded down to 4 KiB and clamped to 64..256 KiB. `bytes`
-/// is the data the image holds (the tree's blocks plus the free spare), what the image
-/// is before metadata; `entries` counts files and directories, the root included
-/// (`find SRC | wc -l`).
+/// `-i` as SMP's `ffpkg.sh` computes it: `bytes` (data + spare) over (`entries` + 2048),
+/// rounded down to 4 KiB, clamped to 64..256 KiB; `entries` counts the root.
 pub fn density_for(bytes: u64, entries: u64) -> u64 {
     let d = bytes / entries.saturating_add(2048);
     (d / 4096 * 4096).clamp(64 * 1024, 256 * 1024)
@@ -256,8 +236,7 @@ mod tests {
         }
     }
 
-    /// newfs's group-growing loop, one block at a time, as `Geom::new` had it: the binary
-    /// search there must pick the same group size for every image size and density.
+    /// newfs's group-growing loop, one block at a time: `Geom::new` must pick the same size.
     #[test]
     fn group_size_matches_newfs_loop() {
         let slow = |size: u64, density: u64| -> u64 {

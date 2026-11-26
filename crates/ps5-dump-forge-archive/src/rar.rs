@@ -4,11 +4,9 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
 };
-// unrar_sys builds and links UnRAR's C++; its declarations are not used. They type wchar_t as
-// libc's (4 bytes on our FreeBSD target) but the PS5 SDK's C++ wchar_t is 2 bytes (UTF-16, as on
-// Windows), so the structs and the wide callbacks are declared here from UnRAR's dll.hpp.
-// dll.hpp wraps them in `#pragma pack(push, 1)`, hence `packed`; fields are copied out by value.
-// build.rs checks the same sizes and offsets (the asserts below) against the C++ compiler.
+// UnRAR's structs and wide callbacks are declared here from dll.hpp (`pragma pack(1)`, hence
+// `packed`): unrar_sys types wchar_t as libc's, but the PS5 SDK's is 2 bytes. build.rs checks the
+// asserts below in C++.
 use unrar_sys as _;
 
 #[cfg(any(windows, target_env = "ps5"))]
@@ -105,8 +103,7 @@ struct OpenArchiveDataEx {
     cmt_buf_w: *mut WChar,
     reserved: [c_uint; 25],
 }
-// Packed layouts on our 64-bit targets: `flags` follows four name arrays (2048 + 2048 x wchar_t).
-// build.rs asserts the same numbers in C++ (keep the two lists in step).
+// Packed layouts on our 64-bit targets; build.rs asserts the same numbers (keep them in step).
 const H: usize = 2048 + 2048 * size_of::<WChar>();
 const _: () = {
     use std::mem::offset_of;
@@ -143,15 +140,14 @@ unsafe extern "C" {
         dest_name: *mut WChar,
     ) -> c_int;
     fn RARSetCallback(handle: *mut c_void, callback: Option<Callback>, user_data: LParam);
-    // UnRAR's global `ErrorHandler ErrHandler` (global.hpp): no vtable, its first member is
-    // `RAR_EXIT ExitCode`, an int-sized enum; only that is read. RAROpenArchiveEx cleans it.
+    // UnRAR's global `ErrorHandler ErrHandler`: its first member is the int-sized `RAR_EXIT
+    // ExitCode`, the only field read.
     // ponytail: the layout is taken from errhnd.hpp by hand; an unrar_sys bump must recheck it.
     #[cfg_attr(target_env = "msvc", link_name = "?ErrHandler@@3VErrorHandler@@A")]
     static mut ErrHandler: c_int;
 }
 
-// Password storage deliberately has no derived Debug. The library's Password type
-// never leaves this module either. All decoder error messages are replaced.
+// Passwords have no derived Debug, and decoder error messages are all replaced.
 struct Secret(Vec<WChar>);
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -225,8 +221,8 @@ fn handle_callback(
             if p1 == 0 || p2 < 0 {
                 return Err(corrupt("Invalid RAR data callback."));
             }
-            // UnRAR owns this valid buffer for the duration of the callback. Split
-            // it into at most 64 KiB writes and check cancellation between writes.
+            // UnRAR's buffer, valid for the callback: written in ≤ 64 KiB pieces, cancel checked
+            // between.
             let data = unsafe { std::slice::from_raw_parts(p1 as *const u8, p2 as usize) };
             for chunk in data.chunks(64 * 1024) {
                 check(state.cancel)?;
@@ -253,9 +249,8 @@ fn handle_callback(
                 ptr::copy_nonoverlapping(pw.0.as_ptr(), p1 as *mut WChar, pw.0.len());
             }
         }
-        // Each volume comes twice, wide then narrow. The narrow name is the one UnRAR opens:
-        // on Unix its wide-to-narrow conversion depends on the C locale (Rust never sets one) and
-        // round-trips the bytes the narrow archive name was given as; Windows opens wide names.
+        // Each volume comes twice, wide then narrow; UnRAR opens the narrow one on Unix (bytes
+        // round-trip with no C locale), wide on Windows.
         #[cfg(windows)]
         UCM_CHANGEVOLUMEW => {
             if p1 == 0 {
@@ -278,7 +273,6 @@ fn handle_callback(
             if p1 == 0 {
                 return Err(corrupt("Invalid RAR volume callback."));
             }
-            // NUL-terminated, in a buffer UnRAR owns for the duration of the callback.
             let name = unsafe { std::ffi::CStr::from_ptr(p1 as *const c_char) };
             volume(
                 state,
@@ -417,8 +411,8 @@ fn entry(h: &HeaderDataEx) -> Result<Entry, ArchiveError> {
         .position(|&c| c == 0)
         .filter(|&n| n + 1 < name_w.len())
         .ok_or_else(|| corrupt("RAR filename is too long."))?;
-    // UnRAR gives each separator as the system's (ConvertFileHeader): `\` on Windows, so it
-    // becomes `/` there. Elsewhere a `\` left is part of a name, which `safe_path` refuses.
+    // UnRAR gives separators as the system's: `\` on Windows becomes `/`; elsewhere `\` is part of
+    // a name, which `safe_path` refuses.
     let name = decode(&name_w[..end])?;
     #[cfg(windows)]
     let name = name.replace('\\', "/");
@@ -444,8 +438,8 @@ fn run<'a>(
     cancel: &'a AtomicBool,
     sink: Option<&'a mut dyn Sink>,
 ) -> Result<Listing, ArchiveError> {
-    // UnRAR keeps one global, unsynchronized ErrHandler (RAROpenArchiveEx cleans it, extraction
-    // sets it), so one session runs at a time, open to close (`handle` drops before the guard).
+    // UnRAR's one global, unsynchronized ErrHandler: one session at a time, open to close (`handle`
+    // drops before the guard).
     // ponytail: a long extraction blocks every other .rar listing or read until it ends.
     let _session = RAR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut state = Box::new(State {
@@ -474,8 +468,8 @@ fn run<'a>(
         let mut h: HeaderDataEx = unsafe { std::mem::zeroed() };
         let code = unsafe { RARReadHeaderEx(handle.0, &raw mut h) };
         if code == ERAR_END_ARCHIVE {
-            // A header cut short (a truncated download) also ends the walk, with only a warning
-            // (RARX_WARNING) left in ErrHandler: the files after it would be missing.
+            // A header cut short also ends the walk with only RARX_WARNING: the files after it
+            // would be missing.
             if unsafe { ptr::read_volatile(&raw const ErrHandler) } != 0 {
                 return Err(corrupt("The archive is truncated or damaged."));
             }

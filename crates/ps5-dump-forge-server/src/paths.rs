@@ -1,7 +1,5 @@
-//! The roots: where the file browser starts (`list_dir` with a `null` path). On a computer
-//! they confine nothing; every path a request names goes to core as given, as in the Tauri
-//! app. On the PS5 (by user request) listings and paired devices reach only them: `/data`
-//! and each drive while it is mounted ([`Roots::confine`], [`Roots::reach`]).
+//! The roots: where the file browser starts. On a computer they confine nothing; on the PS5
+//! listings and paired devices reach only `/data` and each drive while it is mounted.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -10,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use crate::Platform;
 
-/// The PS5's internal storage, whose free space the Library shows.
 const DATA: &str = "/data";
 
 /// Each root with the path it was named by (`/data` may resolve elsewhere).
@@ -19,37 +16,29 @@ type Named = Vec<(PathBuf, PathBuf)>;
 pub(crate) struct Roots {
     list: Vec<Candidate>,
     ps5: bool,
-    /// `statfs`; tests replace it.
     statfs: fn(&Path) -> Option<Mount>,
-    /// [`Self::now`] kept this long for a paired device's calls ([`Self::reach`],
-    /// [`Self::above`]): a transfer asks for every file; 0 in tests.
+    /// [`Self::now`] cached for a paired device's calls: a transfer asks for every file.
     ttl: Duration,
     cached: Mutex<Option<(Instant, Named)>>,
 }
 
 struct Candidate {
     path: PathBuf,
-    /// The canonical path, pinned at startup. On the PS5 a candidate that doesn't exist then
-    /// is resolved each time it is used, and so is every drive.
+    /// Pinned at startup; `None` (PS5: missing then, or a drive) resolves on each use.
     pinned: Option<PathBuf>,
-    /// A PS5 drive (`/mnt/usbN`, `/mnt/extN`, any `/mnt/...`): its folder exists with nothing
-    /// plugged in, so it is listed only while a filesystem is mounted on it.
+    /// A PS5 `/mnt/...` drive: its folder exists with nothing plugged in, so only while mounted.
     drive: bool,
 }
 
-/// What `statfs` says of a path: where its filesystem is mounted, how many blocks it has, and
-/// its size and free space in bytes.
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))] // built by FreeBSD's `statfs` only
 pub(crate) struct Mount {
     on: PathBuf,
     blocks: u64,
-    /// `f_blocks * f_bsize`.
     total: u64,
-    /// `f_bavail * f_bsize`: what a user may still write (0 when the reserve is in use).
+    /// `f_bavail * f_bsize` (0 when the reserve is in use).
     free: u64,
 }
 
-/// A filesystem's free and total bytes, as the Library's scan reply carries them on the PS5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Storage {
     pub free: u64,
@@ -57,8 +46,7 @@ pub(crate) struct Storage {
 }
 
 impl Roots {
-    /// Pins the roots; returns them with a line for the log about each one dropped (and,
-    /// on the PS5, each one that resolves elsewhere: `/data` may be a symlink).
+    /// With a log line for each root dropped (and, on the PS5, each that resolves elsewhere).
     pub fn new(platform: Platform, candidates: &[PathBuf]) -> (Self, Vec<String>) {
         let ps5 = platform == Platform::Ps5;
         let mut notes = Vec::new();
@@ -77,7 +65,6 @@ impl Roots {
                     }
                     list.push(candidate((!drive).then_some(root)));
                 }
-                // A PS5 drive that isn't plugged in is no news.
                 Err(_) if ps5 && !path.exists() => list.push(candidate(None)),
                 Err(why) => notes.push(format!("not serving {}: {why}", path.display())),
             }
@@ -94,13 +81,11 @@ impl Roots {
         )
     }
 
-    /// The roots that exist now (drives: that are mounted now), canonical, each once.
+    /// Canonical, each once; drives only while mounted.
     pub fn current(&self) -> Vec<PathBuf> {
         self.now().into_iter().map(|(_, root)| root).collect()
     }
 
-    /// The PS5's internal storage (`statfs` of `/data`): `None` on a computer, or when
-    /// `statfs` fails. Asked for each Library scan, so Refresh renews it.
     pub fn storage(&self) -> Option<Storage> {
         if !self.ps5 {
             return None;
@@ -112,7 +97,6 @@ impl Roots {
         })
     }
 
-    /// [`Self::now`], at most `ttl` old.
     fn recent(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, roots)) = cached.as_ref().filter(|(at, _)| at.elapsed() < self.ttl) {
@@ -123,7 +107,6 @@ impl Roots {
         roots
     }
 
-    /// [`Self::current`], each with the path it was named by (`/data` may resolve elsewhere).
     fn now(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut roots: Vec<(PathBuf, PathBuf)> = Vec::new();
         for c in &self.list {
@@ -141,10 +124,8 @@ impl Roots {
         roots
     }
 
-    /// The PS5's rule for a path a request names (`list_dir`, `host_tree`, a Library folder):
-    /// at or inside a root now, resolved as far as it exists (the rest as typed, never `..`).
-    /// A computer, and another device's path (`smb://`, `flink://`, ...), pass. `Err`: the
-    /// one line a 400 carries.
+    /// PS5: at or inside a root, resolved as far as it exists (the rest never `..`). A computer
+    /// and another device's path pass.
     pub fn confine(&self, path: &Path) -> Result<(), String> {
         if !self.ps5 || ps5_dump_forge_core::net::is_network(path) {
             return Ok(());
@@ -156,17 +137,14 @@ impl Roots {
         }
     }
 
-    /// The PS5's rule for a paired device's path `p` (its folder resolved, its own name not):
-    /// at or inside a root now, a root's own path as named giving the canonical one (so a
-    /// linked `/data` reads as the folder); with `browse` (stat, list) also a folder above a
-    /// root (`/`; `/mnt` while a drive is mounted). A computer: `p` as it is.
+    /// PS5, a paired device's `p` (its folder resolved): at or inside a root (a root as named
+    /// gives the canonical one); with `browse` also a folder above a root.
     pub fn reach(&self, p: &Path, browse: bool) -> Result<PathBuf, String> {
         if !self.ps5 {
             return Ok(p.to_path_buf());
         }
         let now = self.recent();
-        // The snapshot may be a second old: a write under a drive asks that drive again, so
-        // nothing lands in the mount point of one just unplugged (browsing may be stale).
+        // A write under a drive asks it again: nothing lands in the mount point of one unplugged.
         let still = |named: &PathBuf, root: &Path| {
             browse
                 || !(self.list.iter()).any(|c| c.drive && c.path == *named)
@@ -190,8 +168,7 @@ impl Roots {
         }
     }
 
-    /// On the PS5, for a folder above the roots, the names in it that lead to one: all a
-    /// paired device's listing of it keeps. `None`: list everything.
+    /// PS5, a folder above the roots: the names in it that lead to one. `None`: list everything.
     pub fn above(&self, dir: &Path) -> Option<Vec<OsString>> {
         if !self.ps5 {
             return None;
@@ -213,7 +190,6 @@ impl Roots {
 
 #[cfg(all(test, unix))]
 impl Roots {
-    /// PS5 roots for tests, `(path, drive)` each, resolved on each use, with a fake `statfs`.
     pub(crate) fn fake(list: &[(PathBuf, bool)], statfs: fn(&Path) -> Option<Mount>) -> Roots {
         let list = (list.iter())
             .map(|(path, drive)| Candidate {
@@ -247,7 +223,6 @@ pub(crate) fn fake_statfs(p: &Path) -> Option<Mount> {
     })
 }
 
-/// The refusal of a path off the PS5's storage.
 fn outside(p: &Path) -> String {
     format!(
         "{} is not on this console's storage or a plugged-in drive",
@@ -255,8 +230,7 @@ fn outside(p: &Path) -> String {
     )
 }
 
-/// `path` canonical as far as it exists, the rest appended as named; `None` for a relative
-/// path or one whose missing part holds `..`.
+/// `None` for a relative path or one whose missing part holds `..`.
 fn resolve(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
@@ -273,15 +247,12 @@ fn resolve(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Whether a filesystem is mounted on `root` itself: an empty mount-point folder is on the
-/// filesystem above it (`f_mntonname` names that one), and a drive pulled out may leave a
-/// mount with no blocks.
+/// An empty mount point is on the filesystem above; a drive pulled out may leave no blocks.
 fn mounted(root: &Path, fs: Option<Mount>) -> bool {
     fs.is_some_and(|fs| fs.on == root && fs.blocks > 0)
 }
 
-/// On the PS5 this is `statfs@FBSD_1.0`, forwarded by ps5/compat.c (the FreeBSD 11 layout:
-/// the CLI asserts its size).
+/// On the PS5 `statfs@FBSD_1.0` via ps5/compat.c (FreeBSD 11 layout, size asserted in the CLI).
 #[cfg(target_os = "freebsd")]
 #[allow(clippy::unnecessary_cast)] // f_blocks is u64 on FreeBSD 12+, i64 on 11
 fn statfs(path: &Path) -> Option<Mount> {
@@ -310,15 +281,12 @@ fn statfs(path: &Path) -> Option<Mount> {
     })
 }
 
-/// Only FreeBSD (and the PS5) serves drives.
 #[cfg(not(target_os = "freebsd"))]
 fn statfs(_: &Path) -> Option<Mount> {
     None
 }
 
-/// A root as listed: canonical (Windows: `C:\x`, as core's `list_dir` spells it), not `/`, a
-/// folder. It may resolve elsewhere (`/data` can be a symlink on the PS5, `/tmp` is
-/// `/private/tmp` on macOS).
+/// Canonical (Windows `C:\x`, as core's `list_dir` spells it), not `/`, a folder.
 fn pin(path: &Path) -> Result<PathBuf, String> {
     let canon = dunce::canonicalize(path).map_err(|e| e.to_string())?;
     if canon.parent().is_none() {
@@ -330,7 +298,6 @@ fn pin(path: &Path) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-// Unix: symlinks.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

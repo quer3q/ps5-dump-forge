@@ -1,6 +1,5 @@
-//! Archive sources (`.zip`, `.7z`, `.rar`): the game folder inside is read straight from the
-//! archive, file by file in the order the job asks (`ps5_dump_forge_archive::Reader`), with
-//! nothing unpacked to disk.
+//! Archive sources (`.zip`, `.7z`, `.rar`): the game folder read straight from the archive, in
+//! the order the job asks, nothing unpacked to disk.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -25,8 +24,7 @@ pub(crate) fn name(format: ArchiveFormat) -> &'static str {
     }
 }
 
-/// The archive's game folder as the job's source, and the source stamp extended to every
-/// part of the archive.
+/// The archive's game folder as the job's source, stamped over every part.
 pub(crate) fn open(
     req: &ConvertRequest,
     ctx: &Ctx,
@@ -71,9 +69,8 @@ pub(crate) fn open(
         }
     }
     let empty_dirs = dirs.difference(&parents).cloned().collect();
-    // No read asks for an empty file, so nothing would run the archive's check of one: a
-    // non-solid archive's are all decoded now (one pass of header skips), any data in one
-    // fails. A solid archive's are checked as its reads go past them.
+    // No read asks for an empty file: a non-solid archive's are all checked now (header skips);
+    // a solid archive's as its reads go past them.
     // ponytail: a solid archive's empty files after the last one read go unchecked.
     let empty: std::collections::HashSet<String> = (files.iter())
         .filter(|f| f.size == 0)
@@ -163,8 +160,7 @@ impl SourceTree for ArchiveTree {
     }
 }
 
-/// Passwords release sites put on their archives, tried in this order on an archive that needs
-/// one when none is given. Never logged or shown.
+/// Passwords release sites put on their archives, tried in order. Never logged or shown.
 const KNOWN_PASSWORDS: [&str; 6] = [
     "DLPSGAME.COM",
     "[DLPSGAME.COM]",
@@ -174,15 +170,13 @@ const KNOWN_PASSWORDS: [&str; 6] = [
     "hako",
 ];
 
-/// Archives whose password check passed, newest last, so picking a source decodes a solid
-/// archive once and naming it or starting its job decodes none of it again.
+/// Archives whose password check passed, newest last, so naming or a job decodes none again.
 // ponytail: at most 4 archives remembered (the oldest dropped), each valid while its stamp
 // holds; a part swapped back to identical metadata goes unnoticed, as for a job's stamp.
 static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 const MAX_OPENED: usize = 4;
 
-/// One archive per lock, held across lookup, check and fill, so two callers for one archive
-/// (Convert asks the name while inspect runs) decode it once.
+/// One archive per lock, held across lookup, check and fill, so two callers decode it once.
 static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
 
 /// How many decoding passes this file started (tests count them).
@@ -217,8 +211,7 @@ fn unlocked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `lock`, waited for while `cancel` isn't set (a job behind another tab's inspect of the same
-/// archive stays cancellable).
+/// `lock`, waited for while `cancel` isn't set.
 fn hold<'a>(
     lock: &'a Mutex<()>,
     cancel: &AtomicBool,
@@ -243,10 +236,8 @@ fn path_lock(path: &Path) -> Arc<Mutex<()>> {
     locks.entry(path.to_path_buf()).or_default().clone()
 }
 
-/// The remembered archive `path` when it is unchanged and `given` fits it (its password, or it
-/// needs none; no password fits only one of [`KNOWN_PASSWORDS`], so a typed password is never
-/// handed to a request that didn't give it): the password to use (`given` first), its game
-/// folder and `param.json`.
+/// The remembered archive `path` when it is unchanged and `given` fits it (a typed password is
+/// never handed to a request that didn't give it): the password, game folder and `param.json`.
 fn lookup(path: &Path, given: Option<&str>) -> Option<(Option<String>, String, Vec<u8>)> {
     let fits = |o: &&Opened| match (given, o.password.as_deref()) {
         (_, None) => true,
@@ -303,12 +294,9 @@ fn heads(
     ps5_dump_forge_archive::read_heads(path, password, keep, max_bytes, cancel)
 }
 
-/// The password to read the archive `path` with: `given` as it is (nothing read); none when the
-/// archive needs none; else the first of [`KNOWN_PASSWORDS`] that opens its game folder (its
-/// `param.json` is read, as a wrong password may still list the files). None fitting: the
-/// archive's own "needs a password" error, unless one of them failed some other way (most
-/// likely the right one, on a damaged or unusable archive): that error. An archive checked
-/// before and unchanged since is not read again.
+/// The password to read `path` with: `given` as it is; none when it needs none; else the first
+/// of [`KNOWN_PASSWORDS`] that opens its game folder. None fitting: "needs a password", unless
+/// one failed another way (likely the right one on a damaged archive): that error.
 pub(crate) fn password(
     path: &Path,
     given: Option<&str>,
@@ -327,8 +315,7 @@ pub(crate) fn password(
     Ok(password)
 }
 
-/// The password, the game folder's `param.json` (at `<root>sce_sys/param.json`) and the heads
-/// `extra` asks for, in one decoding pass: [`password`]'s answer, read with `given` when one is.
+/// [`password`]'s answer with the game folder's `param.json` and `extra`'s heads, in one pass.
 pub(crate) fn password_reading(
     path: &Path,
     given: Option<&str>,
@@ -362,10 +349,8 @@ pub(crate) fn cached_param(path: &Path, given: Option<&str>) -> Option<(Option<S
 }
 
 /// Opens the game folder with `pw` in one pass: its `param.json`, a proof and `extra`'s heads.
-/// The game folder's `param.json` is read whatever the folder search did: with names in the
-/// clear a wrong password lists the archive, and a lone game folder is found unread. A
-/// `param.json` in the clear proves nothing, so then the smallest encrypted file of the game is
-/// read too (decoded and checked whole, its head kept: it may be large).
+/// A `param.json` in the clear proves nothing, so then the game's smallest encrypted file is
+/// read too (checked whole, its head kept).
 fn check(
     path: &Path,
     pw: Option<&str>,

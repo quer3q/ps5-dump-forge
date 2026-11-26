@@ -4,13 +4,16 @@
 //! [`Overlay`]: the folder minus every packed original, plus a regenerated `ampr_emu.index`
 //! (listing the original files, which is what `ampr_emu` resolves), the manifest and its
 //! sidecars, and the volumes. A folder emptied by packing is kept as an empty folder.
+//! [`prepare_streamed`] gives the same packed game with nothing written: the packs are measured,
+//! and the volumes are made again from the folder as the image writer reads them
+//! ([`super::regen`]).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::config::{pack_output_glob, Config};
-use super::{glob, pack, runtime_support, Control, Output};
+use super::{glob, pack, regen::Regen, runtime_support, Control, Output};
 use crate::ampr_index;
 use crate::source::{SourceFile, SourceTree};
 use crate::{format_err, Error, Result};
@@ -27,8 +30,12 @@ pub struct Readiness {
     pub refusal: Option<String>,
     /// `ok`; `runtime` (the game's ampr_emu is missing or too old: installing
     /// [`RUNTIME_VERSION`] into the image makes packs possible); `no_ampr` (the game does not
-    /// read through AMPR, so nothing could serve packs: .ffpfsc is its compression).
+    /// read through AMPR, so ampr_emu could not serve LZ4 packs: .ffpfsc is its compression,
+    /// or zstd packs, whose ampr-emu-ng is injected whatever the game imports).
     pub kind: &'static str,
+    /// The game reads through AMPR and ships no emulator at all: it may not start from an image
+    /// or folder without one, packs or not ([`emulator_needed_at`]).
+    pub emulator_missing: bool,
 }
 
 /// The ampr_emu release the engine can put into an image (`fakelib/libSceAmpr.sprx`) when the
@@ -46,15 +53,24 @@ pub const RUNTIME_MODULE_ORIG: &str = "fakelib/libSceAmpr.sprx.orig";
 /// older `ampr_emu` (0.3) would find every packed file missing. The module is recognised by
 /// its own strings (see [`runtime_support`]).
 pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
+    let emulator_missing = emulator_needed_at(tree).is_some();
+    readiness_for_packs(tree).map(|r| Readiness {
+        emulator_missing,
+        ..r
+    })
+}
+
+fn readiness_for_packs(tree: &mut dyn SourceTree) -> Option<Readiness> {
     if !crate::source::imports_ampr(tree, "eboot.bin") {
         return Some(Readiness {
             runtime_version: None,
             refusal: Some(
-                "this game does not read its files through AMPR, so nothing could serve \
+                "this game does not read its files through AMPR, so nothing could serve LZ4 \
                  asset packs; compress it into a .ffpfsc instead"
                     .into(),
             ),
             kind: "no_ampr",
+            emulator_missing: false,
         });
     }
     let Some(module) = tree
@@ -70,15 +86,17 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
                  {RUNTIME_MODULE}, and the folder has none"
             )),
             kind: "runtime",
+            emulator_missing: false,
         });
     };
-    let support = match tree.read(&module) {
+    let support = match crate::source::read_small(tree, &module, crate::source::MAX_ARTWORK_BYTES) {
         Ok(bytes) => runtime_support(&bytes),
         Err(e) => {
             return Some(Readiness {
                 runtime_version: None,
                 refusal: Some(format!("{module} could not be read: {e}")),
                 kind: "runtime",
+                emulator_missing: false,
             })
         }
     };
@@ -94,9 +112,178 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
     });
     Some(Readiness {
         kind: if refusal.is_some() { "runtime" } else { "ok" },
+        emulator_missing: false,
         runtime_version: support.version,
         refusal,
     })
+}
+
+/// Where a game's emulator goes when a new one takes the place of any it has: its `fakelib2` when
+/// it has one, else its `fakelib`, in the game's own spelling.
+pub fn emulator_home(tree: &dyn SourceTree) -> String {
+    for dir in ["fakelib2", "fakelib"] {
+        let prefix = format!("{dir}/");
+        for file in tree.files() {
+            if let Some(found) = file.path.get(..prefix.len()) {
+                if found.eq_ignore_ascii_case(&prefix) {
+                    return format!("{found}libSceAmpr.sprx");
+                }
+            }
+        }
+    }
+    RUNTIME_MODULE.to_string()
+}
+
+/// Where an AMPR emulator has to go for a game that reads its files through libSceAmpr and ships
+/// no emulator; `None` for any other game. Without one some games fail to start from an image or
+/// folder (Alembic's console test: `APR_FATAL_ERROR_ASYNC`, or an abort in eboot.bin) and others
+/// run (LEGO Horizon Adventures on the Pro), and ShadowMount+ doesn't add one. A game with a `fakelib2` loads from there, in its own spelling.
+pub fn emulator_needed_at(tree: &mut dyn SourceTree) -> Option<String> {
+    if !crate::source::imports_ampr(tree, "eboot.bin") {
+        return None;
+    }
+    emulator_place(&*tree)
+}
+
+fn emulator_place(tree: &dyn SourceTree) -> Option<String> {
+    let mut home = None;
+    for dir in ["fakelib2", "fakelib"] {
+        let prefix = format!("{dir}/");
+        for file in tree.files() {
+            let Some(found) = file.path.get(..prefix.len()) else {
+                continue;
+            };
+            if !found.eq_ignore_ascii_case(&prefix) {
+                continue;
+            }
+            if file.path[prefix.len()..].eq_ignore_ascii_case("libSceAmpr.sprx") {
+                return None;
+            }
+            home.get_or_insert_with(|| found.to_string());
+        }
+    }
+    let home = home.unwrap_or_else(|| "fakelib/".to_string());
+    Some(format!("{home}libSceAmpr.sprx"))
+}
+
+/// A game in LZ4 asset packs read as the game it was: every packed file by its own name, decoded
+/// chunk by chunk from the volumes, which are hidden with the rest of the pack set. Lets a packed
+/// game go straight into another pack format, with no copy on disk.
+pub struct Lz4Unpacked {
+    inner: Box<dyn SourceTree>,
+    reader: super::read::Reader,
+    files: Vec<SourceFile>,
+    packed: HashMap<String, usize>,
+    /// The chunk read last: reads run in small pieces, chunks in larger ones.
+    last: Option<(usize, u32, Vec<u8>)>,
+}
+
+/// What [`Lz4Unpacked::open`] made of a game.
+pub enum Unpacking {
+    Decoded(Box<Lz4Unpacked>),
+    /// It has no pack set: the game as it was given.
+    NotPacked(Box<dyn SourceTree>),
+}
+
+impl Lz4Unpacked {
+    /// `inner` decoded, when it has a pack set.
+    pub fn open(mut inner: Box<dyn SourceTree>) -> Result<Unpacking> {
+        let index_name = Config::default().index_name;
+        if !crate::source::lz4_packed(inner.as_mut())? {
+            return Ok(Unpacking::NotPacked(inner));
+        }
+        let reader = super::read::Reader::open(inner.as_mut(), &index_name)?;
+        let m = &reader.manifest;
+        let mut packed = HashMap::new();
+        let mut names = BTreeSet::new();
+        for id in 0..m.packs.len() {
+            names.insert(m.pack_name(id)?.to_ascii_lowercase());
+        }
+        let mut files: Vec<SourceFile> = inner
+            .files()
+            .iter()
+            .filter(|f| {
+                let lower = f.path.to_ascii_lowercase();
+                !names.contains(&lower) && !lower.starts_with(&index_name)
+            })
+            .cloned()
+            .collect();
+        let mut known: BTreeSet<String> =
+            files.iter().map(|f| f.path.to_ascii_lowercase()).collect();
+        for (i, f) in m.files.iter().enumerate() {
+            if !f.packed() {
+                continue;
+            }
+            let path = m.path(i)?;
+            let path = path.strip_prefix("/app0/").unwrap_or(path).to_string();
+            if known.insert(path.to_ascii_lowercase()) {
+                files.push(SourceFile {
+                    path: path.clone(),
+                    size: f.logical_size,
+                });
+                packed.insert(path, i);
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Unpacking::Decoded(Box::new(Self {
+            inner,
+            reader,
+            files,
+            packed,
+            last: None,
+        })))
+    }
+}
+
+impl SourceTree for Lz4Unpacked {
+    fn release(&mut self) {
+        self.inner.release();
+    }
+
+    fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
+    fn empty_dirs(&self) -> &[String] {
+        self.inner.empty_dirs()
+    }
+    fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+        match self.packed.get(path) {
+            Some(&i) => self.reader.read_file(i, self.inner.as_mut(), ""),
+            None => self.inner.read(path),
+        }
+    }
+    fn read_range(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let Some(&i) = self.packed.get(path) else {
+            return self.inner.read_range(path, offset, len);
+        };
+        let f = &self.reader.manifest.files[i];
+        let size = f.logical_size;
+        let chunk_size = 1u64 << f.block_shift;
+        let end = offset.saturating_add(len as u64).min(size);
+        let mut out = Vec::with_capacity(end.saturating_sub(offset) as usize);
+        let mut at = offset;
+        while at < end {
+            let local = (at / chunk_size) as u32;
+            if !matches!(&self.last, Some((file, chunk, _)) if *file == i && *chunk == local) {
+                let raw = self.reader.read_chunk(i, local, self.inner.as_mut(), "")?;
+                self.last = Some((i, local, raw));
+            }
+            let Some((_, _, raw)) = &self.last else {
+                break;
+            };
+            let from = (at % chunk_size) as usize;
+            let take = raw.len().saturating_sub(from).min((end - at) as usize);
+            if take == 0 {
+                break;
+            }
+            out.extend_from_slice(&raw[from..from + take]);
+            at += take as u64;
+        }
+        Ok(out)
+    }
+    fn describe(&self) -> String {
+        format!("{} (LZ4 packs read)", self.inner.describe())
+    }
 }
 
 /// A game with the release ampr_emu in place of its own `fakelib/libSceAmpr.sprx` (kept as
@@ -106,10 +293,22 @@ pub struct RuntimeInstalled {
     files: Vec<crate::source::SourceFile>,
     runtime: Vec<u8>,
     orig_path: Option<String>,
+    module: String,
+    orig_name: String,
 }
 
 impl RuntimeInstalled {
     pub fn new(inner: Box<dyn SourceTree>, runtime: Vec<u8>) -> crate::Result<Self> {
+        Self::new_at(inner, runtime, RUNTIME_MODULE)
+    }
+
+    /// [`Self::new`] at `module`: a game with a `fakelib2` keeps its emulator there.
+    pub fn new_at(
+        inner: Box<dyn SourceTree>,
+        runtime: Vec<u8>,
+        module: &str,
+    ) -> crate::Result<Self> {
+        let orig_name = format!("{module}.orig");
         let support = runtime_support(&runtime);
         if !support.packs {
             return Err(crate::Error::Format(
@@ -119,14 +318,13 @@ impl RuntimeInstalled {
         let orig_path = inner
             .files()
             .iter()
-            .find(|f| f.path.eq_ignore_ascii_case(RUNTIME_MODULE))
+            .find(|f| f.path.eq_ignore_ascii_case(module))
             .map(|f| f.path.clone());
         let mut files: Vec<crate::source::SourceFile> = inner
             .files()
             .iter()
             .filter(|f| {
-                !f.path.eq_ignore_ascii_case(RUNTIME_MODULE)
-                    && !f.path.eq_ignore_ascii_case(RUNTIME_MODULE_ORIG)
+                !f.path.eq_ignore_ascii_case(module) && !f.path.eq_ignore_ascii_case(&orig_name)
             })
             .cloned()
             .collect();
@@ -137,12 +335,12 @@ impl RuntimeInstalled {
                 .find(|f| &f.path == orig)
                 .map_or(0, |f| f.size);
             files.push(crate::source::SourceFile {
-                path: RUNTIME_MODULE_ORIG.to_string(),
+                path: orig_name.clone(),
                 size,
             });
         }
         files.push(crate::source::SourceFile {
-            path: RUNTIME_MODULE.to_string(),
+            path: module.to_string(),
             size: runtime.len() as u64,
         });
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -151,11 +349,13 @@ impl RuntimeInstalled {
             files,
             runtime,
             orig_path,
+            module: module.to_string(),
+            orig_name,
         })
     }
 
     fn resolve(&self, path: &str) -> Option<&str> {
-        if path.eq_ignore_ascii_case(RUNTIME_MODULE_ORIG) {
+        if path.eq_ignore_ascii_case(&self.orig_name) {
             return self.orig_path.as_deref();
         }
         None
@@ -163,6 +363,10 @@ impl RuntimeInstalled {
 }
 
 impl SourceTree for RuntimeInstalled {
+    fn release(&mut self) {
+        self.inner.release();
+    }
+
     fn files(&self) -> &[crate::source::SourceFile] {
         &self.files
     }
@@ -170,7 +374,7 @@ impl SourceTree for RuntimeInstalled {
         self.inner.empty_dirs()
     }
     fn read(&mut self, path: &str) -> crate::Result<Vec<u8>> {
-        if path.eq_ignore_ascii_case(RUNTIME_MODULE) {
+        if path.eq_ignore_ascii_case(&self.module) {
             return Ok(self.runtime.clone());
         }
         if let Some(orig) = self.resolve(path).map(str::to_string) {
@@ -179,7 +383,7 @@ impl SourceTree for RuntimeInstalled {
         self.inner.read(path)
     }
     fn read_range(&mut self, path: &str, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
-        if path.eq_ignore_ascii_case(RUNTIME_MODULE) {
+        if path.eq_ignore_ascii_case(&self.module) {
             let start = (offset as usize).min(self.runtime.len());
             let end = start.saturating_add(len).min(self.runtime.len());
             return Ok(self.runtime[start..end].to_vec());
@@ -222,6 +426,13 @@ fn generated(path: &str, config: &Config, pack_glob: &str) -> bool {
         || glob::matches_any(path, &[pack_glob])
 }
 
+/// Whether packing by `config` leaves `path` out of the packed game, to be replaced by what it
+/// writes (a fresh `ampr_emu.index`, a new pack set) or dropped (what a run of the game wrote).
+/// Every other file of the source is in the packed game, loose or in the packs.
+pub fn replaced_by_packing(path: &str, config: &Config) -> bool {
+    pack_output_glob(&config.pack_pattern).is_ok_and(|g| generated(path, config, &g))
+}
+
 /// What the image holds instead of the folder.
 pub struct Overlay<'a> {
     source: &'a mut dyn SourceTree,
@@ -230,10 +441,16 @@ pub struct Overlay<'a> {
     memory: HashMap<String, Vec<u8>>,
     volumes: HashMap<String, PathBuf>,
     open: Option<(String, std::fs::File)>,
+    /// A measured pack set's volumes, made as they are read.
+    regen: Option<Regen>,
     label: String,
 }
 
 impl SourceTree for Overlay<'_> {
+    fn release(&mut self) {
+        self.source.release();
+    }
+
     fn files(&self) -> &[SourceFile] {
         &self.files
     }
@@ -259,9 +476,14 @@ impl SourceTree for Overlay<'_> {
             }
             let (_, f) = self.open.as_mut().unwrap();
             f.seek(SeekFrom::Start(offset))?;
-            let mut buf = Vec::with_capacity(len);
+            // `len` can come from the image's records: reserve at most a few MiB up front, and let
+            // read_to_end grow the buffer to what the file really holds.
+            let mut buf = Vec::with_capacity(crate::prealloc(len));
             f.by_ref().take(len as u64).read_to_end(&mut buf)?;
             return Ok(buf);
+        }
+        if let Some(regen) = self.regen.as_mut().filter(|r| r.has(path)) {
+            return regen.read_range(&mut *self.source, path, offset, len);
         }
         self.source.read_range(path, offset, len)
     }
@@ -285,6 +507,62 @@ pub fn prepare<'a>(
     mtime: i64,
     control: &mut Control,
 ) -> Result<(Overlay<'a>, Output)> {
+    let (entries, index) = entries_for(source, config, mtime)?;
+    // The spool's folder may not exist yet: the engine's data-folder spools (`lz4spool/`) are
+    // made by the first build that needs one. The spool itself must still be new.
+    if let Some(parent) = spool.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Format(format!("{}: {e}", parent.display())))?;
+    }
+    std::fs::create_dir(spool).map_err(|e| Error::Format(format!("{}: {e}", spool.display())))?;
+    let output = match pack::build(&entries, source, config, spool, control) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(spool);
+            return Err(e);
+        }
+    };
+    let mut volumes = HashMap::new();
+    let mut sizes = Vec::new();
+    for (name, path) in &output.volumes {
+        sizes.push((name.clone(), std::fs::metadata(path)?.len()));
+        volumes.insert(name.clone(), path.clone());
+    }
+    let overlay = overlay(source, &output, index, sizes, volumes, None)?;
+    Ok((overlay, output))
+}
+
+/// [`prepare`] with nothing written: the packs are measured ([`pack::measure`]), and the
+/// volumes the image writer reads are made again from `source` as it reads them ([`Regen`]),
+/// byte for byte what [`prepare`] would spool, each chunk checked against the measure. Twice the
+/// compression, no room on this computer. A source that changed in between fails the read.
+pub fn prepare_streamed<'a>(
+    source: &'a mut dyn SourceTree,
+    config: &Config,
+    mtime: i64,
+    control: &mut Control,
+) -> Result<(Overlay<'a>, Output)> {
+    let (entries, index) = entries_for(source, config, mtime)?;
+    let output = pack::measure(&entries, source, config, control)?;
+    let regen = Regen::new(&output, config)?;
+    let mut sizes = Vec::new();
+    for (name, _) in &output.volumes {
+        let size = regen
+            .size(name)
+            .ok_or_else(|| Error::Format(format!("{name} is not in the measured manifest")))?;
+        sizes.push((name.clone(), size));
+    }
+    let overlay = overlay(source, &output, index, sizes, HashMap::new(), Some(regen))?;
+    Ok((overlay, output))
+}
+
+/// The packing's entries (every file but what packing replaces, at `mtime`) and the
+/// `ampr_emu.index` that lists them.
+fn entries_for(
+    source: &mut dyn SourceTree,
+    config: &Config,
+    mtime: i64,
+) -> Result<(Vec<ampr_index::Entry>, Vec<u8>)> {
     let pack_glob = pack_output_glob(&config.pack_pattern)?;
     if source.files().iter().any(|f| {
         f.path.eq_ignore_ascii_case(&config.index_name) || glob::matches_any(&f.path, &[&pack_glob])
@@ -307,15 +585,23 @@ pub fn prepare<'a>(
     let index = ampr_index::build_entries(&logical).map_err(Error::Format)?;
     let entries = ampr_index::parse(&index)
         .ok_or_else(|| Error::Format("the generated index does not read back".into()))?;
-    std::fs::create_dir(spool).map_err(|e| Error::Format(format!("{}: {e}", spool.display())))?;
-    let output = match pack::build(&entries, source, config, spool, control) {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(spool);
-            return Err(e);
-        }
-    };
+    Ok((entries, index))
+}
 
+/// The packed game over `source`: the loose files, the new index, the manifest and sidecars,
+/// and the volumes (`sizes`, read from `volumes` on disk or made by `regen`).
+fn overlay<'a>(
+    source: &'a mut dyn SourceTree,
+    output: &Output,
+    index: Vec<u8>,
+    volume_sizes: Vec<(String, u64)>,
+    volumes: HashMap<String, PathBuf>,
+    regen: Option<Regen>,
+) -> Result<Overlay<'a>> {
+    // What the runtime checks when it mounts the packs: each packed record matches its index
+    // record by place, size and path. A mismatch is never shipped.
+    let manifest = super::format::Manifest::parse(&output.manifest)?;
+    ampr_index::check_lz4(&index, &manifest.files).map_err(Error::Format)?;
     let sizes: HashMap<&str, u64> = source
         .files()
         .iter()
@@ -342,13 +628,8 @@ pub fn prepare<'a>(
         });
         memory.insert(name, bytes.to_vec());
     }
-    let mut volumes = HashMap::new();
-    for (name, path) in &output.volumes {
-        files.push(SourceFile {
-            path: name.clone(),
-            size: std::fs::metadata(path)?.len(),
-        });
-        volumes.insert(name.clone(), path.clone());
+    for (name, size) in volume_sizes {
+        files.push(SourceFile { path: name, size });
     }
 
     // Folders packing emptied stay, as empty folders: only the innermost need naming.
@@ -390,16 +671,14 @@ pub fn prepare<'a>(
         }
     }
     let label = format!("{} with LZ4 asset packs", source.describe());
-    Ok((
-        Overlay {
-            source,
-            files,
-            empty_dirs,
-            memory,
-            volumes,
-            open: None,
-            label,
-        },
-        output,
-    ))
+    Ok(Overlay {
+        source,
+        files,
+        empty_dirs,
+        memory,
+        volumes,
+        open: None,
+        regen,
+        label,
+    })
 }

@@ -1,4 +1,4 @@
-// The Pack tab's "How pack works": a short how-to in a modal over the inert app (common.tsx
+// Build's "How pack works": a short how-to in a modal over the inert app (common.tsx
 // `openOverlay`). Text only.
 
 

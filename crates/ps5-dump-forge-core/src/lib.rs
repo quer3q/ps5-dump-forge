@@ -1,7 +1,5 @@
-//! Conversion core: scanning, preflight, jobs, verification, finalization.
-//!
-//! The public surface below is frozen: ps5-dump-forge and the Tauri app (`app/src-tauri`) build
-//! against it. Internals can move freely.
+//! Conversion core: scanning, preflight, jobs, verification, finalization. The CLI, the server
+//! and the Tauri app build against this public surface.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,14 +10,14 @@ mod archive;
 mod backport;
 mod convert;
 mod delete;
-// The PS5 (FreeBSD) destination probe; also built for macOS tests.
 #[cfg(any(target_os = "freebsd", all(test, target_os = "macos")))]
 mod dest;
 mod dlc;
 mod edit;
 mod edit_folder;
 mod edit_job;
-// Wired into the PS5 (FreeBSD) build only; tested everywhere.
+mod estimate;
+pub use estimate::{EstimateKind, PackEstimate, pack_estimate};
 #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 mod durable;
 mod extract;
@@ -38,6 +36,7 @@ mod library;
 mod library_roots;
 mod listing;
 mod lz4;
+mod metadata;
 pub mod net;
 mod nfs;
 mod package;
@@ -59,7 +58,7 @@ pub use dlc::Dlc;
 pub use extract::extraction_findings;
 pub use finalize::rename_no_replace;
 pub use host_tree::{HostFile, HostKind, HostTree, host_tree};
-pub use library::{LibraryEntry, LibraryScan, PackageContent, PackageEntry, PackageScan};
+pub use library::{PackageContent, PackageEntry, PackageScan};
 pub use listing::{ListEntry, Listing, list_dir, list_explorer};
 pub use ps5_dump_forge_archive::{
     ARCHIVE_PASSWORD_REQUIRED, ARCHIVE_PASSWORD_WRONG, ArchiveFormat,
@@ -70,23 +69,17 @@ pub use scan::ScannedFolder;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
-    /// A plain game folder (extraction).
     Folder,
-    /// `.exfat` image.
     Exfat,
-    /// `.ffpkg` (UFS2) image.
+    /// UFS2.
     Ffpkg,
-    /// `.ffpfs`: an uncompressed PFS image.
+    /// Uncompressed PFS.
     Ffpfs,
-    /// `.ffpfsc`: a compressed PFS container holding one `.exfat`, `.ffpkg` or `.ffpfs` image
-    /// ([`ConvertRequest::inner`]).
+    /// Compressed PFS container around one image ([`ConvertRequest::inner`]).
     Ffpfsc,
-    /// `.pkg` debug FPKG.
+    /// Debug FPKG.
     Pkg,
-    /// An LZ4 packed folder: a plain folder (no extension) whose assets sit in AMPR LZ4 packs
-    /// (`ampr_assets.index`, `ampr_assets-000.pak`, ...) that the injected
-    /// `fakelib/libSceAmpr.sprx` reads; a title that doesn't import `libSceAmpr` only with
-    /// [`Lz4Runtime::Ng`]. The same as `Folder` with [`Lz4Mode::Pack`] (kept for older requests).
+    /// An LZ4 packed folder: the same as `Folder` with [`Lz4Mode::Pack`] (kept for older requests).
     Lz4,
 }
 
@@ -94,16 +87,12 @@ pub enum Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lz4Mode {
-    /// Decode the packs back to plain files.
     Unpack,
-    /// Pack the assets into LZ4 packs, into the request's `format`: a folder (as the `Lz4`
-    /// target), `.exfat`, `.ffpkg`, `.ffpfs` or `.ffpfsc` (not `.pkg`). An image gets its packs
-    /// straight from the source in two passes (measure, then write), with no staging folder.
+    /// Into the request's `format` (not `.pkg`); an image in two passes, no staging folder.
     Pack,
 }
 
-/// The packs a Pack job makes, for its generated name's `{pack}`
-/// ([`generated_output`]): `zstd` or `LZ4`. Unpack names none.
+/// The packs a Pack job makes, for its generated name's `{pack}` ([`generated_output`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PackKind {
@@ -114,10 +103,7 @@ pub enum PackKind {
 /// The naming template [`generated_output`] uses when none is given: `[Title]-[TITLE_ID]`.
 pub const DEFAULT_NAMING: &str = "[{title}]-[{title_id}]";
 
-/// Why `template` can't name an output (English), `None` when it can. A template is at most
-/// 128 bytes, holds `{title}` or `{title_id}`, no token but `{title}`, `{title_id}`,
-/// `{version}`, `{pack}`, `{region}` and `{fw}`, each at most once (any other `{` or `}` is refused), and its own text no control
-/// character and none of `/ \ : * ? " < > |`.
+/// Why `template` can't name an output (English), `None` when it can.
 pub fn naming_problem(template: &str) -> Option<String> {
     inspect::parse_naming(template).err()
 }
@@ -126,16 +112,13 @@ pub fn naming_problem(template: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lz4Runtime {
-    /// ampr-emu-ng (`runtime::zstd()`): reads LZ4 and zstd packs.
     #[default]
     Ng,
-    /// The bundled upstream ampr_emu release build (`runtime::release()`).
+    /// No longer bundled: a preflight finding.
     AmprEmu,
 }
 
-/// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same,
-/// but `Fast` by default. The console reads every compressed level the same way; a slower one
-/// makes a slightly smaller package with every core busy for longer.
+/// How hard a `.pkg` build compresses its image: the encoder's `kraken::Level`, named the same.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KrakenLevel {
@@ -144,11 +127,9 @@ pub enum KrakenLevel {
     Fast,
     /// An optimal parse priced twice: ~6x slower than `Fast`, ~2.6% smaller (57 MB/s, 35.8%).
     Balanced,
-    /// An optimal parse with deeper searches priced three times: ~9x slower than `Fast`
-    /// (38 MB/s, 35.7%).
+    /// ~9x slower than `Fast` (38 MB/s, 35.7%).
     Smallest,
-    /// No compression: every block stored raw in the same layout. The fallback for a console
-    /// that refuses to start a compressed package (compression is proven on FW 5.10 only).
+    /// Every block raw: the fallback for a console that won't start a compressed package.
     Stored,
 }
 
@@ -174,12 +155,22 @@ impl std::fmt::Debug for ArchivePassword {
     }
 }
 
+/// A metadata recovery's options ([`ConvertRequest::recover_metadata`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataRecovery {
+    /// The game's version XML, its manifest or the `_sc.pkg` piece itself; `None` (or empty):
+    /// `param.json`'s `versionFileUri`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Take Sony's `sdkVersion`, `requiredSystemSoftwareVersion` and `applicationDrmType` too.
+    #[serde(default)]
+    pub original_runtime: bool,
+}
+
 /// One conversion: any readable source to one target format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvertRequest {
-    /// A game folder, `.exfat`, `.ffpkg`, `.ffpfs`, `.ffpfsc` or `.pkg`, or a `.zip`, `.7z` or
-    /// `.rar` holding one game folder (its first part, for a multi-part set), read straight
-    /// from the archive with nothing unpacked to disk.
+    /// A game folder, an image, a `.pkg`, or an archive's (first part's) path.
     pub source: PathBuf,
     pub format: Format,
     /// The final output path (file, or directory for `Folder`). Must not exist yet.
@@ -187,105 +178,72 @@ pub struct ConvertRequest {
     /// Compression thread cap for `.pkg` and `.ffpfsc` builds (all cores when unset).
     #[serde(default)]
     pub compression_threads: Option<usize>,
-    /// For `.ffpfsc`: the image inside, `Ffpkg` (when unset), `Exfat` or `Ffpfs`; any other
-    /// format fails preflight. Ignored for every other target.
+    /// For `.ffpfsc`: the image inside, `Ffpkg` (when unset), `Exfat` or `Ffpfs`.
     #[serde(default)]
     pub inner: Option<Format>,
-    /// Leave the backport out: the `fakelib`/`fakelib2` files that are not a known emulator
-    /// ([`Inspection::backport`]). Preflight refuses when [`Inspection::backport_blocked`] would.
+    /// Leave the backport out ([`Inspection::backport`]).
     #[serde(default)]
     pub remove_backport: bool,
-    /// Re-read every byte of the output; unset, verification is fast: every structural check
-    /// and a seeded sample of the content ([`VerifySummary`]); a `.pkg`'s builder self-check
-    /// samples its blocks with the same seed.
+    /// Re-read every byte of the output; unset, a seeded sample ([`VerifySummary`]).
     #[serde(default)]
     pub full_verify: bool,
-    /// For `.pkg`: the compression level. Ignored for every other target.
+    /// For `.pkg`.
     #[serde(default)]
     pub kraken_level: KrakenLevel,
-    /// For `.ffpfsc`: the zlib level, 0 (store) through 9 (smallest), 6 when unset. Ignored for
-    /// every other target.
+    /// For `.ffpfsc`: the zlib level, 0 (store) through 9.
     #[serde(default = "default_ffpfsc_level")]
     pub ffpfsc_level: u32,
-    /// Pack or unpack LZ4 packs; unset, packs travel as plain files (Forge's old trace
-    /// runtime in an unpacked dump is swapped for the release one).
+    /// Pack or unpack LZ4 packs; unset, packs travel as plain files.
     #[serde(default)]
     pub lz4: Option<Lz4Mode>,
-    /// When packing LZ4: the C liblz4 level, 0 (fast, `LZ4_compress_default`) or an HC level
-    /// 3 through 12 (9 medium, 12 max); 0 when unset. Any other value fails preflight.
+    /// When packing LZ4: 0 (fast) or an HC level 3 through 12.
     #[serde(default)]
     pub lz4_level: u8,
-    /// When packing LZ4: the runtime the packs get, ampr-emu-ng when unset (kept where the
-    /// game already has it), or the bundled ampr_emu release build. Ignored otherwise.
     #[serde(default)]
     pub lz4_runtime: Lz4Runtime,
-    /// Pack the game into zstd packs (`ampr_zstd.index` + `ampr_zstd-NNN.pak`, zstd, 256 KiB chunks;
-    /// `docs/zstd.md`) and install the zstd runtime. Into a `Folder` or an `Exfat`, `Ffpkg`,
-    /// `Ffpfs` or `Ffpfsc` image (straight in, after a measure pass; not `Pkg`), for any title (one
-    /// that doesn't import libSceAmpr gets ampr-emu-ng too), with no LZ4 option; anything else
-    /// fails preflight.
+    /// Replace a game's ampr_emu build with the bundled ampr-emu-ng (else keep it).
+    #[serde(default = "default_true")]
+    pub replace_ampr_emu: bool,
+    /// Pack the game into zstd packs (`docs/zstd.md`), into any `format` but `Pkg`.
     #[serde(default)]
     pub zstd_pack: bool,
-    /// With [`Self::zstd_pack`]: the zstd level, 1 through 22, [`DEFAULT_ZSTD_LEVEL`] when
-    /// unset. Ignored otherwise.
+    /// With [`Self::zstd_pack`]: 1 through 22.
     #[serde(default = "default_zstd_level")]
     pub zstd_level: u8,
-    /// Decode a zstd-packed source's packs into its logical files and write them to `format`
-    /// (any target): the bundled release runtime replaces the zstd one and a fresh
-    /// `ampr_emu.index` is written. A source without zstd packs, [`Self::zstd_pack`] or any
-    /// LZ4 option fails preflight.
+    /// Decode a zstd-packed source's packs into its logical files, into any `format`.
     #[serde(default)]
     pub zstd_unpack: bool,
-    /// With an LZ4 pack ([`Format::Lz4`] or [`Lz4Mode::Pack`]) or [`Self::zstd_pack`]: a TOML
-    /// pack profile (upstream `ampr_pack.py`'s format) whose `[[rule]]`s pick the packed files
-    /// in place of the built-in packing strategy. A file here or on another device the job can read (a
-    /// paired peer's `flink://`, a saved NAS's path); a regular file of at most 1 MiB, read and
-    /// parsed once in preflight. Unused keys are logged, not refused. With anything else it
-    /// fails preflight.
+    /// With an LZ4 or zstd pack: a TOML pack profile (`docs/packing.md`) on any device.
     #[serde(default)]
     pub pack_profile: Option<PathBuf>,
     /// File changes applied in place, in order (an edit job when not empty).
     #[serde(default)]
     pub edits: Vec<Edit>,
-    /// With [`Self::edits`] on an image: rebuild it instead of editing it in place. A new image
-    /// of the source's own format is written from the source plus the edits beside it (its
-    /// `.part`), verified, then renamed over the source once the source is seen unchanged; on
-    /// any failure the source stays as it was. `format` and
-    /// `output` are ignored. Ignored for a folder, which is always changed directly.
+    /// With [`Self::edits`] on an image: rebuild it beside and rename it over the source.
     #[serde(default)]
     pub edit_rebuild: bool,
-    /// Game paths (`/`-separated, relative) of files or folders to copy out of the source into
-    /// `output`, an existing folder, each under its own last component; nothing there is
-    /// replaced unless [`Self::replace`] (an extract job when not empty; `format` must be
-    /// `Folder`).
+    /// Game paths to copy out into the folder `output`, each under its last component (an
+    /// extract job when not empty).
     #[serde(default)]
     pub extract: Vec<String>,
-    /// Files or folders on this device, a peer (`flink://`) or a NAS (`smb://`) to copy into
-    /// `output`, an existing folder on this device or a peer, each under its own name; nothing
-    /// there is replaced unless [`Self::replace`] (a transfer job when not empty; `source` and
-    /// `format` are ignored). A transfer runs beside the one heavy job, one transfer at a time.
+    /// Paths on any device to copy into the folder `output` (a transfer job when not empty).
     #[serde(default)]
     pub transfer: Vec<PathBuf>,
-    /// For an extract or a transfer (the user confirmed it, [`Jobs::existing_targets`]): what
-    /// already exists at a target is replaced, a file onto a file, a folder onto a folder
-    /// merged (same-named files replaced, everything else there kept). A kind mismatch at any
-    /// level, and a replaced file [`Jobs::delete_path`] would refuse, fail preflight (on a peer
-    /// or a NAS, what this device's jobs use; a peer refuses the rest itself). Ignored for
-    /// every other job.
+    /// For an extract or a transfer: replace a file onto a file, merge a folder onto a folder.
     #[serde(default)]
     pub replace: bool,
-    /// A `.pkg` on this device or another one (`flink://`, `smb://`, `ftp://`, `nfs://`) to hand
-    /// to the PS5's installer, which fetches it from a 127.0.0.1 server the job runs (an install
-    /// job when set; `source`, `output` and `format` are ignored, any other job option fails
-    /// preflight, and off the PS5 it fails preflight). It runs in the transfer slot.
+    /// A `.pkg` on any device to hand to the PS5's installer (an install job when set).
     #[serde(default)]
     pub install: Option<PathBuf>,
-    /// For a conversion or an LZ4/zstd pack or unpack: once the job is done (verified, its
-    /// output in place), delete the source (every part of a multi-part archive) as
-    /// [`Jobs::delete_path`] deletes, with the [`Jobs::set_protected`] list. The job stays done
-    /// either way: a line `source deleted: <path>` or `source kept: <reason>` joins
-    /// [`JobReport::checks`] and the log. With edits, an extract, a transfer or an install it
-    /// fails preflight.
+    /// Edit's switch: restore the source's `sce_sys` metadata from Sony's update server, with
+    /// [`Self::edits`] as one edit job. Needs the internet.
+    #[serde(default)]
+    pub recover_metadata: Option<MetadataRecovery>,
+    /// Build's switch: the output gets Sony's metadata for this version; a failure is a warning.
+    #[serde(default)]
+    pub restore_metadata: bool,
+    /// For a conversion or a pack/unpack: delete the source once the job is done, as
+    /// [`Jobs::delete_path`] deletes; the outcome is one line in [`JobReport::checks`].
     #[serde(default)]
     pub delete_source: bool,
     /// For an archive source that needs one. Never serialized.
@@ -293,34 +251,37 @@ pub struct ConvertRequest {
     pub archive_password: Option<ArchivePassword>,
 }
 
-/// One change of an in-place edit ([`ConvertRequest::edits`]), applied in order. Game paths are
-/// relative, `/`-separated, with no empty, `.` or `..` component and no `\`.
+/// One change of an edit ([`ConvertRequest::edits`]); game paths are relative and `/`-separated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Edit {
-    /// Copy `from` (a file on this computer, or a folder and everything in it) to game path `to`,
-    /// replacing a file there; a folder onto an existing folder merges (same-named files replaced).
-    Add { from: PathBuf, to: String },
-    /// Delete a file, or a folder with everything in it.
-    Delete { path: String },
+    /// Copy a file or folder to `to`, replacing a file there; a folder onto a folder merges.
+    Add {
+        from: PathBuf,
+        to: String,
+    },
+    Delete {
+        path: String,
+    },
     /// Move or rename a file or folder; `to` must not exist.
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+    },
     /// A new empty folder (parents created too).
-    Mkdir { path: String },
+    Mkdir {
+        path: String,
+    },
 }
 
-/// Which way an edit request ([`ConvertRequest::edits`]) can be applied, as [`Jobs::edit_check`]
-/// finds it before Apply: the scan and preflight of both modes, nothing written. A check that
-/// passes means that mode's job passes its preflight on the same files.
+/// Which way an edit request can be applied ([`Jobs::edit_check`]); nothing written.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditCheck {
-    /// Why it can't be applied in place (empty = it can): no room, format, unsupported op.
+    /// Why it can't be applied in place (empty = it can).
     pub in_place: Vec<String>,
-    /// Why it can't be rebuilt (empty = it can; a folder is never rebuilt).
+    /// Why it can't be rebuilt (empty = it can).
     pub rebuild: Vec<String>,
-    /// Bytes the changes need inside the image, as its editor plans them (file data, new and
-    /// grown folders, indirect blocks), and what it has free: `.exfat` and `.ffpkg` once the
-    /// edits apply to the game.
+    /// `.exfat`/`.ffpkg`: bytes the changes need inside the image and what it has free.
     pub needed_inside: Option<u64>,
     pub free_inside: Option<u64>,
     /// Free bytes a rebuild needs beside the source, and what the folder has.
@@ -328,43 +289,46 @@ pub struct EditCheck {
     pub free_beside: Option<u64>,
 }
 
-/// The `.ffpfsc` zlib level a request without one gets.
 pub const DEFAULT_FFPFSC_LEVEL: u32 = ps5_dump_forge_pfs::DEFAULT_LEVEL;
 
 fn default_ffpfsc_level() -> u32 {
     DEFAULT_FFPFSC_LEVEL
 }
 
-/// The zstd level a request without one gets.
 pub const DEFAULT_ZSTD_LEVEL: u8 = 5;
 
 fn default_zstd_level() -> u8 {
     DEFAULT_ZSTD_LEVEL
 }
 
+fn default_true() -> bool {
+    true
+}
+
 pub type JobId = u64;
 
-/// What a running job tells its owner. Serialized as `{"kind": "...", ...}`; the app emits
-/// these as `job://stages`, `job://progress`, `job://log` and `job://done`.
+/// What a running job tells its owner, serialized as `{"kind": "...", ...}`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Event {
-    /// Once, first: every `Progress` stage the job will report, in the order it reports them.
-    /// A job that fails stops part way through the list.
+    /// Once, first: every `Progress` stage the job will report, in order.
     Stages {
         job: JobId,
         stages: Vec<String>,
     },
     Progress {
         job: JobId,
-        /// `extract` (an archive source, first), `scan`, `preflight`, `measure` (LZ4 into an
-        /// image), `write`, `pack` (LZ4 folder),
-        /// `verify`, `finalize`, or an FPKG build stage.
         stage: String,
-        /// Bytes over the whole job, every pass (write, verify, ...) included, so one bar
-        /// fills once. `total` is an estimate that can grow; 0 before it is known.
+        /// Bytes over the whole job, every pass included; `total` can grow, 0 until known.
         done: u64,
         total: u64,
+        /// Bytes of this stage alone, every pass in it added up; 0 of 0 when it moves none.
+        stage_done: u64,
+        stage_total: u64,
+        /// This stage's speed over its last few seconds, `None` until known.
+        bytes_per_s: Option<u64>,
+        /// Epoch ms.
+        stage_started_ms: u64,
     },
     Log {
         job: JobId,
@@ -372,8 +336,7 @@ pub enum Event {
     },
     Done {
         job: JobId,
-        /// `Ok` carries the report; `Err` a message for the user (`"cancelled"` when cancelled,
-        /// or `"cancelled; "` + what stays changed or what else failed, a restore say).
+        /// `Err` is `"cancelled"`, or `"cancelled; "` + what stays changed, when cancelled.
         result: Result<JobReport, String>,
     },
 }
@@ -383,9 +346,13 @@ pub struct JobReport {
     pub output: PathBuf,
     pub bytes: u64,
     pub files: u64,
-    /// Verification lines, one per check.
     pub checks: Vec<String>,
     pub verify: VerifySummary,
+    /// Logical bytes of the source the job read (its files' sizes, an edit's added files).
+    pub source_bytes: u64,
+    /// Epoch ms, set by the job runner.
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
 }
 
 /// How a job's output content was verified.
@@ -398,14 +365,11 @@ pub enum VerifyMode {
     Full,
 }
 
-/// What the content comparison read back. Structural checks (geometry, manifest, sizes, empty
-/// dirs, the `.ffpfsc` container) run in both modes.
+/// What the content comparison read back; structural checks run in both modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct VerifySummary {
     pub mode: VerifyMode,
-    /// Bytes of file content read back and compared.
     pub checked_bytes: u64,
-    /// Bytes of file content the output holds.
     pub total_bytes: u64,
     /// Ranges compared (whole files and 8 MiB slices); 0 in full mode.
     pub samples: u64,
@@ -421,6 +385,7 @@ pub struct Jobs {
 impl Jobs {
     /// `emit` receives every event of every job, from worker threads.
     pub fn new(emit: impl Fn(Event) + Send + Sync + 'static) -> Self {
+        metadata::clean_stale();
         Self {
             inner: jobs::Inner::new(Box::new(emit)),
         }
@@ -434,32 +399,15 @@ impl Jobs {
         self.inner.cancel(job);
     }
 
-    /// Deletes `path`, a file or a folder (links inside are removed, not followed), for good.
-    /// Refused for a link, a special file, a drive or volume root, any of `protected` or a
-    /// folder holding one, an interrupted edit's undo journal while its image is there, and
-    /// anything at, in or around what an unfinished job reads or writes, or what a peer is
-    /// writing through [`Jobs::set_external_busy`]; on the PS5 also
-    /// anything at or in ShadowMount+'s mount folder, an image it has mounted and a folder
-    /// holding one (fails closed). No job is admitted while it runs. The third explicit exception to "never touch
-    /// the source", with the LZ4 patches. A paired peer's `flink://` path, unless one of this
-    /// device's unfinished jobs uses it, is deleted by that peer under its own rules
-    /// ([`remote::Remote::delete_path`]); a NAS share's is refused.
+    /// Deletes `path`, a file or a folder (links inside removed, not followed), for good; the
+    /// refusals are `delete.rs`'s (AGENTS.md, exception 1). No job is admitted while it runs.
     pub fn delete_path(&self, path: &Path, protected: &[PathBuf]) -> Result<(), DeleteError> {
         self.inner.delete_path(path, protected)
     }
 
-    /// Moves or renames `from` to `to` on the same volume: `to` is a new name in an existing
-    /// folder, never replaced unless `replace`, and not inside `from`. `from` is refused as
-    /// [`Jobs::delete_path`] refuses it (a link, a special file, a root, any of `protected` or
-    /// a folder holding one, anything an unfinished job uses), and so is a `to` at, in or
-    /// above what an unfinished job uses or a peer is writing, or an image with an interrupted edit's undo journal
-    /// beside it. With `replace` (the user confirmed it) an existing `to` is taken over: a file
-    /// by a file in one rename (the old one refused as `delete_path` refuses it), a folder by a
-    /// folder merged (each entry moved, same-named files replaced, folders both hold merged,
-    /// everything else there kept, the emptied source folders removed); a kind mismatch at any
-    /// level refuses. Every check runs before the first rename; a failure part way says what
-    /// moved. Both folders are synced after; no job is admitted while it runs. Two `flink://`
-    /// paths on one peer are moved by that peer, as [`Jobs::delete_path`] deletes one there.
+    /// Moves or renames `from` to `to` (a new name in an existing folder) on the same volume;
+    /// `from` refused as [`Jobs::delete_path`] refuses it. With `replace` a file goes over a
+    /// file and a folder merges into a folder. Every check runs before the first rename.
     pub fn move_path(
         &self,
         from: &Path,
@@ -470,56 +418,41 @@ impl Jobs {
         self.inner.move_path(from, to, replace, protected)
     }
 
-    /// Whether an unfinished job reads or writes `path`, or anything inside or around it
-    /// (its source, output, `.part`s; an edit's undo journal and added
-    /// files), compared by identity as [`Jobs::delete_path`] compares them. A snapshot: a
-    /// job may start right after.
+    /// Whether an unfinished job reads or writes `path`, or anything inside or around it.
+    /// A snapshot: a job may start right after.
     pub fn uses(&self, path: &Path) -> bool {
         self.inner.uses(path)
     }
 
-    /// [`Jobs::uses`] as a hook of its own (Connect refuses a peer's writes into what this
-    /// device's unfinished jobs use).
+    /// [`Jobs::uses`] as a hook of its own (Connect's).
     pub fn uses_hook(&self) -> Arc<dyn Fn(&Path) -> bool + Send + Sync> {
         let inner = self.inner.clone();
         Arc::new(move |path| inner.uses(path))
     }
 
-    /// Why a file must not be put in place of `path` (a peer's replacing rename here): as a
-    /// job's replace is refused, so as [`Jobs::delete_path`] refuses it (a link, a folder, a
-    /// root, any of [`Jobs::set_protected`]'s paths, an interrupted edit's undo journal or its
-    /// image, anything at, in or around an unfinished job's paths or what a peer is writing
-    /// ([`Jobs::set_external_busy`]); on the PS5 ShadowMount+'s mount folder and the images it
-    /// has mounted). Nothing at `path` passes. A snapshot: a job may start right after.
+    /// Why a file must not be put in place of `path` (a peer's replacing rename here), as a
+    /// job's replace is refused. Nothing at `path` passes. A snapshot.
     pub fn replace_check(&self, path: &Path) -> Result<(), DeleteError> {
         self.inner.replace_check(path)
     }
 
-    /// Sets what says another device is writing a path on this device (Connect's open write
-    /// handles): a job using such a path is refused when it starts, and Delete and Move
-    /// refuse it too. Like job admission, the external check is a snapshot.
+    /// Sets what says another device is writing a path here: jobs, Delete and Move refuse it.
     pub fn set_external_busy(&self, busy: Arc<dyn Fn(&Path) -> bool + Send + Sync>) {
         self.inner.set_external_busy(busy);
     }
 
-    /// Sets what replacing never touches (an extract's or transfer's
-    /// [`ConvertRequest::replace`]), as `protected` is for [`Jobs::delete_path`]: asked once
-    /// per job, at its preflight. Unset, nothing beyond delete's other refusals.
+    /// Sets what replacing never touches, as `protected` is for [`Jobs::delete_path`].
     pub fn set_protected(&self, protected: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>) {
         self.inner.set_protected(protected);
     }
 
-    /// The targets of an extract or transfer `request` that exist already (each selection's,
-    /// at the top level; on another device too), for the UI to ask before it sends
-    /// [`ConvertRequest::replace`]. Reads only; an error for any other request.
+    /// The top-level targets of an extract or transfer that exist already. Reads only.
     pub fn existing_targets(&self, request: &ConvertRequest) -> anyhow::Result<Vec<PathBuf>> {
         extract_paths::existing_targets(request)
     }
 
-    /// Which way `request`'s edits can be applied, in place or by a rebuild ([`EditCheck`]),
-    /// reading the image and the added files only. A journal an interrupted edit left beside
-    /// the image is settled first, as every edit does, unless a job is using the image; then
-    /// both modes say so.
+    /// Which way `request`'s edits can be applied. A leftover undo journal is settled first,
+    /// unless a job is using the image.
     pub fn edit_check(&self, request: &ConvertRequest) -> EditCheck {
         self.inner.edit_check(request)
     }
@@ -533,70 +466,52 @@ impl Jobs {
 /// What `inspect` found in a source.
 #[derive(Debug, Clone, Serialize)]
 pub struct Inspection {
-    /// `folder`, `exfat`, `ffpkg`, `ffpfs`, `ffpfsc` or `pkg`; `zip`, `7z` or `rar` for an archive.
+    /// `folder`, `exfat`, ..., `pkg`; `zip`, `7z` or `rar` for an archive.
     pub kind: String,
-    /// The source reader's one-line description.
     pub describe: String,
     pub title_id: Option<String>,
     pub content_id: Option<String>,
-    /// No `eboot.bin` at the root but a `param.json` with a title id: a DLC, an update or
-    /// another package. Not a finding; it converts only to fpkg or a folder.
+    /// No `eboot.bin` at the root but a `param.json` with a title id.
     pub additional_content: bool,
-    /// From `param.json`: the title in its default language.
+    /// The rest from `param.json`: the default language's title, the localized ones by tag,
+    /// `contentVersion`, `requiredSystemSoftwareVersion` and `sdkVersion` (`7.00`).
     pub title_name: Option<String>,
-    /// From `param.json`: every `localizedParameters` title by language tag (`en-US`, ...).
     pub title_names: std::collections::BTreeMap<String, String>,
-    /// From `param.json`: `contentVersion`, e.g. `01.000.000`.
     pub version: Option<String>,
-    /// The firmware `param.json` declares (`requiredSystemSoftwareVersion`), e.g. `7.00`.
     pub firmware: Option<String>,
-    /// The SDK it was built with (`sdkVersion`), e.g. `7.00`.
     pub sdk: Option<String>,
-    /// Backport libraries: the `fakelib`/`fakelib2` files that are not a known emulator
-    /// (system libraries from newer firmware).
+    /// The `fakelib`/`fakelib2` files that are not a known emulator.
     pub backport: Vec<String>,
-    /// The emulators in `fakelib`/`fakelib2` (AMPR, DLC, PlayGo); removing the backport
-    /// keeps them.
+    /// The emulators there (AMPR, DLC, PlayGo); removing the backport keeps them.
     pub emulators: Vec<Emulator>,
-    /// With backport libraries: why removing them is refused (the executables' SDK was
-    /// lowered, or can't be compared). `None` when removable or there is no backport.
+    /// Why removing the backport is refused, `None` when removable or there is none.
     pub backport_blocked: Option<String>,
-    /// With a `fakelib`/`fakelib2`: the lowest firmware the executables allow (their
-    /// highest PS5 SDK, `fakelib` left out), e.g. `4.50`. `None` without one or a readable
-    /// param.
+    /// With a `fakelib`: the lowest firmware the executables allow (`4.50`).
     pub backport_firmware: Option<String>,
-    /// DLC embedded in the dump (in content-id folders, or merged with its metadata left).
     pub dlcs: Vec<Dlc>,
-    /// The PS5 Dump Forge version that wrote the image (`0.0.1-pre4`), from the maker's mark
-    /// of an `.exfat`, `.ffpkg` or the image inside a `.ffpfsc`. `None` for anything else.
+    /// From the maker's mark of an `.exfat`, `.ffpkg` or a `.ffpfsc`'s inner image.
     pub forge_version: Option<String>,
     /// `sce_sys/icon0.png` as a `data:image/png;base64,` URL, when present and small.
     pub cover: Option<String>,
-    /// `sce_sys/param.json`, parsed, when present.
     pub param_json: Option<serde_json::Value>,
     pub files: Vec<InspectFile>,
     pub empty_dirs: Vec<String>,
     pub total_bytes: u64,
-    /// Format-specific facts (geometry, block size, ...), one per line.
+    /// The source's own size on disk (an archive's every part); `None` for a folder (`total_bytes`).
+    pub file_bytes: Option<u64>,
     pub details: Vec<String>,
-    /// Preflight findings for this source (errors and warnings), one per line.
     pub findings: Vec<String>,
-    /// AMPR / LZ4 pack facts; `None` when the title does not import `libSceAmpr` and holds
-    /// no LZ4 artifact (packs, journal, path index, Forge's runtime).
+    /// `None` for a non-AMPR title holding no LZ4 artifact.
     pub lz4: Option<Lz4Facts>,
-    /// zstd packed: a root `ampr_zstd.index` that starts with `AMPRZPK1`.
+    /// A root `ampr_zstd.index` starting `AMPRZPK1`.
     pub zstd_packed: bool,
-    /// An archive source: the archive's own facts (`files` and `total_bytes` are the game's,
-    /// unpacked). `None` for anything else.
+    /// An archive's own facts (`files` and `total_bytes` are the game's).
     pub archive: Option<ArchiveFacts>,
-    /// An image whose last in-place edit was interrupted: its undo journal
-    /// (`<image>.forge-undo`) is beside it, and the next edit restores the image first.
+    /// An undo journal (`<image>.forge-undo`) is beside the image.
     pub interrupted_edit: bool,
-    /// A patch package (`.pkg` starting `\x7FLIH`): `files` are the ones it carries whole;
-    /// browsed and extracted from only, never converted or edited.
+    /// A patch package (`\x7FLIH`): `files` are the ones it carries whole.
     pub patch: bool,
-    /// PS5 executables (fakelib's included) that are plain ELF, not fake-signed SELF: the
-    /// console won't launch the game. A conversion signs them. Empty for a patch package.
+    /// Plain ELF executables, not fake-signed SELF; a conversion signs them.
     pub unsigned: Vec<String>,
 }
 
@@ -604,9 +519,8 @@ pub struct Inspection {
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveFacts {
     pub format: ArchiveFormat,
-    /// Every part on disk.
+    /// Every part's bytes, and their names, the first one first.
     pub archive_bytes: u64,
-    /// The parts' file names, the first one first.
     pub volumes: Vec<String>,
     pub solid: bool,
     pub encrypted: bool,
@@ -614,55 +528,41 @@ pub struct ArchiveFacts {
     pub root: String,
 }
 
-/// What `inspect` found about LZ4 asset packs in a source. The containing-format facts of
-/// [`Inspection`] are unchanged; these describe the logical game inside it.
+/// What `inspect` found about AMPR and LZ4 packs in the logical game.
 #[derive(Debug, Clone, Serialize)]
 pub struct Lz4Facts {
-    /// `eboot.bin` imports `libSceAmpr`.
     pub imports_ampr: bool,
-    /// From the manifest, when the source holds packs and the manifest is sound.
     pub packed: Option<Lz4Packed>,
-    /// A root `ampr_assets.index` starts with the pack magic but does not parse: the reason
-    /// (also a finding). `packed` is `None` then.
+    /// Why a root `ampr_assets.index` with the pack magic does not parse (also a finding).
     pub manifest_error: Option<String>,
-    /// The runtime at `fakelib/libSceAmpr.sprx`: `forge_release`, `forge_trace`, `zstd`
-    /// (ampr-emu-ng, which reads LZ4 and zstd packs), `other` or `none`.
+    /// `forge_release`, `forge_trace`, `zstd` (ampr-emu-ng), `other` or `none`.
     pub runtime: String,
-    /// The ampr_emu version of the release runtime Forge ships.
+    /// The ampr_emu version Forge last bundled.
     pub shipped_runtime_version: &'static str,
-    /// The version the game's own runtime names itself with, when it does: ampr_emu's, or
-    /// ampr-emu-ng's when `runtime` is `zstd` (`runtime::ng_version_of`).
     pub runtime_version: Option<String>,
-    /// What a plain conversion does to the runtime (by user decision): `install` (none there),
-    /// `replace` (Forge's trace runtime, ampr-emu-ng, an older ampr_emu or one naming no
-    /// version: the bundled release runtime goes in) or `keep` (Forge's release runtime, or
-    /// ampr_emu at [`Lz4Facts::shipped_runtime_version`] or newer). A zstd-packed game keeps
-    /// ampr-emu-ng (installed where missing, any other replaced). `None` for a non-AMPR title.
+    /// `install`, `replace` or `keep` (AGENTS.md's runtime rule): a plain conversion's, with
+    /// `replace_ampr_emu` on, then off; an unpack's, a Pack's, and into a `.pkg` `omit`.
+    /// `None` for a non-AMPR title.
     pub runtime_action: Option<&'static str>,
-    /// The same for the LZ4 tab's Unpack (a packed source) or Pack with
-    /// [`Lz4Runtime::AmprEmu`] (an unpacked one), which also replaces a not-older runtime that
-    /// can't read packs, and ampr-emu-ng. Pack with [`Lz4Runtime::Ng`] keeps ampr-emu-ng where
-    /// [`Lz4Facts::runtime`] is `zstd` and installs it otherwise.
+    pub keep_runtime_action: Option<&'static str>,
+    pub unpack_runtime_action: Option<&'static str>,
     pub pack_runtime_action: Option<&'static str>,
-    /// `ampr_emu.index` against the files a plain conversion writes (the same comparison the
-    /// job makes, the runtime as it installs, replaces or keeps it): `ok`, `stale`, `damaged`
-    /// or `missing` (the last three written anew by any conversion). `None` when no conversion
-    /// touches it: a packed source (kept byte for byte), a non-AMPR title or an archive's
-    /// unread index.
+    pub pkg_runtime_action: Option<&'static str>,
+    /// `ampr_emu.index` against what a plain conversion writes: `ok`, `stale`, `damaged` or
+    /// `missing`; `None` when no conversion touches it. `keep_index` with `replace_ampr_emu` off.
     pub index: Option<&'static str>,
+    pub keep_index: Option<&'static str>,
 }
 
 /// Counts from an LZ4 manifest.
 #[derive(Debug, Clone, Serialize)]
 pub struct Lz4Packed {
-    /// Files the manifest lists (packed and loose).
+    /// Packed and loose.
     pub files: u64,
-    /// Of those, the files stored in volumes. `None` when the manifest was too large to
-    /// parse (only its header counts are known; a finding says so).
+    /// `None` when the manifest was too large to parse.
     pub packed_files: Option<u64>,
     pub volumes: u64,
-    /// Whole percent: the stored bytes of the packed files over their logical (unpacked)
-    /// bytes. 0 with nothing packed; `None` like `packed_files`.
+    /// Stored over logical bytes of the packed files, whole percent.
     pub stored_percent: Option<u64>,
 }
 
@@ -670,7 +570,6 @@ pub struct Lz4Packed {
 #[derive(Debug, Clone, Serialize)]
 pub struct Emulator {
     pub path: String,
-    /// `AMPR`, `DLC` or `PlayGo`.
     pub name: String,
 }
 
@@ -680,8 +579,7 @@ pub struct InspectFile {
     pub size: u64,
 }
 
-/// Whether `path` is at, in or above one of `guarded`, as [`Jobs::uses`] judges a job's paths
-/// (Connect's hook for [`Jobs::set_external_busy`]: the files peers are writing here).
+/// Whether `path` is at, in or above one of `guarded`, as [`Jobs::uses`] judges.
 pub fn path_in_use(path: &Path, guarded: &[PathBuf]) -> bool {
     delete::in_use(path, guarded)
 }
@@ -690,57 +588,33 @@ pub fn inspect(path: &Path) -> anyhow::Result<Inspection> {
     inspect::inspect(path, None)
 }
 
-/// [`inspect`] with an archive's password (ignored for any other source). An archive is read
-/// from its listing and the few files inspecting needs, in memory; without the password it
-/// needs the error is exactly [`ARCHIVE_PASSWORD_REQUIRED`], with a wrong one
-/// [`ARCHIVE_PASSWORD_WRONG`].
+/// [`inspect`] with an archive's password; errors are exactly [`ARCHIVE_PASSWORD_REQUIRED`]
+/// or [`ARCHIVE_PASSWORD_WRONG`] for one missing or wrong.
 pub fn inspect_with(path: &Path, password: Option<&str>) -> anyhow::Result<Inspection> {
     inspect::inspect(path, password)
 }
 
-/// PS5 only (FreeBSD; any other OS returns an error for non-empty `roots`). Lists the game dumps
-/// under `roots` (folders and `.exfat`, `.ffpkg`, `.ffpfs`, `.ffpfsc`,
-/// `.pkg` images, by extension, any case) on local disk filesystems: breadth first, at most 6
-/// folders deep, links and network mounts never entered, a game folder never entered, bounded
-/// by fixed limits (`truncated` when one cut the walk short) and about 15 seconds (checked
-/// between steps, so a slow read can overrun it). Reads only `param.json` and the listings;
-/// an image is opened with its reader, which is slower than a folder. Sorted by title. One
-/// scan runs at a time; a second call waits. Empty `roots` is an empty result.
-pub fn scan_library(roots: &[PathBuf]) -> anyhow::Result<LibraryScan> {
-    library::scan_library(roots)
+/// The bytes free on the volume holding the folder `dir`, on any device; `None` when unknown.
+pub fn free_space(dir: &Path) -> Option<u64> {
+    if remote::is_remote(dir) {
+        let at = remote::FlinkPath::parse(dir).ok()?;
+        if at.scheme == remote::Scheme::Ftp {
+            return None;
+        }
+        return remote::get_for(&at).ok()?.free_space(&at).ok();
+    }
+    out::free_space(dir).ok()
 }
 
-/// PS5 only, as [`scan_library`]: every `.pkg` under `roots` (any case), walked by the same
-/// rules and limits, game folders entered too. Each is read only for its header and container
-/// (a few KiB; a patch's blocks are not placed); one that can't be read is listed as
-/// [`PackageContent::Unknown`] with no title. Sorted by title, untitled last.
+/// PS5 only: every `.pkg` under `roots` on local disk filesystems, within the walk's limits
+/// (`library.rs`), each read only for its header and container. Sorted by title, untitled last.
 pub fn scan_packages(roots: &[PathBuf]) -> anyhow::Result<PackageScan> {
     library::scan_packages(roots)
 }
 
-/// Like [`scan_library`] for one folder the user chose: any filesystem (a network share, mounts
-/// nested inside it), since the choice is explicit. Errors (nothing listed) when the folder is
-/// the filesystem root (Windows: the system drive root), `~/Library` or `~/AppData`, or one of the OS's own folders or
-/// inside one, is under ShadowMountPlus's mounts, or cannot be read.
-/// Failures below the folder are warnings.
-pub fn scan_library_folder(root: &Path) -> anyhow::Result<LibraryScan> {
-    library::scan_library_folder(root)
-}
-
-/// Why the desktop explorer refuses `path` (a folder to list, a delete, a move's source or
-/// target): the folders [`scan_library_folder`] refuses (the filesystem root,
-/// `~/Library`/`~/AppData`, the OS's own folders and everything inside), with the Library's
-/// message. `None` when allowed, and always on the PS5.
+/// Why the desktop explorer refuses `path` (`library_roots::refusal`); always `None` on the PS5.
 pub fn folder_refusal(path: &Path) -> Option<String> {
     library::folder_refusal(path)
-}
-
-/// The cover of a Library entry (a supported image or a plain game folder, on any filesystem:
-/// no locality check) as a PNG data URL. `None` when the icon is absent, empty, over 512 KiB (checked before and
-/// after reading) or not a PNG; an error when the source is a link, not eligible, or cannot
-/// be opened.
-pub fn library_cover(path: &Path) -> anyhow::Result<Option<String>> {
-    library::library_cover(path)
 }
 
 /// The default output path for `source` in `format`: in `dir`, named from the title id. An
@@ -749,8 +623,7 @@ pub fn default_output(source: &Path, format: Format, dir: &Path) -> anyhow::Resu
     inspect::default_output(source, format, dir, None)
 }
 
-/// [`default_output`] with an archive's password (ignored for any other source): without the
-/// one an archive with encrypted headers needs, the name is the archive's own.
+/// [`default_output`] with an archive's password.
 pub fn default_output_with(
     source: &Path,
     format: Format,
@@ -760,15 +633,10 @@ pub fn default_output_with(
     inspect::default_output(source, format, dir, password)
 }
 
-/// The output path for `source` in `format` in `dir` (empty: the folder holding the source),
-/// named from the game by the `naming` template (`None`: [`DEFAULT_NAMING`], e.g.
-/// `[Astro Bot]-[PPSA01234].ffpkg`; the tokens and cleanup: `inspect::Template`). `{pack}`
-/// names `pack` ([`Format::Lz4`] counts as LZ4). A template [`naming_problem`] refuses is an
-/// error. Values the source lacks are empty; with nothing left it is the title id, else the
-/// source's own name. Never a path that exists or is in `taken` (outputs of jobs still
-/// running): `-2`, `-3`, ... instead. The name without its extension stays within what
-/// ShadowMountPlus mounts (63 bytes, 58 for a `.ffpfsc`, and 63 for a folder or `.pkg` too;
-/// see `preflight::stem_limit`): the game name is cut first, then the version left out.
+/// The output path for `source` in `format` in `dir` (empty: the source's folder), named by
+/// the `naming` template (`None`: [`DEFAULT_NAMING`]; `inspect::Template`). Never a path that
+/// exists or is in `taken`: `-2`, `-3`, ... instead; the stem stays within
+/// `preflight::stem_limit`.
 pub fn generated_output(
     source: &Path,
     format: Format,
@@ -780,10 +648,7 @@ pub fn generated_output(
     inspect::generated_output(source, format, dir, taken, None, pack, naming)
 }
 
-/// [`generated_output`] with an archive's password (ignored for any other source). An archive
-/// is named from its game folder's `param.json`, the only file read; without the password it
-/// needs the error is exactly [`ARCHIVE_PASSWORD_REQUIRED`], with a wrong one
-/// [`ARCHIVE_PASSWORD_WRONG`].
+/// [`generated_output`] with an archive's password (errors as [`inspect_with`]'s).
 pub fn generated_output_with(
     source: &Path,
     format: Format,
@@ -801,16 +666,14 @@ pub fn stale_parts(dir: &Path) -> Vec<PathBuf> {
     finalize::stale_parts(dir)
 }
 
-/// What a paired device writing onto this one (the server's `connect_fs`) writes with: the
-/// same rules as a job's outputs here (no link followed, 0777 on the PS5, its sync retries).
+/// What a paired device writing onto this one writes with: a job's output rules.
 pub mod out {
     use std::fs::File;
     use std::io;
     use std::path::Path;
 
-    /// Why a peer may not write, rename or remove at `path` (resolved): on the PS5 ShadowMount+'s
-    /// mount folder and everything inside it, as a job's outputs here. ponytail: no destination
-    /// probe (U1) per peer write; the sync rules below still apply.
+    /// Why a peer may not write, rename or remove at `path`: on the PS5 ShadowMount+'s mount
+    /// folder. ponytail: no destination probe (U1) per peer write.
     pub fn refusal(path: &Path) -> Option<String> {
         #[cfg(target_os = "freebsd")]
         return ps5_refusal(path);
@@ -821,8 +684,7 @@ pub mod out {
         }
     }
 
-    /// The PS5 destination rule, also available to a server selected by `Platform::Ps5`:
-    /// refuse ShadowMount+'s mount folder and everything inside it, including aliases.
+    /// The PS5 rule on any OS (a server selected by `Platform::Ps5`).
     pub fn ps5_refusal(path: &Path) -> Option<String> {
         crate::edit_job::smp_inside(path)
     }
@@ -832,14 +694,13 @@ pub mod out {
         crate::finalize::create_new(path)
     }
 
-    /// A regular file made by [`create_new`] and closed, open again for writing (a link at
-    /// `path` not followed); refused unless it still matches its [`closed_stamp`].
+    /// A file made by [`create_new`] and closed, open again; refused unless it matches its
+    /// [`closed_stamp`].
     pub fn reopen(path: &Path, (dev, len): (u64, u64)) -> io::Result<File> {
         crate::finalize::reopen(path, dev, len)
     }
 
-    /// What [`reopen`] checks of a file being closed: its device (unix dev, Windows volume
-    /// serial) and length.
+    /// What [`reopen`] checks: the file's device and length.
     pub fn closed_stamp(file: &File) -> io::Result<(u64, u64)> {
         Ok((crate::finalize::handle_id(file)?.0, file.metadata()?.len()))
     }
@@ -850,8 +711,7 @@ pub mod out {
         crate::finalize::make_dir_open(path)
     }
 
-    /// A written file's data on the drive. On FreeBSD a sync that only succeeded after a
-    /// retry fails (pages may have been lost in between, U4).
+    /// On FreeBSD a sync that only succeeded after a retry fails (pages may be lost, U4).
     pub fn sync_file(file: &File) -> io::Result<()> {
         #[cfg(target_os = "freebsd")]
         {
@@ -879,16 +739,14 @@ pub mod out {
     }
 }
 
-/// Where the app keeps its WebView data: always next to the app (user decision 2026-10-06: no
-/// marker file, no OS per-user fallback).
+/// Where the app keeps its WebView data: always next to the app.
 #[derive(Debug, Clone, Serialize)]
 pub struct DataDirs {
-    /// The app dir: the folder holding the exe, or the folder holding `PS5 Dump Forge.app` on macOS.
+    /// The folder holding the exe, or `PS5 Dump Forge.app` on macOS.
     pub root: PathBuf,
 }
 
 impl DataDirs {
-    /// `exe` is the running executable (`std::env::current_exe()`).
     pub fn resolve(exe: &Path) -> Self {
         Self {
             root: portable::app_dir(exe),
@@ -911,9 +769,7 @@ pub(crate) fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Whether a test's hard link or symlink `made` it: false only where the volume cannot make
-/// one at all (EOPNOTSUPP/ENOTSUP, FreeBSD's msdosfs); any other error fails the test.
-/// Only the macOS/FreeBSD rename tests in `finalize.rs` use it.
+/// Whether a test's link `made` it: false only for EOPNOTSUPP/ENOTSUP (msdosfs).
 #[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
 pub(crate) fn supported(made: std::io::Result<()>, what: &str) -> bool {
     match made {

@@ -1,6 +1,5 @@
-//! Our own folder walker. Upstream `scan_tree` follows symlinks, converts
-//! names lossily and turns a literal `\` into `/`. A game opens its files by their exact
-//! spelling, so each of those is an error here instead of a silent change.
+//! Our own folder walker: upstream `scan_tree` follows symlinks and changes names; a game
+//! opens files by their exact spelling, so each of those is an error here.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, Metadata, OpenOptions};
@@ -32,8 +31,7 @@ pub(crate) fn is_junk(name: &str) -> bool {
         )
 }
 
-/// What a file looked like when it was scanned. Checked again on every read, so a file
-/// that changes mid-conversion fails the job instead of landing half old, half new.
+/// What a file looked like when scanned, checked again on every read (a change fails the job).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stamp {
     size: u64,
@@ -69,10 +67,8 @@ pub struct ScannedFolder {
     ahead: Option<OpenAhead>,
 }
 
-/// Files a few ahead of the reader opened on [`OPENERS`] threads. With many small files the
-/// open is most of a file's cost (~60 us each on a macOS SSD, 100k files 6 s of a folder
-/// copy), and a reader opening them one at a time waits on each. Only the open moves:
-/// [`ScannedFolder::checked`] still checks every file against its stamp as it reads it.
+/// Files a few ahead of the reader opened on [`OPENERS`] threads: with many small files the open
+/// is most of a file's cost (~60 us on a macOS SSD). Every read still checks the stamp.
 struct OpenAhead {
     ask: Option<mpsc::Sender<(usize, PathBuf)>>,
     got: mpsc::Receiver<(usize, io::Result<File>)>,
@@ -113,9 +109,8 @@ impl OpenAhead {
         })
     }
 
-    /// File `i`'s open, if it was asked for (waiting for it if it still runs). When the reads
-    /// go forward (`forward`), the files after it are asked for; every other one is forgotten.
-    /// A reader in its own order (the pack writers) then asks for nothing.
+    /// File `i`'s open, if it was asked for. Reads going `forward` ask for the files after it;
+    /// every other one is forgotten.
     fn take(
         &mut self,
         i: usize,
@@ -185,9 +180,8 @@ struct Walk {
 impl ScannedFolder {
     /// Walks `root`. Every offending entry is collected first, then all are reported at once.
     pub fn scan(root: &Path, cancel: &AtomicBool) -> anyhow::Result<Self> {
-        // The root itself may be reached through a link (`/tmp` on macOS); only what is
-        // inside it is held to the no-symlink rule. Plain `C:\x` on Windows, as `output_path`
-        // spells the outputs it is compared with.
+        // The root may be reached through a link (`/tmp` on macOS); only what is inside it is
+        // held to the no-symlink rule.
         let root = dunce::canonicalize(root).with_context(|| format!("{}", root.display()))?;
         if !root.is_dir() {
             bail!("{} is not a folder", root.display());
@@ -241,9 +235,7 @@ impl ScannedFolder {
         let path = &self.files[i].path;
         let with_path = |e: io::Error| Error::Io(io::Error::new(e.kind(), format!("{path}: {e}")));
         if self.open.as_ref().is_none_or(|(at, _)| *at != i) {
-            // Reads moving to the next file in order start the openers; forward within the
-            // window (empty files are never opened) they keep asking; a jump elsewhere finds
-            // nothing opened for it and asks for nothing.
+            // Moving to the next file in order starts the openers; a jump asks for nothing.
             let last = self.open.take().map(|(at, _)| at);
             let forward = last.is_some_and(|at| i > at && i <= at + OPEN_AHEAD);
             if last.is_some_and(|at| at + 1 == i) && self.ahead.is_none() {
@@ -325,8 +317,7 @@ impl SourceTree for ScannedFolder {
 }
 
 impl Walk {
-    /// Walks one directory; returns whether anything under it was kept (or refused), so a
-    /// directory holding only junk counts as empty.
+    /// Walks one directory; whether anything under it was kept (a junk-only one is empty).
     fn dir(&mut self, dir: &Path, rel: &str, cancel: &AtomicBool) -> anyhow::Result<bool> {
         let shown = |name: &str| {
             if rel.is_empty() {
@@ -411,10 +402,8 @@ impl Walk {
     }
 }
 
-/// Opens an existing file without following a link planted in its place. `O_NONBLOCK`
-/// keeps a FIFO swapped in for the file from blocking the open (and with it cancellation);
-/// callers then refuse anything that is not a regular file. It changes nothing for reads
-/// of a regular file.
+/// Opens an existing file without following a link; `O_NONBLOCK` keeps a FIFO swapped in from
+/// blocking the open (callers refuse anything not regular).
 pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
@@ -431,13 +420,9 @@ pub(crate) fn open_nofollow(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
-/// How many names the regular file at `path` (listed with the lstat `meta`) has; an error
-/// when it can't be read. Unix: the lstat already holds the link count, and the read
-/// permission comes from its mode bits where they decide it alone (root, ours and
-/// owner-readable, or group- and world-readable), else from access(2); no open (on macOS
-/// an open per file was ~3.8 s of a 100k-file scan's 5.6 s, access(2) ~9 us each, the lstat
-/// ~1 us). A file swapped after the listing is caught when it is read: every read opens it
-/// with `O_NOFOLLOW` and checks its stamp.
+/// How many names the regular file at `path` (lstat `meta`) has; an error when it can't be
+/// read. Unix: no open (on macOS ~3.8 s of a 100k-file scan's 5.6 s); the mode bits decide
+/// readability where they can, else access(2). Reads open with `O_NOFOLLOW` and check stamps.
 // ponytail: an ACL or MAC policy denying a mode-readable file is found only when it is read.
 #[cfg(unix)]
 fn links(path: &Path, meta: &Metadata) -> io::Result<u64> {
@@ -445,8 +430,7 @@ fn links(path: &Path, meta: &Metadata) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
-    // Only the one class that applies counts: the owner's when it is ours, else the group's
-    // or the world's (which one needs our groups), so both of those must allow it.
+    // Only the class that applies counts: the owner's when ours, else group's and world's.
     let mode = meta.mode();
     let readable = euid == 0
         || if meta.uid() == euid {
@@ -465,9 +449,7 @@ fn links(path: &Path, meta: &Metadata) -> io::Result<u64> {
     Ok(meta.nlink())
 }
 
-/// Windows: opened for attributes only, since an open for reading has an on-access scanner
-/// (Defender) check the file first; one at a time, ~95k assets kept the scan going for
-/// minutes.
+/// Windows: opened for attributes only (a read open has Defender scan the file first).
 #[cfg(windows)]
 fn links(path: &Path, _: &Metadata) -> io::Result<u64> {
     let f = crate::finalize::open_attributes(path, false)?;
@@ -515,10 +497,8 @@ fn special_kind(_: &std::fs::FileType) -> &'static str {
     "unknown type"
 }
 
-/// An image reader's tree without junk: every path with a junk component (by [`is_junk`],
-/// the one list) is dropped, and the empty dirs are worked out again, so a directory that
-/// held only junk counts as empty, as it does for a scanned folder. The vendored readers
-/// filter by lists of their own; this makes every source agree with the folder scanner.
+/// An image reader's tree without junk ([`is_junk`]), empty dirs worked out again, so every
+/// source agrees with the folder scanner.
 pub(crate) struct JunkFiltered {
     inner: Box<dyn SourceTree>,
     files: Vec<SourceFile>,

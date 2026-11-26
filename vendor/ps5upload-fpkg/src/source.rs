@@ -11,6 +11,37 @@ pub struct SourceFile {
     pub size: u64,
 }
 
+/// The most a `param.json` or `param.sfo` may be to be read whole. Real ones are a few KiB.
+pub const MAX_PARAM_BYTES: u64 = 4 << 20;
+/// The most one piece of artwork or sound the container carries (`icon0.png`, `pic0.png`,
+/// `snd0.at9`, …) or a runtime module may be to be read whole. Real ones are a few MiB.
+pub const MAX_ARTWORK_BYTES: u64 = 256 << 20;
+/// The most an asset index or pack manifest may be to be read whole. A quarter of a million
+/// files make one of a few tens of MiB. (Forge: 256 MiB, not upstream's 512, the bound for whole
+/// reads `build::prepare` keeps: a job stays within 512 MiB, parsing included.)
+pub const MAX_INDEX_BYTES: u64 = 256 << 20;
+
+/// The whole of a file that is known to be small, refused when the tree lists it as larger than
+/// `cap`. A tree's sizes are the image's own claims: a crafted image that lists a terabyte
+/// `param.json` is an error here, not an allocation of that size.
+pub fn read_small(tree: &mut dyn SourceTree, path: &str, cap: u64) -> Result<Vec<u8>> {
+    let too_large = |size: u64| {
+        Error::Format(format!(
+            "{path} is {size} bytes, more than the {cap} this kind of file may be"
+        ))
+    };
+    if let Some(size) = tree.files().iter().find(|f| f.path == path).map(|f| f.size) {
+        if size > cap {
+            return Err(too_large(size));
+        }
+    }
+    let bytes = tree.read(path)?;
+    if bytes.len() as u64 > cap {
+        return Err(too_large(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
 /// The game files to convert, whatever they live in. Sizes are known up front, so the
 /// plan fixes every offset before the first byte is read. Images seek, so reading takes
 /// `&mut self`.
@@ -39,8 +70,76 @@ pub trait SourceTree: Send {
         &[]
     }
 
+    /// The first `len` bytes of each file in `paths`, in the same order. `progress` is told
+    /// how many are done now and then and returns `false` to stop, which ends in
+    /// [`Error::Cancelled`]. One after another by default; a folder reads several at once.
+    fn read_heads(
+        &mut self,
+        paths: &[String],
+        len: usize,
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::with_capacity(paths.len());
+        let mut last = std::time::Instant::now();
+        for (i, path) in paths.iter().enumerate() {
+            if last.elapsed() >= HEADS_REPORT_EVERY {
+                last = std::time::Instant::now();
+                if !progress(i) {
+                    return Err(Error::Cancelled);
+                }
+            }
+            out.push(self.read_range(path, 0, len)?);
+        }
+        Ok(out)
+    }
+
     /// One line for logs: what the source is and where it came from.
     fn describe(&self) -> String;
+
+    /// What a user should know about this source before using it as a game: a patch package
+    /// says which files it leaves to the base game. Nothing for most sources.
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Lets go of what reading holds beyond the listing (an archive's decoder and the files it
+    /// kept on the way), before the same source is opened again: a read-back then never holds
+    /// two decoders. A read after it starts over. Nothing for most sources; a tree that wraps
+    /// another passes it on.
+    fn release(&mut self) {}
+}
+
+/// How often [`SourceTree::read_heads`] reports progress (and can be stopped).
+const HEADS_REPORT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How many files a folder opens at once in [`SourceTree::read_heads`]. Opening a file costs
+/// far more than reading its first bytes, most of all on Windows, where an antivirus scans
+/// each open: a 156 GiB game took ~14 minutes at Check source one file at a time. A handful
+/// of opens in flight hides that latency without flooding a hard disk or a network share.
+const FOLDER_HEAD_READERS: usize = 8;
+
+/// `len` bytes of `root/path` from `offset`, fewer at the end of the file. Reads until `len` or
+/// the end: a network or FUSE mount may answer short of either, and a short read is not the
+/// end of the file.
+fn read_folder_range(root: &Path, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let io = |e: std::io::Error| Error::Io(std::io::Error::new(e.kind(), format!("{path}: {e}")));
+    let mut file = std::fs::File::open(root.join(path)).map_err(io)?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+    }
+    let mut buf = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
 }
 
 /// A game folder on the filesystem.
@@ -76,14 +175,85 @@ impl SourceTree for FolderSource {
     }
 
     fn read_range(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(self.root.join(path))
-            .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{path}: {e}"))))?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; len];
-        let read = file.read(&mut buf)?;
-        buf.truncate(read);
-        Ok(buf)
+        read_folder_range(&self.root, path, offset, len)
+    }
+
+    fn read_heads(
+        &mut self,
+        paths: &[String],
+        len: usize,
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        if paths.len() < 2 {
+            let mut out = Vec::with_capacity(paths.len());
+            for path in paths {
+                out.push(read_folder_range(&self.root, path, 0, len)?);
+            }
+            return Ok(out);
+        }
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let results: Mutex<Vec<Option<Result<Vec<u8>>>>> =
+            Mutex::new((0..paths.len()).map(|_| None).collect());
+        let root = self.root.as_path();
+        let workers = FOLDER_HEAD_READERS.min(paths.len());
+        let lane = crate::workshop::Lane::current();
+        let cancelled = std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    lane.enter();
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { break };
+                    let head = read_folder_range(root, path, 0, len);
+                    let failed = head.is_err();
+                    if let Ok(mut r) = results.lock() {
+                        r[i] = Some(head);
+                    }
+                    done.fetch_add(1, Ordering::Relaxed);
+                    if failed {
+                        // The first error is what the build reports; the rest is wasted work.
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                });
+            }
+            // This thread only reports, so a stop is seen within a tick.
+            loop {
+                let n = done.load(Ordering::Relaxed);
+                if n >= paths.len() || stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if !progress(done.load(Ordering::Relaxed)) {
+                    stop.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        });
+        if cancelled {
+            return Err(Error::Cancelled);
+        }
+        let results = results
+            .into_inner()
+            .map_err(|_| crate::Error::Format("a header reader panicked".into()))?;
+        // In path order, so the error reported is the first failing file's, as one at a time.
+        let mut out = Vec::with_capacity(paths.len());
+        for (i, r) in results.into_iter().enumerate() {
+            match r {
+                Some(head) => out.push(head?),
+                None => {
+                    // Not read: a reader stopped at an earlier failure.
+                    out.push(read_folder_range(root, &paths[i], 0, len)?);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn describe(&self) -> String {
@@ -112,8 +282,27 @@ pub fn open(path: &Path) -> Result<Box<dyn SourceTree>> {
             Box::new(std::fs::File::open(path)?),
             format!("ffpfs {}", path.display()),
         ),
+        "pkg" => {
+            let mut magic = [0u8; 4];
+            let mut file = std::fs::File::open(path)?;
+            let ps4 = std::io::Read::read_exact(&mut file, &mut magic).is_ok()
+                && crate::ps4_pkg::is_ps4_magic(&magic);
+            if ps4 {
+                let len = file.metadata()?.len();
+                return Ok(Box::new(crate::ps4_pkg::Ps4Package::open(
+                    Box::new(file),
+                    len,
+                    crate::crypto::DEFAULT_PASSCODE,
+                    format!("pkg {}", path.display()),
+                )?));
+            }
+            Ok(Box::new(crate::pkg_source::open(
+                path,
+                crate::crypto::DEFAULT_PASSCODE,
+            )?))
+        }
         _ => format_err(format!(
-            "{} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc)",
+            "{} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc) or debug package (.pkg)",
             path.display()
         )),
     }
@@ -131,27 +320,36 @@ pub(crate) fn ffpfsc_tree(
     open: &dyn Fn() -> Result<Box<dyn crate::ReadSeek>>,
     label: &str,
 ) -> Result<Box<dyn SourceTree>> {
+    ffpfsc_tree_of(open, label).map(|(tree, _)| tree)
+}
+
+/// [`ffpfsc_tree`], with the filesystem the image inside turned out to be.
+pub(crate) fn ffpfsc_tree_of(
+    open: &dyn Fn() -> Result<Box<dyn crate::ReadSeek>>,
+    label: &str,
+) -> Result<(Box<dyn SourceTree>, crate::browse::Filesystem)> {
+    use crate::browse::Filesystem;
     use crate::pfsc_reader::PfscReader;
+    type Tree = (Box<dyn SourceTree>, Filesystem);
     let pfsc = |r: Box<dyn crate::ReadSeek>| {
         PfscReader::new(r).map_err(|e| crate::Error::Format(format!("{label}: {e}")))
     };
     let reader = pfsc(open()?)?;
     let inner = reader.inner_name().to_ascii_lowercase();
     let label = format!("{label} ({})", reader.inner_name());
-    let exfat = |r: PfscReader<Box<dyn crate::ReadSeek>>| {
+    let exfat = |r: PfscReader<Box<dyn crate::ReadSeek>>| -> Result<Tree> {
         let len = r.len();
         crate::remote_source::exfat_tree(Box::new(r), len, label.clone())
+            .map(|t| (t, Filesystem::Exfat))
     };
-    let ufs2 = |r: PfscReader<Box<dyn crate::ReadSeek>>| -> Result<Box<dyn SourceTree>> {
-        Ok(Box::new(crate::ufs2_source::Ufs2Source::from_reader(
-            Box::new(r),
-            label.clone(),
-        )?))
+    let ufs2 = |r: PfscReader<Box<dyn crate::ReadSeek>>| -> Result<Tree> {
+        let tree = crate::ufs2_source::Ufs2Source::from_reader(Box::new(r), label.clone())?;
+        Ok((Box::new(tree), Filesystem::Ufs2))
     };
     // A nested PFS image (a `pfs_image.dat` inside a `.ffpfsc`) is a third kind of image.
     let mut reader = reader;
     if crate::pfs_source::is_pfs_image(&mut reader) {
-        return crate::pfs_source::open(Box::new(reader), label);
+        return crate::pfs_source::open(Box::new(reader), label).map(|t| (t, Filesystem::Pfs));
     }
     if inner.ends_with(".exfat") {
         return exfat(reader);
@@ -229,17 +427,39 @@ fn walk(
     })?;
     for entry in entries {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        // A name is stored as it is: one that is not UTF-8 would be renamed by a lossy
+        // read, and a backslash in one is a separator in the image's path (and in `rel`),
+        // so both are refused here, naming the file, instead of failing with "not found"
+        // part-way through the build.
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return format_err(format!(
+                "{}: the file name is not valid UTF-8",
+                path.display()
+            ));
+        };
+        if name.contains('\\') {
+            return format_err(format!(
+                "{}: a backslash in a file name cannot be stored in the image",
+                path.display()
+            ));
+        }
         if is_junk(&name) {
             continue;
         }
-        let path = entry.path();
+        let with_path = |e: std::io::Error| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", path.display()),
+            ))
+        };
         // A symbolic link counts as what it points at, so a build can be staged as a folder of
         // links (to add or leave out a file) without copying or touching the game's own folder.
-        let meta = if entry.file_type()?.is_symlink() {
-            std::fs::metadata(&path)?
+        // A dangling one is an error that names it.
+        let meta = if entry.file_type().map_err(with_path)?.is_symlink() {
+            std::fs::metadata(&path).map_err(with_path)?
         } else {
-            entry.metadata()?
+            entry.metadata().map_err(with_path)?
         };
         if meta.is_dir() {
             if !walk(root, &path, out, empty)? {
@@ -339,10 +559,15 @@ fn string_value_span(text: &str, key: &str) -> Option<(usize, usize)> {
 fn set_string_value(param_json: &[u8], key: &str, value: &str) -> Option<Vec<u8>> {
     let text = String::from_utf8_lossy(param_json);
     let (start, end) = string_value_span(&text, key)?;
-    let mut out = Vec::with_capacity(param_json.len() + value.len());
-    out.extend_from_slice(&param_json[..start]);
+    // The span is an offset into `text`, so `text` is what gets cut: the two are the same
+    // bytes for every real param.json, but a file with bytes that are not UTF-8 decodes
+    // longer than it is, and its offsets cut the file itself in the wrong place or past its
+    // end (a panic the fuzzer found). Such a file comes out as the text it was read as.
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + value.len());
+    out.extend_from_slice(&bytes[..start]);
     out.extend_from_slice(value.as_bytes());
-    out.extend_from_slice(&param_json[end..]);
+    out.extend_from_slice(&bytes[end..]);
     Some(out)
 }
 
@@ -481,9 +706,10 @@ fn remove_string_field(param_json: &[u8], key: &str) -> Option<Vec<u8>> {
         start = key_at - lead;
         // Keep the indentation of the removed line for the next key.
         let indent = &text[start..key_at];
-        let mut out = param_json[..start].to_vec();
+        // Cut from `text`, which the offsets index (see `set_string_value`).
+        let mut out = text.as_bytes()[..start].to_vec();
         out.extend_from_slice(indent.as_bytes());
-        out.extend_from_slice(&param_json[end..]);
+        out.extend_from_slice(&text.as_bytes()[end..]);
         return Some(out);
     }
     let before = &text[..key_at];
@@ -492,8 +718,8 @@ fn remove_string_field(param_json: &[u8], key: &str) -> Option<Vec<u8>> {
         return None;
     }
     start = comma;
-    let mut out = param_json[..start].to_vec();
-    out.extend_from_slice(&param_json[end..]);
+    let mut out = text.as_bytes()[..start].to_vec();
+    out.extend_from_slice(&text.as_bytes()[end..]);
     Some(out)
 }
 
@@ -504,7 +730,8 @@ fn blank_string_array(param_json: &[u8], key: &str) -> Option<Vec<u8>> {
     let at = text.find(key)? + key.len();
     let open = at + text[at..].find('[')?;
     let close = open + text[open..].find(']')?;
-    let mut out = param_json.to_vec();
+    // The bytes the offsets index (see `set_string_value`).
+    let mut out = text.as_bytes().to_vec();
     let mut changed = false;
     let mut in_str = false;
     for byte in &mut out[open + 1..close] {
@@ -590,6 +817,42 @@ const AMPR_SEGMENT_LIMIT: u64 = 64 * 1024 * 1024;
 /// The import whose presence means the title needs `ampr_emu` on the console.
 const AMPR_LIB: &[u8] = b"libSceAmpr";
 
+/// Is `tree` an LZ4-packed game: a root `ampr_assets.index` that starts with `AMPRPAK4`? Its
+/// `ampr_emu.index` also lists the files inside the packs, and `ampr_emu` checks each one it opens
+/// against the pack's list (id = record order, path, size), so that index is carried as it is. A
+/// list that can't be read is an error, never "not packed": that answer would drop those records.
+pub fn lz4_packed(tree: &mut dyn SourceTree) -> Result<bool> {
+    let listed = tree
+        .files()
+        .iter()
+        .any(|f| f.path == "ampr_assets.index" && f.size >= 8);
+    Ok(listed && tree.read_range("ampr_assets.index", 0, 8)? == b"AMPRPAK4")
+}
+
+/// Which packs `tree` holds its game files in, if any: `"lz4"` (a root `ampr_assets.index` that
+/// starts with `AMPRPAK4`) or `"zstd"` (a root `ampr_zstd.index` that starts with `AMPRZPK1`).
+/// Such a game's files are only there for a console that runs the packs' emulator from a
+/// ShadowMount+ mount; a plain mount shows the packs and the game does not start.
+pub fn packed_kind(tree: &mut dyn SourceTree) -> Result<Option<&'static str>> {
+    for (name, magic, kind) in [
+        ("ampr_assets.index", b"AMPRPAK4", "lz4"),
+        ("ampr_zstd.index", b"AMPRZPK1", "zstd"),
+    ] {
+        // Any spelling of the name, as the zstd runtime check reads it (ng::is_zstd_packed).
+        let listed = tree
+            .files()
+            .iter()
+            .find(|f| f.path.eq_ignore_ascii_case(name) && f.size >= 8)
+            .map(|f| f.path.clone());
+        if let Some(path) = listed {
+            if tree.read_range(&path, 0, 8)? == magic {
+                return Ok(Some(kind));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Does `rel` import `libSceAmpr`?
 ///
 /// A title built against AMPR installs normally and then fails to start unless `ampr_emu` is
@@ -628,9 +891,13 @@ fn dynamic_segment(tree: &mut dyn SourceTree, rel: &str) -> Option<(u64, u64)> {
     const PT_LOAD: u32 = 1;
     const PT_DYNAMIC: u32 = 2;
     let head = tree.read_range(rel, 0, 0x1_0000).ok()?;
-    let u16_at = |at: usize| Some(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?));
-    let u32_at = |at: usize| Some(u32::from_le_bytes(head.get(at..at + 4)?.try_into().ok()?));
-    let u64_at = |at: usize| Some(u64::from_le_bytes(head.get(at..at + 8)?.try_into().ok()?));
+    // Every offset below comes from the file, so none is added to without a check: a module
+    // whose program header offset is near the top of the range is not a module, and must read
+    // as one we cannot place, not overflow (a panic in a debug build, found by the fuzzer).
+    let bytes = |at: usize, n: usize| head.get(at..at.checked_add(n)?);
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes(at, 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes(at, 4)?.try_into().ok()?));
+    let u64_at = |at: usize| Some(u64::from_le_bytes(bytes(at, 8)?.try_into().ok()?));
     let magic = head.get(..4)?;
     let (elf, self_segments) = if magic == magic::SELF_PS5 || magic == magic::SELF_PS4 {
         let n = usize::from(u16_at(0x18)?);
@@ -646,15 +913,22 @@ fn dynamic_segment(tree: &mut dyn SourceTree, rel: &str) -> Option<(u64, u64)> {
     let phoff = usize::try_from(u64_at(elf + 0x20)?).ok()?;
     let phentsize = usize::from(u16_at(elf + 0x36)?);
     let phnum = usize::from(u16_at(elf + 0x38)?);
-    let ph = |i: usize| elf + phoff + i * phentsize;
-    // (type, file offset, file size) per program header.
+    let ph = |i: usize| {
+        elf.checked_add(phoff)?
+            .checked_add(i.checked_mul(phentsize)?)
+    };
+    // (type, file offset, file size) per program header. Once its type is read, the header
+    // lies inside `head`, so the two fields after it are plain additions.
     let headers: Vec<(u32, u64, u64)> = (0..phnum)
-        .map(|i| Some((u32_at(ph(i))?, u64_at(ph(i) + 8)?, u64_at(ph(i) + 0x20)?)))
+        .map(|i| {
+            let at = ph(i)?;
+            Some((u32_at(at)?, u64_at(at + 8)?, u64_at(at + 0x20)?))
+        })
         .collect::<Option<_>>()?;
     let (_, dyn_off, _) = *headers.iter().find(|h| h.0 == PT_DYNAMIC)?;
-    let load = headers
-        .iter()
-        .position(|&(t, off, size)| t == PT_LOAD && off <= dyn_off && dyn_off < off + size)?;
+    let load = headers.iter().position(|&(t, off, size)| {
+        t == PT_LOAD && off <= dyn_off && off.checked_add(size).is_some_and(|end| dyn_off < end)
+    })?;
     if self_segments == 0 {
         return Some((headers[load].1, headers[load].2));
     }
@@ -673,7 +947,8 @@ fn dynamic_segment(tree: &mut dyn SourceTree, rel: &str) -> Option<(u64, u64)> {
 /// length, so a match lying across a boundary is still found; without that, detection would
 /// depend on where in the file the string happened to land.
 fn scan_for(tree: &mut dyn SourceTree, rel: &str, start: u64, len: u64, needle: &[u8]) -> bool {
-    let end = start + len;
+    // `start` may be a module's own claim of where its segment lies.
+    let end = start.saturating_add(len);
     let mut offset = start;
     let mut carry: Vec<u8> = Vec::new();
     while offset < end {
@@ -701,54 +976,26 @@ fn scan_for(tree: &mut dyn SourceTree, rel: &str, start: u64, len: u64, needle: 
     false
 }
 
-/// Is `tree` a packed folder: ampr_emu's LZ4 asset packs (a root `ampr_assets.index` that
-/// starts with `AMPRPAK4`) or Forge's zstd packs (a root `ampr_zstd.index` that starts with
-/// `AMPRZPK1`)? Its `ampr_emu.index` also lists the files inside the packs, and the runtime
-/// looks them up through it (LZ4: the pack manifest is checked against it, file id = record
-/// order, path, size), so a package carries that index as it is. A listed manifest whose first
-/// bytes cannot be read is an error, never "not packed": that answer would regenerate the index
-/// and drop the packed records.
-pub fn lz4_packed(tree: &mut dyn SourceTree) -> crate::Result<bool> {
-    for (index, magic) in [
-        ("ampr_assets.index", b"AMPRPAK4"),
-        ("ampr_zstd.index", b"AMPRZPK1"),
-    ] {
-        let listed = tree.files().iter().any(|f| f.path == index && f.size >= 8);
-        if listed && tree.read_range(index, 0, 8)? == magic {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Does the folder's own `ampr_emu.index` describe the folder? `ampr_emu` trusts its sizes, so
-/// a stale one is worth saying, even though a package always carries a freshly generated one
-/// (an LZ4-packed folder's excepted: see [`lz4_packed`]).
+/// a stale one is worth saying, even though a package always carries a freshly generated one.
 fn ampr_index_check(tree: &mut dyn SourceTree) -> (bool, String) {
     let name = crate::ampr_index::NAME;
-    let packed = match lz4_packed(tree) {
-        Ok(packed) => packed,
-        Err(e) => {
-            return (
-                false,
-                format!("the folder's ampr_assets.index (LZ4 packs?) cannot be read: {e}"),
-            );
-        }
-    };
-    let unlisted_packs = || {
-        format!(
-            "the folder holds LZ4 packs but no readable {name}, the one list of the files \
-             inside them: a package cannot be built from it"
-        )
-    };
-    let Some((at, size)) = tree
+    let packs = packed_kind(tree).ok().flatten();
+    let Some(at) = tree
         .files()
         .iter()
         .find(|f| f.path.eq_ignore_ascii_case(name))
-        .map(|f| (f.path.clone(), f.size))
+        .map(|f| f.path.clone())
     else {
-        if packed {
-            return (false, unlisted_packs());
+        if packs.is_some() {
+            return (
+                false,
+                format!(
+                    "the game is in {} asset packs and has no {name}: the AMPR runtime finds a \
+                     packed file only through its record there, so none would be served",
+                    packs.unwrap_or_default()
+                ),
+            );
         }
         return (
             true,
@@ -758,38 +1005,62 @@ fn ampr_index_check(tree: &mut dyn SourceTree) -> (bool, String) {
             ),
         );
     };
-    let regenerated = "a package or a game image carries one generated from its files \
-                       instead";
-    // Read whole only within the builder's bound for whole reads: a corrupt, huge file is
-    // reported, never held in memory.
-    let Some(listed) = (size <= crate::build::MAX_WHOLE_READS)
-        .then(|| tree.read(&at).ok())
-        .flatten()
-        .and_then(|d| crate::ampr_index::parse(&d))
-    else {
-        if packed {
-            return (false, unlisted_packs());
-        }
+    // A packed game's index goes into a package or image as it is; anyone else's is made again.
+    let regenerated = if packs.is_some() {
+        "a packed game keeps its index as it is, so convert it again (zstd packs) or rebuild \
+         the index"
+    } else {
+        "a package or a game image carries one generated from its files instead"
+    };
+    let Ok(bytes) = read_small(tree, &at, MAX_INDEX_BYTES) else {
+        return (
+            false,
+            format!("the folder's {name} could not be read: {regenerated}"),
+        );
+    };
+    let Some(listed) = crate::ampr_index::parse(&bytes) else {
         return (
             false,
             format!("the folder's {name} is not a readable AMPRIDX3 index: {regenerated}"),
         );
     };
-    if packed {
-        return (
-            true,
-            format!(
-                "the folder holds LZ4 packs: its {name} lists {} files, the packed ones \
-                 included, and a package keeps it as it is (it must match the packs)",
-                listed.len()
-            ),
-        );
+    // The runtime's own checks: one bad record and it refuses the whole file.
+    if let Err(why) = crate::ampr_index::check(&bytes) {
+        return (false, format!("{why}; {regenerated}"));
     }
-    let on_disk: std::collections::HashMap<String, u64> = tree
-        .files()
-        .iter()
-        .filter(|f| !f.path.eq_ignore_ascii_case(name))
-        .map(|f| (f.path.to_ascii_lowercase(), f.size))
+    let joined = match packs {
+        Some("zstd") => crate::ampr_index::zstd_packed(tree).and_then(|packed| {
+            crate::ampr_index::check_zstd(&bytes, packed.iter().map(|(p, s)| (p.as_str(), *s)))?;
+            Ok(Some(crate::ampr_index::zstd_listing_of(
+                tree.files(),
+                packed,
+            )))
+        }),
+        Some(_) => read_small(tree, "ampr_assets.index", MAX_INDEX_BYTES)
+            .map_err(|e| e.to_string())
+            .and_then(|m| crate::ampr_pack::format::Manifest::parse(&m).map_err(|e| e.to_string()))
+            .and_then(|m| crate::ampr_index::check_lz4(&bytes, &m.files))
+            .map(|()| None),
+        None => Ok(Some(crate::ampr_index::listing(tree.files()))),
+    };
+    let expected = match joined {
+        Err(why) => return (false, format!("{why}; {regenerated}")),
+        // The LZ4 manifest matched record by record: nothing more to compare.
+        Ok(None) => {
+            return (
+                true,
+                format!(
+                    "the game's {name} matches its LZ4 packs record by record ({} files)",
+                    listed.len()
+                ),
+            )
+        }
+        Ok(Some(expected)) => expected,
+    };
+    let on_disk: std::collections::HashMap<String, u64> = expected
+        .into_iter()
+        .filter(|(p, _)| !p.eq_ignore_ascii_case(name))
+        .map(|(p, s)| (p.to_ascii_lowercase(), s))
         .collect();
     let mut first: Option<String> = None;
     let (mut gone, mut resized) = (0usize, 0usize);
@@ -874,7 +1145,7 @@ pub fn readiness_with(tree: &mut dyn SourceTree, imports_ampr: Option<bool>) -> 
         !has("sce_sys/param.sfo"),
         "a param.sfo makes the launch path treat the title as PS4",
     );
-    let param = tree.read("sce_sys/param.json").unwrap_or_default();
+    let param = read_small(tree, "sce_sys/param.json", MAX_PARAM_BYTES).unwrap_or_default();
     match content_id(&param) {
         Some(id) => r.push(
             "content id",
@@ -906,9 +1177,25 @@ pub fn readiness_with(tree: &mut dyn SourceTree, imports_ampr: Option<bool>) -> 
     // Spider-Man 2 built without `ampr_emu.index` exited at startup ("returned from main",
     // CE-108255-1); the same build with the index at the folder root played (FW 5.10).
     r.imports_ampr = imports_ampr.unwrap_or_else(|| self::imports_ampr(tree, "eboot.bin"));
-    if r.imports_ampr {
+    // A game in packs is read through its index whatever its eboot imports.
+    if r.imports_ampr || packed_kind(tree).ok().flatten().is_some() {
         let (ok, detail) = ampr_index_check(tree);
         r.push("ampr_emu.index for a libSceAmpr title", ok, detail);
+    }
+
+    // A module named in another letter case than the path eboot.bin loads: fine in an exFAT
+    // or PFS image, fatal (a crash a second in) in a folder on /data or a .ffpkg.
+    let renames = crate::module_case::tree_fixes(tree);
+    if !renames.is_empty() {
+        r.push(
+            "module names match eboot.bin",
+            true,
+            format!(
+                "eboot.bin loads these in another letter case; a game folder or .ffpkg built \
+                 here takes the eboot's spelling, the source is left as it is: {}",
+                crate::module_case::describe(&renames)
+            ),
+        );
     }
 
     if let Some(m) = module_magic(tree, "eboot.bin") {
@@ -930,6 +1217,36 @@ pub fn readiness_with(tree: &mut dyn SourceTree, imports_ampr: Option<bool>) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::SourceTree;
+
+    #[test]
+    fn packed_kind_reads_the_pack_index_magic() {
+        let base = std::env::temp_dir().join(format!("fpkg-packed-kind-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let kind = |name: &str, files: &[(&str, &[u8])]| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("eboot.bin"), b"x").unwrap();
+            for (f, body) in files {
+                std::fs::write(dir.join(f), body).unwrap();
+            }
+            let mut tree = super::FolderSource::open(&dir).unwrap();
+            super::packed_kind(&mut tree).unwrap()
+        };
+        assert_eq!(kind("plain", &[]), None);
+        assert_eq!(
+            kind("lz4", &[("ampr_assets.index", b"AMPRPAK4\x01\x00")]),
+            Some("lz4")
+        );
+        assert_eq!(
+            kind("zstd", &[("ampr_zstd.index", b"AMPRZPK1\x01\x00")]),
+            Some("zstd")
+        );
+        // The name alone is not a pack: a short file, or other bytes.
+        assert_eq!(kind("short", &[("ampr_assets.index", b"AMPR")]), None);
+        assert_eq!(kind("other", &[("ampr_zstd.index", b"notapack!")]), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     /// The launch rewrite leaves valid JSON with only the three launch fields changed.
     #[test]
@@ -947,6 +1264,56 @@ mod tests {
         assert!(
             launch_rewrite(&out).is_none(),
             "a second pass has nothing to do"
+        );
+    }
+
+    /// Found by the `param` and `game_checks` fuzz targets: a `param.json` holding bytes that
+    /// are not UTF-8 ahead of the value to rewrite. The value's place was worked out in the
+    /// decoded text, where each such byte is three, and then cut from the file itself: past
+    /// its end (a panic that ended the build), or in range and through the wrong bytes.
+    #[test]
+    fn a_param_json_with_bytes_that_are_not_utf8_is_rewritten_without_panicking() {
+        let with_junk = |rest: &str| {
+            let mut v = b"{\"junk\":\"".to_vec();
+            v.extend_from_slice(&[0xFF; 40]);
+            v.extend_from_slice(rest.as_bytes());
+            v
+        };
+        let drm = drm_rewrite(&with_junk("\",\"applicationDrmType\":\"free\"}")).unwrap();
+        assert_eq!(
+            parse_param_json(&drm).unwrap()["applicationDrmType"],
+            "standard"
+        );
+
+        let fw = with_junk("\",\"requiredSystemSoftwareVersion\":\"0x1260000000000000\"}");
+        let fw = firmware_rewrite(&fw, "0x0510000000000000").unwrap();
+        assert_eq!(
+            parse_param_json(&fw).unwrap()["requiredSystemSoftwareVersion"],
+            "0x0510000000000000"
+        );
+
+        let id = "UP0000-PPSA01234_00-0000000000000000";
+        let ids =
+            with_junk("\",\"contentId\":\"UP0000-PPSA09999_00-X\",\"titleId\":\"PPSA09999\"}");
+        let v = parse_param_json(&content_id_rewrite(&ids, id).unwrap()).unwrap();
+        assert_eq!(
+            (v["contentId"].as_str(), v["titleId"].as_str()),
+            (Some(id), Some("PPSA01234"))
+        );
+
+        let launch = with_junk(
+            "\",\"originContentVersion\":\"01.000.000\",\"versionFileUri\":\"https://x/v.xml\",\
+             \"addcont\":{\"serviceIdForSharing\":[\"UP4433-CUSA00744_00\"]}}",
+        );
+        let v = parse_param_json(&launch_rewrite(&launch).unwrap()).unwrap();
+        assert_eq!(v["versionFileUri"], "");
+        assert!(v.get("originContentVersion").is_none());
+        assert_eq!(
+            v["addcont"]["serviceIdForSharing"][0]
+                .as_str()
+                .unwrap()
+                .trim(),
+            ""
         );
     }
 
@@ -1034,6 +1401,47 @@ mod tests {
         // Without the name, the same module is not flagged.
         eboot[name_at..name_at + 14].fill(0);
         let mut tree = MemTree(vec![("eboot.bin".to_string(), eboot)]);
+        assert!(!imports_ampr(&mut tree, "eboot.bin"));
+    }
+
+    /// Found by the `game_checks` fuzz target: a module whose program headers claim to lie at
+    /// the top of the address range. The offsets were added up unchecked, which panics where
+    /// overflow is checked (tests, a debug build) and wraps elsewhere.
+    #[test]
+    fn a_module_with_offsets_that_overflow_is_one_we_cannot_place() {
+        let module = |phoff: u64, load: (u64, u64), dynamic: u64| {
+            let mut m = vec![0u8; 0x200];
+            m[..4].copy_from_slice(&magic::RAW_ELF);
+            m[0x20..0x28].copy_from_slice(&phoff.to_le_bytes());
+            m[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+            m[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());
+            // Two program headers at 0x40, read when `phoff` says so: PT_LOAD, PT_DYNAMIC.
+            for (i, (kind, off, size)) in [(1u32, load.0, load.1), (2, dynamic, 0x80)]
+                .into_iter()
+                .enumerate()
+            {
+                let at = 0x40 + i * 56;
+                m[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+                m[at + 8..at + 16].copy_from_slice(&off.to_le_bytes());
+                m[at + 0x20..at + 0x28].copy_from_slice(&size.to_le_bytes());
+            }
+            MemTree(vec![("eboot.bin".to_string(), m)])
+        };
+        // The program headers' own offset overflows.
+        for phoff in [u64::MAX, u64::MAX - 3, u64::MAX / 56 + 1] {
+            let mut tree = module(phoff, (0, 0x100), 0x10);
+            assert_eq!(dynamic_segment(&mut tree, "eboot.bin"), None);
+            assert!(!imports_ampr(&mut tree, "eboot.bin"));
+        }
+        // A load segment whose end overflows holds nothing.
+        let mut tree = module(0x40, (u64::MAX - 8, 0x100), u64::MAX - 4);
+        assert_eq!(dynamic_segment(&mut tree, "eboot.bin"), None);
+        // One at the very top that does not overflow is placed, and scanning it finds nothing.
+        let mut tree = module(0x40, (u64::MAX - 0x100, 0x100), u64::MAX - 4);
+        assert_eq!(
+            dynamic_segment(&mut tree, "eboot.bin"),
+            Some((u64::MAX - 0x100, 0x100))
+        );
         assert!(!imports_ampr(&mut tree, "eboot.bin"));
     }
 
@@ -1125,5 +1533,55 @@ mod tests {
             .unwrap();
         assert_eq!(read, b"moved");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tree that lists sizes it never has to back: reading a file it lists as huge panics.
+    struct Liar(Vec<SourceFile>);
+    impl SourceTree for Liar {
+        fn files(&self) -> &[SourceFile] {
+            &self.0
+        }
+        fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+            let Some(f) = self.0.iter().find(|f| f.path == path) else {
+                return Err(Error::Format(format!("no {path}")));
+            };
+            assert!(
+                f.size <= 1 << 20,
+                "{path} must be refused by its size, not read"
+            );
+            Ok(vec![b'{'; f.size as usize])
+        }
+        fn describe(&self) -> String {
+            "liar".into()
+        }
+    }
+
+    #[test]
+    fn a_small_file_listed_as_huge_is_refused_unread() {
+        let mut tree = Liar(vec![
+            SourceFile {
+                path: "sce_sys/param.json".into(),
+                size: 1 << 45,
+            },
+            SourceFile {
+                path: "sce_sys/icon0.png".into(),
+                size: 100,
+            },
+        ]);
+        let e = read_small(&mut tree, "sce_sys/param.json", MAX_PARAM_BYTES)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("more than"), "{e}");
+        assert_eq!(
+            read_small(&mut tree, "sce_sys/icon0.png", MAX_ARTWORK_BYTES)
+                .unwrap()
+                .len(),
+            100
+        );
+        // Under the cap by its listing, over it by what came back.
+        assert!(read_small(&mut tree, "sce_sys/icon0.png", 99).is_err());
+        // The readiness check reads param.json through the cap: no panic, a failed check.
+        let r = readiness(&mut tree);
+        assert!(r.checks.iter().any(|c| c.name == "content id" && !c.ok));
     }
 }

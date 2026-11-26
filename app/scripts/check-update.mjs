@@ -38,14 +38,15 @@ for (const [l, c] of notNewer) assert.equal(U.isNewer(l, c), false, `${l} !> ${c
 console.log("order: numeric, a current prerelease is older than its release, junk is never newer");
 
 // ---- the release file ----
-const ps5 = { version: "0.1.1", asset: "ps5.elf" };
-const mac = { version: "0.1.1", asset: "macos-universal.zip" };
+const ps5 = { version: "0.1.1", asset: "ps5-dump-forge-{v}-ps5.elf" };
+const mac = { version: "0.1.1", asset: "ps5-dump-forge-{v}-macos-arm64.dmg" };
 const rel = (tag, names) => ({ tag_name: tag, assets: names.map((name) => ({ name, state: "uploaded", size: 1 })) });
-const all = (v) => ["ps5.elf", "macos-universal.zip", "windows-x86-64.zip", "linux-x86-64.tar.gz"].map((a) => U.assetName(v, a));
-assert.equal(U.assetName("0.2.0", "ps5.elf"), "ps5-dump-forge-0.2.0-ps5.elf");
+const all = (v) =>
+  ["ps5.elf", "macos-arm64.dmg", "windows-x86-64.exe", "linux-x86-64.AppImage"].map((a) => U.assetName(v, `ps5-dump-forge-{v}-${a}`));
+assert.equal(U.assetName("0.2.0", "ps5-dump-forge-{v}-ps5.elf"), "ps5-dump-forge-0.2.0-ps5.elf");
 assert.equal(U.offer(rel("v0.2.0", all("0.2.0")), ps5), "0.2.0");
 assert.equal(U.offer(rel("v0.2.0", all("0.2.0")), mac), "0.2.0");
-assert.equal(U.offer(rel("v0.2.0", ["ps5-dump-forge-0.2.0-macos-universal.zip"]), ps5), null, "no elf");
+assert.equal(U.offer(rel("v0.2.0", ["ps5-dump-forge-0.2.0-macos-arm64.dmg"]), ps5), null, "no elf");
 assert.equal(U.offer(rel("v0.2.0", all("0.1.9")), ps5), null, "another version's files");
 assert.equal(U.offer(rel("v0.2.0", ["PS5-DUMP-FORGE-0.2.0-PS5.ELF"]), ps5), null, "exact name");
 assert.equal(U.offer(rel("v0.2.0", []), ps5), null, "no files yet");
@@ -61,7 +62,7 @@ assert.equal(U.offer(rel("v0.1.0", all("0.1.0")), ps5), null, "older");
 assert.equal(U.offer(rel("v0.2.0-pre1", all("0.2.0-pre1")), ps5), null, "prerelease tag");
 assert.equal(U.offer(null, ps5), null);
 assert.equal(U.offer("x", ps5), null);
-assert.equal(U.offer(rel("v0.1.1", all("0.1.1")), { version: "0.1.1-pre2", asset: "ps5.elf" }), "0.1.1");
+assert.equal(U.offer(rel("v0.1.1", all("0.1.1")), { version: "0.1.1-pre2", asset: "ps5-dump-forge-{v}-ps5.elf" }), "0.1.1");
 console.log("offer: a newer tag whose assets hold this platform's exact file name");
 
 // ---- checkUpdate: the request, and every failure is null ----
@@ -103,7 +104,7 @@ const releases = (byUrl) => async (url) => {
 };
 const tag = U.tagUrl("0.3.1");
 assert.equal(tag, "https://api.github.com/repos/quer3q/ps5-dump-forge/releases/tags/v0.3.1");
-const elfOf = (v) => rel(`v${v}`, [U.assetName(v, "ps5.elf")]);
+const elfOf = (v) => rel(`v${v}`, [U.assetName(v, "ps5-dump-forge-{v}-ps5.elf")]);
 assert.equal(await U.ps5Release("0.3.1", releases({ [tag]: elfOf("0.3.1"), [U.LATEST_URL]: elfOf("0.4.0") })), "0.3.1", "own version");
 assert.equal(await U.ps5Release("0.3.1", releases({ [U.LATEST_URL]: elfOf("0.4.0") })), "0.4.0", "unreleased: latest");
 assert.equal(await U.ps5Release("0.3.1", releases({ [tag]: rel("v0.3.1", []), [U.LATEST_URL]: elfOf("0.4.0") })), "0.4.0", "own release without the ELF");

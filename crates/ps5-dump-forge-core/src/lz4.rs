@@ -1,12 +1,5 @@
 //! LZ4 asset packs in a conversion: unpacking a packed source, and the logical tree
-//! the `Lz4` target packs (`ps5-dump-forge-lz4` does the bytes; this is the job's glue).
-//!
-//! Without an LZ4 option packs travel as plain files, and an AMPR title gets the release
-//! runtime where its own is missing, older or unknown, and an `ampr_emu.index` that fits
-//! ([`plain`]). Otherwise the tree the job writes is
-//! an overlay: the packs decoded ([`open`]), the journal, logs and old path index left out, the
-//! requested runtime installed and `ampr_emu.index` rebuilt for the final file set
-//! ([`prepare`]).
+//! the `Lz4` target packs, and the AMPR runtime and index rules (AGENTS.md); `ps5-dump-forge-lz4` does the bytes.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -28,17 +21,14 @@ use crate::{ConvertRequest, Format, Lz4Mode, Lz4Runtime};
 /// A runtime is a few hundred KiB; a bigger file is not read to be recognized.
 const MAX_RUNTIME: u64 = 64 << 20;
 /// The largest `ampr_emu.index` read whole to be compared with the files written.
-// ponytail: 64 MiB is about 600,000 records; a bigger index is taken as damaged and rebuilt
-// (its journal and logs left out) rather than read whole into a job's 512 MiB.
+// ponytail: 64 MiB is about 600,000 records; a bigger index is taken as damaged and rebuilt.
 const MAX_INDEX_CHECK: u64 = 64 << 20;
 
 /// The runtime at `fakelib/libSceAmpr.sprx`, as [`Runtime::action`] judges it.
 pub(crate) struct Runtime {
     /// Which one it is ([`RuntimeKind::None`] without one).
     pub kind: RuntimeKind,
-    /// The version it names itself with, when it does: ampr_emu's ([`runtime::version_of`]),
-    /// ampr-emu-ng's ([`runtime::ng_version_of`]) for [`RuntimeKind::Zstd`]. Only an
-    /// [`RuntimeKind::Other`]'s decides an action.
+    /// Its self-named version (ampr_emu's or ampr-emu-ng's); an ampr-emu-ng's decides Keep or Replace.
     pub version: Option<String>,
     /// It holds the pack format ([`runtime::reads_packs`]).
     pub packs: bool,
@@ -46,64 +36,61 @@ pub(crate) struct Runtime {
     pub bundled: bool,
 }
 
-/// What a conversion does to the source's runtime (by user decision).
+/// What a job does to the source's runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeAction {
-    /// An AMPR title without one: the release runtime goes in.
+    /// An AMPR title without one: the bundled ampr-emu-ng goes in.
     Install,
-    /// Forge's trace runtime, ampr-emu-ng (outside packing and a zstd-packed source), or another
-    /// one older than the bundled ampr_emu or naming no version (into packs also one that reads
-    /// none): the release runtime replaces it.
+    /// Forge's trace runtime, an older or unversioned ampr-emu-ng, or (with `replace_ampr_emu`) ampr_emu: replaced.
     Replace,
-    /// Forge's release runtime, or ampr_emu at the bundled version or newer: left as it is.
+    /// ampr-emu-ng at the bundled version or newer, or an ampr_emu build the request keeps.
     Keep,
-    /// Not an AMPR title (and not Forge's trace runtime): nothing to do.
+    /// A `.pkg` output: no AMPR runtime goes in, the one there is left out; the console's loader provides it.
+    Omit,
+    /// Not an AMPR title: nothing to do.
     Untouched,
 }
 
 impl Runtime {
-    /// The action for a title that imports libSceAmpr (`ampr`, [`imports_ampr`]) or not, into
-    /// an output that holds LZ4 packs (`packs`: Pack, or a packed source converted as it is)
-    /// or not: the one rule the jobs and Inspect share.
-    pub(crate) fn action(&self, ampr: bool, packs: bool) -> RuntimeAction {
-        let current = self.version.as_deref().is_some_and(runtime::not_older);
+    /// ampr-emu-ng at the bundled version or newer (the bundled build byte for byte included).
+    fn ng_current(&self) -> bool {
+        self.kind == RuntimeKind::Zstd
+            && (self.bundled || self.version.as_deref().is_some_and(runtime::ng_not_older))
+    }
+
+    /// The one rule jobs and Inspect share, for an AMPR title (`ampr`) or not, into an output holding LZ4 packs (`packs`) or not; not for a `.pkg`.
+    pub(crate) fn action(&self, ampr: bool, packs: bool, replace_ampr_emu: bool) -> RuntimeAction {
         match self.kind {
             RuntimeKind::ForgeTrace => RuntimeAction::Replace,
             _ if !ampr => RuntimeAction::Untouched,
             RuntimeKind::None => RuntimeAction::Install,
-            RuntimeKind::ForgeRelease => RuntimeAction::Keep,
-            // ampr-emu-ng goes into a game only by packing (by user decision): any other job
-            // puts the release runtime in its place. A zstd-packed source keeps it
-            // ([`Self::zstd_action`]).
+            RuntimeKind::Zstd if self.ng_current() => RuntimeAction::Keep,
             RuntimeKind::Zstd => RuntimeAction::Replace,
-            RuntimeKind::Other if current && (self.packs || !packs) => RuntimeAction::Keep,
-            RuntimeKind::Other => RuntimeAction::Replace,
+            // An ampr_emu build (Forge's old release one, another, or a file that doesn't read).
+            RuntimeKind::ForgeRelease | RuntimeKind::Other
+                if !replace_ampr_emu && (self.packs || !packs) =>
+            {
+                RuntimeAction::Keep
+            }
+            RuntimeKind::ForgeRelease | RuntimeKind::Other => RuntimeAction::Replace,
         }
     }
 
-    /// The action for LZ4 Pack with the runtime the request chose: the bundled ampr-emu-ng goes in
-    /// unless it is there byte for byte (an older ampr-emu-ng doesn't serve the fully packed LZ4
-    /// game pack everything except system files makes, so it is replaced, as zstd Pack does);
-    /// ampr_emu follows [`Self::action`] into packs (ampr-emu-ng replaced too).
-    pub(crate) fn pack_action(&self, choice: Lz4Runtime) -> RuntimeAction {
-        match (choice, self.kind) {
-            (Lz4Runtime::Ng, RuntimeKind::Zstd) if self.bundled => RuntimeAction::Keep,
-            (Lz4Runtime::Ng, RuntimeKind::None) => RuntimeAction::Install,
-            (Lz4Runtime::Ng, _) => RuntimeAction::Replace,
-            (Lz4Runtime::AmprEmu, _) => self.action(true, true),
-        }
-    }
-
-    /// The action for a zstd-packed source converted as it is: its packs need the zstd
-    /// runtime, whatever `eboot.bin` says, so any other one is replaced and none installed.
-    /// ampr-emu-ng is kept at the bundled version or newer (by user decision); an older one, or
-    /// one naming no version, is replaced by the bundled build (v0.3.4's 48 MiB index cap, #59).
-    pub(crate) fn zstd_action(&self) -> RuntimeAction {
-        let current = self.version.as_deref().is_some_and(runtime::ng_not_older);
+    /// Where only ampr-emu-ng serves the output (Pack, a zstd-packed source as it is): a current one kept, none installed, anything else replaced (#59).
+    pub(crate) fn ng_action(&self) -> RuntimeAction {
         match self.kind {
-            RuntimeKind::Zstd if self.bundled || current => RuntimeAction::Keep,
+            _ if self.ng_current() => RuntimeAction::Keep,
             RuntimeKind::None => RuntimeAction::Install,
             _ => RuntimeAction::Replace,
+        }
+    }
+
+    /// Into a `.pkg`: [`RuntimeAction::Omit`] for an AMPR title or wherever a runtime is, else untouched.
+    pub(crate) fn pkg_action(&self, ampr: bool) -> RuntimeAction {
+        if ampr || self.kind != RuntimeKind::None {
+            RuntimeAction::Omit
+        } else {
+            RuntimeAction::Untouched
         }
     }
 }
@@ -127,7 +114,8 @@ pub(crate) fn runtime_of(tree: &mut dyn SourceTree) -> Runtime {
             ..unknown
         };
     };
-    if size > MAX_RUNTIME {
+    // An empty file is a runtime that doesn't read, not none: replaced, or left out of a `.pkg`.
+    if size == 0 || size > MAX_RUNTIME {
         return unknown;
     }
     match tree.read_range(RUNTIME, 0, size as usize) {
@@ -157,14 +145,13 @@ fn size_of(tree: &dyn SourceTree, path: &str) -> Option<u64> {
 pub(crate) struct Packs {
     /// The source holds packs (a root `ampr_assets.index` starting `AMPRPAK4`).
     pub packed: bool,
-    /// ... and the tree [`open`] returned has them decoded.
+    /// ... and [`open`] decoded them.
     pub unpacked: bool,
     /// The tree [`open`] returned has the source's zstd packs decoded.
     pub zstd_unpacked: bool,
 }
 
-/// Whether the job packs: the `Lz4` target (a packed folder), or [`Lz4Mode::Pack`] into any
-/// `format`.
+/// Whether the job packs: the `Lz4` target, or [`Lz4Mode::Pack`] into any `format`.
 pub(crate) fn packing(req: &ConvertRequest) -> bool {
     req.format == Format::Lz4 || req.lz4 == Some(Lz4Mode::Pack)
 }
@@ -174,8 +161,42 @@ fn wants_unpack(req: &ConvertRequest) -> bool {
     req.lz4.is_some() || packing(req) || req.zstd_pack
 }
 
-/// The source with its packs decoded when the job asks for that. Before the backport is left
-/// out: its files are records of the manifest. Packs that fail any check fail the job.
+/// A plain request taking a packed game into a `.pkg`, as the unpack it becomes (issue #73); additional content keeps its packs.
+pub(crate) fn auto_unpack(
+    req: &ConvertRequest,
+    tree: &mut dyn SourceTree,
+) -> anyhow::Result<Option<ConvertRequest>> {
+    if req.format != Format::Pkg
+        || req.zstd_pack
+        || packing(req)
+        || size_of(tree, "eboot.bin").is_none()
+    {
+        return Ok(None);
+    }
+    // zstd by the magic, as Inspect labels it: a stray file of that name is an ordinary file.
+    let zstd = crate::zstd_pack::packed(tree);
+    let lz4 = ps5_dump_forge_lz4::reader::detect(tree).context("looking for LZ4 packs")?;
+    if zstd && lz4 {
+        // ponytail: one unpack per job; a game holding both kinds is refused, not half unpacked.
+        anyhow::bail!(
+            "this game holds both zstd and LZ4 packs, and a .pkg carries none: unpack it into a \
+             folder first (--zstd-unpack, then --lz4-unpack)"
+        );
+    }
+    let mut auto = req.clone();
+    if zstd && !lz4 && !req.zstd_unpack {
+        // An LZ4 unpack asked of a zstd-packed game becomes the zstd one.
+        auto.zstd_unpack = true;
+        auto.lz4 = None;
+    } else if lz4 && req.lz4.is_none() && !req.zstd_unpack {
+        auto.lz4 = Some(Lz4Mode::Unpack);
+    } else {
+        return Ok(None);
+    }
+    Ok(Some(auto))
+}
+
+/// The source with its packs decoded when the job asks (before the backport goes: its files are manifest records).
 pub(crate) fn open(
     req: &ConvertRequest,
     mut source: Box<dyn SourceTree>,
@@ -248,7 +269,7 @@ pub(crate) struct Prepared {
     pub pack: Option<PackPlan>,
 }
 
-/// The findings the request's LZ4 options make on their own (ruling 3 of the design).
+/// The findings the request's LZ4 options make on their own.
 fn combinations(req: &ConvertRequest) -> Vec<String> {
     let mut findings = Vec::new();
     if req.lz4 == Some(Lz4Mode::Unpack) && req.format == Format::Lz4 {
@@ -280,10 +301,7 @@ pub(crate) fn target_name(format: Format) -> String {
     }
 }
 
-/// The tree the job writes, per the request's LZ4 options (`packs` from [`open`], the
-/// backport already left out). `mtime` is the job's one timestamp (integer seconds) for a
-/// rebuilt `ampr_emu.index` and the pack manifest. Without an LZ4 option, [`plain`] decides.
-/// Untouched sources come back as they were.
+/// The tree the job writes per the request's LZ4 options (`packs` from [`open`]); `mtime` stamps a rebuilt index and the manifest; without an LZ4 option, [`plain`].
 pub(crate) fn prepare(
     req: &ConvertRequest,
     mut tree: Box<dyn SourceTree>,
@@ -294,7 +312,6 @@ pub(crate) fn prepare(
     let mut findings = combinations(req);
     let target = packing(req);
     let rt = runtime_of(tree.as_mut());
-    let kind = rt.kind;
     let ampr = imports_ampr(tree.as_mut());
     if req.lz4 == Some(Lz4Mode::Unpack) && !packs.packed {
         ctx.log("unpack LZ4: nothing to unpack, the source holds no LZ4 packs");
@@ -302,18 +319,13 @@ pub(crate) fn prepare(
     if req.zstd_unpack && !packs.zstd_unpacked {
         findings.push("zstd unpack: the source holds no zstd packs (ampr_zstd.index)".into());
     }
-    // A title without AMPR is packed too (by user decision), with ampr-emu-ng only: ShadowMount+
-    // loads it, and only it serves a game that never calls the AMPR API.
-    if target && size_of(tree.as_ref(), "eboot.bin").is_some() && !ampr {
-        if req.lz4_runtime != Lz4Runtime::Ng {
-            findings.push(
-                "eboot.bin does not import libSceAmpr: its LZ4 packs need the ampr-emu-ng runtime \
-                 (ng), not ampr_emu"
-                    .into(),
-            );
-        } else {
-            ctx.log("LZ4: eboot.bin does not import libSceAmpr; injecting ampr-emu-ng");
-        }
+    if target && req.lz4_runtime != Lz4Runtime::Ng {
+        findings.push(
+            "LZ4 packs get the ampr-emu-ng runtime (ng): ampr_emu is no longer bundled".into(),
+        );
+    } else if target && size_of(tree.as_ref(), "eboot.bin").is_some() && !ampr {
+        // A title without AMPR is packed too: ShadowMount+ force-loads ampr-emu-ng.
+        ctx.log("LZ4: eboot.bin does not import libSceAmpr; injecting ampr-emu-ng");
     }
     if !findings.is_empty() {
         return Ok(Prepared {
@@ -325,44 +337,46 @@ pub(crate) fn prepare(
     if !(target || packs.unpacked || packs.zstd_unpacked) {
         return plain(req, tree, packs.packed, &rt, ampr, mtime, ctx);
     }
-    let ng = target && req.lz4_runtime == Lz4Runtime::Ng;
-    if target && !ng {
-        ctx.log(runtime::WARNING);
-    }
-    // Pack installs the chosen runtime whatever `eboot.bin` says (the check above lets a
-    // non-AMPR title through only to ampr-emu-ng). Unpacked, an
-    // AMPR title's zstd runtime has nothing left to read: the release one replaces it; a title
-    // without AMPR keeps what it has (`action(false, ..)`: untouched), as an LZ4 Unpack does.
-    let action = match kind {
-        _ if target => rt.pack_action(req.lz4_runtime),
-        RuntimeKind::Zstd if packs.zstd_unpacked && ampr => RuntimeAction::Replace,
-        _ => rt.action(ampr, false),
+    // Into a `.pkg` no runtime goes; Pack installs ampr-emu-ng; unpacked, the plain conversion's rule.
+    let pkg = req.format == Format::Pkg;
+    // A zstd unpack's lines are zstd's; LZ4 unpack and LZ4 Pack keep the LZ4 tag.
+    let tag = if packs.zstd_unpacked && !target {
+        "zstd"
+    } else {
+        "LZ4"
+    };
+    let action = if pkg {
+        rt.pkg_action(ampr)
+    } else if target {
+        rt.ng_action()
+    } else {
+        rt.action(ampr, false, req.replace_ampr_emu)
     };
     let installed: Option<&'static [u8]> = match action {
-        RuntimeAction::Install | RuntimeAction::Replace if ng => {
-            ctx.log(format!("LZ4: installing ampr-emu-ng at {RUNTIME}"));
+        RuntimeAction::Install | RuntimeAction::Replace => {
+            ctx.log(install_log(tag, &rt));
             Some(runtime::zstd())
         }
-        RuntimeAction::Install | RuntimeAction::Replace => {
-            ctx.log(release_log(kind));
-            Some(runtime::release())
-        }
         RuntimeAction::Keep => {
-            keep_log(&rt, ctx);
+            keep_log(tag, &rt, ctx);
+            None
+        }
+        RuntimeAction::Omit => {
+            omit_log(tag, &rt, ctx);
             None
         }
         RuntimeAction::Untouched => None,
     };
-    // Into a `.pkg` the builder writes the index from exactly what it packages (as in
-    // [`plain`]); a non-AMPR title's own stays listed so that the builder rebuilds it too.
-    let pkg = req.format == Format::Pkg;
-    let dropped = |p: &str| p == JOURNAL || LOGS.contains(&p) || (p == INDEX && (ampr || !pkg));
+    // Into a `.pkg` the builder indexes what it packages; a non-AMPR title's own index stays listed so it is rebuilt too.
+    let dropped = |p: &str| {
+        p == JOURNAL || LOGS.contains(&p) || (p == INDEX && (ampr || !pkg)) || (p == RUNTIME && pkg)
+    };
     let mut files: Vec<SourceFile> = Vec::with_capacity(tree.files().len() + 2);
     for f in tree.files() {
         if !dropped(&f.path) {
             files.push(f.clone());
-        } else if f.path != INDEX {
-            ctx.log(format!("LZ4: leaving out {}", f.path));
+        } else if f.path != INDEX && f.path != RUNTIME {
+            ctx.log(format!("{tag}: leaving out {}", f.path));
         }
     }
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
@@ -377,8 +391,7 @@ pub(crate) fn prepare(
             pack: None,
         });
     }
-    // The `Lz4` target always writes a new one: the space bound counts exactly that. So does
-    // zstd unpack: the zstd runtime's index listed its size.
+    // The `Lz4` target and zstd unpack always write a new index (the space bound counts it).
     let keep = !target && !packs.zstd_unpacked;
     let Some(index) = final_index(tree.as_mut(), &files, keep, mtime, ctx, &mut findings)? else {
         return Ok(Prepared {
@@ -404,59 +417,70 @@ pub(crate) fn prepare(
     })
 }
 
-/// The job log's line for the release runtime going in where `kind` was.
-fn release_log(kind: RuntimeKind) -> String {
-    match kind {
-        RuntimeKind::ForgeTrace => {
-            format!("LZ4: swapping the tracing runtime at {RUNTIME} for the release one")
+/// The log line for the bundled ampr-emu-ng going in where `rt` was.
+pub(crate) fn install_log(tag: &str, rt: &Runtime) -> String {
+    let ng = runtime::NG_VERSION;
+    let was = match (rt.kind, &rt.version) {
+        (RuntimeKind::None, _) => {
+            return format!("{tag}: installing ampr-emu-ng {ng} at {RUNTIME}");
         }
-        RuntimeKind::Other => format!(
-            "LZ4: replacing the game's runtime at {RUNTIME} with the bundled ampr_emu {}",
-            runtime::VERSION
-        ),
-        RuntimeKind::Zstd => format!(
-            "LZ4: replacing ampr-emu-ng at {RUNTIME} with the bundled ampr_emu {}",
-            runtime::VERSION
-        ),
-        _ => format!("LZ4: installing the release runtime at {RUNTIME}"),
+        (RuntimeKind::ForgeTrace, _) => "the tracing runtime".to_string(),
+        (RuntimeKind::Zstd, Some(v)) => format!("ampr-emu-ng {v}"),
+        (RuntimeKind::Zstd, None) => "an ampr-emu-ng naming no version".to_string(),
+        (_, Some(v)) => format!("the game's ampr_emu {v}"),
+        (_, None) => "the game's runtime".to_string(),
+    };
+    format!("{tag}: replacing {was} at {RUNTIME} with the bundled ampr-emu-ng {ng}")
+}
+
+/// The log line for a runtime kept: a non-older ampr-emu-ng, or ampr_emu the request keeps.
+pub(crate) fn keep_log(tag: &str, rt: &Runtime, ctx: &Ctx) {
+    let v = rt
+        .version
+        .as_deref()
+        .map(|v| format!(" {v}"))
+        .unwrap_or_default();
+    match rt.kind {
+        RuntimeKind::Zstd if !rt.bundled => ctx.log(format!(
+            "{tag}: keeping the game's ampr-emu-ng{v} at {RUNTIME} (the bundled one is {})",
+            runtime::NG_VERSION
+        )),
+        RuntimeKind::Other | RuntimeKind::ForgeRelease => ctx.log(format!(
+            "{tag}: keeping the game's ampr_emu{v} at {RUNTIME} (replace_ampr_emu is off)"
+        )),
+        _ => {}
     }
 }
 
-/// The job log's line for a runtime left as it is (another build, not older than ours).
-fn keep_log(rt: &Runtime, ctx: &Ctx) {
-    if let (RuntimeKind::Other, Some(v)) = (rt.kind, &rt.version) {
-        ctx.log(format!(
-            "LZ4: keeping the game's ampr_emu {v} at {RUNTIME} (the bundled one is {})",
-            runtime::VERSION
-        ));
-    }
+fn omit_log(tag: &str, rt: &Runtime, ctx: &Ctx) {
+    ctx.log(if rt.kind == RuntimeKind::None {
+        format!("{tag}: no AMPR runtime goes into a .pkg: the console's loader provides it")
+    } else {
+        format!(
+            "{tag}: leaving out {RUNTIME}: a .pkg carries no AMPR runtime, the console's loader \
+             provides it"
+        )
+    });
 }
 
-/// What a `.pkg` of an AMPR title leaves out of `all`, since the builder writes the index from
-/// exactly what it packages: the journal and logs (their file ids follow the old index's
-/// order), and when `ampr` (`eboot.bin` imports libSceAmpr) the old index too. The paths left
-/// out come back, the index not among them.
-pub(crate) fn leave_out_for_pkg(all: &mut Vec<SourceFile>, ampr: bool) -> Vec<String> {
+/// What a `.pkg` leaves out of `all`: the runtime always; with `traces` the journal and logs, and with `ampr` the old index. Returns the paths left out, bar the index and runtime.
+pub(crate) fn leave_out_for_pkg(
+    all: &mut Vec<SourceFile>,
+    ampr: bool,
+    traces: bool,
+) -> Vec<String> {
     let mut gone = Vec::new();
     all.retain(|f| {
-        let trace = f.path == JOURNAL || LOGS.contains(&f.path.as_str());
+        let trace = traces && (f.path == JOURNAL || LOGS.contains(&f.path.as_str()));
         if trace {
             gone.push(f.path.clone());
         }
-        !(trace || (ampr && f.path == INDEX))
+        !(trace || f.path == RUNTIME || (traces && ampr && f.path == INDEX))
     });
     gone
 }
 
-/// A conversion without LZ4 options (by user decision). An AMPR title (`eboot.bin` imports
-/// libSceAmpr) gets the release runtime per [`Runtime::action`] (installed where there is none,
-/// replacing ampr-emu-ng and an older or unknown one, another as new as ours kept) and keeps its
-/// `ampr_emu.index` only when it lists exactly the files written ([`index_state`]); else a new
-/// one is written, and the journal and logs are left out with the old one: the journal's file
-/// ids follow its record order. Into a `.pkg` the builder writes the index from the files it
-/// packages, so the old one, the journal and logs are left out here. A packed source keeps its
-/// index, journal and logs byte for byte. Forge's trace runtime is swapped whatever the title.
-/// Anything else comes back untouched.
+/// A conversion without LZ4 options: the runtime by [`Runtime::action`] and the index kept only when [`index_state`] says it fits (AGENTS.md's runtime and index rules).
 fn plain(
     req: &ConvertRequest,
     mut tree: Box<dyn SourceTree>,
@@ -473,45 +497,50 @@ fn plain(
             pack: None,
         })
     };
-    // zstd packs travel as plain files too, read by the zstd runtime only. By the magic, as
-    // Inspect labels it: a stray file of that name gets the plain repair.
+    // zstd packs travel as plain files too; by the magic, as Inspect labels it.
     let zstd = !packed && crate::zstd_pack::packed(tree.as_mut());
-    let action = if zstd {
-        rt.zstd_action()
+    let pkg = req.format == Format::Pkg;
+    let action = if pkg {
+        rt.pkg_action(ampr)
+    } else if zstd {
+        rt.ng_action()
     } else {
-        rt.action(ampr, packed)
+        rt.action(ampr, packed, req.replace_ampr_emu)
     };
-    let release = match action {
+    let tag = if zstd { "zstd" } else { "LZ4" };
+    let install = match action {
         RuntimeAction::Untouched => return untouched(tree),
         RuntimeAction::Keep => {
-            keep_log(rt, ctx);
+            keep_log(tag, rt, ctx);
             false
         }
-        RuntimeAction::Install if zstd => {
-            ctx.log(format!("zstd: installing the zstd runtime at {RUNTIME}"));
-            true
-        }
-        RuntimeAction::Replace if zstd => {
-            ctx.log(format!(
-                "zstd: replacing the runtime at {RUNTIME} with the zstd runtime"
-            ));
-            true
+        RuntimeAction::Omit => {
+            omit_log(tag, rt, ctx);
+            false
         }
         RuntimeAction::Install | RuntimeAction::Replace => {
-            ctx.log(release_log(rt.kind));
+            ctx.log(install_log(tag, rt));
             true
         }
     };
-    let bytes = if zstd {
-        runtime::zstd()
-    } else {
-        runtime::release()
-    };
+    let bytes = runtime::zstd();
     let mut generated: HashMap<String, Cow<'static, [u8]>> = HashMap::new();
     let mut all = tree.files().to_vec();
-    if release {
+    if install {
         generated.insert(RUNTIME.into(), Cow::Borrowed(bytes));
         put(&mut all, RUNTIME, bytes.len() as u64);
+    }
+    let traces = |f: &SourceFile| f.path == JOURNAL || LOGS.contains(&f.path.as_str());
+    if pkg {
+        // The builder indexes what survives its SDK filter; a packed source's index is kept as it is.
+        let before = all.len();
+        for path in leave_out_for_pkg(&mut all, ampr, !(packed || zstd)) {
+            ctx.log(format!("LZ4: leaving out {path}"));
+        }
+        if all.len() == before {
+            return untouched(tree);
+        }
+        return untouched(overlay(tree, all, generated));
     }
     // The zstd index lists the packed files, which the folder does not hold as such.
     if packed || zstd {
@@ -519,30 +548,17 @@ fn plain(
         ctx.log(format!(
             "LZ4: keeping {INDEX} as it is: it must match the packs"
         ));
-        return untouched(if release {
+        return untouched(if install {
             overlay(tree, all, generated)
         } else {
             tree
         });
     }
-    let traces = |f: &SourceFile| f.path == JOURNAL || LOGS.contains(&f.path.as_str());
-    if req.format == Format::Pkg {
-        // Built only after the builder leaves out SDK leftovers, from exactly what it packages
-        // (an AMPR title's always; another's only when it has one, so that one stays).
-        let before = all.len();
-        for path in leave_out_for_pkg(&mut all, ampr) {
-            ctx.log(format!("LZ4: leaving out {path}"));
-        }
-        if all.len() == before && !release {
-            return untouched(tree);
-        }
-        return untouched(overlay(tree, all, generated));
-    }
     let mut files = plain_listing(tree.files(), action);
     let state = index_state(tree.as_mut(), &files)?;
     match state {
         IndexState::Ok(_) => {
-            return untouched(if release {
+            return untouched(if install {
                 overlay(tree, all, generated)
             } else {
                 tree
@@ -570,9 +586,7 @@ fn plain(
     untouched(overlay(tree, files, generated))
 }
 
-/// `listing` as written beside `ampr_emu.index` by a conversion without LZ4 options: without
-/// the index, the journal and the logs, with the release runtime when `action` installs or
-/// replaces one. What [`index_state`] compares with there.
+/// `listing` as a conversion without LZ4 options writes it beside `ampr_emu.index` (index, journal and logs out, the runtime as `action` puts it).
 pub(crate) fn plain_listing(listing: &[SourceFile], action: RuntimeAction) -> Vec<SourceFile> {
     let mut files: Vec<SourceFile> = listing
         .iter()
@@ -580,14 +594,12 @@ pub(crate) fn plain_listing(listing: &[SourceFile], action: RuntimeAction) -> Ve
         .cloned()
         .collect();
     if matches!(action, RuntimeAction::Install | RuntimeAction::Replace) {
-        put(&mut files, RUNTIME, runtime::release().len() as u64);
+        put(&mut files, RUNTIME, runtime::zstd().len() as u64);
     }
     files
 }
 
-/// `inner` as `files`, the `generated` ones served from memory; its empty folders that now
-/// hold a file are left out. `files` keeps the source's order (no sort): a solid archive is read
-/// front to back, and an entry it already went past starts its decode again.
+/// `inner` as `files`, the `generated` ones served from memory; `files` keeps the source's order (a solid archive is read front to back).
 pub(crate) fn overlay(
     inner: Box<dyn SourceTree>,
     files: Vec<SourceFile>,
@@ -635,8 +647,7 @@ pub(crate) enum IndexState {
     Missing,
 }
 
-/// The one comparison of the source's `ampr_emu.index` with `files` (every file written but the
-/// index itself), for conversions and Inspect alike.
+/// The one comparison of the source's `ampr_emu.index` with `files`, for conversions and Inspect alike.
 pub(crate) fn index_state(
     tree: &mut dyn SourceTree,
     files: &[SourceFile],
@@ -644,8 +655,7 @@ pub(crate) fn index_state(
     Ok(index_states(tree, &[files])?.remove(0))
 }
 
-/// [`index_state`] against each of `listings`, the index read at most once (a remote source
-/// keeps no read).
+/// [`index_state`] against each of `listings`, the index read at most once.
 pub(crate) fn index_states(
     tree: &mut dyn SourceTree,
     listings: &[&[SourceFile]],
@@ -661,8 +671,7 @@ pub(crate) fn index_states(
     let mut states = Vec::with_capacity(listings.len());
     let mut first_ok = None;
     for files in listings {
-        // Bounded before it is read: one that lists exactly `files` is about a fresh one's size,
-        // so anything bigger is `Stale`; one that could fit but is over the read cap is `Damaged`.
+        // Bounded before it is read: bigger than one listing exactly `files` could be is `Stale`, over the read cap `Damaged`.
         if size > index_bound(files) {
             states.push(IndexState::Stale);
             continue;
@@ -695,7 +704,6 @@ pub(crate) fn index_states(
         states.push(if have != want {
             IndexState::Stale
         } else if first_ok.is_none() {
-            // Its bytes are moved in below, not copied.
             first_ok = Some(states.len());
             IndexState::Ok(Vec::new())
         } else {
@@ -708,9 +716,7 @@ pub(crate) fn index_states(
     Ok(states)
 }
 
-/// The largest `ampr_emu.index` that could list exactly `files`: four times a fresh one's size
-/// (0x30-byte header, 24 bytes a record, the `/app0/` paths, 16-byte slots at twice the
-/// records), plus 1 MiB, room for another tool's slot table or padding.
+/// The largest index that could list exactly `files`: four times a fresh one's size plus 1 MiB.
 fn index_bound(files: &[SourceFile]) -> u64 {
     let n = files.len() as u64;
     let paths: u64 = files.iter().map(|f| f.path.len() as u64 + 7).sum();
@@ -718,9 +724,7 @@ fn index_bound(files: &[SourceFile]) -> u64 {
     4 * fresh + (1 << 20)
 }
 
-/// `ampr_emu.index` for `files` (every file but the index itself): with `keep`, the source's
-/// own when it lists exactly these paths and sizes, else a new one. `None` with a finding when
-/// the paths cannot be indexed.
+/// `ampr_emu.index` for `files`: with `keep` the source's own when it fits, else a new one; `None` with a finding when unindexable.
 fn final_index(
     tree: &mut dyn SourceTree,
     files: &[SourceFile],
@@ -751,8 +755,7 @@ fn final_index(
     }
 }
 
-/// All `size` bytes of `path`, in as many reads as the source takes (an `.pkg`'s serves at
-/// most 64 MiB each); only one that returns nothing early is a short file.
+/// All `size` bytes of `path`, in as many reads as the source takes (a `.pkg`'s serves at most 64 MiB each).
 fn read_all(tree: &mut dyn SourceTree, path: &str, size: u64) -> anyhow::Result<Vec<u8>> {
     let len = usize::try_from(size).context("too big")?;
     let mut bytes = Vec::with_capacity(len);
@@ -772,11 +775,8 @@ fn read_all(tree: &mut dyn SourceTree, path: &str, size: u64) -> anyhow::Result<
 /// The most a pack profile may hold.
 const MAX_PROFILE: u64 = 1 << 20;
 
-/// The request's pack profile, read (here or on another device) and parsed: `None` without one
-/// or when it fails, every problem a finding (`pack rules <file>: ...`); the keys it ignores
-/// are logged once.
-// ponytail: the profile and its pattern files are read once here, not guarded as job paths: a
-// change after preflight isn't seen.
+/// The request's pack profile, read and parsed: `None` without one or on failure (every problem a finding).
+// ponytail: the profile and its pattern files are read once, not guarded as job paths.
 pub(crate) fn pack_profile(
     req: &ConvertRequest,
     ctx: &Ctx,
@@ -811,9 +811,7 @@ pub(crate) fn pack_profile(
     }
 }
 
-/// A rule's `include_from` / `exclude_from` file: `name` (relative, `/`-separated, checked by the
-/// parser) in the profile's folder, read as the profile is; locally its folder must not lead
-/// out of the profile's through a link. `total` caps the bytes of all of one profile's files.
+/// A rule's `include_from` / `exclude_from` file in the profile's folder (locally not out of it through a link); `total` caps all of one profile's.
 fn read_pattern_file(
     profile: &std::path::Path,
     name: &str,
@@ -874,8 +872,7 @@ fn read_profile(path: &std::path::Path) -> anyhow::Result<String> {
         if meta.len() > MAX_PROFILE {
             return Err(too_big());
         }
-        // A link or FIFO swapped in after the lstat: opened without following or blocking,
-        // then judged by the opened file itself.
+        // A link or FIFO swapped in after the lstat: opened without following or blocking, then judged by the handle.
         let file = crate::scan::open_nofollow(path)?;
         let opened = file.metadata()?;
         if !opened.is_file() {
@@ -894,16 +891,10 @@ fn read_profile(path: &std::path::Path) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("not UTF-8 text"))
 }
 
-/// The built-in packing strategies' names (by user decision), as the logs give them: zstd Pack and
-/// LZ4 Pack with ampr-emu-ng take [`EVERYTHING`], LZ4 Pack with ampr_emu [`COMPATIBILITY`].
+/// The built-in packing strategy's name, as the logs give it.
 pub(crate) const EVERYTHING: &str = "pack everything except system files";
-pub(crate) const COMPATIBILITY: &str = "compatibility LZ4 strategy";
 
-/// The pack list, in `records` (final index) order: the request's pack profile or a built-in
-/// strategy. With ampr-emu-ng ([`Lz4Runtime::Ng`]) everything but system files is packed
-/// (`rules::select_everything`, no auto-loose, as zstd Pack); with ampr_emu the compatibility
-/// LZ4 strategy (the keep-loose list and root files stay loose), then auto-loose samples the
-/// large files left to pack (from `tree`). A profile's rules and auto-loose keys decide either way.
+/// The pack list in `records` order: a profile's rules (then its auto-loose sampling), else the built-in strategy.
 fn plan(
     tree: &mut dyn SourceTree,
     records: &[(String, u64)],
@@ -913,8 +904,7 @@ fn plan(
 ) -> anyhow::Result<PackPlan> {
     let profile = pack_profile(req, ctx, findings);
     if req.pack_profile.is_some() && profile.is_none() {
-        // A profile that doesn't read or parse refuses the job (its findings): nothing is
-        // sampled and no built-in strategy is logged. Every file loose, never packed.
+        // A profile that doesn't parse refuses the job: every file loose, nothing sampled.
         let files = (records.iter())
             .map(|(path, size)| PackFile {
                 path: path.clone(),
@@ -927,26 +917,17 @@ fn plan(
             level: req.lz4_level,
         });
     }
-    let everything = req.lz4_runtime == Lz4Runtime::Ng;
     let mut files: Vec<PackFile> = records
         .iter()
         .map(|(path, size)| PackFile {
             path: path.clone(),
             size: *size,
-            spec: if everything {
-                ps5_dump_forge_lz4::select_everything(path, *size, profile.as_ref())
-            } else {
-                ps5_dump_forge_lz4::select(path, *size, profile.as_ref())
-            },
+            spec: ps5_dump_forge_lz4::select_everything(path, *size, profile.as_ref()),
         })
         .collect();
     let ruled: Vec<bool> = files.iter().map(|f| f.spec.is_some()).collect();
-    match &profile {
-        Some(p) => auto_loose(tree, &mut files, req.lz4_level, &p.auto_loose, ctx)?,
-        None if !everything => {
-            auto_loose(tree, &mut files, req.lz4_level, &Default::default(), ctx)?
-        }
-        None => {}
+    if let Some(p) = &profile {
+        auto_loose(tree, &mut files, req.lz4_level, &p.auto_loose, ctx)?;
     }
     // Names the runtime cannot take, and names the pack files will take.
     let bad: Vec<String> = files
@@ -977,12 +958,7 @@ fn plan(
             req.lz4_level
         )),
         _ => ctx.log(format!(
-            "packing strategy: {}; {packed} files to pack, {} loose; level {}",
-            if everything {
-                EVERYTHING
-            } else {
-                COMPATIBILITY
-            },
+            "packing strategy: {EVERYTHING}; {packed} files to pack, {} loose; level {}",
             files.len() - packed,
             req.lz4_level
         )),
@@ -991,10 +967,9 @@ fn plan(
         .filter(|(f, _)| f.spec.is_none())
         .map(|(f, r)| (f.path.as_str(), f.size, *r))
         .collect();
-    ctx.log(if everything && profile.is_none() {
-        everything_loose_line(&loose, profile.as_ref())
-    } else {
-        loose_line(&loose, profile.as_ref(), true)
+    ctx.log(match &profile {
+        None => everything_loose_line(&loose, None),
+        Some(_) => loose_line(&loose, true),
     });
     Ok(PackPlan {
         files,
@@ -1019,76 +994,30 @@ fn gb(bytes: u64) -> String {
     }
 }
 
-/// The packing strategy's "kept loose" log line: the loose files as `(path, size, auto)`, `auto`
-/// when auto-loose kept a file the rules would pack (LZ4 only, `auto_loose` true), counted by
-/// the reason each stays loose (`rules::loose_reason`, or with a profile: the profile or
-/// `always_loose`).
-pub(crate) fn loose_line(
-    loose: &[(&str, u64, bool)],
-    profile: Option<&ps5_dump_forge_lz4::Profile>,
-    auto_loose: bool,
-) -> String {
-    use ps5_dump_forge_lz4::rules::{Loose, loose_reason};
-    let (mut root, mut suffix, mut prot, mut auto) = (0u64, 0u64, 0u64, 0u64);
-    let (mut sys, mut sys_n, mut prof, mut prof_n, mut empty) = (0u64, 0, 0u64, 0, 0);
-    let mut by_suffix: HashMap<&str, u64> = HashMap::new();
+/// A profile's "kept loose" line: `(path, size, auto)`, `auto` when auto-loose kept a file the rules would pack.
+pub(crate) fn loose_line(loose: &[(&str, u64, bool)], auto_loose: bool) -> String {
+    let (mut auto, mut sys, mut sys_n, mut prof, mut prof_n, mut empty) =
+        (0u64, 0u64, 0, 0u64, 0, 0);
     for &(path, size, a) in loose {
         if a {
             auto += size;
-        } else if profile.is_some() {
-            if ps5_dump_forge_lz4::always_loose(path) {
-                (sys, sys_n) = (sys + size, sys_n + 1);
-            } else if size == 0 {
-                empty += 1;
-            } else {
-                (prof, prof_n) = (prof + size, prof_n + 1);
-            }
+        } else if ps5_dump_forge_lz4::always_loose(path) {
+            (sys, sys_n) = (sys + size, sys_n + 1);
+        } else if size == 0 {
+            empty += 1;
         } else {
-            match loose_reason(path) {
-                Some(Loose::Root) => root += size,
-                Some(Loose::Suffix(s)) => {
-                    suffix += size;
-                    *by_suffix.entry(s).or_default() += size;
-                }
-                Some(Loose::Protected) => prot += size,
-                None => empty += 1,
-            }
+            (prof, prof_n) = (prof + size, prof_n + 1);
         }
     }
     let total: u64 = loose.iter().map(|l| l.1).sum();
     let mut s = format!(
-        "packing strategy: kept loose {} files, {}: ",
+        "packing strategy: kept loose {} files, {}: the profile {prof_n} files, {}, system and \
+         runtime files (always_loose) {sys_n} files, {}",
         loose.len(),
-        gb(total)
+        gb(total),
+        gb(prof),
+        gb(sys)
     );
-    if profile.is_some() {
-        s.push_str(&format!(
-            "the profile {prof_n} files, {}, system and runtime files (always_loose) {sys_n} files, {}",
-            gb(prof),
-            gb(sys)
-        ));
-    } else {
-        let mut top: Vec<(&str, u64)> = by_suffix.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        let mut names: Vec<String> = top
-            .iter()
-            .take(5)
-            .map(|(n, b)| format!("{n} {}", gb(*b)))
-            .collect();
-        if top.len() > 5 {
-            names.push("...".into());
-        }
-        let names = match names.is_empty() {
-            true => String::new(),
-            false => format!(" ({})", names.join(", ")),
-        };
-        s.push_str(&format!(
-            "root files {}, keep-loose suffixes {}{names}, protected folders and names {}",
-            gb(root),
-            gb(suffix),
-            gb(prot)
-        ));
-    }
     if auto_loose {
         s.push_str(&format!(", auto-loose {}", gb(auto)));
     }
@@ -1098,15 +1027,13 @@ pub(crate) fn loose_line(
     s
 }
 
-/// The "kept loose" line of pack everything except system files: without a profile only system
-/// and runtime files (`always_loose`, `.ini` files counted among them) and empty files stay loose
-/// (`rules::select_everything`).
+/// The "kept loose" line of the built-in strategy: only `always_loose` and empty files stay loose.
 pub(crate) fn everything_loose_line(
     loose: &[(&str, u64, bool)],
     profile: Option<&ps5_dump_forge_lz4::Profile>,
 ) -> String {
     if profile.is_some() {
-        return loose_line(loose, profile, false);
+        return loose_line(loose, false);
     }
     let bytes: u64 = loose.iter().map(|l| l.1).sum();
     let empty = loose.iter().filter(|l| l.1 == 0).count();
@@ -1119,9 +1046,7 @@ pub(crate) fn everything_loose_line(
     )
 }
 
-/// Upstream's auto-loose over the pack list: every file it applies to is sampled (a few
-/// blocks spread over it, encoded as the writer would) and kept loose when the sample barely
-/// shrinks. Counted as preflight progress.
+/// Upstream's auto-loose: each large file is sampled as the writer encodes and kept loose when it barely shrinks.
 fn auto_loose(
     tree: &mut dyn SourceTree,
     files: &mut [PackFile],
@@ -1208,21 +1133,19 @@ fn auto_loose(
     Ok(())
 }
 
-/// Whether `path` is a name the `Lz4` target writes at the root, as a case-insensitive
-/// destination sees it.
+/// Whether `path` is a root name the `Lz4` target writes, case-insensitively.
 fn is_pack_name(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     [MANIFEST, CRC_SIDECAR, PROFILE].contains(&p.as_str())
         || (p.starts_with("ampr_assets-") && p.ends_with(".pak") && !p.contains('/'))
 }
 
-/// The prepared tree: the inner tree's files less the diagnostics, plus the generated runtime
-/// and index served from memory.
-struct Overlay {
-    inner: Box<dyn SourceTree>,
-    files: Vec<SourceFile>,
-    empty_dirs: Vec<String>,
-    generated: HashMap<String, Cow<'static, [u8]>>,
+/// The prepared tree: the inner tree's files less the diagnostics, plus the generated ones from memory.
+pub(crate) struct Overlay {
+    pub(crate) inner: Box<dyn SourceTree>,
+    pub(crate) files: Vec<SourceFile>,
+    pub(crate) empty_dirs: Vec<String>,
+    pub(crate) generated: HashMap<String, Cow<'static, [u8]>>,
 }
 
 impl SourceTree for Overlay {
@@ -1262,9 +1185,7 @@ impl SourceTree for Overlay {
     }
 }
 
-/// The pack files, created at the root of the `.part` folder like extracted files (exclusive,
-/// no link followed) and synced as each one is finished. On FreeBSD every byte goes through
-/// the job's sync cadence (U5) and a retried sync fails the job.
+/// The pack files at the `.part` folder's root (exclusive, no link followed), synced as each is finished; on FreeBSD through the sync cadence (U5).
 pub(crate) struct PartOutput<'a> {
     dest: &'a mut crate::extract::Dest,
     #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
@@ -1310,15 +1231,13 @@ impl PackOutput for PartOutput<'_> {
         Ok(self.dest.reopen_root(name)?)
     }
 
-    /// A `File` buffers nothing: syncing is all there is to finish (durable with the caller's
-    /// `Dest::sync`, as for every extracted file).
+    /// A `File` buffers nothing: syncing is all there is to finish.
     fn finish(&mut self, _: &str, w: File) -> ps5upload_fpkg::Result<()> {
         Ok(crate::extract::sync_file(&w)?)
     }
 }
 
-/// A reopened volume starts a fresh `SyncEvery` at offset 0: the packer only seeks there and
-/// rewrites the 64-byte header, so nothing past it is written or zeroed.
+/// A reopened volume starts a fresh `SyncEvery` at 0: the packer only rewrites its 64-byte header.
 #[cfg(target_os = "freebsd")]
 impl<'a> PackOutput for PartOutput<'a> {
     type W = crate::durable::SyncEvery<'a, File>;
@@ -1357,10 +1276,7 @@ impl ps5_dump_forge_zstd::writer::PackOutput for PartOutput<'_> {
     }
 }
 
-/// The biggest single file the `Lz4` target writes, for the destination's file size limit
-/// (FAT32's 4 GiB): a loose file, the path index (`index` bytes), the manifest or a sidecar,
-/// or a volume, which never passes `VOLUME_CAP`. Packed files' own sizes do not count: their
-/// chunks are spread over volumes.
+/// The biggest single file the `Lz4` target writes, for FAT32's 4 GiB limit (packed files are spread over volumes).
 pub(crate) fn largest_file(files: &[PackFile], index: u64) -> u64 {
     use ps5_dump_forge_lz4::writer::{VOLUME_CAP, worst_case_bytes};
     let loose = files
@@ -1375,8 +1291,7 @@ pub(crate) fn largest_file(files: &[PackFile], index: u64) -> u64 {
         let shift = f.spec.map_or(16, |s| s.block_shift);
         sum.saturating_add(f.size.div_ceil(1 << shift))
     });
-    // Manifest: header, file, chunk and pack records, then every path (as `/app0/...`, NUL
-    // ended) and up to the runtime's 1024 volume names.
+    // Manifest: header, records, then every `/app0/...` path NUL-ended and up to 1024 volume names.
     let strings = files.iter().fold(1024 * 32, |sum: u64, f| {
         sum.saturating_add(f.path.len() as u64 + 7)
     });

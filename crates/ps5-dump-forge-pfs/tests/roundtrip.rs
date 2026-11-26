@@ -1,6 +1,4 @@
-//! Tree → `.ffpfs` → `PfsSource`, and tree → inner image → `.ffpfsc` → `open_ffpfsc`, comparing
-//! paths, sizes and bytes; the on-disk fields MkPFS lays out; name and limit refusals; and a
-//! reader fed damaged images.
+//! `.ffpfs` and `.ffpfsc` round trips, MkPFS's on-disk fields, refusals and damaged images.
 
 use std::fs::File;
 use std::io::{Cursor, Write};
@@ -17,7 +15,6 @@ use ps5upload_fpkg::{Error, Result};
 const TIME: i64 = 1_700_000_000;
 const B: usize = BLOCK as usize;
 
-/// A fresh directory under the system temp dir, removed when dropped.
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -103,7 +100,6 @@ fn opts() -> Options {
     Options { time: Some(TIME) }
 }
 
-/// Plans and writes `tree` into memory.
 fn build(tree: &mut MemTree) -> (Layout, Vec<u8>) {
     let cancel = AtomicBool::new(false);
     let layout = plan(tree, &opts(), &cancel).unwrap();
@@ -119,7 +115,6 @@ fn build(tree: &mut MemTree) -> (Layout, Vec<u8>) {
     (layout, img)
 }
 
-/// Every file and empty directory of `want` is in `got`, with the same bytes.
 fn assert_same(want: &mut dyn SourceTree, got: &mut dyn SourceTree) {
     let mut a: Vec<SourceFile> = want.files().to_vec();
     let mut b: Vec<SourceFile> = got.files().to_vec();
@@ -157,13 +152,11 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-/// Inode `n`'s bytes (D32, 390 to a block).
 fn inode(img: &[u8], n: usize) -> &[u8] {
     let at = B * (1 + n / 390) + (n % 390) * 0xA8;
     &img[at..at + 0xA8]
 }
 
-/// `(inode, type, name)` of the entries at `at`, up to the first empty record.
 fn dirents(img: &[u8], mut at: usize) -> Vec<(u32, i32, String)> {
     let mut out = Vec::new();
     while u32_at(img, at + 12) != 0 {
@@ -480,7 +473,6 @@ fn write_refuses_a_changed_tree_a_used_output_and_a_cancel() {
     ));
 }
 
-/// A small game tree, written as `inner` into a `.ffpfsc` and read back through it.
 fn wrap_round_trip(inner: &str) {
     let tmp = TempDir::new(inner);
     let mut tree = MemTree::new(&[
@@ -549,7 +541,6 @@ fn ffpfsc_round_trips_with_an_exfat_inside() {
     wrap_round_trip("exfat");
 }
 
-/// Damaged images fail to open or read, and never panic.
 #[test]
 fn damaged_images_are_refused() {
     let mut tree = MemTree::new(&[
@@ -618,7 +609,6 @@ fn damaged_images_are_refused() {
         let mut bad = img.clone();
         let at = (x as usize) % (11 * B);
         let block = at / B;
-        // Header fields, inodes, dirents and the FPT: where the bytes mean something.
         let at = block * B + (at % B) % 0x400;
         bad[at] ^= 1 << (x >> 29);
         if let Ok(mut src) = open(bad) {

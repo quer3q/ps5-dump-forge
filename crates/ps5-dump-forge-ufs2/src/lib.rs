@@ -1,14 +1,9 @@
 //! Write-once UFS2 image writer for the single ShadowMountPlus `.ffpkg` geometry.
 //!
-//! Frozen interface (ps5-dump-forge-core depends on it): `plan` validates names and sizes the image
-//! without reading file data; `write` streams the files into `out` in offset order.
-//!
-//! The image is what `newfs -O 2 -b 65536 -f 65536 -m 0 -S 4096 -i <density>` would format
-//! (no soft updates, no journal, no check hashes), filled the way a one-pass `makefs` would:
-//! the raw filesystem starts at byte 0, every file is one contiguous run of 64 KiB blocks
-//! with its indirect blocks in front of the blocks they map, and inodes are numbered
-//! depth-first from the root (inode 2). Everything — the cylinder groups, the superblock
-//! totals, every pointer — is computed by `plan`, so `write` never goes back.
+//! `plan` validates names and sizes the image without reading file data; `write` streams the
+//! files into `out` in offset order, never going back. The image is what `newfs -O 2 -b 65536
+//! -f 65536 -m 0 -S 4096 -i <density>` formats, filled as a one-pass `makefs` would: each file
+//! one run of blocks, its indirect blocks in front, inodes numbered depth-first from 2.
 
 mod bmap;
 pub mod edit;
@@ -31,12 +26,10 @@ use tree::{Kind, Node};
 pub(crate) const ROOTINO: u64 = 2;
 /// File data is read and written in runs of at most this many bytes.
 const CHUNK: u64 = 8 * 1024 * 1024;
-/// Spare inodes kept for writable (`image_rw=`) mounts: the 2048 of SMP's `-i` formula,
-/// guaranteed even where the 64 KiB density floor would eat into them (the image grows).
+/// Spare inodes for `image_rw=` mounts: the 2048 of SMP's `-i` formula, kept even at the floor.
 /// ponytail: ~2048 new files on a writable image; more needs a lower `-i` than SMP's.
 const SPARE_INODES: u64 = 2048;
-/// Free data blocks every image keeps for writable mounts: 64 MiB, like the floor of the
-/// exFAT spare. ponytail: room for saves and small patches, not for installing DLC.
+/// Free data blocks every image keeps (64 MiB). ponytail: room for saves, not for DLC.
 const SPARE_BLOCKS: u64 = 1024;
 
 /// Knobs a caller may set. `Default` is the SMP-recommended layout.
@@ -44,8 +37,7 @@ const SPARE_BLOCKS: u64 = 1024;
 pub struct Options {
     /// Extra free space (bytes) beyond what the files need, for `image_rw=` mounts.
     pub free_bytes: u64,
-    /// Maker's mark for `fs_volname`: printable ASCII, at most 31 bytes (the field is 32,
-    /// NUL-terminated); `plan` rejects anything else. `None` leaves it empty, as newfs does.
+    /// Maker's mark for `fs_volname`: printable ASCII, at most 31 bytes (NUL-terminated 32).
     pub maker: Option<String>,
 }
 
@@ -54,16 +46,12 @@ pub struct Options {
 pub struct Layout {
     /// Final image size in bytes (a multiple of 64 KiB).
     pub image_size: u64,
-    /// Cylinder groups (`fs_ncg`).
     pub cylinder_groups: u64,
     /// Blocks per full group (`fs_fpg`; one fragment per block).
     pub blocks_per_group: u64,
-    /// Inodes per group (`fs_ipg`).
     pub inodes_per_group: u64,
-    /// The `-i` the layout was built with.
     pub bytes_per_inode: u64,
-    /// Blocks in the last group, and the metadata blocks every group starts with
-    /// (`fs_dblkno`); the last group always holds more than its metadata.
+    /// Blocks in the last group, and the metadata blocks every group starts with (`fs_dblkno`).
     pub last_group_blocks: u64,
     pub metadata_blocks_per_group: u64,
     /// Free space and inodes left once the files are written.
@@ -100,8 +88,7 @@ fn overflow() -> Error {
     Error::Format("UFS2 image size overflows".into())
 }
 
-/// FNV-1a over every planned path and size, so `write` can tell a renamed, reordered or
-/// resized source from the one `plan` saw without keeping a second copy of the paths.
+/// FNV-1a over every planned path and size, so `write` can tell a changed source.
 fn fingerprint(tree: &dyn SourceTree) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
@@ -122,8 +109,7 @@ fn fingerprint(tree: &dyn SourceTree) -> u64 {
     h
 }
 
-/// `fs_volname` of a UFS2 image (where this crate puts the maker's mark), from the primary
-/// superblock: `None` when the image is not UFS2 or the label is empty.
+/// `fs_volname` (the maker's mark) of a UFS2 image: `None` when not UFS2 or empty.
 pub fn read_volname<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<String>> {
     let mut sb = vec![0u8; 1376];
     r.seek(SeekFrom::Start(ondisk::SBLOCK_UFS2))?;
@@ -140,7 +126,6 @@ pub fn read_volname<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<String>
 }
 
 /// Validate names and lay the image out. Fails with every offending path listed.
-/// Checks `cancel` between steps.
 pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Result<Layout> {
     check_cancel(cancel)?;
     let mut volname = [0u8; ondisk::VOLNAME_LEN];
@@ -182,10 +167,8 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
     }
     let used_blocks = next;
     let objects = nodes.len() as u64;
-    // The smallest image that holds the tree's blocks plus SPARE_BLOCKS free (and the
-    // caller's extra), and its inodes plus SPARE_INODES. No percentage headroom: UFS2Tool's
-    // `-D` (+10% + 10 MiB) left ~5 GiB free in a 50 GiB game. Metadata only ever adds to
-    // the size, so the search starts at the data alone and grows by each shortfall.
+    // The smallest image holding the blocks + SPARE_BLOCKS (+ the caller's extra) and the
+    // inodes + SPARE_INODES; no percentage headroom (UFS2Tool's `-D` wasted ~10%).
     let data_blocks = used_blocks.checked_add(SPARE_BLOCKS).ok_or_else(overflow)?;
     let need_blocks = data_blocks
         .checked_add(opts.free_bytes.div_ceil(BSIZE))
@@ -236,14 +219,9 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
     })
 }
 
-/// The smallest newfs layout from `start` blocks up whose groups hold `need_blocks` data
-/// blocks and `need_inodes` inodes and whose last group is sound. Capacity is not monotonic
-/// in the size (inodes come in whole blocks per group, groups re-balance as the size
-/// changes), so no step can be skipped: every size is tried, from `start`, which must be a
-/// lower bound (metadata only takes from the data, so `need_blocks` is one).
-/// ponytail: linear; a data-bound image tries about its metadata in sizes (~10k for 150
-/// GiB), an inode-bound one up to its inode count (~1M for 1M empty files), each a
-/// logarithmic `Geom::new`.
+/// The smallest newfs layout from `start` (a lower bound) up holding `need_blocks` and
+/// `need_inodes` with a sound last group. Capacity is not monotonic in size, so every size
+/// is tried. ponytail: linear (~10k sizes for 150 GiB, ~1M for 1M empty files).
 fn size_image(
     start: u64,
     density: u64,
@@ -266,8 +244,7 @@ fn size_image(
     Err(overflow())
 }
 
-/// Write the image described by `layout` into `out` (empty: a fresh file the caller owns,
-/// fsyncs and renames, or a `.ffpfsc` stream). `progress(done, total)` counts file-data bytes.
+/// Write the image described by `layout` into an empty `out`. `progress` counts file-data bytes.
 pub fn write<W: Write + Seek>(
     tree: &mut dyn SourceTree,
     layout: &Layout,
@@ -283,8 +260,7 @@ pub fn write<W: Write + Seek>(
         ));
     }
     if out.seek(SeekFrom::End(0))? != 0 {
-        // Unwritten regions are left as holes (or zero-filled by a stream) and must read
-        // back as zeros.
+        // Unwritten regions are holes and must read back as zeros.
         return Err(Error::Format("the UFS2 output is not empty".into()));
     }
     let mut w = Writer {
@@ -358,8 +334,7 @@ pub fn write<W: Write + Seek>(
             w.pos, layout.image_size
         )));
     }
-    // One zero byte at the end extends the image: sparse on a fresh file, zero-filled by a
-    // stream.
+    // One zero byte at the end extends the image (sparse on a fresh file).
     if w.pos < layout.image_size {
         w.put(layout.image_size - 1, &[0])?;
     }
@@ -409,9 +384,7 @@ fn group_summaries(layout: &Layout) -> Vec<GroupUse> {
     out
 }
 
-/// Writes strictly forward through the image, emitting each cylinder group's metadata
-/// (backup superblock, cg block, inodes; in group 0 also the primary superblock and the
-/// summary area) just before the first data block that follows it.
+/// Writes strictly forward, each cylinder group's metadata just before the data after it.
 struct Writer<'a, W: Write + Seek> {
     out: &'a mut W,
     pos: u64,
@@ -536,9 +509,8 @@ fn dinode(g: &Geom, node: &Node) -> Dinode {
 mod tests {
     use super::*;
 
-    /// Inode-bound layouts, where inode capacity holds still over many sizes: the search
-    /// must not give up there, and must land on the first size that fits (a jump-then-
-    /// backtrack search returned 797 128 blocks for the second, 6 GiB too many).
+    /// Inode-bound layouts, where capacity holds still over many sizes: the search must land
+    /// on the first size that fits.
     #[test]
     fn inode_bound_sizing_is_exact() {
         let cancel = AtomicBool::new(false);

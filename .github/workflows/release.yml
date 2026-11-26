@@ -1,9 +1,10 @@
 name: Release
 
 # A `v*` tag builds the macOS, Windows, Linux and PS5 releases and creates a *draft* GitHub Release
-# with the macOS universal (arm64 + Intel) zip, the two Windows x86-64 zips (with and without a
-# bundled WebView2 runtime), the Windows arm64 zip, the Linux x86-64 and arm64 tarballs, the static Linux CLI tarballs (musl, x86-64 and arm64), the PS5
-# payload (one plain .elf), SHA256SUMS and payloads.json (the PS5 payload's catalog for ps5-payload-manager) (the source is GitHub's own archive of the tag); publishing the draft is a manual step on GitHub, after checking its assets.
+# of single files, no archives: per desktop platform and arch (macOS, Windows and Linux; arm64 and
+# x86-64) the app (a .dmg, an .exe, an .AppImage) and the bare ps5-dump-forge CLI (on Linux static,
+# musl), the PS5 payload (one plain .elf), SHA256SUMS, payloads.json (the payload's catalog for
+# ps5-payload-manager); the licences are in the source (GitHub's own archive of the tag); publishing the draft is a manual step on GitHub, after checking its assets.
 # `workflow_dispatch` is a dry run, even on a tag: same build, artifact kept on the run,
 # nothing published.
 on:
@@ -19,7 +20,8 @@ env:
 
 jobs:
   macos:
-    # PS5 Dump Forge.app + the CLI, ad-hoc signed, as one universal (arm64 + Intel) zip.
+    # Per arch (arm64, x86-64; one run builds both): a .dmg of PS5 Dump Forge.app (no CLI inside)
+    # and the bare CLI, ad-hoc signed. The x86-64 CLI's smoke run goes through Rosetta.
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -35,20 +37,24 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      # Builds PS5 Dump Forge.app (tauri build, universal) and the CLI (both targets,
-      # lipo-joined), assembles and verifies the zip, writes SHA256SUMS into dist/.
+      # Without Rosetta the script skips the x86-64 CLI's run (with a note); make sure it is there.
+      - name: Rosetta (the x86-64 CLI's smoke run)
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+      # The web UI, then PS5 Dump Forge.app (tauri build) and the CLI for each arch; writes and checks
+      # (mounted read-only) the two .dmg and the two bare CLIs, and a SHA256SUMS, into dist/.
       - run: scripts/release-macos.sh
       - uses: actions/upload-artifact@v7
         with:
           name: release-macos
-          path: dist/*
+          path: |
+            dist/*.dmg
+            dist/ps5-dump-forge-cli-*-macos-*
           if-no-files-found: error
           retention-days: 3
 
   windows:
-    # PS5 Dump Forge.exe + the CLI (MSVC, built natively on each runner), unsigned. x86-64: one zip
-    # for the installed WebView2 Runtime, one that carries Microsoft's Fixed Version runtime next to
-    # the exe. arm64: one zip for the installed runtime (Windows 11 ships it).
+    # The app (PS5 Dump Forge.exe, renamed) and the CLI as two bare .exe per arch (MSVC, built
+    # natively on each runner), unsigned; the app uses the installed (Evergreen) WebView2 Runtime.
     name: windows (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -64,8 +70,7 @@ jobs:
       run:
         shell: bash
     steps:
-      # LF checkout: the runner's Git converts to CRLF, which breaks the bash scripts (and the zips
-      # would carry CRLF docs).
+      # LF checkout: the runner's Git converts to CRLF, which breaks the bash scripts.
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
@@ -79,20 +84,19 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      # Builds PS5 Dump Forge.exe (tauri build --no-bundle) and the CLI, (x86-64 only) downloads and
-      # checks the pinned WebView2 Fixed Version .cab, assembles and verifies the zips into dist/.
+      # Builds PS5 Dump Forge.exe (tauri build --no-bundle), the web UI and the CLI, copies both exes
+      # into dist/ under their asset names and checks the copies (PE machine, no VC++ DLL, CLI run).
       - run: scripts/release-windows.sh
       - uses: actions/upload-artifact@v7
         with:
           name: release-windows-${{ matrix.arch }}
-          path: dist/*
+          path: dist/*.exe
           if-no-files-found: error
           retention-days: 3
 
   linux:
-    # The extracted AppImage (an AppDir) + forge.sh + the CLI, unsigned, as one tarball per arch,
-    # built natively on each runner.
-    # ubuntu-22.04, not -latest: the binaries need the build host's glibc (2.35) or newer.
+    # The AppImage itself, unsigned, one per arch, built natively on each runner (the CLI is
+    # linux-musl's). ubuntu-22.04, not -latest: the app needs the build host's glibc (2.35) or newer.
     name: linux (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -123,13 +127,13 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      # Builds the AppImage (tauri build) and the CLI, extracts the AppImage into the AppDir,
-      # assembles the tarball into dist/ and verifies it after a round trip (CLI run, GUI launch).
+      # Builds the AppImage (tauri build), checks it (extracted: AppRun and the app binary; a 10 s
+      # GUI launch under Xvfb) and copies it into dist/.
       - run: scripts/release-linux.sh
       - uses: actions/upload-artifact@v7
         with:
           name: release-linux-${{ matrix.arch }}
-          path: dist/*
+          path: dist/*.AppImage
           if-no-files-found: error
           retention-days: 3
 
@@ -158,12 +162,13 @@ jobs:
         with:
           node-version: lts/*
       # The web UI, then the static CLI in rust:1.100.0-alpine (by digest); checks that it has no
-      # NEEDED libraries and starts, and writes dist/ps5-dump-forge-<v>-linux-<arch>-musl.tar.gz.
+      # NEEDED libraries, starts and embeds the web UI, and writes the stripped
+      # dist/ps5-dump-forge-cli-<v>-linux-<arch>.
       - run: scripts/release-linux-musl.sh
       - uses: actions/upload-artifact@v7
         with:
           name: release-linux-musl-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          path: dist/ps5-dump-forge-cli-*-linux-*
           if-no-files-found: error
           retention-days: 3
 
@@ -211,28 +216,29 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Recompute SHA256SUMS over every platform's archives
+      - name: Recompute SHA256SUMS over every platform's files
         run: |
           cd dist
           rm -f SHA256SUMS
-          # merge-multiple lets a mislabelled leg overwrite another's archive, or a leg go missing:
-          # require exactly the nine archives of this tag before checksumming.
+          # merge-multiple lets a mislabelled leg overwrite another's file, or a leg go missing:
+          # require exactly the thirteen binaries of this tag before checksumming.
           ver=${GITHUB_REF_NAME#v}
-          printf '%s\n' \
-            "ps5-dump-forge-$ver-linux-arm64-musl.tar.gz" \
-            "ps5-dump-forge-$ver-linux-arm64.tar.gz" \
-            "ps5-dump-forge-$ver-linux-x86-64-musl.tar.gz" \
-            "ps5-dump-forge-$ver-linux-x86-64.tar.gz" \
-            "ps5-dump-forge-$ver-macos-universal.zip" \
-            "ps5-dump-forge-$ver-ps5.elf" \
-            "ps5-dump-forge-$ver-windows-arm64.zip" \
-            "ps5-dump-forge-$ver-windows-x86-64-webview2.zip" \
-            "ps5-dump-forge-$ver-windows-x86-64.zip" | LC_ALL=C sort > ../expected.txt
-          printf '%s\n' * | LC_ALL=C sort | diff ../expected.txt - || { echo "::error::dist/ does not hold exactly the expected archives"; exit 1; }
+          {
+            for a in arm64 x86-64; do
+              echo "ps5-dump-forge-$ver-macos-$a.dmg"
+              echo "ps5-dump-forge-cli-$ver-macos-$a"
+              echo "ps5-dump-forge-$ver-windows-$a.exe"
+              echo "ps5-dump-forge-cli-$ver-windows-$a.exe"
+              echo "ps5-dump-forge-$ver-linux-$a.AppImage"
+              echo "ps5-dump-forge-cli-$ver-linux-$a"
+            done
+            echo "ps5-dump-forge-$ver-ps5.elf"
+          } | LC_ALL=C sort > ../expected.txt
+          printf '%s\n' * | LC_ALL=C sort | diff ../expected.txt - || { echo "::error::dist/ does not hold exactly the expected files"; exit 1; }
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       # The catalog for ps5-payload-manager: this release's .elf and its SHA-256. It is written
-      # after SHA256SUMS and the check above, so neither lists it (it is not an archive).
+      # after SHA256SUMS and the check above, so neither lists it (it is not a binary).
       - name: Write payloads.json
         run: scripts/make-payloads-json.sh "dist/ps5-dump-forge-${GITHUB_REF_NAME#v}-ps5.elf" dist/payloads.json
       # gh is preinstalled on the runner; no third-party release action needed.
@@ -243,24 +249,21 @@ jobs:
         run: |
           ver=${GITHUB_REF_NAME#v}
           {
-            echo "macOS 11 or later (Intel and Apple Silicon): unzip the universal zip, then see \"macOS\" in README.md."
-            echo "The app is ad-hoc signed only (no Developer ID, not notarized), so macOS asks you to allow it once."
+            echo "Every download is one file, no archive: the app, or the ps5-dump-forge command-line tool (ps5-dump-forge-cli-...; it also runs the web UI with \`serve\`). Pick your system and arch (arm64 or x86-64)."
             echo
-            echo "Windows 10 or 11 (x86-64): the windows-x86-64 zip uses the Microsoft Edge WebView2 Runtime, which Windows 11 and most Windows 10 PCs already have."
-            echo "No WebView2 Runtime (or not allowed to install it)? The windows-x86-64-webview2 zip is larger but carries its own copy in its WebView2 folder."
-            echo "Windows 11 (arm64): the windows-arm64 zip uses the installed WebView2 Runtime, which Windows 11 ships."
-            echo "Unzip to a folder you can write to (the app keeps its WebView data beside it), then run PS5 Dump Forge.exe."
-            echo "The app is not signed, so SmartScreen may stop the first launch: choose \"More info\", then \"Run anyway\"."
+            echo "macOS 11 or later: open the macos-arm64 (Apple Silicon) or macos-x86-64 (Intel) .dmg and drag PS5 Dump Forge to Applications. It is ad-hoc signed only (not notarized): on the first launch macOS refuses it; open System Settings > Privacy & Security and choose \"Open Anyway\". The CLI: chmod +x it first (the same Open Anyway step applies)."
             echo
-            echo "Linux (x86-64 or arm64, glibc 2.35 or later, e.g. Ubuntu 22.04 or newer): extract the linux-x86-64 or linux-arm64 tarball (tar -xzf) to a folder you can write to (the app keeps its WebView data beside it), then run ./forge.sh."
-            echo "It needs no FUSE and no install; keep the PS5 Dump Forge.AppDir folder next to forge.sh."
-            echo "Linux without a desktop (a NAS, Alpine, an older glibc): the linux-x86-64-musl or linux-arm64-musl tarball holds the ps5-dump-forge command-line tool alone, statically linked."
+            echo "Windows 10 or 11: run the .exe (it uses the Microsoft Edge WebView2 Runtime, which Windows 11 and most Windows 10 PCs already have). Keep it in a folder you can write to (the app keeps its WebView data beside it). It is not signed, so SmartScreen may stop the first launch: choose \"More info\", then \"Run anyway\"."
+            echo
+            echo "Linux (glibc 2.35 or later, e.g. Ubuntu 22.04 or newer): chmod +x the .AppImage and run it (no install; it keeps its WebView data in data/ beside it). Without FUSE 2 (libfuse2), run it with --appimage-extract-and-run. The Linux CLI is static (musl): a NAS, Alpine or an older glibc too; chmod +x it first."
+            echo
+            echo "Update the CLI in place with \`ps5-dump-forge update --install\` (checked against SHA256SUMS); the app tells you when a release is out."
             echo
             echo "PS5 (jailbroken, with an ELF loader): load ps5-dump-forge-$ver-ps5.elf, e.g. send it to elfldr's port 9021 or list it in the webkit autoloader's autoload.txt, then open http://<ps5-ip>:8095 in a browser."
             echo "The web UI has no access control: use it on a trusted network."
             echo "ps5-payload-manager: add https://github.com/$GITHUB_REPOSITORY/releases/latest/download/payloads.json as a custom repository to install and update the payload there (payloads.json carries the .elf's SHA-256)."
             echo
-            echo "Each desktop archive (macOS, Windows, Linux) holds the app (PS5 Dump Forge.app, PS5 Dump Forge.exe or PS5 Dump Forge.AppDir with forge.sh) and the ps5-dump-forge command-line tool. README, LICENSE (GPL-3.0), the UnRAR license and THIRD-PARTY-NOTICES.md are in the source archives below, the complete corresponding source of this release. SHA256SUMS lists every archive's SHA-256."
+            echo "SHA256SUMS lists every app, CLI and .elf. README, LICENSE (GPL-3.0), the UnRAR license and THIRD-PARTY-NOTICES.md are in the source archives below, the complete corresponding source of this release."
             case "$GITHUB_REF_NAME" in *-*)
               echo
               echo "Test release: not every format has been tested on a console yet. Keep the original dump." ;;

@@ -1,9 +1,5 @@
-//! In-place editor for an existing `.exfat` image. This slice reads the volume: boot region,
-//! FAT, allocation bitmap, up-case table and the directory tree; [`plan`] turns ops into writes
-//! (deleting, renaming or moving a file or folder, adding or replacing a file, a new folder).
-//!
-//! The FAT (4 B per cluster) and the bitmap are held in memory whole, a plan's directory listings
-//! beside them while they fit, within [`MEMORY_LIMIT`].
+//! In-place editor for an existing `.exfat` image: [`plan`] turns ops into writes. The FAT and
+//! bitmap are held whole, a plan's directory listings beside them while they fit [`MEMORY_LIMIT`].
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -27,16 +23,13 @@ pub const MEMORY_LIMIT: u64 = 128 << 20;
 pub struct Volume {
     pub sector_shift: u8,
     pub cluster_shift: u8,
-    /// VolumeLength, in bytes.
     pub volume_len: u64,
     /// Byte offset and length of the (only) FAT.
     pub fat_offset: u64,
     pub fat_len: u64,
-    /// Byte offset of cluster 2.
     pub heap_offset: u64,
     pub cluster_count: u32,
     pub root_cluster: u32,
-    /// VolumeFlags' VolumeDirty bit.
     pub dirty: bool,
     /// FAT entries 0..cluster_count + 2.
     pub fat: Vec<u32>,
@@ -49,14 +42,12 @@ pub struct Volume {
     upcase: Option<Vec<u16>>,
     /// What [`plan`]'s ops changed so far; reads see it.
     changes: Changes,
-    /// [`MEMORY_LIMIT`] (lowered by tests).
     limit: u64,
 }
 
 /// The planned change set: modified copies of whole sectors, each written once.
 #[derive(Debug, Clone, Default)]
 struct Changes {
-    /// Directory sectors by byte offset in the image.
     dir: BTreeMap<u64, Vec<u8>>,
     /// FAT sectors (index from the FAT's start) whose entries in [`Volume::fat`] changed.
     fat: BTreeSet<u64>,
@@ -64,17 +55,15 @@ struct Changes {
     bitmap: BTreeSet<u64>,
     /// Directory clusters this plan allocates, their whole content (written as free space).
     fresh: BTreeMap<u32, Vec<u8>>,
-    /// The bitmap as it was before the first cluster was freed, with every cluster this plan
-    /// frees marked too: only clusters free in both are allocated, so a free-space write never
-    /// lands on bytes the current filesystem uses, nor on another free-space write.
+    /// The bitmap at open with every cluster this plan frees marked too: only clusters free in
+    /// both are allocated, so a free-space write never lands on live bytes or on another one.
     before: Option<Vec<u8>>,
     /// Bytes of the folders a delete holds in memory, waiting to be listed.
     held: u64,
     /// New files' data and zeroed tails, as free-space writes, and the bytes they hold.
     data: Vec<Write>,
     data_bytes: u64,
-    /// Free clusters when the volume was opened, those this plan took, and those it could not
-    /// take (no room: one finding at the end, "the changes need N MB ...").
+    /// Free clusters at open, those this plan took, and those it lacked room for.
     free: u64,
     taken: u64,
     short: u64,
@@ -87,8 +76,7 @@ struct Changes {
 }
 
 /// A folder's entries as [`Volume::read_dir`] would read them now: read once per plan, the
-/// entries written since re-read before its next use (so N puts into one folder don't read
-/// it N times).
+/// entries written since re-read before its next use.
 #[derive(Debug, Clone, Default)]
 struct Listing {
     clusters: Vec<u32>,
@@ -101,14 +89,12 @@ struct Listing {
     names: HashMap<Vec<u16>, BTreeSet<usize>>,
     /// Entries written since they were read.
     dirty: BTreeSet<usize>,
-    /// What it holds, roughly.
     bytes: u64,
 }
 
 /// The [`Listing`]s held, charged within [`MEMORY_LIMIT`] when added (dropped to make room).
 #[derive(Debug, Clone, Default)]
 struct Listings {
-    /// By the folder's first cluster.
     by_first: HashMap<u32, Listing>,
     /// Each cluster of a held folder: that folder's first cluster and the cluster's place in it.
     owner: HashMap<u32, (u32, usize)>,
@@ -206,7 +192,6 @@ impl Listings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream {
     pub first_cluster: u32,
-    /// DataLength in bytes.
     pub len: u64,
     pub no_fat_chain: bool,
 }
@@ -215,12 +200,10 @@ pub struct Stream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub name: String,
-    /// FileAttributes of the File entry.
     pub attributes: u16,
     pub stream: Stream,
     pub valid_len: u64,
-    /// The directory cluster holding the File entry, and the absolute byte offset of each
-    /// entry of the set (File, Stream Extension, File Names), in order.
+    /// The directory cluster holding the File entry, and the image offset of each set entry.
     pub cluster: u32,
     pub entries: Vec<u64>,
     /// The set holds benign secondaries past its names (Vendor Extension/Allocation): kept on
@@ -241,7 +224,6 @@ impl Volume {
         1 << (self.sector_shift + self.cluster_shift)
     }
 
-    /// Byte offset of heap cluster `c` (≥ 2).
     pub fn cluster_offset(&self, c: u32) -> u64 {
         self.heap_offset + (u64::from(c) - FIRST_CLUSTER) * self.cluster_size()
     }
@@ -258,7 +240,6 @@ impl Volume {
             .count() as u64
     }
 
-    /// Free clusters × cluster size.
     pub fn free_bytes(&self) -> u64 {
         self.free_clusters() * self.cluster_size()
     }
@@ -267,9 +248,8 @@ impl Volume {
         (FIRST_CLUSTER as u32..self.cluster_count + FIRST_CLUSTER as u32).contains(&c)
     }
 
-    /// The clusters of `s` in order: a contiguous run under NoFatChain, else its FAT chain.
-    /// A stream of `len` 0 owns none. A chain that loops, leaves the heap or ends early is an
-    /// error, and so is a list of clusters (4 B each) past what [`MEMORY_LIMIT`] leaves.
+    /// The clusters of `s` in order; a chain that loops, leaves the heap, ends early or passes
+    /// the memory budget is an error.
     pub fn chain(&self, s: Stream) -> io::Result<Vec<u32>> {
         self.chain_within(s, 4)
     }
@@ -307,20 +287,16 @@ impl Volume {
         self.walk(s.first_cluster, Some(n), n)
     }
 
-    /// A directory chain followed to its end of chain (the root has no DataLength), at most
-    /// what the budget leaves for a directory's clusters.
+    /// A directory chain followed to its end (the root has no DataLength), within the budget.
     fn whole_chain(&self, first: u32) -> io::Result<Vec<u32>> {
         let cap = self.remaining() / (4 + self.cluster_size());
         self.walk(first, None, cap)
     }
 
-    /// The FAT chain from `first` to its end of chain, which must come after exactly `want`
-    /// clusters when given. A free, bad or out-of-range entry before the end, a chain longer
-    /// or shorter than `want`, or one longer than the cluster count (a loop: no HashSet, the
-    /// length says it) is an error; past `cap` clusters the walk stops as too big.
+    /// The FAT chain from `first`, exactly `want` long when given. A free, bad or out-of-range
+    /// entry, a wrong length or one past the cluster count (a loop) is an error; past `cap`, too big.
     fn walk(&self, first: u32, want: Option<u64>, cap: u64) -> io::Result<Vec<u32>> {
-        // Reserved once, exactly: the loop below never pushes past `cap` (or the cluster
-        // count), so the list never regrows past its bound.
+        // The loop never pushes past `cap` or the cluster count, so this never regrows.
         let cap = cap.min(u64::from(self.cluster_count));
         let mut out = Vec::with_capacity(cap as usize);
         let mut c = first;
@@ -352,7 +328,6 @@ impl Volume {
         }
     }
 
-    /// The stream's `len` bytes, read cluster by cluster.
     pub fn read_stream(&self, image: &mut File, s: Stream) -> io::Result<Vec<u8>> {
         let clusters = self.chain(s)?;
         self.read_clusters(image, &clusters, s.len)
@@ -410,8 +385,7 @@ fn le64(b: &[u8], at: usize) -> u64 {
 }
 
 impl Volume {
-    /// Reads and checks the boot region (any valid sector and cluster shift; the boot
-    /// checksum verified), the FAT, the allocation bitmap and the up-case table.
+    /// Reads and checks the boot region (checksum verified), FAT, bitmap and up-case table.
     pub fn open(image: &mut File) -> io::Result<Volume> {
         let mut s0 = [0u8; 512];
         read_at(image, 0, &mut s0)?;
@@ -515,8 +489,7 @@ impl Volume {
         Err(too_big(total))
     }
 
-    /// The in-memory FAT and bitmap, and the sectors [`plan`]'s change set holds (or will
-    /// copy into its writes, the boot sector's two included), in bytes.
+    /// Bytes of the in-memory FAT and bitmap and the sectors the change set holds or will copy.
     fn tables_bytes(&self) -> u64 {
         let cc = u64::from(self.cluster_count);
         let c = &self.changes;
@@ -610,8 +583,7 @@ impl Volume {
         self.read_dir(image, &clusters)
     }
 
-    /// The node at game path `path` (`/`-separated, compared through the up-case table), or
-    /// `None` when it does not exist (or a parent is a file).
+    /// The node at game path `path`, or `None` when it does not exist (or a parent is a file).
     pub fn lookup(&self, image: &mut File, path: &str) -> io::Result<Option<Node>> {
         let parts: Vec<&str> = path.split('/').collect();
         if parts.iter().any(|p| p.is_empty()) {
@@ -635,8 +607,7 @@ impl Volume {
 }
 
 impl Volume {
-    /// The File entry sets of a directory held by `clusters`, each set checked (layout and
-    /// SetChecksum). Deleted entries are skipped; an end-of-directory entry stops the scan.
+    /// The checked entry sets of a directory held by `clusters`, up to end-of-directory.
     fn read_dir(&self, image: &mut File, clusters: &[u32]) -> io::Result<Vec<Node>> {
         Ok(self.scan_dir(image, clusters)?.1)
     }
@@ -672,8 +643,7 @@ impl Volume {
         Ok((raw.chunks(ENTRY).map(|e| e[0]).collect(), out))
     }
 
-    /// The listing of the folder held by `clusters` (read when not held, or held for another
-    /// chain), its written entries re-read, given to `f`. Held while it fits beside the rest.
+    /// The up-to-date listing of the folder held by `clusters`, given to `f`; kept while it fits.
     fn with_listing<R>(
         &self,
         image: &mut File,
@@ -719,8 +689,7 @@ impl Volume {
         Ok(f(&held.by_first[&first]))
     }
 
-    /// Re-reads `l`'s written entries: their EntryTypes, the sets they were or are part of,
-    /// and the sets an end-of-directory entry moved now hides or shows.
+    /// Re-reads `l`'s written entries, the sets they touch and those a moved end entry hides.
     fn refresh(&self, image: &mut File, l: &mut Listing) -> io::Result<()> {
         if l.dirty.is_empty() {
             return Ok(());
@@ -773,9 +742,8 @@ impl Volume {
     }
 }
 
-/// The entry set `set` (File entry first, then its secondaries) as a [`Node`], checked:
-/// layout and SetChecksum. `at`: the image byte of the set's entry `k`; `cluster`: the one
-/// holding its File entry.
+/// The entry set `set` as a checked [`Node`]. `at`: the image byte of entry `k`; `cluster`:
+/// the one holding its File entry.
 fn parse_set(set: &[u8], at: impl Fn(usize) -> u64, cluster: u32) -> io::Result<Node> {
     let sc = set.len() / ENTRY - 1;
     if le16(set, 2) != crate::set_checksum(set) {
@@ -844,8 +812,7 @@ impl Volume {
         1 << self.sector_shift
     }
 
-    /// The (planned) sector holding image byte `at`, copied on first touch, and `at`'s index in
-    /// it; inside a cluster this plan allocated, that cluster's content instead.
+    /// The planned sector holding image byte `at` (copied on first touch) and `at`'s index in it.
     fn dir_sector(&mut self, image: &mut File, at: u64) -> io::Result<(&mut [u8], usize)> {
         let ss = self.sector_size();
         let start = at & !(ss - 1);
@@ -929,8 +896,7 @@ impl Volume {
         was == 0 && !self.in_use(c)
     }
 
-    /// Clusters [`Self::allocatable`] holds: those free at open that this plan has not taken
-    /// (what it frees is never allocatable).
+    /// Clusters free at open that this plan has not taken.
     fn allocatable_clusters(&self) -> u64 {
         self.changes.free.saturating_sub(self.changes.taken)
     }
@@ -955,9 +921,8 @@ impl Volume {
     }
 
     /// A run of `n` allocatable clusters from the cursor on, else from the heap's start.
-    // ponytail: linear bitmap scans, a couple per file or folder (next fit keeps them short
-    // while the free space is in one piece); a free-extent index would lift a huge, fragmented
-    // image's many small files.
+    // ponytail: linear bitmap scans, a couple per file or folder; a free-extent index would lift
+    // a huge, fragmented image's many small files.
     fn find_run(&self, n: u64) -> Option<u32> {
         let (first, end) = (
             FIRST_CLUSTER as u32,
@@ -976,8 +941,7 @@ impl Volume {
         Ok(())
     }
 
-    /// A new zeroed directory cluster, `prefer` when it is allocatable, else the next free one;
-    /// marked in use (its FAT entry is the caller's). `Ok(None)`: the image is full.
+    /// A new zeroed directory cluster (`prefer` when allocatable), marked in use. `None`: full.
     fn allocate(&mut self, prefer: Option<u32>) -> io::Result<Option<u32>> {
         let found = prefer
             .filter(|&c| self.valid(c) && self.allocatable(c))
@@ -1002,18 +966,15 @@ impl Volume {
         Ok(())
     }
 
-    /// Deletes the file or folder at `path`: its entry set's InUse bits cleared, its clusters
-    /// (and its Vendor Allocations') freed; for a folder, everything under it freed too (the
-    /// sets inside are left as they are: the clusters holding them are free).
-    /// `Ok(Err(finding))` when the op does not apply.
+    /// Deletes `path`: its set's InUse bits cleared, its clusters (everything under a folder
+    /// too) freed. `Ok(Err(finding))` when the op does not apply.
     fn delete(&mut self, image: &mut File, path: &str) -> io::Result<Result<(), String>> {
         let Some(node) = self.lookup(image, path)? else {
             return Ok(Err(format!("{path}: not found")));
         };
         self.clear_set(image, &node)?;
-        // Each folder is listed before its own clusters are freed (a FAT-chained one's chain
-        // is zeroed with them). Files are freed as they are listed; folders waiting to be
-        // listed are kept on a stack (not recursed), charged to the budget with the listing.
+        // Each folder is listed before its clusters are freed (its chain is zeroed with them);
+        // folders waiting to be listed sit on a stack charged to the budget.
         let held = node_bytes(&node);
         self.fits(held)?;
         self.changes.held = held;
@@ -1082,9 +1043,7 @@ impl Volume {
         Ok(set)
     }
 
-    /// `node`'s File and Stream Extension entries (attributes, times, data) with new File Name
-    /// entries for `name`: NameLength, NameHash (this volume's up-case table), SecondaryCount
-    /// and SetChecksum renewed. The set must hold no vendor entries.
+    /// `node`'s set renamed to `name` (hash, counts and checksum renewed); no vendor entries.
     fn renamed_set(&self, image: &mut File, node: &Node, name: &str) -> io::Result<Vec<u8>> {
         let old = self.read_set(image, node)?;
         let head = old
@@ -1093,8 +1052,7 @@ impl Volume {
         Ok(self.named_set(head, name))
     }
 
-    /// File and Stream Extension entries `head` with File Name entries for `name`:
-    /// NameLength, NameHash (this volume's up-case table), SecondaryCount and SetChecksum set.
+    /// Entries `head` with File Name entries for `name`, hash, counts and checksum set.
     fn named_set(&self, head: &[u8], name: &str) -> Vec<u8> {
         let units: Vec<u16> = name.encode_utf16().collect();
         let name_entries = units.len().div_ceil(15);
@@ -1116,8 +1074,7 @@ impl Volume {
         set
     }
 
-    /// A new entry set as the writer makes one (its fixed timestamps): a file (archive) or a
-    /// folder named `name`, its data in `s` (ValidDataLength = DataLength).
+    /// A new entry set as the writer makes one: a file or folder named `name`, its data in `s`.
     fn new_set(&self, name: &str, dir: bool, s: Stream) -> Vec<u8> {
         let mut head = [0u8; 2 * ENTRY];
         head[0] = 0x85;
@@ -1140,8 +1097,7 @@ impl Volume {
     }
 }
 
-/// What a [`Node`] held in a list costs: its slot twice (a `Vec` grows by doubling), its
-/// name and its two lists.
+/// What a [`Node`] held in a list costs: its slot twice (a `Vec` doubles), name and lists.
 fn node_bytes(n: &Node) -> u64 {
     (2 * std::mem::size_of::<Node>()
         + n.name.capacity()
@@ -1149,8 +1105,7 @@ fn node_bytes(n: &Node) -> u64 {
         + n.vendor_allocations.capacity() * std::mem::size_of::<Stream>()) as u64
 }
 
-/// Stream Extension entry `e`'s flags (AllocationPossible, NoFatChain), lengths and first
-/// cluster set to `s` (ValidDataLength = DataLength).
+/// Stream Extension entry `e`'s flags, lengths and first cluster set to `s`.
 fn set_stream(e: &mut [u8], s: Stream) {
     e[0] = 0xC0;
     e[1] = if s.no_fat_chain && s.first_cluster != 0 {
@@ -1169,9 +1124,8 @@ fn split(path: &str) -> (&str, &str) {
 }
 
 impl Volume {
-    /// Renames or moves `from` to `to`: in place when the new set has as many entries and
-    /// stays in its folder, else the old set is marked unused and the new one placed in the
-    /// target folder ([`Self::place`]). `Ok(Err(finding))` when the op does not apply.
+    /// Renames or moves `from` to `to`: in place when the set keeps its size and folder, else
+    /// the old set is marked unused and a new one placed. `Ok(Err(finding))`: does not apply.
     fn rename(&mut self, image: &mut File, from: &str, to: &str) -> io::Result<Result<(), String>> {
         let Some(node) = self.lookup(image, from)? else {
             return Ok(Err(format!("{from}: not found")));
@@ -1233,13 +1187,9 @@ impl Volume {
         Ok(())
     }
 
-    /// Writes `set` into the first run of unused entries of the folder `dir` (`None`: the
-    /// root) that leaves an end-of-directory entry after the last set, else appends as many
-    /// clusters as that takes and writes the set from the start of the unused entries the
-    /// folder ends with (nothing may follow the end-of-directory entries, so the set spans
-    /// into the new clusters): the chain extended (a NoFatChain folder stays one when the next
-    /// clusters are free, else gets a FAT chain) and its DataLength and ValidDataLength grown.
-    /// Without room for those clusters the set is left out, counted in `Changes::short`.
+    /// Writes `set` into the first fitting run of unused entries of folder `dir` (`None`: the
+    /// root), else appends clusters (the chain extended, lengths grown) and writes it from the
+    /// folder's trailing unused entries. No room: left out, counted in `Changes::short`.
     fn place(
         &mut self,
         image: &mut File,
@@ -1259,10 +1209,8 @@ impl Volume {
         let per = cs as usize / ENTRY;
         let need = set.len() / ENTRY;
         let total = kinds.len();
-        // Readers stop at the first end-of-directory (0x00) entry, and one must stay after the
-        // last set (a reader may otherwise run past the folder's end). `end`: where the
-        // unused entries leading up to it start. A set goes into a run of deleted entries
-        // before `end`, else from `end` on with an end-of-directory entry after it.
+        // Readers stop at the first end-of-directory entry, and one must stay after the last
+        // set. `end`: where the unused entries leading up to it start.
         let stop = kinds.iter().position(|&k| k == 0x00).unwrap_or(total);
         let visible = kinds.get(..stop).unwrap_or_default();
         let end = stop - visible.iter().rev().take_while(|&&k| k & 0x80 == 0).count();
@@ -1277,8 +1225,7 @@ impl Volume {
         let after = end + need;
         if after < total {
             self.write_set(image, &clusters, per, end, set)?;
-            // Every entry after an end-of-directory one must be one too: the deleted entries
-            // the set did not cover are zeroed (and the entry after it, when not one yet).
+            // Every entry after an end-of-directory one must be one too: the rest are zeroed.
             for j in after..stop.max(after + 1) {
                 if kinds.get(j).is_some_and(|&k| k != 0x00) {
                     self.write_set(image, &clusters, per, j, &[0u8; ENTRY])?;
@@ -1286,8 +1233,7 @@ impl Volume {
             }
             return Ok(Ok(()));
         }
-        // Appended: the set from `end` on, spanning into new clusters (zeroed, so the entry
-        // after it is an end-of-directory one).
+        // Appended from `end` into new, zeroed clusters.
         let more = (after + 1 - total).div_ceil(per) as u64;
         let len = clusters.len() as u64 * cs;
         if len + more * cs > MAX_DIR_BYTES {
@@ -1296,7 +1242,6 @@ impl Volume {
             )));
         }
         if self.allocatable_clusters() < more {
-            // No room: counted for the plan's one finding, the set left out.
             self.changes.short += more;
             return Ok(Ok(()));
         }
@@ -1309,8 +1254,7 @@ impl Volume {
             clusters.push(c);
         }
         self.write_set(image, &clusters, per, end, set)?;
-        // A NoFatChain folder whose new clusters follow its run stays one; any other gets
-        // (or keeps) a FAT chain, written from the first link that is new.
+        // A NoFatChain folder stays one when the new clusters follow its run, else gets a chain.
         let old = clusters.len() - more as usize;
         let no_fat_chain = dir.as_ref().is_some_and(|n| n.stream.no_fat_chain);
         let contiguous = no_fat_chain && clusters.windows(2).all(|w| w[1] == w[0] + 1);
@@ -1360,9 +1304,8 @@ enum Parent {
 }
 
 impl Volume {
-    /// `n` (≥ 1) allocatable clusters as runs `(first, count)`: one contiguous run when there
-    /// is one, else the lowest ones. Taken (marked in use, counted) and FAT-chained in order,
-    /// a contiguous run too (as the writer does). `Ok(None)`: fewer than `n` are allocatable.
+    /// `n` allocatable clusters as runs, one contiguous run when there is one, else the lowest;
+    /// taken and FAT-chained in order. `Ok(None)`: fewer than `n` are allocatable.
     fn take_clusters(&mut self, n: u64) -> io::Result<Option<Vec<(u32, u64)>>> {
         if n > self.allocatable_clusters() {
             return Ok(None);
@@ -1450,8 +1393,7 @@ fn slice(data: &Data, offset: u64, len: u64) -> io::Result<Data> {
 }
 
 impl Volume {
-    /// The folder at game path `dir` (`""`: the root), made with its parents when missing:
-    /// each new one a zeroed cluster (NoFatChain) and an entry set in its parent.
+    /// The folder at game path `dir`, made with its parents when missing.
     /// `Ok(Err(finding))`: a part of the path is a file or a name exFAT can't hold.
     fn ensure_dir(&mut self, image: &mut File, dir: &str) -> io::Result<Result<Parent, String>> {
         let mut parent = Parent::Root;
@@ -1486,8 +1428,7 @@ impl Volume {
                         }
                         self.changes.missing.insert(key);
                     }
-                    // Not made for want of room (by this op or an earlier one): each folder
-                    // below it would take a cluster too, counted once.
+                    // Not made for want of room: each folder below takes a cluster, counted once.
                     for rest in dir.split('/').skip(i + 1) {
                         prefix.push('/');
                         prefix.push_str(rest);
@@ -1503,8 +1444,7 @@ impl Volume {
         Ok(Ok(parent))
     }
 
-    /// One new, empty folder `name` in `dir` (`None`: the root): a zeroed cluster and its set.
-    /// No room: counted, nothing placed.
+    /// One new, empty folder `name` in `dir` (`None`: the root). No room: counted, not placed.
     fn new_folder(
         &mut self,
         image: &mut File,
@@ -1533,11 +1473,8 @@ impl Volume {
 }
 
 impl Volume {
-    /// [`Op::Put`]: the file at `path` (its folders made when missing) gets `len` bytes of
-    /// `data` in new clusters (one run when there is one, NoFatChain; else a FAT chain), the
-    /// last cluster's tail zeroed, all as free-space writes. A new file gets a new set; a
-    /// replaced one keeps its set (name, attributes, timestamps) with the new stream, and its
-    /// old clusters are freed after (its old data never overwritten). No room: counted.
+    /// [`Op::Put`]: `len` bytes of `data` in new clusters (free-space writes). A replaced file
+    /// keeps its set with the new stream; its old clusters are freed, never overwritten.
     fn put(
         &mut self,
         image: &mut File,
@@ -1599,8 +1536,7 @@ impl Volume {
         }
     }
 
-    /// New clusters for `len` bytes of `data`, its writes planned; the stream that holds
-    /// them. No room: counted, and an empty stream stands in (the plan is refused anyway).
+    /// New clusters for `len` bytes of `data`, writes planned. No room: an empty stream.
     fn put_data(&mut self, len: u64, data: &Data) -> io::Result<Stream> {
         let cs = self.cluster_size();
         let n = len.div_ceil(cs);
@@ -1638,11 +1574,8 @@ impl Volume {
 }
 
 impl Volume {
-    /// The change set as writes: new directory clusters and file data as free-space writes,
-    /// then the live ones, each changed sector once between two writes of the boot sector: the
-    /// first sets VolumeDirty, the last clears it with PercentInUse updated (both outside the
-    /// boot checksum). In between: directory sectors (entry sets marked
-    /// deleted before the clusters they owned are freed), FAT, bitmap. No change, no writes.
+    /// The change set as writes: free-space data first, then the live sectors between two boot
+    /// sector writes (VolumeDirty set, then cleared with PercentInUse): directory, FAT, bitmap.
     fn writes(mut self, image: &mut File) -> io::Result<Vec<Write>> {
         let ss = self.sector_size();
         let c = &self.changes;
@@ -1653,8 +1586,7 @@ impl Volume {
         read_at(image, 0, &mut boot)?;
         let mut first = boot.clone();
         first[106] |= 0x2;
-        // New directory clusters first: free space (allocated only from clusters free before
-        // this plan), referenced by the live writes after them.
+        // New directory clusters first: free space the live writes then reference.
         let mut out: Vec<Write> = std::mem::take(&mut self.changes.fresh)
             .into_iter()
             .map(|(c, b)| Write {
@@ -1713,26 +1645,20 @@ impl Volume {
     }
 }
 
-/// Plans the writes that apply `ops` to the image, in order (each op sees the ones before
-/// it), reading it only. An op that does not apply (a missing path, a taken name, a path
-/// through a file) is a finding; so is too little room, once for the whole plan: "the changes
-/// need N MB, the image has M MB free" (decimal MB; data and new directory clusters counted,
-/// clusters the plan frees not reused; the image never grows).
+/// Plans the writes that apply `ops` in order, reading the image only. An op that does not
+/// apply is a finding; so is too little room, once: "the changes need N MB, the image has M MB free".
 pub fn plan(image: &mut File, ops: &[Op]) -> Result<Vec<Write>, Vec<String>> {
     plan_sized(image, ops).0
 }
 
-/// What a plan allocates in the image's free space and what it had: `needed` counts every
-/// cluster it takes (file data, new and grown directories), those it lacked room for too;
-/// `free` the free clusters when the volume was opened. Bytes.
+/// Bytes a plan allocates (`needed`, the unmet ones too) and those free at open (`free`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Space {
     pub needed: u64,
     pub free: u64,
 }
 
-/// [`plan`], with the [`Space`] the plan counted (`None` when the volume could not be read or
-/// was not planned).
+/// [`plan`], with the [`Space`] it counted (`None` when the volume was not planned).
 pub fn plan_sized(
     image: &mut File,
     ops: &[Op],
@@ -1763,8 +1689,7 @@ fn plan_volume(
     }
     let mut findings = Vec::new();
     for op in ops {
-        // Once the plan is short of room, later ops may fail only because of it (a folder or
-        // file left out): their findings are dropped, the one no-room finding stands for them.
+        // Once short of room, later ops' findings are dropped: the no-room finding stands for them.
         let short = v.changes.short > 0;
         let done = match op {
             Op::Delete { path } => v.delete(image, path).map_err(fail)?,

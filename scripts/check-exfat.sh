@@ -7,7 +7,7 @@
 # (a) macOS: attach the raw image without mounting, fsck_exfat -n, always detach.
 # (b) Docker: Debian's exfatprogs fsck.exfat -n.
 # (c) macOS, with a source dir: mount read-only and compare "files bytes alloc" (allocation
-#     rounded to 64 KiB clusters, as exfat.sh does), then every file's hash and empty dir.
+#     rounded to 64 KiB clusters), then every file's hash and empty dir.
 # Skips (a)/(c) off macOS and (b) without docker. Exits non-zero if any check fails.
 set -euo pipefail
 
@@ -29,7 +29,7 @@ attach() {
 detach() { [[ -z $dev ]] || diskutil eject "$dev" >/dev/null 2>&1 || hdiutil detach "$dev" >/dev/null 2>&1 || true; dev=""; }
 trap detach EXIT INT TERM
 
-# "files bytes alloc", macOS junk skipped — the same numbers exfat.sh compares.
+# "files bytes alloc", macOS junk skipped.
 stats() {
   find "$1" -type f ! -name .DS_Store ! -name '._*' ! -path '*/.fseventsd/*' ! -path '*/.Spotlight-V100/*' ! -path '*/.Trashes/*' \
     -exec stat -f %z {} + | awk -v c=65536 '{n++; s+=$1; a+=int(($1+c-1)/c)*c} END {print n+0, s+0, a+0}'

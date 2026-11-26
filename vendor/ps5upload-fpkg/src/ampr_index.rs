@@ -30,13 +30,7 @@ const DUPLICATE: u32 = 1;
 
 /// The lookup key: `\` as `/`, ASCII `A`–`Z` lowered, everything else as it is.
 fn key(path: &str) -> Vec<u8> {
-    path.bytes()
-        .map(|b| match b {
-            b'\\' => b'/',
-            b'A'..=b'Z' => b + 0x20,
-            _ => b,
-        })
-        .collect()
+    path.bytes().map(fold).collect()
 }
 
 /// The format's FNV offset basis (see the module notes): not the standard `0xcbf29ce484222325`.
@@ -44,10 +38,408 @@ const BASIS: u64 = 1_469_598_103_934_665_603;
 
 /// 64-bit FNV-1a of a path's key, from the format's basis.
 pub fn hash(path: &str) -> u64 {
-    let h = key(path).iter().fold(BASIS, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    hash_bytes(path.as_bytes())
+}
+
+/// [`hash`] of a path's bytes (the runtime hashes bytes; a path need not be UTF-8).
+fn hash_bytes(path: &[u8]) -> u64 {
+    let h = path.iter().fold(BASIS, |h, &b| {
+        (h ^ u64::from(fold(b))).wrapping_mul(0x0100_0000_01b3)
     });
     h.max(1)
+}
+
+/// One byte of the key: `\` as `/`, ASCII `A`–`Z` lowered.
+fn fold(b: u8) -> u8 {
+    match b {
+        b'\\' => b'/',
+        b'A'..=b'Z' => b + 0x20,
+        _ => b,
+    }
+}
+
+// ─── The runtime's rules ────────────────────────────────────────────────────────────────────
+//
+// What ampr-emu-ng checks before it trusts an index (quer3q/ampr-emu-ng, GPL-3.0, like this
+// project): `crates/ampr-format/src/index.rs` (`Layout::parse`, `Index::check`, `checked_path`,
+// `kernel_path_limits`, `find`), `crates/ampr-format/src/lib.rs` (`logical_path`,
+// `safe_components`) and `crates/ampr-format/src/view_join.rs` (`join_zstd`, `join_records`),
+// as `docs/zstd-format.md` "What the runtime needs from ampr_emu.index" lists them. One record
+// that fails makes the whole file invalid: a title without packs then gets an index the runtime
+// builds from the folder, and a title with packs has none of its packed files served.
+
+/// SCE_KERNEL_PATH_MAX: every stored path is shorter than this, `/app0/` included.
+pub const PATH_MAX: usize = 1024;
+/// SCE_KERNEL_NAME_MAX: the longest name part of a path, in bytes.
+pub const NAME_MAX: usize = 255;
+/// The runtime's limits on the header (`MAX_RECORDS`, `MAX_PATH_BYTES`).
+const MAX_RECORDS: u64 = 2_000_000;
+const MAX_PATH_BYTES: u64 = 256 << 20;
+/// Hash-table steps [`check`] takes per record on average before it refuses the table.
+const MAX_PROBES_PER_RECORD: usize = 64;
+
+/// Why the runtime would refuse `path` (an index path, `/app0/...`), or `None`. Bytes, as the
+/// runtime counts them: a name of 100 CJK characters is 300 bytes, over [`NAME_MAX`].
+pub fn path_problem(path: &[u8]) -> Option<String> {
+    if path.len() >= PATH_MAX {
+        return Some(format!(
+            "the path is {} bytes long; the AMPR runtime takes paths under {PATH_MAX} bytes \
+             (with /app0/)",
+            path.len()
+        ));
+    }
+    if let Some(part) = path.split(|&b| b == b'/').find(|p| p.len() > NAME_MAX) {
+        return Some(format!(
+            "a name in the path is {} bytes long; the AMPR runtime takes names of at most \
+             {NAME_MAX} bytes",
+            part.len()
+        ));
+    }
+    let app0 = path.len() > 6
+        && path[0] == b'/'
+        && path[5] == b'/'
+        && path[1..5].iter().map(|&b| fold(b)).eq(*b"app0");
+    if !app0 {
+        return Some("the path does not start with /app0/".into());
+    }
+    if path.contains(&0) {
+        return Some("the path holds a NUL byte".into());
+    }
+    if path.contains(&b'\\') {
+        return Some("the path holds a backslash (\\)".into());
+    }
+    if path[6..]
+        .split(|&b| b == b'/')
+        .any(|p| p.is_empty() || p == b"." || p == b"..")
+    {
+        return Some("the path has an empty, \".\" or \"..\" part".into());
+    }
+    None
+}
+
+/// What [`check`] found in an index the runtime accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checked {
+    /// Records in it.
+    pub records: usize,
+    /// Records in folded order: the runtime pages such an index without building a rank order.
+    pub sorted: bool,
+}
+
+/// Whether two paths are equal with `A`-`Z` folded to `a`-`z` (and `\` to `/`).
+fn folded_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| fold(x) == fold(y))
+}
+
+/// The runtime's checks of an `ampr_emu.index` (ampr-emu-ng `Index::open`: `Layout::parse`, then
+/// `Index::check`), or the first reason it would refuse the file, in plain words. Every record's
+/// path keeps the rules of [`path_problem`] and is NUL-terminated in the path blob; every slot
+/// carries its record's hash; every record is the lookup's answer for its own path, so no two
+/// paths are equal after folding letter case.
+pub fn check(d: &[u8]) -> Result<Checked, String> {
+    fn bad<T>(why: &str) -> Result<T, String> {
+        Err(format!("{NAME} is not one the AMPR runtime accepts: {why}"))
+    }
+    let u32_at = |at: usize| {
+        d.get(at..at.checked_add(4)?)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let u64_at = |at: usize| {
+        d.get(at..at.checked_add(8)?)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    if d.len() < HEADER || &d[..8] != MAGIC {
+        return bad("it has no AMPRIDX3 header");
+    }
+    let field = |at: usize| u32_at(at).unwrap_or(0);
+    if field(8) != 3 || field(12) as usize != RECORD || field(40) as usize != SLOT {
+        return bad("its header names another version or record size");
+    }
+    let count = u64_at(0x10).unwrap_or(0);
+    let path_bytes = u64_at(0x18).unwrap_or(0);
+    let slots_at = u64_at(0x20).unwrap_or(0);
+    let slot_count = field(0x2C);
+    if count == 0 {
+        return bad("it lists no file");
+    }
+    if count > MAX_RECORDS || !(1..=MAX_PATH_BYTES).contains(&path_bytes) {
+        return bad("it lists more files or path bytes than the runtime takes");
+    }
+    if slot_count < 2 || !slot_count.is_power_of_two() || u64::from(slot_count) < count {
+        return bad("its hash table is not a power of two at least as large as its records");
+    }
+    // Bounded above (count and path_bytes are capped), but every sum and product of the file's
+    // own numbers is checked: a hostile index names a table at the end of the address space.
+    let paths_at = HEADER as u64 + count * RECORD as u64;
+    if paths_at
+        .checked_add(path_bytes)
+        .is_none_or(|end| slots_at < end)
+        || slots_at % 8 != 0
+    {
+        return bad("its hash table overlaps its paths or is not 8-byte aligned");
+    }
+    let file_len = u64::from(slot_count)
+        .checked_mul(SLOT as u64)
+        .and_then(|t| t.checked_add(slots_at));
+    if file_len.is_none_or(|end| (d.len() as u64) < end) {
+        return bad("it is shorter than its header says");
+    }
+    // Within `d` from here (its length is a usize): the casts and the sums below fit.
+    let (count, paths_at, path_bytes) = (count as usize, paths_at as usize, path_bytes as usize);
+    let (slots_at, slot_count) = (slots_at as usize, slot_count as usize);
+    // Record `id` (one-based): its path without the NUL, and its size.
+    let record = |id: usize| -> Result<&[u8], String> {
+        let r = HEADER + (id - 1) * RECORD;
+        let (off, len) = (field(r) as usize, field(r + 4) as usize);
+        match off.checked_add(len) {
+            Some(end) if len < PATH_MAX && end < path_bytes => {
+                Ok(&d[paths_at + off..paths_at + end])
+            }
+            _ => Err(format!("record {id}'s path is out of bounds or too long")),
+        }
+    };
+    let shown = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+    let mut sorted = true;
+    let mut previous: Option<&[u8]> = None;
+    for id in 1..=count {
+        let path = record(id).or_else(|e| bad(&e))?;
+        let r = HEADER + (id - 1) * RECORD;
+        let end = paths_at + field(r) as usize + path.len();
+        if d[end] != 0 {
+            return bad(&format!("{}: its path has no NUL after it", shown(path)));
+        }
+        if let Some(why) = path_problem(path) {
+            return bad(&format!("{}: {why}", shown(path)));
+        }
+        if previous.is_some_and(|p| p.iter().map(|&b| fold(b)).gt(path.iter().map(|&b| fold(b)))) {
+            sorted = false;
+        }
+        previous = Some(path);
+    }
+    // `pos` < slot_count: inside `d` (checked above). Checked anyway; out of range reads empty.
+    let slot = |pos: usize| {
+        let Some(at) = pos.checked_mul(SLOT).and_then(|o| o.checked_add(slots_at)) else {
+            return (0, 0, 0);
+        };
+        (
+            u64_at(at).unwrap_or(0),
+            at.checked_add(8).map_or(0, field) as usize,
+            at.checked_add(12).map_or(0, field),
+        )
+    };
+    let mut occupied = 0usize;
+    for pos in 0..slot_count {
+        let (hash, id, flags) = slot(pos);
+        if id == 0 {
+            if hash != 0 || flags != 0 {
+                return bad("an empty hash slot is not zero");
+            }
+            continue;
+        }
+        if id > count || flags & !DUPLICATE != 0 {
+            return bad("a hash slot names no record or carries unknown flags");
+        }
+        let path = record(id).or_else(|e| bad(&e))?;
+        if hash != hash_bytes(path) {
+            return bad(&format!(
+                "{}: its hash slot holds another hash",
+                shown(path)
+            ));
+        }
+        occupied += 1;
+    }
+    if occupied != count {
+        return bad("its hash table does not hold every record once");
+    }
+    let mask = slot_count - 1;
+    // Every lookup walks its run of full slots: a table the runtime's builders write (at most
+    // half full) takes a step or two each. One whose records all collide would take count² steps
+    // (hours for two million): refused past a budget no real index comes near.
+    let mut budget = count.saturating_mul(MAX_PROBES_PER_RECORD);
+    for id in 1..=count {
+        let path = record(id).or_else(|e| bad(&e))?;
+        let h = hash_bytes(path);
+        let mut pos = h as usize & mask;
+        let mut found = None;
+        for _ in 0..slot_count {
+            if budget == 0 {
+                return bad("its hash table is too crowded to look every file up");
+            }
+            budget -= 1;
+            let (slot_hash, slot_id, _) = slot(pos);
+            if slot_id == 0 {
+                break;
+            }
+            if slot_hash == h && folded_eq(record(slot_id).or_else(|e| bad(&e))?, path) {
+                found = Some(slot_id);
+                break;
+            }
+            pos = (pos + 1) & mask;
+        }
+        match found {
+            Some(f) if f == id => {}
+            Some(f) => {
+                return bad(&format!(
+                    "{} and {} differ only in letter case",
+                    shown(record(f).or_else(|e| bad(&e))?),
+                    shown(path)
+                ))
+            }
+            None => return bad(&format!("{} is not found through its hash", shown(path))),
+        }
+    }
+    Ok(Checked {
+        records: count,
+        sorted,
+    })
+}
+
+/// The runtime's join of `ampr_zstd.index` to the index (ampr-emu-ng `join_zstd`): each packed
+/// file, `(path relative to /app0, logical size)` as `ampr_zstd.index` lists it, needs a record
+/// whose path is `/app0/` plus its own (letter case aside) at the same size. A packed file with
+/// no record is never served; one at another size makes the runtime serve no packed file at
+/// all; of two that differ only in case, the second is never served. `index` must pass
+/// [`check`].
+pub fn check_zstd<'a>(
+    index: &[u8],
+    packed: impl IntoIterator<Item = (&'a str, u64)>,
+) -> Result<(), String> {
+    let entries = parse(index).ok_or_else(|| format!("{NAME} does not read"))?;
+    let sizes: std::collections::HashMap<String, u64> = entries
+        .into_iter()
+        .map(|e| (e.path.to_ascii_lowercase(), e.size))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for (path, size) in packed {
+        let key = path.to_ascii_lowercase();
+        match sizes.get(&key) {
+            None => {
+                return Err(format!(
+                    "{path} is in the zstd packs but not in {NAME}, so the game could not open \
+                     it"
+                ))
+            }
+            Some(&listed) if listed != size => {
+                return Err(format!(
+                    "{path} is {size} bytes in ampr_zstd.index and {listed} in {NAME}; the AMPR \
+                     runtime then serves no packed file"
+                ))
+            }
+            Some(_) => {}
+        }
+        if !seen.insert(key) {
+            return Err(format!(
+                "two files in the zstd packs differ from {path} only in letter case; the second \
+                 would never be served"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The runtime's join of an LZ4 manifest (`ampr_assets.index`, AMPRPAK4) to the index
+/// (ampr-emu-ng `join_records`): manifest record `i` is index record `i + 1`, and a packed one
+/// has that record's size and the hash of its path. A packed record that does not match is never
+/// served. `index` must pass [`check`].
+pub fn check_lz4(
+    index: &[u8],
+    manifest: &[crate::ampr_pack::format::FileRecord],
+) -> Result<(), String> {
+    let entries = parse(index).ok_or_else(|| format!("{NAME} does not read"))?;
+    for (i, f) in manifest.iter().enumerate().filter(|(_, f)| f.packed()) {
+        let Some(e) = entries.get(i) else {
+            return Err(format!(
+                "the LZ4 manifest has a packed file at record {} and {NAME} only {} records",
+                i + 1,
+                entries.len()
+            ));
+        };
+        let path = format!("/app0/{}", e.path);
+        if f.logical_size != e.size || f.path_hash != crate::ampr_pack::format::path_hash(&path) {
+            return Err(format!(
+                "the LZ4 manifest's record {} is not {path} at {} bytes, as {NAME} lists it; the \
+                 game could not open that file",
+                i + 1,
+                e.size
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The files `ampr_zstd.index` (AMPRZPK1) lists, `(path relative to /app0, logical size)`, read
+/// from its header and file records alone; `None` when it does not read as one. For
+/// [`check_zstd`] where the zstd reader is not at hand (this crate's checks of a game).
+pub fn zstd_files(d: &[u8]) -> Option<Vec<(String, u64)>> {
+    let u64_at = |at: usize| Some(u64::from_le_bytes(d.get(at..at + 8)?.try_into().ok()?));
+    if d.get(..8)? != b"AMPRZPK1" {
+        return None;
+    }
+    let count = usize::try_from(u64_at(40)?).ok()?;
+    let files_at = usize::try_from(u64_at(56)?).ok()?;
+    let strings_at = usize::try_from(u64_at(80)?).ok()?;
+    let strings = d.get(strings_at..strings_at.checked_add(usize::try_from(u64_at(88)?).ok()?)?)?;
+    let mut out = Vec::with_capacity(count.min(d.len() / 32));
+    for i in 0..count {
+        let r = d
+            .get(files_at.checked_add(i.checked_mul(32)?)?..)?
+            .get(..32)?;
+        let size = u64::from_le_bytes(r[8..16].try_into().ok()?);
+        let off = u32::from_le_bytes(r[20..24].try_into().ok()?) as usize;
+        let len = u16::from_le_bytes(r[24..26].try_into().ok()?) as usize;
+        let path = std::str::from_utf8(strings.get(off..off.checked_add(len)?)?).ok()?;
+        out.push((path.to_string(), size));
+    }
+    Some(out)
+}
+
+/// Gives the record of `from` (a path relative to `/app0`) the spelling `to`, which differs from
+/// it only in ASCII letter case: same length, same hash, same place in the folded order, so the
+/// bytes are changed where they are and nothing else moves. Whether a record was changed.
+pub fn respell(d: &mut [u8], from: &str, to: &str) -> bool {
+    if from.len() != to.len() || !from.eq_ignore_ascii_case(to) || d.get(..8) != Some(MAGIC) {
+        return false;
+    }
+    let u32_at = |d: &[u8], at: usize| {
+        d.get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())) as usize
+    };
+    let u64_at = |d: &[u8], at: usize| {
+        d.get(at..at + 8)
+            .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap())) as usize
+    };
+    let count = u64_at(d, 0x10);
+    let Some(paths_at) = count
+        .checked_mul(RECORD)
+        .and_then(|n| n.checked_add(HEADER))
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for i in 0..count {
+        let r = HEADER + i * RECORD;
+        if r + RECORD > d.len() {
+            break;
+        }
+        let (off, len) = (u32_at(d, r), u32_at(d, r + 4));
+        let at = paths_at.saturating_add(off);
+        let Some(path) = d.get_mut(at..at.saturating_add(len)) else {
+            continue;
+        };
+        if len == from.len() + 6
+            && folded_eq(&path[6..], from.as_bytes())
+            && &path[6..] != to.as_bytes()
+        {
+            path[6..].copy_from_slice(to.as_bytes());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Where record `i`'s size sits in an index (a plain u64, no checksum over it).
+pub(crate) fn size_at(i: usize) -> usize {
+    HEADER + i * RECORD + 8
 }
 
 /// The index's name at the image root.
@@ -75,8 +467,15 @@ pub fn build(files: &[(String, u64)], mtime: i64) -> Result<Vec<u8>, String> {
     build_entries(&entries)
 }
 
-/// The index for `entries`, each with its own mtime.
+/// The index for `entries`, each with its own mtime. Fails, in plain words, on anything the AMPR
+/// runtime would refuse the whole index for ([`check`]): no file, a path it does not take
+/// ([`path_problem`]), two paths that differ only in case.
 pub fn build_entries(entries: &[Entry]) -> Result<Vec<u8>, String> {
+    if entries.is_empty() {
+        return Err(format!(
+            "{NAME} would list no file, which the AMPR runtime refuses"
+        ));
+    }
     let mut rows: Vec<(Vec<u8>, String, u64, i64)> = entries
         .iter()
         .map(|e| {
@@ -84,6 +483,15 @@ pub fn build_entries(entries: &[Entry]) -> Result<Vec<u8>, String> {
             (key(&path), path, e.size, e.mtime)
         })
         .collect();
+    if let Some((path, why)) = rows
+        .iter()
+        .find_map(|r| path_problem(r.1.as_bytes()).map(|why| (&r.1, why)))
+    {
+        return Err(format!(
+            "{path}: {why}, and one such file makes it refuse the whole {NAME}; rename the file \
+             or leave it out"
+        ));
+    }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     if let Some(w) = rows.windows(2).find(|w| w[0].0 == w[1].0) {
         return Err(format!(
@@ -135,6 +543,8 @@ pub fn build_entries(entries: &[Entry]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&index.to_le_bytes());
         out.extend_from_slice(&flags.to_le_bytes());
     }
+    // Every index made here passes the runtime's own checks before anything writes it.
+    check(&out)?;
     Ok(out)
 }
 
@@ -171,8 +581,162 @@ pub fn parse(d: &[u8]) -> Option<Vec<Entry>> {
     Some(out)
 }
 
+/// Where a rebuild keeps the index it replaced, once: a second rebuild leaves it alone, so it is
+/// always the game's own (#621).
+pub const BACKUP: &str = "ampr_emu.index.bak";
+
+/// What an index lists for a game's `files`: every file at its size, but the index itself. A
+/// game image's build (the engine's `AmprIndexed`) and [`rebuild`] both list this, so an index
+/// rebuilt in place is the one the game's image would carry.
+pub fn listing(files: &[crate::source::SourceFile]) -> Vec<(String, u64)> {
+    files
+        .iter()
+        .filter(|f| !f.path.eq_ignore_ascii_case(NAME))
+        .map(|f| (f.path.clone(), f.size))
+        .collect()
+}
+
+/// Why an index is not rebuilt for a game in LZ4 packs: the runtime ties manifest record `i` to
+/// index record `i + 1` ([`check_lz4`]), so an index made again could leave packed files unserved.
+pub const LZ4_PACKED: &str = "this game's files are in LZ4 asset packs, whose manifest is tied \
+                              to its ampr_emu.index record by record; convert the game again \
+                              to get a fresh index";
+
+/// Whether `path` is `ampr_zstd.index` or one of its volumes at the game's root.
+fn zstd_pack_file(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    !p.contains('/')
+        && (p == "ampr_zstd.index" || (p.starts_with("ampr_zstd-") && p.ends_with(".pak")))
+}
+
+/// What the index of a game in zstd packs lists, as the packer made it: every file on disk but
+/// the index and the packs, and every packed file at the size `ampr_zstd.index` gives it (the
+/// runtime refuses the packs when the two disagree).
+pub fn zstd_listing(
+    tree: &mut dyn crate::source::SourceTree,
+) -> Result<Vec<(String, u64)>, String> {
+    let packed = zstd_packed(tree)?;
+    Ok(zstd_listing_of(tree.files(), packed))
+}
+
+/// The files the game's `ampr_zstd.index` lists ([`zstd_files`]).
+pub fn zstd_packed(tree: &mut dyn crate::source::SourceTree) -> Result<Vec<(String, u64)>, String> {
+    let at = tree
+        .files()
+        .iter()
+        .find(|f| f.path.eq_ignore_ascii_case("ampr_zstd.index"))
+        .map(|f| f.path.clone())
+        .ok_or("the game has no ampr_zstd.index")?;
+    let bytes = crate::source::read_small(tree, &at, crate::source::MAX_INDEX_BYTES)
+        .map_err(|e| format!("{at}: {e}"))?;
+    zstd_files(&bytes).ok_or_else(|| format!("{at} does not read"))
+}
+
+/// [`zstd_listing`] of a game's `files` and the `packed` files its `ampr_zstd.index` lists.
+pub fn zstd_listing_of(
+    files: &[crate::source::SourceFile],
+    packed: Vec<(String, u64)>,
+) -> Vec<(String, u64)> {
+    // A file both on disk and in the packs is one record, the packed one (the runtime serves
+    // that record from the packs).
+    let in_packs: std::collections::HashSet<String> =
+        packed.iter().map(|(p, _)| p.to_ascii_lowercase()).collect();
+    let loose: Vec<crate::source::SourceFile> = files
+        .iter()
+        .filter(|f| !zstd_pack_file(&f.path) && !in_packs.contains(&f.path.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    let mut listed = listing(&loose);
+    listed.extend(packed);
+    listed
+}
+
+/// Why an index is not rebuilt for a game that does not read through AMPR.
+pub const NOT_AMPR: &str = "this game's eboot.bin does not import libSceAmpr, so ampr_emu \
+                            never reads an ampr_emu.index for it";
+
+/// An index regenerated for a game as it stands (Workshop's "Rebuild AMPR index", #621).
+#[derive(Debug)]
+pub struct Rebuilt {
+    /// The new `ampr_emu.index`.
+    pub index: Vec<u8>,
+    /// How many files it lists.
+    pub files: usize,
+    /// The index the game had, and its path in the game (its own spelling), when it had one.
+    pub old: Option<(String, Vec<u8>)>,
+    /// Keep the old index as [`BACKUP`]: it had one and there is no backup yet. The new index
+    /// lists the backup, which is in the folder once it is written.
+    pub save_backup: bool,
+    /// The new index lists other files or sizes than the old one did (mtimes and the backup
+    /// aside: every rebuild stamps its own); true when there was none or it was unreadable.
+    pub differs: bool,
+}
+
+/// Regenerates the index of the game in `tree`, every file stamped `mtime`, without writing
+/// anything: the caller puts [`Rebuilt::index`] at the game's root (and the backup beside it).
+/// Refused ([`NOT_AMPR`]) unless `eboot.bin` imports libSceAmpr, the same test a build uses.
+pub fn rebuild(tree: &mut dyn crate::source::SourceTree, mtime: i64) -> Result<Rebuilt, String> {
+    // A game in packs is read through the index whatever its eboot imports (ampr-emu-ng
+    // serves zstd packs of a game without libSceAmpr too).
+    let packs = crate::source::packed_kind(tree).map_err(|e| e.to_string())?;
+    if packs.is_none() && !crate::source::imports_ampr(tree, "eboot.bin") {
+        return Err(NOT_AMPR.to_string());
+    }
+    let old_path = tree
+        .files()
+        .iter()
+        .find(|f| f.path.eq_ignore_ascii_case(NAME))
+        .map(|f| f.path.clone());
+    let old = match old_path {
+        Some(p) => Some((
+            p.clone(),
+            crate::source::read_small(tree, &p, crate::source::MAX_INDEX_BYTES)
+                .map_err(|e| format!("{p}: {e}"))?,
+        )),
+        None => None,
+    };
+    let has_backup = tree
+        .files()
+        .iter()
+        .any(|f| f.path.eq_ignore_ascii_case(BACKUP));
+    let save_backup = old.is_some() && !has_backup;
+    let mut listed = match packs {
+        None => listing(tree.files()),
+        Some("zstd") => zstd_listing(tree)?,
+        Some(_) => return Err(LZ4_PACKED.to_string()),
+    };
+    if save_backup {
+        let len = old.as_ref().map_or(0, |(_, d)| d.len() as u64);
+        listed.push((BACKUP.to_string(), len));
+    }
+    let index = build(&listed, mtime)?;
+    // The game's files, the backup aside: keeping the old index is not a difference in it.
+    let shape = |rows: &mut dyn Iterator<Item = (String, u64)>| {
+        let mut v: Vec<(String, u64)> = rows
+            .filter(|(p, _)| !p.eq_ignore_ascii_case(BACKUP))
+            .map(|(p, s)| (p.to_ascii_lowercase(), s))
+            .collect();
+        v.sort();
+        v
+    };
+    let differs = match old.as_ref().and_then(|(_, d)| parse(d)) {
+        None => true,
+        Some(before) => {
+            shape(&mut before.into_iter().map(|e| (e.path, e.size)))
+                != shape(&mut listed.iter().cloned())
+        }
+    };
+    Ok(Rebuilt {
+        files: listed.len(),
+        index,
+        old,
+        save_backup,
+        differs,
+    })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn u32_at(d: &[u8], at: usize) -> u32 {
@@ -266,5 +830,33 @@ mod tests {
         let mut bad = d.clone();
         bad[7] = b'2';
         assert!(parse(&bad).is_none());
+    }
+
+    /// What [`build`] refuses rather than write an index the runtime would throw away whole.
+    #[test]
+    fn build_refuses_what_the_runtime_refuses() {
+        let one = |p: &str| build(&[(p.to_string(), 1)], 0);
+        assert!(one("data/\u{3042}\u{3044}.bin").is_ok());
+        let long_name = format!("data/{}", "\u{3042}".repeat(86));
+        let e = one(&long_name).unwrap_err();
+        assert!(e.contains("255 bytes") && e.contains("rename"), "{e}");
+        let long_path = format!("{}/x.bin", vec!["d"; 510].join("/"));
+        assert!(one(&long_path).unwrap_err().contains("under 1024 bytes"));
+        for bad in [
+            "a\\b.bin",
+            "a//b.bin",
+            "./a.bin",
+            "a/../b.bin",
+            "a\0b",
+            "a/",
+        ] {
+            assert!(one(bad).is_err(), "{bad:?}");
+        }
+        assert!(build(&[], 0).unwrap_err().contains("no file"));
+        // At the limit: a 1023-byte path (with /app0/) is taken.
+        let dirs = vec!["d".repeat(200); 4].join("/");
+        let at_limit = format!("{dirs}/{}", "e".repeat(1023 - 6 - dirs.len() - 1));
+        assert_eq!(at_limit.len() + 6, PATH_MAX - 1);
+        assert!(one(&at_limit).is_ok());
     }
 }

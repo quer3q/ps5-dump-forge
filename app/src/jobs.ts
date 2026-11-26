@@ -1,5 +1,4 @@
-// Job list state, fed by `job://*` events (and, in the http build, rebuilt from the server's
-// job list). Lives in App so it survives tab switches.
+// Job list state, fed by `job://*` events (http build: the server's job list); lives in App.
 
 import type {
   ConvertRequest,
@@ -24,31 +23,32 @@ export interface Job {
   stage?: string;
   /** Every stage the job will run, in order, once core said (`job://stages`). */
   stages?: string[];
-  /** Where `stage` is in `stages`: searched forward from the last one, so a stage id that comes
-   * twice is found in order. */
+  /** Where `stage` is in `stages`, searched forward (a stage id may come twice). */
   step?: number;
   done: number;
   total: number;
   /** Shown fraction, 0..1. Never drops: core's job total is an estimate that can grow. */
   shown: number;
-  /** When the current stage began, and how far it was then (for the rate). */
   stageAt: number;
   stageDone: number;
-  /** Milliseconds left in the job at the current stage's rate, when a rate is known. */
+  stageTotal: number;
+  /** Core's `stage_done`/`stage_total`; absent from an older server. */
+  stageBytes?: { done: number; total: number };
+  /** Milliseconds left in the job at the current stage's rate. */
   etaMs?: number;
-  /** Bytes per second in the current stage, when known. */
   speed?: number;
   log: string[];
   result?: JobResult;
+  /** On this page (not for a restored job): the result card's time. */
+  startedAt?: number;
+  endedAt?: number;
   /** Started from this page (not restored by a reload): its row scrolls into view. */
   fresh?: boolean;
-  /** A job on a paired peer that uses this device's files (Connect's `remote_jobs`): shown read
-   * only, only cancellable. Its `id` is the peer's. */
+  /** A paired peer's job using this device's files: read only but Cancel; `id` is the peer's. */
   remote?: { keyId: string; name: string; cancelling: boolean; instance?: string };
 }
 
-/** What a Pack tab job does, for its row's tag: an LZ4 or zstd pack or unpack. A legacy `lz4`
- * target is an LZ4 pack into a folder. */
+/** An LZ4 or zstd pack or unpack, for its row's tag (a legacy `lz4` target: an LZ4 pack). */
 export function packJob(r: ConvertRequest | undefined): { kind: "lz4" | "zstd"; id: "pack" | "unpack" } | null {
   if (!r) return null;
   if (r.zstd_pack) return { kind: "zstd", id: "pack" };
@@ -61,14 +61,12 @@ export function packJob(r: ConvertRequest | undefined): { kind: "lz4" | "zstd"; 
 /** The zstd level a zstd pack request without one gets (core's `DEFAULT_ZSTD_LEVEL`). */
 export const DEFAULT_ZSTD_LEVEL = 5;
 
-/** The tab a job belongs to (its counter and colour): a package install (Storage; a peer's, using
- * this device's package, Connect), a transfer (Connect), an edit or extract (Edit), a Pack tab
- * job (LZ4 or zstd, pack or unpack), else a conversion. */
+/** A job's type, for its row's tag. */
 export type JobType = "convert" | "edit" | "pack" | "transfer" | "install";
 export function jobType(r: ConvertRequest | undefined): JobType {
   if (r?.install) return "install";
   if (r?.transfer?.length) return "transfer";
-  if (r?.edits?.length || r?.extract?.length) return "edit";
+  if (r?.edits?.length || r?.extract?.length || r?.recover_metadata) return "edit";
   if (packJob(r)) return "pack";
   return "convert";
 }
@@ -80,17 +78,30 @@ export type Action =
   | { type: "log"; e: LogEvent }
   | { type: "done"; e: DoneEvent }
   | { type: "restore"; e: JobsRestore; at: number }
-  | { type: "dismiss"; id: JobId };
+  | { type: "dismiss"; id: JobId }
+  | { type: "clearFinished" };
 
-/** The bar for `done` of `total`: never back, and short of full until the job succeeds (core's
- * estimate can be met before its last pass ends). */
+/** A cancel, also an edit's "cancelled; ..." (what stays changed). */
+export function isCancelled(j: Job): boolean {
+  const r = j.result;
+  return !!r && "Err" in r && (r.Err === "cancelled" || r.Err.startsWith("cancelled; "));
+}
+
+/** A failure here (not a cancel, not a peer's job) can start again, but not an edit adding a
+ * browser's uploads: their staging folder goes when the job ends. */
+export function canRetry(j: Job): boolean {
+  const r = j.result;
+  const staged = j.request?.edits?.some((e) => e.op === "add" && /\.forge-upload-\d+\.part[\\/]/.test(e.from));
+  return !j.remote && !!j.request && !staged && !!r && "Err" in r && !isCancelled(j);
+}
+
+/** Never back, and short of full until the job succeeds (core's estimate can be met early). */
 function bar(shown: number, done: number, total: number): number {
   return Math.max(shown, total > 0 ? Math.min(UNFINISHED, done / total) : 0);
 }
 const UNFINISHED = 0.99;
 
-/** `stage`'s index in `stages`, from `from` on, else anywhere; else `from` (a stage the list
- * doesn't name leaves the step where it was). */
+/** `stage`'s index in `stages`, from `from` on, else anywhere, else `from`. */
 function stepOf(stages: string[] | undefined, stage: string | undefined, from: number | undefined): number | undefined {
   if (!stages || stage === undefined) return from;
   const i = stages.indexOf(stage, from ?? 0);
@@ -100,37 +111,61 @@ function stepOf(stages: string[] | undefined, stage: string | undefined, from: n
 }
 
 function blank(id: JobId): Job {
-  return { id, done: 0, total: 0, shown: 0, stageAt: 0, stageDone: 0, log: [] };
+  return { id, done: 0, total: 0, shown: 0, stageAt: 0, stageDone: 0, stageTotal: 0, log: [] };
 }
 
-/** A job as the server's list has it: request, last progress, log tail and result. */
 function fromSnapshot(j: Job, s: Omit<SnapshotJob, "log_total">, at: number): Job {
   let k: Job = { ...j, request: s.request ?? j.request, log: s.log.slice(-LOG_LINES) };
   if (s.stages?.length) k = { ...k, stages: s.stages };
   const p = s.progress;
   if (p) {
     const shown = bar(j.shown, p.done, p.total);
-    k = { ...k, stage: p.stage, done: p.done, total: p.total, shown, stageAt: at, stageDone: p.done };
-    k = { ...k, etaMs: undefined, speed: undefined };
+    k = { ...k, stage: p.stage, done: p.done, total: p.total, shown, stageAt: stageStart(p, at), stageDone: p.done, stageTotal: p.total };
+    k = { ...k, stageBytes: sameStageBytes(j, p), ...rateOf(p) };
   }
   k = { ...k, step: stepOf(k.stages, k.stage, k.step) };
   if (s.done) k = finish(k, s.done.result);
   return k;
 }
 
-/** Connect's `remote_jobs` as rows, each built on its row in `prev` (same peer and id): the bar
- * never drops and a stage keeps its start while it lasts. */
+/** Connect's `remote_jobs` as rows, each built on its row in `prev`, so the bar never drops. */
 export function remoteJobs(list: RemoteJob[], prev: Job[], at: number): Job[] {
   return list.map((r) => {
     // Same peer, same run (ids start again at 1 when it restarts), same id.
     const old = prev.find((j) => j.remote?.keyId === r.key_id && j.remote.instance === r.instance && j.id === r.job.id);
     let k = fromSnapshot(old ?? blank(r.job.id), r.job, at);
-    if (old && old.stage !== undefined && old.stage === k.stage) k = { ...k, stageAt: old.stageAt, stageDone: old.stageDone };
+    // An older peer sends no stage start: the stage keeps the one this page saw.
+    if (old && old.stage !== undefined && old.stage === k.stage && r.job.progress?.stage_started_ms === undefined)
+      k = { ...k, stageAt: old.stageAt, stageDone: old.stageDone, stageTotal: old.stageTotal };
     return { ...k, remote: { keyId: r.key_id, name: r.name, cancelling: r.cancelling, instance: r.instance } };
   });
 }
 
-/** The job's result: full only on success. */
+function stageBytes(p: ProgressEvent): Job["stageBytes"] {
+  return p.stage_done !== undefined && p.stage_total !== undefined ? { done: p.stage_done, total: p.stage_total } : undefined;
+}
+
+/** Never behind the count shown: a stage of several passes learns each pass's size only when it starts. */
+function sameStageBytes(j: Job, p: ProgressEvent): Job["stageBytes"] {
+  const next = stageBytes(p);
+  const old = j.stageBytes;
+  const frac = (b: { done: number; total: number }) => (b.total > 0 ? b.done / b.total : 0);
+  return next && old && j.stage === p.stage && frac(next) < frac(old) ? old : next;
+}
+
+/** Core's clock when sent (a reloaded page shows the real time), never later than `at`.
+ * ponytail: a server clock behind the page's reads as a longer step. */
+function stageStart(p: ProgressEvent, at: number): number {
+  return p.stage_started_ms ? Math.min(p.stage_started_ms, at) : at;
+}
+
+/** Core's speed for a byte stage and the job's time left at it. */
+function rateOf(p: ProgressEvent): Pick<Job, "speed" | "etaMs"> {
+  const bps = BYTE_STAGES.has(p.stage) ? p.bytes_per_s : null;
+  if (!bps || bps <= 0) return { speed: undefined, etaMs: undefined };
+  return { speed: bps, etaMs: p.total > p.done ? ((p.total - p.done) / bps) * 1000 : undefined };
+}
+
 function finish(j: Job, result: JobResult): Job {
   return { ...j, result, shown: "Ok" in result ? 1 : j.shown, etaMs: undefined, speed: undefined };
 }
@@ -143,9 +178,39 @@ function update(jobs: Job[], id: JobId, f: (j: Job) => Job): Job[] {
   return next;
 }
 
-/** Stages whose time grows with the bytes they stream: speed and time left are shown only for
- * these. */
+/** Stages whose time grows with their bytes: only these show speed and time left. */
 const BYTE_STAGES = new Set(["compress", "write", "measure", "pack", "verify", "install"]);
+
+/** A stage's share of the job's bytes and its segment's width in the bar. */
+export const STAGE_WEIGHT: Record<string, number> = { compress: 4, write: 4, measure: 3, pack: 3, install: 4, verify: 2 };
+export function stageWeight(stage: string): number {
+  return STAGE_WEIGHT[stage] ?? 1;
+}
+
+/** How far the current stage is, 0..1 (never 1 while it runs): core's `stage_done` of
+ * `stage_total`. A stage that moves no bytes (0 of 0) eases with time (half at 8 s) and waits
+ * under 95% until the next stage starts.
+ * An older server sends only the job's `done`/`total`: a byte stage's span is then guessed as its
+ * weight's share of the bytes left when it began, among the byte stages still to run. */
+export function stageFraction(j: Job, now: number): number {
+  if (j.stage === undefined) return 0;
+  const own = j.stageBytes;
+  if (own && own.total > 0) return Math.max(0, Math.min(UNFINISHED, own.done / own.total));
+  if (own) return easing(now - j.stageAt);
+  // The job total is an estimate that grows as passes learn their size: the larger of then and now.
+  const left = Math.max(j.total, j.stageTotal) - j.stageDone;
+  if (BYTE_STAGES.has(j.stage) && left > 0) {
+    const rest = (j.stages ?? []).slice(j.step ?? 0).filter((s) => BYTE_STAGES.has(s));
+    const sum = rest.reduce((n, s) => n + stageWeight(s), 0) || stageWeight(j.stage);
+    const span = (left * stageWeight(j.stage)) / sum;
+    return Math.max(0, Math.min(UNFINISHED, (j.done - j.stageDone) / span));
+  }
+  return easing(now - j.stageAt);
+}
+
+function easing(ms: number): number {
+  return 0.95 * (1 - Math.pow(0.5, Math.max(0, ms) / 1000 / 8));
+}
 
 export function jobsReducer(jobs: Job[], a: Action): Job[] {
   switch (a.type) {
@@ -158,19 +223,22 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
         if (stage !== j.stage) {
           return {
             ...j,
+            startedAt: j.startedAt ?? a.at,
             stage,
             step: stepOf(j.stages, stage, j.step),
             done,
             total,
             shown,
-            stageAt: a.at,
+            stageAt: stageStart(a.e, a.at),
             stageDone: done,
-            etaMs: undefined,
-            speed: undefined,
+            stageTotal: total,
+            stageBytes: stageBytes(a.e),
+            ...rateOf(a.e),
           };
         }
-        // Only a pass that streams the game's bytes has a rate worth projecting; the others
-        // (reading the source, checking, planning, finishing) show their time in the step.
+        // Core's speed when it sends one (`bytes_per_s`, null until known).
+        if (a.e.bytes_per_s !== undefined) return { ...j, done, total, shown, stageBytes: sameStageBytes(j, a.e), ...rateOf(a.e) };
+        // An older server: the bytes done since the stage began over the time since then.
         const elapsed = a.at - j.stageAt;
         const rate = BYTE_STAGES.has(stage) && elapsed >= 1000 ? (done - j.stageDone) / elapsed : 0;
         const etaMs = rate > 0 && total > done ? (total - done) / rate : undefined;
@@ -183,10 +251,9 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
     case "log":
       return update(jobs, a.e.job, (j) => ({ ...j, log: [...j.log, a.e.line].slice(-LOG_LINES) }));
     case "done":
-      return update(jobs, a.e.job, (j) => finish(j, a.e.result));
+      return update(jobs, a.e.job, (j) => ({ ...finish(j, a.e.result), endedAt: j.endedAt ?? Date.now() }));
     case "restore": {
-      // `replace`: the server's list is the whole truth (a reload, or the payload restarted,
-      // which reuses ids), so each job is only what the snapshot says.
+      // `replace`: the server's list is the whole truth (a restarted payload reuses ids).
       if (a.e.replace) return a.e.jobs.map((s) => fromSnapshot(blank(s.id), s, a.at));
       let next = jobs;
       for (const s of a.e.jobs) next = update(next, s.id, (j) => fromSnapshot(j, s, a.at));
@@ -194,5 +261,7 @@ export function jobsReducer(jobs: Job[], a: Action): Job[] {
     }
     case "dismiss":
       return jobs.filter((j) => j.id !== a.id);
+    case "clearFinished":
+      return jobs.filter((j) => !j.result);
   }
 }

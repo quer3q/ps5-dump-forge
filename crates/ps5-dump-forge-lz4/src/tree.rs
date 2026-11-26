@@ -1,13 +1,7 @@
-//! The packed output as a tree, without writing it: the loose files of the logical tree plus
-//! the volumes, manifest, CRC sidecar and profile `pack` would write, with their exact sizes
-//! from a [`crate::writer::measure`] pass. A volume's bytes are made on demand: each chunk is
-//! re-read from its source block, compressed again by the one encoder `pack` uses, checked
-//! against what the measure pass recorded (stored length, codec, CRC, and an LZ4 chunk's
-//! decoded CRC) and put at its recorded offset; the header carries the final build ID and
-//! everything else is zeros. So an image writer can take the packs straight from the source.
-//!
-//! Memory: the [`Measured`] metadata (16 bytes per chunk), one cached chunk, and at most
-//! `threads * DEPTH_PER_WORKER` blocks in flight (twice that right after a seek).
+//! The packed output as a tree from a [`crate::writer::measure`] pass: loose files plus the pack
+//! files at their exact sizes. A volume's chunks are re-read, recompressed by `pack`'s encoder and
+//! checked against the measurement (stored length, codec, CRC, LZ4 decoded CRC). Memory: 16 B per
+//! chunk, one cached chunk, `threads * DEPTH_PER_WORKER` blocks in flight.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
@@ -28,7 +22,6 @@ fn bad(msg: impl Into<String>) -> Error {
     Error::Format(msg.into())
 }
 
-/// What the measure pass recorded for one chunk.
 #[derive(Debug, Clone, Copy)]
 struct Want {
     codec: Codec,
@@ -109,7 +102,6 @@ impl Drop for Workers {
     }
 }
 
-/// See the module docs. `inner` is the logical tree the plan was measured on.
 pub struct PackedTree<'a> {
     inner: &'a mut dyn SourceTree,
     m: &'a Measured,
@@ -132,8 +124,8 @@ pub struct PackedTree<'a> {
 }
 
 impl<'a> PackedTree<'a> {
-    /// `m` must come from `measure` over `inner` with `plan`; `threads` workers (0 counts as
-    /// 1) compress, started on the first volume read.
+    /// `m` must come from `measure` over `inner` with `plan`; `threads` workers (0 = 1) start on
+    /// the first volume read.
     pub fn new(
         inner: &'a mut dyn SourceTree,
         m: &'a Measured,
@@ -470,8 +462,8 @@ mod tests {
         (src, files, m)
     }
 
-    /// The tree serves exactly the deployed folder `pack` writes: same listing, same bytes
-    /// whole, sequentially in odd pieces, and out of order.
+    /// The tree serves exactly the folder `pack` writes: listing, whole reads, odd pieces, out of
+    /// order.
     #[test]
     fn serves_what_pack_writes() {
         let p = profile();

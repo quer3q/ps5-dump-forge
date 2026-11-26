@@ -1,7 +1,5 @@
-//! Worker threads: one per job, one heavy job and one transfer running at a time, each kind's
-//! others waiting in FIFO order. Each job has its own cancel flag. A job that would use what an
-//! unfinished job of the other kind uses (or what another device is writing here) is refused
-//! when it starts.
+//! Worker threads: one per job, one heavy job and one transfer running at a time, each FIFO.
+//! A job using what an unfinished job of the other kind uses is refused when it starts.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -14,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 
-use crate::{ConvertRequest, Event, JobId};
+use crate::{ConvertRequest, Event, JobId, JobReport};
 
 type Emit = Box<dyn Fn(Event) + Send + Sync>;
 type Busy = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
@@ -36,9 +34,8 @@ pub(crate) struct Inner {
 
 #[derive(Default)]
 struct State {
-    /// Waiting and running heavy jobs; the front one runs.
+    /// Heavy jobs and transfers, waiting and running; each front one runs.
     queue: VecDeque<JobId>,
-    /// Waiting and running transfers; the front one runs.
     transfers: VecDeque<JobId>,
     cancels: HashMap<JobId, Arc<AtomicBool>>,
     /// What each unfinished job reads or writes, which [`Inner::delete_path`] leaves alone.
@@ -67,9 +64,7 @@ impl Inner {
     }
 
     /// Why `job` must not replace `path` (`dir`: a folder it merges into), as
-    /// [`Inner::delete_path`] would refuse it: against what `job` itself reads (`reads`), what
-    /// another device is writing and every other unfinished job's paths (its other own paths
-    /// are its targets).
+    /// [`Inner::delete_path`] would refuse it; `job`'s paths but `reads` are its targets.
     fn replace_refusal(
         &self,
         job: JobId,
@@ -97,8 +92,7 @@ impl Inner {
         crate::delete::replace_refusal(path, dir, &protected, others)
     }
 
-    /// [`crate::Jobs::replace_check`]: `path` as a file put in its place, against what another
-    /// device is writing, the protected paths and every unfinished job; nothing there passes.
+    /// [`crate::Jobs::replace_check`].
     pub(crate) fn replace_check(&self, path: &Path) -> Result<(), crate::DeleteError> {
         self.refuse_external_write(path)?;
         let protected = self
@@ -147,8 +141,7 @@ impl Inner {
         self.turn.notify_all();
     }
 
-    /// Deletes `path` with the table locked: no job is admitted between the check and the
-    /// removal, and none that reads or writes anything at, in or around `path` is unfinished.
+    /// Deletes `path` with the table locked, so no job is admitted between check and removal.
     // ponytail: the lock is held through the removal, so a large folder holds off starting,
     // cancelling and finishing jobs until it is gone.
     pub(crate) fn delete_path(
@@ -180,9 +173,7 @@ impl Inner {
         crate::delete::in_use(path, self.state().paths.values().flatten())
     }
 
-    /// [`crate::Jobs::edit_check`]: with the table locked, no job is admitted between the
-    /// check that none uses the image and the recovery of its leftover journal; the rest reads
-    /// only, unlocked.
+    /// Locked only from the in-use check through the leftover journal's recovery.
     pub(crate) fn edit_check(&self, req: &crate::ConvertRequest) -> crate::EditCheck {
         // A game folder is changed directly: never rebuilt, so only `in_place` speaks.
         let folder = matches!(
@@ -284,8 +275,7 @@ fn transfer_slot(req: &ConvertRequest) -> bool {
     !req.transfer.is_empty() || req.install.is_some()
 }
 
-/// Why a job (a transfer or not) using `paths` can't start: one of them is at, in or above
-/// what an unfinished job of the other kind uses (jobs of one kind run one after another).
+/// Why a job using `paths` can't start: an unfinished job of the other kind uses one of them.
 fn conflict(state: &State, transfer: bool, paths: &[PathBuf]) -> Option<String> {
     let others: Vec<&PathBuf> = (state.paths.iter())
         .filter(|(job, _)| state.transfers.contains(job) != transfer)
@@ -303,10 +293,6 @@ fn conflict(state: &State, transfer: bool, paths: &[PathBuf]) -> Option<String> 
     ))
 }
 
-/// The paths a job reads or writes: source, output (the source, in place), its `.part`s
-/// (`finalize::part_path`, and `Part::replace`'s `.orig.part`), an archive's later parts,
-/// for an edit, the undo journal and
-/// every file or folder it adds.
 /// An archive's later parts, found by name beside it (`source` is the first part).
 fn later_parts(source: &Path) -> Vec<PathBuf> {
     if !crate::archive::is_archive(source) {
@@ -321,8 +307,7 @@ fn later_parts(source: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// What an Extract or a transfer reads (a transfer's sources, else the source and an
-/// archive's later parts): never what it replaces.
+/// What an Extract or a transfer reads: never what it replaces.
 fn read_paths(req: &ConvertRequest) -> Vec<PathBuf> {
     if let Some(package) = &req.install {
         return install_paths(package);
@@ -335,9 +320,8 @@ fn read_paths(req: &ConvertRequest) -> Vec<PathBuf> {
     paths
 }
 
-/// An install's package and its `.crc` sidecar: here only when it exists. These run under the
-/// job table's lock (start, delete, quit), so another device is never asked: its sidecar is
-/// guarded whether or not it is there.
+/// An install's package and its `.crc` sidecar (here only when it exists; under the table
+/// lock another device is never asked).
 // ponytail: a remote package's missing sidecar name is guarded too (refused to other jobs).
 fn install_paths(package: &Path) -> Vec<PathBuf> {
     let mut paths = vec![package.to_path_buf()];
@@ -348,9 +332,7 @@ fn install_paths(package: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Whether `path` is `read` or inside it (resolved on this device; on another one as
-/// [`crate::remote::FlinkPath::within`] compares them). A folder above `read` is not: what it
-/// holds is checked name by name.
+/// Whether `path` is `read` or inside it; a folder above `read` is checked name by name.
 fn at_or_in(path: &Path, read: &Path) -> bool {
     use crate::remote::{FlinkPath, is_remote};
     if is_remote(path) || is_remote(read) {
@@ -363,6 +345,8 @@ fn at_or_in(path: &Path, read: &Path) -> bool {
     real(path).starts_with(real(read))
 }
 
+/// The paths a job reads or writes: source, output, its `.part`s, an archive's later parts,
+/// an edit's undo journal and added files.
 fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
     // An install: the package and its existing sidecar, nothing written.
     if let Some(package) = &req.install {
@@ -374,11 +358,9 @@ fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
         paths.extend(crate::transfer::targets(req));
         return paths;
     }
-    let out = if !req.edits.is_empty() {
-        &req.source
-    } else {
-        &req.output
-    };
+    // A metadata recovery is an edit of its source.
+    let edit = !req.edits.is_empty() || req.recover_metadata.is_some();
+    let out = if edit { &req.source } else { &req.output };
     let mut paths = vec![req.source.clone()];
     if req.extract.is_empty() {
         let part = crate::finalize::part_path(out, job);
@@ -392,7 +374,7 @@ fn used_paths(job: JobId, req: &ConvertRequest) -> Vec<PathBuf> {
     }
     paths.extend(later_parts(&req.source));
     // An edit job's undo journal and added files.
-    if !req.edits.is_empty() {
+    if edit {
         paths.push(ps5_dump_forge_patch::journal_path(&req.source));
         paths.extend(req.edits.iter().filter_map(|e| match e {
             crate::Edit::Add { from, .. } => Some(from.clone()),
@@ -419,6 +401,8 @@ impl Inner {
             Some(why) => Err(anyhow::anyhow!("preflight failed:\n  {why}")),
             None => self.wait_turn(job, transfer, cancel),
         };
+        // Its turn came (or it was refused) now: the report's start.
+        let started_at_ms = epoch_ms();
         let result = admitted.and_then(|()| {
             // U8: auto rest mode waits while the job runs.
             let _awake = crate::awake();
@@ -481,16 +465,17 @@ impl Inner {
                 result.map(|(report, _)| report)
             }
         };
+        let result = result.map(|report| JobReport {
+            started_at_ms,
+            ended_at_ms: epoch_ms(),
+            ..report
+        });
         (self.emit)(Event::Done { job, result });
     }
 
-    /// [`ConvertRequest::delete_source`] for `job`, done: the source it read (`read`: an
-    /// archive's every part it stamped) checked unchanged first (a NAS or server source refused
-    /// at once), then its paths dropped and the source deleted with the table locked, as
-    /// [`Inner::delete_path`] deletes, so no job is admitted between them. A peer's source is
-    /// deleted with the table unlocked (the peer's delete takes its own table, and a peer
-    /// deleting here at once would wait on this one), the job's paths kept in it meanwhile as
-    /// the reservation, then dropped. Its output is never at or inside what goes.
+    /// [`ConvertRequest::delete_source`]: the source checked unchanged, then deleted with the
+    /// table locked. A peer's with it unlocked (two devices deleting on each other would
+    /// deadlock), the job's paths kept meanwhile as the reservation.
     fn delete_source(
         &self,
         job: JobId,
@@ -591,9 +576,18 @@ impl Drop for Leave<'_> {
     }
 }
 
-/// How often progress for the same stage is passed on. Writers report per chunk and per
-/// file; a quarter of a million events would only flood the UI.
+/// How often progress for the same stage is passed on (writers report per chunk and file).
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// How long a stage's speed is measured over before [`Event::Progress`] reports it anew.
+const SPEED_WINDOW: Duration = Duration::from_secs(2);
+
+/// Epoch ms (0 on a clock set before it).
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
 
 /// What a running job uses to report and to notice cancellation.
 pub(crate) struct Ctx<'a> {
@@ -604,21 +598,27 @@ pub(crate) struct Ctx<'a> {
     pub(crate) shared_cancel: Option<Arc<AtomicBool>>,
     last: Cell<Option<Instant>>,
     stage: RefCell<String>,
-    /// What every byte pass of the job adds up to, set by [`Ctx::expect`]; 0 until known.
+    /// Every byte pass of the job; finished passes; (done, total) of the running one.
     expected: Cell<u64>,
-    /// Bytes of the passes already finished.
     base: Cell<u64>,
-    /// (done, total) of the running pass.
     pass: Cell<(u64, u64)>,
     /// Bytes of passes after those [`Ctx::expect_rest`] is told of, set by [`Ctx::reserve`].
     later: Cell<u64>,
+    /// `base` when the running stage began, and when that was (epoch ms).
+    stage_base: Cell<u64>,
+    stage_started_ms: Cell<u64>,
+    /// The speed window's start (time, stage bytes) and the last window's speed.
+    rate_mark: Cell<Option<(Instant, u64)>>,
+    rate: Cell<Option<u64>>,
     /// U7: the source's and destination's mount points, with their `st_dev` at job start.
     #[cfg(target_os = "freebsd")]
     pub mounts: RefCell<Vec<crate::durable::Watched>>,
-    /// The job table's [`Ctx::replace_refusal`]; unset outside [`crate::Jobs`] (a test's).
+    /// Unset outside [`crate::Jobs`] (a test's).
     pub(crate) replace_guard: Option<ReplaceGuard<'a>>,
-    /// What the job read of its source, set by a conversion that deletes it afterwards.
+    /// Set by a conversion that deletes its source afterwards.
     pub(crate) read: RefCell<Option<crate::delete::ReadSource>>,
+    /// [`Ctx::fix_stages`] was called.
+    stages_fixed: Cell<bool>,
 }
 
 impl<'a> Ctx<'a> {
@@ -634,16 +634,19 @@ impl<'a> Ctx<'a> {
             base: Cell::new(0),
             pass: Cell::new((0, 0)),
             later: Cell::new(0),
+            stage_base: Cell::new(0),
+            stage_started_ms: Cell::new(0),
+            rate_mark: Cell::new(None),
+            rate: Cell::new(None),
             #[cfg(target_os = "freebsd")]
             mounts: RefCell::new(Vec::new()),
             replace_guard: None,
             read: RefCell::new(None),
+            stages_fixed: Cell::new(false),
         }
     }
 
-    /// Why this job must not replace `path` (`dir`: a folder it merges into), as Delete would
-    /// refuse it ([`crate::delete::replace_refusal`]): against every other unfinished job and
-    /// what another device is writing; outside [`crate::Jobs`], against no job.
+    /// Why this job must not replace `path` (`dir`: a folder it merges into).
     pub(crate) fn replace_refusal(&self, path: &Path, dir: bool) -> Result<(), crate::DeleteError> {
         match self.replace_guard {
             Some(guard) => guard(path, dir),
@@ -651,9 +654,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Records the mount point `path` is on (`statfs`), once, with its `st_dev`, for the
-    /// drive-removal check (U7); `path` itself where `statfs` fails. A path that cannot be
-    /// stat'ed is skipped: the job fails on it anyway.
+    /// Records the mount point `path` is on, once, with its `st_dev`, for U7's check.
     #[cfg(target_os = "freebsd")]
     pub(crate) fn watch(&self, path: &std::path::Path) {
         let (path, mount) = match crate::dest::mount_of(path) {
@@ -682,26 +683,30 @@ impl<'a> Ctx<'a> {
         });
     }
 
+    /// From now on [`Ctx::stages`] announces nothing: the job already said every stage.
+    pub(crate) fn fix_stages(&self) {
+        self.stages_fixed.set(true);
+    }
+
     /// Announces the job's stages ([`Event::Stages`]).
     pub(crate) fn stages(&self, stages: &[&str]) {
+        if self.stages_fixed.get() {
+            return;
+        }
         (self.emit)(Event::Stages {
             job: self.job,
             stages: stages.iter().map(|s| s.to_string()).collect(),
         });
     }
 
-    /// Starts a pass: it and every pass after it move `bytes` in total. Renewed as each
-    /// pass learns its size, so progress is one bar for the whole job that ends at 100%.
-    /// Plus what [`Ctx::reserve`] holds back, so no pass fills the bar while one is left.
+    /// Starts a pass: it and every pass after it (plus [`Ctx::reserve`]'s) move `bytes`.
     pub(crate) fn expect_rest(&self, bytes: u64) {
         self.close_pass();
         let rest = bytes.saturating_add(self.later.get());
         self.expected.set(self.base.get().saturating_add(rest));
     }
 
-    /// Holds back `bytes` for passes that come after the ones the next [`Ctx::expect_rest`]
-    /// counts (a packed image's check through its packs while it is checked as written);
-    /// 0 once they are the ones it counts.
+    /// Holds back `bytes` for passes after the ones the next [`Ctx::expect_rest`] counts.
     pub(crate) fn reserve(&self, bytes: u64) {
         self.later.set(bytes);
     }
@@ -711,10 +716,8 @@ impl<'a> Ctx<'a> {
         self.base.set(self.base.get().saturating_add(done));
     }
 
-    /// `done` of `total` bytes in the running pass of `stage`. A `total` of 0 or 1 only
-    /// marks a stage and ends the running pass. Emitted as job-wide `done`/`total`: a pass
-    /// starts where the last one ended. Passed on when the stage changes, a pass
-    /// completes, or enough time has passed.
+    /// `done` of `total` bytes in the running pass of `stage` (a `total` of 0 or 1 only marks
+    /// the stage), emitted job-wide and throttled.
     pub(crate) fn progress(&self, stage: &str, done: u64, total: u64) {
         let new_stage = *self.stage.borrow() != stage;
         if new_stage || total <= 1 {
@@ -741,14 +744,53 @@ impl<'a> Ctx<'a> {
         }
         if new_stage {
             *self.stage.borrow_mut() = stage.to_string();
+            self.stage_base.set(self.base.get());
+            self.stage_started_ms.set(epoch_ms());
+            self.rate_mark.set(None);
+            self.rate.set(None);
         }
         self.last.set(Some(now));
+        let stage_base = self.stage_base.get();
+        let stage_done = job_done.saturating_sub(stage_base);
+        // Verify is every job's last byte stage, so the rest of the job is its span.
+        let stage_total = if stage == "verify" {
+            job_total
+        } else {
+            self.base.get().saturating_add(pass_total)
+        }
+        .saturating_sub(stage_base);
+        let bytes_per_s = if stage_total == 0 {
+            None
+        } else {
+            self.speed(now, stage_done)
+        };
         (self.emit)(Event::Progress {
             job: self.job,
             stage: stage.to_string(),
             done: job_done,
             total: job_total,
+            stage_done,
+            stage_total,
+            bytes_per_s,
+            stage_started_ms: self.stage_started_ms.get(),
         });
+    }
+
+    /// The stage's speed, renewed once per [`SPEED_WINDOW`] from the bytes moved in it.
+    fn speed(&self, now: Instant, stage_done: u64) -> Option<u64> {
+        match self.rate_mark.get() {
+            None => self.rate_mark.set(Some((now, stage_done))),
+            Some((at, from)) => {
+                let elapsed = now - at;
+                if elapsed >= SPEED_WINDOW {
+                    let moved = stage_done.saturating_sub(from) as u128;
+                    let rate = moved * 1000 / elapsed.as_millis().max(1);
+                    self.rate.set(Some(u64::try_from(rate).unwrap_or(u64::MAX)));
+                    self.rate_mark.set(Some((now, stage_done)));
+                }
+            }
+        }
+        self.rate.get()
     }
 }
 

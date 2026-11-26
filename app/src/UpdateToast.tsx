@@ -1,21 +1,24 @@
-// The update toast (bottom corner): GitHub has a newer release for this build (update.ts),
-// checked once per start. Later hides it until the app or page closes; nothing is stored. On
-// the PS5, Update has elfldr load the new version and the page reloads into it; the app opens
-// the release archive's download in the browser.
+// The update toast: checked once per start (update.ts); Later hides it until the app or page closes.
 
 import { useEffect, useState } from "react";
 
-import { api, errorText, web } from "./api";
+import { api, errorText, runtimePlatform, web } from "./api";
 import { useMessages } from "./i18n";
 import { Icon } from "./icons";
 import { checkUpdate, UPDATE_TIMEOUT } from "./update";
 
 // One check per start, StrictMode's second mount included; any failure is no toast.
 let check: Promise<string | null> | null = null;
+// The PS5's page: Update reloads it into the new version; elsewhere the download opens.
+let reloads = false;
 function newer(): Promise<string | null> {
   check ??= api
     .updateTarget()
-    .then((t) => (t ? checkUpdate(t) : null))
+    .then(async (t) => {
+      if (!t) return null;
+      reloads = web && (await runtimePlatform()) === "ps5";
+      return checkUpdate(t);
+    })
     .catch(() => null);
   return check;
 }
@@ -49,13 +52,13 @@ export function UpdateToast() {
     try {
       await api.startUpdate(version);
       // The PS5's page reloads by itself; until then it stays "Updating".
-      if (!web) setState({ step: "opened" });
+      if (!reloads) setState({ step: "opened" });
     } catch (e) {
       setState({ step: "failed", reason: e === UPDATE_TIMEOUT ? t.timeout(version) : errorText(e) });
     }
   };
-  // The app's command answers at once: its buttons just wait, no spinner.
-  const spinning = state.step === "updating" && web;
+  // Opening the download answers at once: its buttons just wait, no spinner.
+  const spinning = state.step === "updating" && reloads;
   const busy = state.step === "updating";
   const title = spinning ? t.updating : state.step === "failed" ? t.failed(version) : t.available(version);
 
@@ -74,7 +77,7 @@ export function UpdateToast() {
           <span className="update-title">{title}</span>
         </div>
         {spinning && <p className="muted">{t.updatingNote}</p>}
-        {state.step === "opened" && <p className="muted">{t.downloading}</p>}
+        {state.step === "opened" && <p className="muted">{web ? t.downloadingCli : t.downloading}</p>}
         {state.step === "failed" && <p className="muted backend">{state.reason}</p>}
         {!spinning && (
           <div className="row end">

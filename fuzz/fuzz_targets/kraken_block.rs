@@ -1,5 +1,5 @@
 //! The Kraken block decoder (`kraken::decode_block`) on arbitrary halves.
-//! Input: u8 kinds (bits 0-1 even, 2-3 odd: raw/LZ/LZ-delta), u32 LE logical length (taken
+//! Input: u8 kinds (bits 0-1 even, 2-3 odd: raw/LZ/LZ-delta/entropy), u32 LE logical length (taken
 //! modulo 256 KiB, plus one), u32 LE length of the even half's bytes, then the halves' bytes.
 #![no_main]
 
@@ -7,10 +7,11 @@ use libfuzzer_sys::fuzz_target;
 use ps5upload_fpkg::kraken::{HALF, Half, decode_block};
 
 fn half(kind: u8, bytes: &[u8]) -> Half {
-    match kind % 3 {
+    match kind & 3 {
         0 => Half::Raw(bytes.to_vec()),
         1 => Half::Lz(bytes.to_vec()),
-        _ => Half::LzDelta(bytes.to_vec()),
+        2 => Half::LzDelta(bytes.to_vec()),
+        _ => Half::Entropy(bytes.to_vec()),
     }
 }
 

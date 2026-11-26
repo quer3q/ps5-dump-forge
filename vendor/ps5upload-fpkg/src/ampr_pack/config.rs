@@ -1,3 +1,5 @@
+// Ported from drakmor's ampr_emu tools (https://github.com/drakmor/ampr_emu, GPL-3.0). This
+// Rust port is part of ps5upload, GPL-3.0-or-later.
 //! What gets packed and how: drakmor's TOML profile (`[pack]`, `[groups.*]`, `[[rule]]`,
 //! `[runtime]`), the same keys, defaults and checks as `ampr_pack.py`'s `load_config`, and the
 //! built-in profile used when the user gives none.
@@ -228,7 +230,7 @@ impl Default for Config {
             io_page_size: 64 << 10,
             payload_alignment: 64 << 10,
             chunk_alignment: 64,
-            workers: std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+            workers: crate::workshop::workshop_threads().min(8),
             compression_mode: CompressionMode::Hc,
             compression_level: 12,
             acceleration: 1,
@@ -1116,6 +1118,9 @@ pub(crate) fn python_float(f: f64) -> String {
 /// mmap, which the runtime does not serve), the system and backport folders, AMPR's own
 /// files, text configuration a title may read outside AMPR, already-compressed media, and the
 /// streaming containers Insomniac titles open at boot.
+///
+/// No game gets this one unasked any more: [`default_profile_for`] picks a narrower profile
+/// from the game's own files, built on this one's settings and loose list.
 pub fn default_profile(level: u8, block_shift: u8) -> Config {
     let mut c = Config {
         compression_mode: if level <= 2 {
@@ -1141,6 +1146,197 @@ pub fn default_profile(level: u8, block_shift: u8) -> Config {
         ..base
     });
     c
+}
+
+/// The engine a game was built with, as far as the built-in profiles care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameEngine {
+    /// Unreal Engine with IoStore containers (`.ucas`).
+    Unreal,
+    /// Unity (a player data folder, `Media` on PS5, or Unity's own modules).
+    Unity,
+    /// Anything else, an Unreal title with `.pak` files only included.
+    Unknown,
+}
+
+impl GameEngine {
+    /// Recognise the engine from the game's paths (relative to `/app0`, any letter case).
+    pub fn detect<'a>(paths: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut unity = false;
+        for p in paths {
+            if is_iostore_container(p) {
+                return Self::Unreal;
+            }
+            unity |= is_unity_marker(p);
+        }
+        if unity {
+            Self::Unity
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// The built-in profile's name, for the log.
+    pub fn profile_name(self) -> &'static str {
+        match self {
+            Self::Unreal => "unreal",
+            Self::Unity => "unity",
+            Self::Unknown => "large-files",
+        }
+    }
+}
+
+/// The profile used when the user gives none, for a game with these files (paths relative to
+/// `/app0`, with their sizes).
+///
+/// - Unreal Engine with IoStore containers (`.ucas`): [`unreal_profile`], only the containers.
+/// - Unity: [`unity_profile`], only `StreamingAssets` and the big resource files.
+/// - Anything else: [`large_files_profile`], only files of [`LARGE_FILE_MIN`] or more inside a
+///   folder, so the many small files a title may open outside its own file layer stay loose.
+///
+/// A measured (traced) or user-given profile replaces all of these.
+pub fn default_profile_for<'a>(
+    files: impl IntoIterator<Item = (&'a str, u64)>,
+    level: u8,
+    block_shift: u8,
+) -> Config {
+    let files: Vec<(&str, u64)> = files.into_iter().collect();
+    match GameEngine::detect(files.iter().map(|&(p, _)| p)) {
+        GameEngine::Unreal => unreal_profile(level, block_shift),
+        GameEngine::Unity => unity_profile(level, block_shift),
+        GameEngine::Unknown => large_files_profile(files, level, block_shift),
+    }
+}
+
+/// Which built-in profile [`default_profile_for`] picks for these files: `"unreal"`,
+/// `"unity"` or `"large-files"`.
+pub fn default_profile_name<'a>(paths: impl IntoIterator<Item = &'a str>) -> &'static str {
+    GameEngine::detect(paths).profile_name()
+}
+
+/// An Unreal Engine IoStore container, in any letter case.
+fn is_iostore_container(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(UCAS_EXT)
+}
+
+const UCAS_EXT: &str = ".ucas";
+/// `*.ucas` in any letter case: rules match case-sensitively.
+const UCAS_GLOB: &str = "*.[uU][cC][aA][sS]";
+
+/// File names only a Unity player ships, compared in lower case: the player data folder's
+/// manager file (`Media/globalgamemanagers` on PS5, `<Game>_Data/...` elsewhere) or, in a
+/// compressed build, `data.unity3d`; the built-in resources; the player and IL2CPP modules.
+/// Every PS5 Unity title checked (PPSA22999, PPSA31909, PPSA30883, PPSA33090) has
+/// `Media/globalgamemanagers` and `Media/Modules/Il2CppUserAssemblies.prx`.
+const UNITY_MARKERS: &[&str] = &[
+    "globalgamemanagers",
+    "data.unity3d",
+    "unity default resources",
+    "unityplayer.prx",
+    "unityplayer.sprx",
+    "il2cppuserassemblies.prx",
+];
+
+fn is_unity_marker(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    UNITY_MARKERS.iter().any(|m| name.eq_ignore_ascii_case(m))
+}
+
+/// What the Unity profile packs. `*` crosses folders, so `*/StreamingAssets/*` is anything
+/// under a `StreamingAssets` folder at any depth. Rules match case-sensitively and detection
+/// does not, so every pattern is spelled in any letter case: a dump with lowercased names is
+/// still recognised as Unity, and must then still pack its assets.
+const UNITY_PACKED: &[&str] = &[
+    // Asset bundles, Addressables, video and audio banks: nearly all of a Unity title's bytes.
+    "[sS][tT][rR][eE][aA][mM][iI][nN][gG][aA][sS][sS][eE][tT][sS]/*",
+    "*/[sS][tT][rR][eE][aA][mM][iI][nN][gG][aA][sS][sS][eE][tT][sS]/*",
+    // Texture, mesh and audio payloads that the serialized files point into, read in ranges.
+    "*.[rR][eE][sS][sS]",
+    "*.[rR][eE][sS][oO][uU][rR][cC][eE]",
+];
+
+/// The profile for a Unity title: `StreamingAssets` and the `.resS` / `.resource` payloads
+/// compressed, everything else loose (the default's loose list still wins, so the
+/// Addressables catalog `.json`, the modules and media files stay real files).
+///
+/// The serialized files (`globalgamemanagers`, `level*`, `*.assets`) are small, read at boot,
+/// and no community profile is known to pack them; they stay loose.
+pub fn unity_profile(level: u8, block_shift: u8) -> Config {
+    let include: Vec<String> = UNITY_PACKED.iter().map(|s| s.to_string()).collect();
+    only_these_packed(level, block_shift, include)
+}
+
+/// The smallest file [`large_files_profile`] packs: 16 MiB.
+pub const LARGE_FILE_MIN: u64 = 16 << 20;
+
+/// The profile for a game of no known engine: files of [`LARGE_FILE_MIN`] or more inside a
+/// folder compressed, everything else loose (and the default's loose list still wins). The
+/// rule names each such file, since a rule cannot match by size.
+pub fn large_files_profile<'a>(
+    files: impl IntoIterator<Item = (&'a str, u64)>,
+    level: u8,
+    block_shift: u8,
+) -> Config {
+    let mut include: Vec<String> = files
+        .into_iter()
+        .filter(|&(p, size)| size >= LARGE_FILE_MIN && p.trim_start_matches('/').contains('/'))
+        .map(|(p, _)| glob_literal(p.trim_start_matches('/')))
+        .collect();
+    include.sort();
+    include.dedup();
+    only_these_packed(level, block_shift, include)
+}
+
+/// `path` as a pattern that matches only itself: `*`, `?` and `[` in brackets.
+fn glob_literal(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '*' | '?' | '[' => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// [`default_profile`] with its folder-wide compress rule replaced by one for `include` (no
+/// rule at all when it is empty), followed by the default's loose rule.
+fn only_these_packed(level: u8, block_shift: u8, include: Vec<String>) -> Config {
+    let mut c = default_profile(level, block_shift);
+    let base = c.default_rule();
+    let loose = c
+        .rules
+        .pop()
+        .expect("the default profile ends with its loose rule");
+    c.rules.clear();
+    if !include.is_empty() {
+        c.rules.push(Rule {
+            action: Action::Compress,
+            include,
+            layout: Layout::Mixed,
+            ..base
+        });
+    }
+    c.rules.push(loose);
+    c
+}
+/// The profile for an Unreal Engine title: its IoStore containers (`*.ucas`, nearly all of the
+/// game's bytes) compressed, everything else loose.
+///
+/// Unreal opens its other files through its own platform file layer, and ampr_emu 0.4.2.1
+/// (whose release build hooks POSIX `open`/`stat`/`read`, not every libkernel entry) did not
+/// serve a packed one: Star Wars Galactic Racer (PPSA28416, FW 13.60) built with the default
+/// profile stopped at boot with "Failed to open descriptor file
+/// ../../../griffin/griffin.uproject". The `.pak` files, `.utoc` tables, `.sig` signatures and
+/// the shader and pipeline caches go through the same layer; Lazy_AMPR, exfat2ampr and
+/// theghostonline's tool also keep `.pak` and `.utoc` loose. Packing only the containers
+/// leaves nothing else to guess.
+pub fn unreal_profile(level: u8, block_shift: u8) -> Config {
+    only_these_packed(level, block_shift, vec![UCAS_GLOB.into()])
 }
 
 /// Paths the built-in profile leaves loose. `*` crosses folders (see [`glob`]), so `*.sprx`
@@ -1170,6 +1366,9 @@ const DEFAULT_LOOSE: &[&str] = &[
     "ampr_assets-*.pak",
     "ampr_commands.bin",
     "apr_emu.log",
+    // An Unreal project descriptor, opened through the engine's own file layer: packed, it
+    // stopped Star Wars Galactic Racer at boot ("Failed to open descriptor file"). Any case.
+    "*.[uU][pP][rR][oO][jJ][eE][cC][tT]",
     // Text configuration, which a title may open with ordinary file calls.
     "*.json",
     "*.ini",

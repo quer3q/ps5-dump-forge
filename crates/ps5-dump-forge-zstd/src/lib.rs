@@ -1,11 +1,6 @@
-//! The zstd pack format: `ampr_zstd.index` and the volume headers, each with an
-//! encoder and a validating decoder (so a decoder project can import them), plus
-//! the pack writer (`writer`, and `measure`), a validated reader (`reader`, the packs as a
-//! `SourceTree`) and `tree` (the packs `pack` would write, made on demand from the source).
-//!
-//! Without the default `std` feature the crate is `no_std` and keeps only the
-//! convention (magics, layout, names, `Chunk`, the volume header): the runtime
-//! (ampr-emu-ng) reads its packs with these.
+//! The zstd pack format (`docs/zstd.md`): index and volume header codecs, the writer, reader and
+//! on-demand `tree`. Without `std` only the convention (magics, layout, names, `Chunk`, volume
+//! header) is kept, for ampr-emu-ng.
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(feature = "std")]
@@ -28,7 +23,6 @@ pub const INDEX_MAGIC: &[u8; 8] = b"AMPRZPK1";
 pub const VOLUME_MAGIC: &[u8; 8] = b"AMPRZDT1";
 /// The format version at byte 8 of the index and of each volume header.
 pub const FORMAT_VERSION: u32 = 1;
-/// The index file at the game root.
 pub const INDEX_NAME: &str = "ampr_zstd.index";
 /// Volume `id` is `VOLUME_PREFIX` + the id (three digits at least) + `VOLUME_SUFFIX`.
 pub const VOLUME_PREFIX: &str = "ampr_zstd-";
@@ -36,9 +30,7 @@ pub const VOLUME_SUFFIX: &str = ".pak";
 /// log2 of `CHUNK_SIZE`, stored at index header byte 16.
 pub const CHUNK_SHIFT: u8 = 18;
 pub const CHUNK_SIZE: u64 = 1 << CHUNK_SHIFT;
-/// 4 GiB less 64 KiB (4,294,901,760 bytes), as the LZ4 packs: the largest
-/// volume whose every offset fits the u32 chunk offset, and under FAT32's
-/// 4 GiB file limit.
+/// 4 GiB - 64 KiB: every offset fits the u32 chunk offset, and under FAT32's file limit.
 pub const VOLUME_LIMIT: u64 = (1 << 32) - (1 << 16);
 pub const INDEX_HEADER_SIZE: usize = 128;
 pub const VOLUME_HEADER_SIZE: usize = 64;
@@ -112,7 +104,6 @@ pub fn path_hash(path: &str) -> u64 {
     path_hash_bytes(path.as_bytes())
 }
 
-/// `path_hash` over the path's bytes.
 pub fn path_hash_bytes(path: &[u8]) -> u64 {
     path.iter().fold(14695981039346656037, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(1099511628211)
@@ -132,9 +123,8 @@ pub enum Codec {
     Zstd,
 }
 
-/// Absolute location and stored length of one independently decoded chunk.
-/// Packed as a u64: bits 0..31 offset, 32..43 volume id, 44..61
-/// `stored_size - 1`, 62..63 codec (0 raw, 1 zstd).
+/// One chunk's location as a u64: bits 0..31 offset, 32..43 volume id, 44..61 `stored_size - 1`,
+/// 62..63 codec (0 raw, 1 zstd).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chunk {
     pub offset: u32,
@@ -253,8 +243,7 @@ mod tests {
         bytes[116..120].copy_from_slice(&header.to_le_bytes());
     }
 
-    /// The layout of docs/zstd.md written without `validate` (or `Chunk::pack`'s
-    /// checks): what a faulty writer would emit, for the decoder to refuse.
+    /// The docs/zstd.md layout written without `validate`: what a faulty writer would emit.
     fn raw(index: &Index) -> Vec<u8> {
         let paths: Vec<u8> = index.files.iter().flat_map(|f| f.path.bytes()).collect();
         let chunks_off = INDEX_HEADER_SIZE + 32 * index.files.len();
@@ -359,8 +348,7 @@ mod tests {
         }
     }
 
-    /// A store-only file (two raw chunks) and a zstd one; `swap` writes the
-    /// records (and so their strings and chunks) in the wrong order.
+    /// A store-only file and a zstd one; `swap` writes the records in the wrong order.
     fn two_files(swap: bool) -> Index {
         let mut files = vec![
             FileRecord {
@@ -502,8 +490,7 @@ mod tests {
         let mut bytes = good.clone();
         bytes[24] ^= 1;
         assert!(decode_index(&bytes).is_err(), "header CRC");
-        // Payload CRC: a payload change valid on its own (the zstd file one
-        // byte longer, the total to match, the header CRC renewed).
+        // Payload CRC: a payload change valid on its own, the header CRC renewed.
         let mut bytes = good.clone();
         let i = index.files.iter().position(|f| !f.store_only).unwrap();
         bytes[INDEX_HEADER_SIZE + 32 * i + 8] += 1;

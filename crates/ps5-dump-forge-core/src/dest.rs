@@ -1,11 +1,7 @@
-//! The destination probe (U1 in ps5/README.md, "Writing safely on the PS5"): what the output
-//! folder's filesystem can do, asked of the folder itself once per job, before anything is
-//! written, and never guessed from its path. A PS5 USB drive is never tested on hardware, so whatever the probe is not
-//! sure of counts as the stricter answer (fail closed).
-//!
-//! Every step goes through one held descriptor of the folder (`openat`, `fstatat`, `linkat`),
-//! which is also right under `nullfs` (`/data` can be a nullfs view). FreeBSD (the PS5) only;
-//! it also builds on macOS for its tests.
+//! The destination probe (U1, ps5/README.md): what the output folder's filesystem can do, asked
+//! of the folder once per job before anything is written, never guessed from its path; anything
+//! unsure counts as the stricter answer (fail closed). Every step goes through one held folder
+//! descriptor (right under `nullfs` too). FreeBSD only; builds on macOS for its tests.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
@@ -26,22 +22,18 @@ const GIB: u64 = 1024 * MIB;
 /// The probe file's size: big enough to need real blocks, small enough for a nearly full drive.
 const PROBE_LEN: usize = 1 << 20;
 
-/// What the probe saw.
 #[derive(Debug)]
 pub(crate) struct Dest {
-    /// `st_dev` of the folder, through the view it was opened by.
+    /// The folder's `st_dev`, through the view it was opened by.
     pub dev: u64,
     /// Bytes an unprivileged user may still write.
     pub free: u64,
     pub fstype: String,
-    /// Where the filesystem is mounted (`f_mntonname`).
+    /// `f_mntonname`.
     pub mount: PathBuf,
-    /// The largest file the folder can hold.
     pub max_file: u64,
-    /// Names that differ only in case or Unicode normalization may name one file (or it is
-    /// not known that they don't).
+    /// Names differing in case or normalization may name one file (or it isn't known).
     pub folds_names: bool,
-    /// Creating a non-ASCII name was refused.
     pub ascii_only: bool,
     pub hard_links: bool,
     /// Why an answer is a fail-closed guess, for the log.
@@ -49,7 +41,7 @@ pub(crate) struct Dest {
 }
 
 impl Dest {
-    /// One log line: `destination /mnt/usb0: exfatfs, 118 GiB free, 64-bit files, ...`.
+    /// `destination /mnt/usb0: exfatfs, 118 GiB free, 64-bit files, ...`.
     pub(crate) fn describe(&self) -> String {
         let free = if self.free >= GIB {
             format!("{} GiB", self.free / GIB)
@@ -84,8 +76,7 @@ impl Dest {
     }
 }
 
-/// Probes `dir` (the output's folder) and removes every probe file again. Any failure refuses
-/// the job, quoting the step and errno.
+/// Probes `dir`, removing every probe file again; any failure refuses the job.
 pub(crate) fn probe(dir: &Path, cancel: &AtomicBool) -> anyhow::Result<Dest> {
     let step = |what: &str| format!("destination probe of {}: {what}", dir.display());
     let folder = std::fs::OpenOptions::new()
@@ -108,8 +99,7 @@ pub(crate) fn probe(dir: &Path, cancel: &AtomicBool) -> anyhow::Result<Dest> {
         .dev();
     let mut notes = Vec::new();
 
-    // Per call, not only per process: a job's preflight and an `edit_check` may probe one folder
-    // at once, and the names are created exclusively.
+    // Per call: a preflight and an `edit_check` may probe one folder at once.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let pid = format!(
         "{}-{}",
@@ -175,10 +165,7 @@ pub(crate) fn probe(dir: &Path, cancel: &AtomicBool) -> anyhow::Result<Dest> {
                 .with_context(|| step("fstat of the non-ASCII probe"))?;
             (fold(lookup(&folder, &nfd), (meta.dev(), meta.ino())), false)
         }
-        Err(e) if matches!(errno(&e), Some(libc::EINVAL | libc::EILSEQ)) => {
-            // No non-ASCII names at all: folder output lists them as findings instead.
-            (Fold::Distinct, true)
-        }
+        Err(e) if matches!(errno(&e), Some(libc::EINVAL | libc::EILSEQ)) => (Fold::Distinct, true),
         Err(e) => return Err(e).with_context(|| step("creating the non-ASCII probe")),
     };
     for (what, answer) in [("case", &case), ("Unicode normalization", &normalization)] {
@@ -221,18 +208,17 @@ pub(crate) fn probe(dir: &Path, cancel: &AtomicBool) -> anyhow::Result<Dest> {
     })
 }
 
-/// The probe's files. Dropping it checks each name still names the file this probe made,
-/// closes the handles, removes the names and syncs the folder (best effort, U6).
+/// The probe's files; dropped, each name still naming its file is removed (best effort, U6).
 struct Probes<'a> {
     folder: &'a File,
     cancel: &'a AtomicBool,
     open: Vec<File>,
-    /// Each name made, with the index in `open` of the file it must name.
+    /// Each name made, with its file's index in `open`.
     made: Vec<(CString, usize)>,
 }
 
 impl Probes<'_> {
-    /// Creates `name` (exclusive, not following a link) and returns its index in `open`.
+    /// Creates `name` exclusively, link not followed; its index in `open`.
     fn create(&mut self, name: &CStr) -> io::Result<usize> {
         let flags =
             libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_RDWR | libc::O_CLOEXEC;
@@ -279,7 +265,6 @@ fn c_name(name: &str) -> CString {
     CString::new(name).expect("probe names hold no NUL")
 }
 
-/// The (dev, ino) `name` in `folder` names, not following a link.
 #[allow(clippy::unnecessary_cast)] // field types differ between FreeBSD and macOS
 fn lookup(folder: &File, name: &CStr) -> io::Result<(u64, u64)> {
     // SAFETY: valid descriptor and name; `st` is a properly sized out-parameter.
@@ -307,17 +292,14 @@ fn linkat(folder: &File, from: &CStr, to: &CStr) -> io::Result<()> {
     Ok(())
 }
 
-/// What one name lookup says about folding.
 #[derive(Debug, PartialEq, Eq)]
 enum Fold {
     /// Not found: the filesystem keeps the two spellings apart.
     Distinct,
-    /// Found the probe itself.
     Folds,
     Unknown(String),
 }
 
-/// `found`: the other spelling's lookup; `probe`: the (dev, ino) of the file it was made from.
 /// Only "not found" proves the spellings distinct.
 fn fold(found: io::Result<(u64, u64)>, probe: (u64, u64)) -> Fold {
     match found {
@@ -337,9 +319,7 @@ enum LinkFailure {
     Refuse,
 }
 
-/// Why `linkat` on the fresh probe failed. EPERM counts as unsupported only because the probe
-/// was just created by us, with no flags, in a folder we just wrote to. Comparisons, not a
-/// match: ENOTSUP == EOPNOTSUPP on FreeBSD.
+/// EPERM is unsupported only because the probe is ours, fresh, with no flags.
 fn link_failure(e: &io::Error) -> LinkFailure {
     match errno(e) {
         Some(c) if c == libc::EOPNOTSUPP || c == libc::ENOTSUP || c == libc::EPERM => {
@@ -365,9 +345,8 @@ fn file_size_bits(folder: &File) -> io::Result<Option<libc::c_long>> {
     Err(e)
 }
 
-/// The largest file: from the reported bit count when it is believable, else from the
-/// filesystem's name. Anything unknown gets FAT32's limit, with a note. Only EINVAL (the
-/// question is unsupported) falls back; any other error (EIO, ENODEV, ...) refuses the job.
+/// The largest file: from a believable bit count, else by filesystem name, else FAT32's limit
+/// with a note. Only EINVAL falls back; any other error refuses the job.
 fn max_file(
     bits: io::Result<Option<libc::c_long>>,
     fstype: &str,
@@ -394,30 +373,26 @@ fn max_file(
     })
 }
 
-/// The mount point `path` is on (`statfs`), for U7's drive-removal check.
+/// `path`'s mount point, for U7.
 pub(crate) fn mount_of(path: &Path) -> io::Result<PathBuf> {
     Ok(Statfs::at(path)?.mount)
 }
 
-/// A mount point's (or a folder's) `(st_dev, f_blocks)` now: a removed drive fails the stat,
-/// shows another device (the folder under it) or no blocks (U7).
+/// `(st_dev, f_blocks)` now (U7).
 pub(crate) fn mount_state(mount: &Path) -> io::Result<(u64, u64)> {
     Ok((std::fs::metadata(mount)?.dev(), Statfs::at(mount)?.blocks))
 }
 
-/// The filesystem type `path` is on, for tests that depend on it.
 #[cfg(all(test, target_os = "freebsd"))]
 pub(crate) fn fstype_of(path: &Path) -> io::Result<String> {
     Ok(Statfs::at(path)?.fstype)
 }
 
-/// The bytes an unprivileged user may still write on `path`'s filesystem.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn free_at(path: &Path) -> io::Result<u64> {
     Ok(Statfs::at(path)?.free)
 }
 
-/// What `fstatfs` says about the folder's filesystem.
 struct Statfs {
     free: u64,
     blocks: u64,
@@ -428,8 +403,7 @@ struct Statfs {
 
 impl Statfs {
     fn of(folder: &File) -> io::Result<Self> {
-        // SAFETY: a valid descriptor; `st` is a properly sized out-parameter. On the PS5 this
-        // is `fstatfs@FBSD_1.0`, forwarded by ps5/compat.c.
+        // SAFETY: a valid descriptor and a sized out-parameter (PS5: ps5/compat.c's symver).
         let mut st: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatfs(folder.as_raw_fd(), &mut st) } != 0 {
             return Err(io::Error::last_os_error());
@@ -509,8 +483,7 @@ mod tests {
         }
     }
 
-    /// On this Mac the temp folder is APFS: it folds case (and normalization), has hard links
-    /// and no 4 GiB limit. In the FreeBSD VM it is whatever volume `TMPDIR` names.
+    /// macOS's temp folder is APFS; in the FreeBSD VM whatever `TMPDIR` names.
     #[test]
     fn probes_the_temp_folder_and_leaves_nothing() {
         let dir = crate::test_dir("dest-probe");

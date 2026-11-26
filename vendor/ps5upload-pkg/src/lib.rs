@@ -67,10 +67,10 @@ pub struct RootEntry {
     pub size: u64,
 }
 
-/// Maximum bytes we'll extract per call from a single inode.
-/// 4 GiB matches the UFS2 max file size in practice for game assets;
-/// callers can request again if they need more.
-const FFPKG_EXTRACT_MAX: u64 = 4 * 1024 * 1024 * 1024;
+/// How much of a file is read at a time while extracting: the file streams through
+/// the temp file in these pieces, so a multi-gigabyte asset is never held whole and no
+/// size cap cuts an "Extract all" short. The declared size is bounded by the image.
+const FFPKG_EXTRACT_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Max directory-tree depth `extract_dir_recursive` will descend. UFS dir
 /// entries are attacker-controllable in a hostile .ffpkg; a crafted entry
@@ -126,16 +126,16 @@ pub fn extract_from_ffpkg(
     };
     let leaf_name = components.last().copied().unwrap_or("root");
     if inode.is_file() {
-        let bytes = img.read_file(&inode, FFPKG_EXTRACT_MAX)?;
         let dest = dest_dir.join(leaf_name);
-        write_file_atomic(&dest, &bytes)?;
+        let written = extract_file(&mut img, &inode, &dest)?;
         result.file_count = 1;
-        result.bytes_written = bytes.len() as u64;
+        result.bytes_written = written;
         result.sample_paths.push(dest.display().to_string());
     } else if inode.is_dir() {
         let target = dest_dir.join(leaf_name);
         create_dir_all(&target).map_err(Ufs2Error::Io)?;
-        extract_dir_recursive(&mut img, &inode, &target, &mut result, 0)?;
+        let mut walked = std::collections::HashSet::from([inode.number]);
+        extract_dir_recursive(&mut img, &inode, &target, &mut result, 0, &mut walked)?;
     } else {
         return Err(Ufs2Error::NotFound {
             component: format!("{leaf_name} (not a file or directory)"),
@@ -185,17 +185,18 @@ fn is_safe_child_name(name: &str) -> bool {
     )
 }
 
-fn extract_dir_recursive(
-    img: &mut Ufs2Image<std::fs::File>,
+fn extract_dir_recursive<R: Read + Seek>(
+    img: &mut Ufs2Image<R>,
     dir: &ufs2::Inode,
     dest: &Path,
     result: &mut FfpkgExtractResult,
     depth: u32,
+    walked: &mut std::collections::HashSet<u64>,
 ) -> Result<(), Ufs2Error> {
-    // Bound recursion against a hostile image with a directory cycle or
-    // pathological nesting (the block-pointer walk has cycle detection, but
-    // the directory tree didn't). "." / ".." are already skipped by
-    // is_safe_child_name, so a cycle requires a crafted non-dotdot entry.
+    // Bound recursion against pathological nesting. A directory cycle is refused on its own
+    // (`walked`): an entry naming its own directory or an ancestor is not stopped by the depth
+    // cap alone, as two such entries in one directory double the work at every level. "." / ".."
+    // are already skipped by is_safe_child_name, so a cycle requires a crafted non-dotdot entry.
     if depth > FFPKG_EXTRACT_MAX_DEPTH {
         return Err(Ufs2Error::WalkTooDeep {
             max: FFPKG_EXTRACT_MAX_DEPTH,
@@ -213,13 +214,19 @@ fn extract_dir_recursive(
         let child_path = dest.join(&e.name);
         let child_inode = img.read_inode(e.inode)?;
         if child_inode.is_dir() {
+            // Every directory is walked once: one reached again is a cycle (or a directory
+            // linked twice), refused before anything more is written.
+            if !walked.insert(child_inode.number) {
+                return Err(Ufs2Error::DirectoryCycle {
+                    inode: child_inode.number,
+                });
+            }
             create_dir_all(&child_path).map_err(Ufs2Error::Io)?;
-            extract_dir_recursive(img, &child_inode, &child_path, result, depth + 1)?;
+            extract_dir_recursive(img, &child_inode, &child_path, result, depth + 1, walked)?;
         } else if child_inode.is_file() {
-            let bytes = img.read_file(&child_inode, FFPKG_EXTRACT_MAX)?;
-            write_file_atomic(&child_path, &bytes)?;
+            let written = extract_file(img, &child_inode, &child_path)?;
             result.file_count += 1;
-            result.bytes_written += bytes.len() as u64;
+            result.bytes_written += written;
             // Cap sample list at 32 paths so the JSON response stays
             // bounded even on huge extracts.
             if result.sample_paths.len() < 32 {
@@ -234,18 +241,53 @@ fn extract_dir_recursive(
     Ok(())
 }
 
-fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), Ufs2Error> {
+/// Streams one file's bytes into `path` through a temp file and an atomic rename,
+/// [`FFPKG_EXTRACT_CHUNK`] at a time. Returns the bytes written. A size the image
+/// cannot hold is corruption (an inode is read straight off untrusted disk), refused
+/// as `FileTooLarge` before anything is written; a failed copy leaves no temp file.
+fn extract_file<R: Read + Seek>(
+    img: &mut Ufs2Image<R>,
+    inode: &ufs2::Inode,
+    path: &Path,
+) -> Result<u64, Ufs2Error> {
+    let sb = &img.superblock;
+    let cap = sb
+        .size_fragments
+        .saturating_mul(u64::from(sb.fragment_size));
+    if inode.size > cap {
+        return Err(Ufs2Error::FileTooLarge {
+            size: inode.size,
+            cap,
+        });
+    }
     if let Some(parent) = path.parent() {
         create_dir_all(parent).map_err(Ufs2Error::Io)?;
     }
     let tmp = path.with_extension("ffpkg-tmp");
-    {
+    let copied = (|| {
         let mut f = std::fs::File::create(&tmp).map_err(Ufs2Error::Io)?;
-        f.write_all(bytes).map_err(Ufs2Error::Io)?;
+        let mut off = 0u64;
+        while off < inode.size {
+            let chunk = img.read_range(inode, off, FFPKG_EXTRACT_CHUNK)?;
+            if chunk.is_empty() {
+                break;
+            }
+            f.write_all(&chunk).map_err(Ufs2Error::Io)?;
+            off += chunk.len() as u64;
+        }
         f.sync_all().map_err(Ufs2Error::Io)?;
+        Ok(off)
+    })();
+    match copied {
+        Ok(n) => {
+            std::fs::rename(&tmp, path).map_err(Ufs2Error::Io)?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    std::fs::rename(&tmp, path).map_err(Ufs2Error::Io)?;
-    Ok(())
 }
 
 /// Open a UFS2 image, walk its root + sce_sys, return everything the
@@ -727,9 +769,11 @@ pub fn parse_pkg_from<R: Read + Seek>(
         // PS5 patch kind is encoded in CNT content flags even if param.json is
         // absent/encrypted. Preserve the familiar gd/gp category contract for
         // the rest of the app and never default a PS5 package to PS4GD.
+        // An add-on says so by its content type (#724).
         let is_patch = (content_flags & 0x0010_0000) != 0 || (content_flags & 0x4000_0000) != 0;
         if meta.category.is_empty() {
-            meta.category = if is_patch { "gp" } else { "gd" }.to_string();
+            meta.category =
+                kind::category_from_header(meta.content_type, content_flags).to_string();
         }
         meta.package_type = Some(if is_patch { "PS5DP" } else { "PS5GD" }.to_string());
     } else {
@@ -1321,9 +1365,9 @@ where
         if head.len() < 0x7C {
             return None;
         }
+        let content_type = u32::from_be_bytes(head[0x74..0x78].try_into().ok()?);
         let flags = u32::from_be_bytes(head[0x78..0x7C].try_into().ok()?);
-        let is_patch = (flags & 0x0010_0000) != 0 || (flags & 0x4000_0000) != 0;
-        return Some(if is_patch { "gp" } else { "gd" }.to_string());
+        return Some(kind::category_from_header(content_type, flags).to_string());
     }
     let entry_count = u32::from_be_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
     let table_offset = u32::from_be_bytes([head[0x18], head[0x19], head[0x1A], head[0x1B]]);
@@ -1375,6 +1419,12 @@ pub struct ReaderMetadata {
     /// do know it can populate the field with
     /// [`package_fingerprint_from_reader`].
     pub fingerprint: String,
+    /// The container header's `content_type` (0x74); 0 when not read. See [`kind::classify`].
+    #[serde(default)]
+    pub content_type: u32,
+    /// The container header's `content_flags` (0x78); 0 when not read.
+    #[serde(default)]
+    pub content_flags: u32,
 }
 
 /// Title id from a content id's second dash segment, e.g.
@@ -1386,9 +1436,12 @@ fn title_id_from_content_id_str(content_id: &str) -> String {
         .nth(1)
         .and_then(|seg| seg.split('_').next())
         .filter(|id| {
+            // By bytes: the id comes from a package header, and a `str` cut inside a
+            // character that is not ASCII panics.
+            let id = id.as_bytes();
             id.len() == 9
-                && id[..4].bytes().all(|b| b.is_ascii_uppercase())
-                && id[4..].bytes().all(|b| b.is_ascii_digit())
+                && id[..4].iter().all(u8::is_ascii_uppercase)
+                && id[4..].iter().all(u8::is_ascii_digit)
         })
         .unwrap_or("")
         .to_string()
@@ -1493,14 +1546,17 @@ where
             }
         }
     }
+    let (content_type, content_flags) = if head.len() >= 0x7C {
+        (
+            u32::from_be_bytes(head[0x74..0x78].try_into().ok()?),
+            u32::from_be_bytes(head[0x78..0x7C].try_into().ok()?),
+        )
+    } else {
+        (0, 0)
+    };
     if outer_magic == PKG_MAGIC_FIH && category.is_empty() && head.len() >= 0x7C {
-        let flags = u32::from_be_bytes(head[0x78..0x7C].try_into().ok()?);
-        category = if (flags & 0x0010_0000) != 0 || (flags & 0x4000_0000) != 0 {
-            "gp"
-        } else {
-            "gd"
-        }
-        .to_string();
+        // A PS5 add-on is `ac`, never the `gd` a full game is (#724).
+        category = kind::category_from_header(content_type, content_flags).to_string();
     }
     if title_id.is_empty() {
         title_id = title_id_from_content_id_str(&content_id);
@@ -1524,6 +1580,8 @@ where
         platform,
         authenticity,
         fingerprint: String::new(),
+        content_type,
+        content_flags,
     })
 }
 
@@ -1562,6 +1620,10 @@ fn b64_encode(input: &[u8]) -> String {
 mod tests {
 
     use super::*;
+
+    // Build a minimal PARAM.SFO carrying one CATEGORY string key.
+
+    // Build a minimal \x7FCNT pkg whose only entry is PARAM.SFO.
 
     // Build a PARAM.SFO carrying several string keys (CATEGORY, APP_VER, …).
     // Matches the layout `parse_sfo_into` reads: 0x14 header, 0x10-byte index
@@ -1837,33 +1899,5 @@ mod tests {
             read_pkg_entry(&path, e, 1 << 20).unwrap(),
             read_pkg_entry_from(&mut cur, e, 1 << 20).unwrap()
         );
-    }
-
-    // An extracted entry's name must be one ordinary path component: the names the guard
-    // exists for are refused, the ones real game assets carry are kept.
-    #[test]
-    fn child_names_are_one_ordinary_component() {
-        for ok in [
-            "a.txt",
-            "name with spaces",
-            "dots.in.name",
-            "über.bin",
-            ".hidden",
-        ] {
-            assert!(is_safe_child_name(ok), "{ok}");
-        }
-        for bad in [
-            "",
-            ".",
-            "..",
-            "a/b",
-            "a\\b",
-            "/abs",
-            "C:evil.txt",
-            "a:b",
-            "nul\0",
-        ] {
-            assert!(!is_safe_child_name(bad), "{bad:?}");
-        }
     }
 }

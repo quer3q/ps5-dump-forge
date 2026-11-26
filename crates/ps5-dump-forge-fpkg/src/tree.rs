@@ -1,10 +1,6 @@
-//! The inner filesystem's tree, walked through the mount the way the console walks it: the
-//! superblock at the metadata base, the inode table one block after it (390 inodes to a block),
-//! and one dirent stream per directory from `uroot` (inode 4) down.
-//!
-//! Everything here is untrusted: counts are capped before anything is sized by them, every
-//! directory is entered once (a second visit is a cycle), and the walk stops at a fixed number
-//! of entries and of path bytes.
+//! The inner filesystem's tree: superblock at the metadata base, inode table one block after it,
+//! dirent streams from `uroot` (inode 4) down. Untrusted: counts capped before sizing anything,
+//! each directory entered once, entries and path bytes capped.
 
 use std::collections::HashSet;
 
@@ -15,13 +11,9 @@ use ps5upload_fpkg::{BLOCK, Result};
 use crate::pfs::{le32, le64};
 use crate::{CORRUPT, Reader, err};
 
-/// Inodes accepted, as the vendored reader caps them.
 const MAX_INODES: u64 = 4_000_000;
-/// Entries listed in all (files and directories), as the vendored UFS2/exFAT walkers cap them.
 pub(crate) const MAX_ENTRIES: usize = 1_000_000;
-/// Path bytes kept in all.
 pub(crate) const MAX_PATH_BYTES: usize = 256 << 20;
-/// One directory's dirent stream, read whole.
 // ponytail: 64 MiB per directory (~1 M entries), read whole; stream it if a title ever needs more
 const MAX_DIR_BYTES: u64 = 64 << 20;
 const SUPERBLOCK_MAGIC: u64 = 20_130_315;
@@ -38,7 +30,6 @@ pub(crate) struct InnerFile {
 pub(crate) struct InnerTree {
     pub files: Vec<InnerFile>,
     pub empty_dirs: Vec<String>,
-    /// Every directory path (for collisions with container entries).
     pub dirs: Vec<String>,
     /// A patch's directories and files left out: their metadata is the base game's.
     pub in_base: Vec<String>,
@@ -51,9 +42,8 @@ struct Inode {
     afid: i32,
 }
 
-/// Walk the tree whose metadata starts at `meta_base` of a mount `mount_size` long. File data
-/// must lie below `meta_base`. A `patch` skips (and lists in `in_base`) each directory or file
-/// whose metadata the patch doesn't carry.
+/// Walk the tree at `meta_base`; file data must lie below it. A `patch` skips (into `in_base`)
+/// what the patch doesn't carry.
 pub(crate) fn walk(
     reader: &mut Reader,
     meta_base: u64,
@@ -115,9 +105,7 @@ pub(crate) fn walk(
     };
     let mut entries = 0usize;
     let mut path_bytes = 0usize;
-    // Directory streams live in the metadata region, each in its own blocks, so together they
-    // cannot be longer than it; this stops a tree whose directories all point at one huge
-    // stream from reading it once per directory.
+    // All directory streams fit the metadata region: stops many dirs pointing at one huge stream.
     let mut dir_budget = mount_size - meta_base;
     let mut visited: HashSet<u32> = HashSet::new();
     let mut pending: Vec<(u32, String)> = vec![(FIRST_DIR_INODE, String::new())];
@@ -264,8 +252,6 @@ pub(crate) fn walk(
             tree.empty_dirs.push(prefix);
         }
     }
-    // A name listed twice in one directory (as two files, or a file and a directory) would
-    // make two entries of one path.
     let mut all: Vec<&str> = tree
         .files
         .iter()

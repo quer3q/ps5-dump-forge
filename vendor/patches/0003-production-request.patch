@@ -1,11 +1,11 @@
 diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
-index bbd3b02..86d7769 100644
+index da41c6f91ca5e2e93417209b3d1867dfff6043f2..3dfb9ac41e930a7e2d77bd3f5a1ec60f698d5cea 100644
 --- a/ps5upload-fpkg/src/build.rs
 +++ b/ps5upload-fpkg/src/build.rs
-@@ -66,6 +66,12 @@ pub struct BuildRequest {
-     /// Narrows the package's PlayGo languages to this one (`fr-FR`, …; see
-     /// [`cnt_write::playgo_scenario_json`]). Absent, it declares all of them with `en-US` first.
-     pub language: Option<String>,
+@@ -73,6 +73,12 @@ pub struct BuildRequest {
+     /// written. Everything after it (the checks, the `ampr_emu.index` made from the files
+     /// packaged, the plan) sees only what it gives.
+     pub reader: Option<SourceReader>,
 +    /// Whether the build itself consults the diagnostic variables `PS5UPLOAD_FPKG_PARAM_FILE`,
 +    /// `PS5UPLOAD_FPKG_SPOOL_DIR`, `PS5UPLOAD_FPKG_DRM_TYPE` and `PS5UPLOAD_FPKG_KRAKEN_STORE`.
 +    /// [`BuildRequest::new`] sets it, as the build always did; [`BuildRequest::production`]
@@ -14,11 +14,11 @@ index bbd3b02..86d7769 100644
 +    pub env_overrides: bool,
  }
  
- impl BuildRequest {
-@@ -91,14 +97,68 @@ impl BuildRequest {
-                 .and_then(|v| v.parse().ok())
+ /// The game as the build reads it, made from the source as it was opened, or why it can't be.
+@@ -115,14 +121,69 @@ impl BuildRequest {
                  .unwrap_or_default(),
              language: None,
+             reader: None,
 +            env_overrides: true,
 +        }
 +    }
@@ -48,6 +48,7 @@ index bbd3b02..86d7769 100644
 +            kraken: true,
 +            level: crate::kraken::Level::Balanced,
 +            language: None,
++            reader: None,
 +            env_overrides: false,
          }
      }
@@ -87,7 +88,7 @@ index bbd3b02..86d7769 100644
          Some(dir) if !dir.is_empty() => stream::KrakenSpool::File(spool_path(&dir, partial)),
          _ => stream::KrakenSpool::InPlace,
      }
-@@ -600,9 +660,27 @@ fn prepare_with(
+@@ -682,9 +743,27 @@ fn prepare_with(
      // `PS5UPLOAD_FPKG_PARAM_FILE` packages that exact param.json instead, e.g. one taken from a
      // known-good release of the same title, whose edits (sdkVersion, userDefinedParam*) the
      // game may depend on. Its content id must still match the package's.
@@ -117,7 +118,7 @@ index bbd3b02..86d7769 100644
              if source::content_id(&replaced).as_deref() != Some(content_id.as_str()) {
                  return format_err(format!(
                      "{} names a different content id than {content_id}",
-@@ -1025,8 +1103,11 @@ fn write_mode(
+@@ -1172,8 +1251,11 @@ fn write_mode(
                  icon_dds: prepared.icon_dds.clone(),
                  extras: prepared.extras.clone(),
                  playgo_chunks: request.playgo_chunks,
@@ -131,7 +132,7 @@ index bbd3b02..86d7769 100644
                  metadata_codec: request.metadata_codec,
              };
              // A separate spool is only ever scratch, whatever happens to the build.
-@@ -1134,8 +1215,7 @@ fn write_mode(
+@@ -1281,8 +1363,7 @@ fn write_mode(
                  seed,
                  passcode: &request.passcode,
                  content_type: cnt_write::content_class(param_json, plan.has_eboot()).0,
@@ -142,10 +143,10 @@ index bbd3b02..86d7769 100644
                  inner_size,
              })?;
 diff --git a/ps5upload-fpkg/src/kraken_image.rs b/ps5upload-fpkg/src/kraken_image.rs
-index 3e16fe4..e2e8d1d 100644
+index fdf16c7a9fc0fca7b439be09688918feb27f018b..03d29177eabe8d747224441baa4eab5ba5bc8f13 100644
 --- a/ps5upload-fpkg/src/kraken_image.rs
 +++ b/ps5upload-fpkg/src/kraken_image.rs
-@@ -141,7 +141,9 @@ fn plan_blocks(plan: &Plan) -> (Vec<Todo>, u64) {
+@@ -143,7 +143,9 @@ fn plan_blocks(plan: &Plan) -> (Vec<Todo>, u64) {
  /// Store every block uncompressed instead of compressing it: `PS5UPLOAD_FPKG_KRAKEN_STORE=1`.
  /// Compression is the default since the console's hardware decoder accepted our blocks (a
  /// compressed Minecraft played on a FW 5.10 console); storing stays available as a fallback.
@@ -156,7 +157,7 @@ index 3e16fe4..e2e8d1d 100644
      std::env::var("PS5UPLOAD_FPKG_KRAKEN_STORE").is_ok_and(|v| v == "1")
  }
  
-@@ -289,9 +291,10 @@ pub fn compress(
+@@ -293,9 +295,10 @@ pub fn compress(
              Ok(Some((t, bytes)))
          },
          |(t, bytes)| {
@@ -171,7 +172,7 @@ index 3e16fe4..e2e8d1d 100644
                      .chunks(kraken::HALF)
                      .map(|h| Half::Raw(h.to_vec()))
 diff --git a/ps5upload-fpkg/src/stream.rs b/ps5upload-fpkg/src/stream.rs
-index ff4ffd3..b467b6a 100644
+index c87b9db228e26dcc7fc193b9d735d84a92aa8402..f7a9802ed9f8c752d764549117536c7dcbd24e03 100644
 --- a/ps5upload-fpkg/src/stream.rs
 +++ b/ps5upload-fpkg/src/stream.rs
 @@ -47,8 +47,10 @@ pub struct StreamRequest<'a> {
@@ -196,8 +197,20 @@ index ff4ffd3..b467b6a 100644
          content_flags: cnt_write::content_class(&request.param_json, plan.has_eboot()).1,
          inner_size,
      })?;
+diff --git a/ps5upload-fpkg/tests/pkg_source.rs b/ps5upload-fpkg/tests/pkg_source.rs
+index fbe27797ec7adc005d9f14aac1612b466d1a177e..4eeeb2445b05b9ff0375a8d2567739499005c7ec 100644
+--- a/ps5upload-fpkg/tests/pkg_source.rs
++++ b/ps5upload-fpkg/tests/pkg_source.rs
+@@ -553,6 +553,7 @@ fn packages_with_os_junk_convert_with_the_same_visible_tree() {
+             playgo_chunks: 1,
+             kraken_spool: kraken.then_some(KrakenSpool::InPlace),
+             level: Level::Fast,
++            drm_type: ps5upload_fpkg::cnt_write::LICENSED_DRM_TYPE,
+             metadata_codec: MetaCodec::Stored,
+         };
+         stream::write_package(
 diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
-index f6cc99e..2e4519e 100644
+index f6cc99e99ecf91e040bae29c264ce30f942b9bc9..2e4519e759408ee0e26c063320dc76584cb5aac9 100644
 --- a/ps5upload-fpkg/tests/prepared.rs
 +++ b/ps5upload-fpkg/tests/prepared.rs
 @@ -415,6 +415,58 @@ fn the_estimate_covers_a_directory_heavy_tree() {
@@ -261,7 +274,7 @@ index f6cc99e..2e4519e 100644
  #[test]
 diff --git a/ps5upload-fpkg/tests/production.rs b/ps5upload-fpkg/tests/production.rs
 new file mode 100644
-index 0000000..0557842
+index 0000000000000000000000000000000000000000..0557842f8c55717177d9a0eba5521a0ce7893a3b
 --- /dev/null
 +++ b/ps5upload-fpkg/tests/production.rs
 @@ -0,0 +1,103 @@

@@ -11,7 +11,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::cnt_write::{self, CntParams};
 use crate::crypto::{crc32c, derive_ekpfs, derive_xts_keys, sha3, Hasher};
@@ -173,10 +173,11 @@ fn spool_base(spool: &KrakenSpool) -> u64 {
     }
 }
 
-/// The compression pool's size: every core, or fewer when the request caps it. A cap above the
-/// core count buys nothing, and the pool sizes its queues from this number.
+/// The compression pool's size: [`crate::workshop::workshop_threads`] (every core, unless the
+/// gentle mode or the process's thread cap says fewer), or fewer when the request caps it. A
+/// cap above that buys nothing, and the pool sizes its queues from this number.
 pub(crate) fn compression_threads(cap: Option<usize>) -> usize {
-    let all = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let all = crate::workshop::workshop_threads();
     match cap {
         Some(n) if n > 0 => n.min(all),
         _ => all,
@@ -253,7 +254,7 @@ pub fn write_package(
     // A stored build passes through this stage at once.
     (progress.stage)(crate::build::Stage::Compress);
     // Before the block list and the metadata region are built for the compressor.
-    if cancel.load(Ordering::Relaxed) {
+    if crate::workshop::checkpoint(cancel) {
         return Err(cancelled());
     }
     // A plaintext image spooled in place is already where the outer image keeps it, as it is
@@ -371,7 +372,7 @@ pub fn write_package(
         let threads = compression_threads(request.threads);
         let mut batch = Vec::new();
         while index < inner_blocks {
-            if cancel.load(Ordering::Relaxed) {
+            if crate::workshop::checkpoint(cancel) {
                 return Err(cancelled());
             }
             let n = (inner_blocks - index).min(WRITE_BATCH);
@@ -397,7 +398,7 @@ pub fn write_package(
         }
     }
     for index in index..inner_blocks {
-        if cancel.load(Ordering::Relaxed) {
+        if crate::workshop::checkpoint(cancel) {
             return Err(cancelled());
         }
         block_spans(&source, plan, index, &mut spans);
@@ -424,7 +425,7 @@ pub fn write_package(
     };
 
     // ── the outer metadata ───────────────────────────────────────────────────────────
-    if cancel.load(Ordering::Relaxed) {
+    if crate::workshop::checkpoint(cancel) {
         return Err(cancelled());
     }
     (progress.phase)("writing the layout");
@@ -439,7 +440,7 @@ pub fn write_package(
         image_time(request.image_mode, request.time),
         kraken.as_ref().map(|_| inner_size),
     )? {
-        if cancel.load(Ordering::Relaxed) {
+        if crate::workshop::checkpoint(cancel) {
             return Err(cancelled());
         }
         if index != lay.superblock_block {
@@ -483,7 +484,7 @@ pub fn write_package(
     out.write_all(&fih)?;
 
     // ── the container ────────────────────────────────────────────────────────────────
-    if cancel.load(Ordering::Relaxed) {
+    if crate::workshop::checkpoint(cancel) {
         return Err(cancelled());
     }
     (progress.phase)("writing the container");
@@ -554,7 +555,7 @@ pub fn write_package(
     crc_table.extend_from_slice(&si_write::chunk_crc(&cnt.bytes));
 
     // ── the install metadata ─────────────────────────────────────────────────────────
-    if cancel.load(Ordering::Relaxed) {
+    if crate::workshop::checkpoint(cancel) {
         return Err(cancelled());
     }
     (progress.phase)("writing the install metadata");
@@ -622,7 +623,7 @@ pub fn write_package(
     out.seek(SeekFrom::Start(cnt_offset + cnt.bytes.len() as u64))?;
     out.write_all(&si)?;
     // Flushing a large package to disk takes a while; a stop asked for by now skips it.
-    if cancel.load(Ordering::Relaxed) {
+    if crate::workshop::checkpoint(cancel) {
         return Err(cancelled());
     }
     out.sync_out()?;

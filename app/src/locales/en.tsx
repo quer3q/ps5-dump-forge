@@ -4,32 +4,27 @@
 
 import type { ReactNode } from "react";
 
-import type { Format, KrakenLevel, Lz4Runtime } from "../api";
-import type { Features, Rating, Row } from "../Formats";
+import type { Format, KrakenLevel } from "../api";
+import type { Rating, Row } from "../Formats";
 import type { ClientText } from "../http-client";
 import { dotted, num, plural } from "../i18n";
 import type { Failure } from "../launcher";
-import type { Engine, PackAction, PackLevel } from "../Pack";
+import type { Engine, PackLevel } from "../build/formats";
 import type { Note } from "../target";
 
-/** A flat image holds the game's files as they are: about as large as the game. */
 const FLAT = "Equal to the game size";
 
 const en = {
   // App.tsx
   app: {
     screens: "Screens",
-    convert: "Convert",
     active: (n: number) => `, ${num(n)} active`,
     edit: "Edit",
-    pack: "Pack",
     storage: "Storage",
     connect: "Connect",
     disconnected: "Disconnected",
-    connected: (n: number) => plural(n, { one: `Connected (${num(n)} device)`, other: `Connected (${num(n)} devices)` }),
+    connected: (n: number) => plural(n, { one: `${num(n)} device`, other: `${num(n)} devices` }),
     about: "About",
-    prevTab: "Previous tab (L2)",
-    nextTab: "Next tab (R2)",
     offline: "Offline, retrying…",
     stop: "Stop",
     stillRunning: (n: number): string => (n === 1 ? "A job is still running" : `${num(n)} jobs are still running`),
@@ -55,42 +50,17 @@ const en = {
     queued: "queued",
     progress: (percent: number, left: string | null) => `${percent}% done${left ? `, ${left} left` : ""}`,
   },
-  // Convert.tsx
+  // build/ (Build's convert settings and checks)
   convert: {
-    target: "Target",
-    targetFormat: "Target format",
+    targetFormat: "Format",
     alreadyFolder: "the source is already a folder",
-    lz4Backport:
-      "This game's assets are LZ4 packed and its LZ4 manifest lists the backport: unpack it in the Pack tab first, then remove the backport here.",
-    zstdBackport:
-      "This game's assets are zstd packed and its zstd index lists the backport: unpack it in the Pack tab first, then remove the backport here.",
-    unreadable: "Can't build: this source couldn't be read (see Source).",
     patchBlocked: "Can't build: this is a patch package, which holds only what the update changed. Open it in Edit to extract its files.",
     openInEdit: "Open in Edit",
-    noContentId: "Can't build as fpkg: this game's param.json has no content ID, which a package needs.",
+    noContentId: "Can't build as FPKG: this game's param.json has no content ID, which a package needs.",
     blocked: (first: string, more: number) =>
       `Can't build: ${first}${more > 0 ? ` (and ${num(more)} more, see Source)` : ""}.`,
-    /** What the conversion does to an AMPR game's ampr_emu. `own` is the game's version:
-     * for "keep", null when it is Forge's release runtime (the bundled one); for "replace", null
-     * when it names none. "trace": Forge's old LZ4 trace runtime, said as a plain replace. */
-    amprZstdRuntime: "This conversion installs ampr-emu-ng at fakelib/libSceAmpr.sprx, which these packs need.",
-    /** A game whose runtime is ampr-emu-ng that the conversion replaces with ampr_emu. */
-    amprNgReplaced: (version: string) => `Replaces this game's ampr-emu-ng with ampr_emu ${version}.`,
-    amprRuntime: (a: "install" | "trace" | "replace" | "keep", own: string | null, version: string) => {
-      if (a === "install") return `This game uses AMPR but has no ampr_emu: the conversion installs the bundled ampr_emu ${version}.`;
-      if (a === "trace") return `The conversion replaces this game's ampr_emu with the bundled ampr_emu ${version}.`;
-      if (a === "replace")
-        return own
-          ? `The conversion replaces this game's ampr_emu ${own} with the bundled ampr_emu ${version}.`
-          : `The conversion replaces this game's ampr_emu, which names no version, with the bundled ampr_emu ${version}.`;
-      return own
-        ? `This game's ampr_emu ${own} is as new as the bundled ${version} or newer: the conversion keeps it.`
-        : `This game already has the bundled ampr_emu ${version}: the conversion keeps it.`;
-    },
     amprIndex: (state: "stale" | "damaged" | "missing") =>
       `${state === "stale" ? "ampr_emu.index doesn't list this game's files" : state === "damaged" ? "ampr_emu.index can't be read" : "This game has no ampr_emu.index"}: the conversion writes a fresh one.`,
-    /** A package's index: the builder always writes it afresh from what it packages. */
-    amprPkgIndex: "The package gets a fresh ampr_emu.index built from the files it holds.",
     removeBackport: "Remove backport",
     /** What "Remove backport" leaves out and keeps: the emulators by name, and any other homebrew libraries. */
     removeHint: (libs: number, emulators: string[], other: boolean) =>
@@ -124,9 +94,9 @@ const en = {
         tagline: "Best, if your firmware allows",
         cells: ["Native, full speed", "30–60% less, depending on the game"],
       },
-      zstd: { tagline: "With ampr-emu-ng", cells: ["Up to 80% faster loading", "Up to half the game size"] },
+      zstd: { tagline: "With ampr-emu-ng", cells: ["Faster loading", "Up to half the game size"] },
       lz4: {
-        tagline: "With ampr-emu-ng or ampr_emu",
+        tagline: "With ampr-emu-ng",
         cells: ["30–40% faster loading, upstream's numbers", "About half the game size, upstream's numbers"],
       },
       ffpkg: { tagline: "Recommended for ShadowMountPlus", cells: ["Full image speed", FLAT] },
@@ -138,35 +108,22 @@ const en = {
       },
       folder: { tagline: "Plain game files", cells: ["Full drive speed", FLAT] },
     } satisfies Record<Format | "zstd", Row>,
-    /** About's feature list: name, then a few words. */
-    features: [
-      ["Convert", "between a folder, ffpkg, exfat, ffpfs, ffpfsc and fpkg, both ways."],
-      ["Transfer", "send files and convert games between your PS5, computers and a NAS over SMB, FTP or NFS."],
-      ["Edit", "a game's files like a folder, and see its cover, firmware, backport, DLC and file name problems before you build."],
-      ["Streamed", "from any source to any target: no temporary copy, not even the image inside an ffpfsc or a game in an archive."],
-      ["Archives", "a .zip, .7z or .rar holding one game is browsed, converted or packed like a folder."],
-      ["USB and SD cards", "written onto sticks and cards formatted exFAT or FAT32."],
-      ["Pack", "zstd or LZ4 asset packs with smart healing."],
-      ["Storage", "a Library of your games and a File explorer to rename, move and delete."],
-      ["Safe", "your game is never changed unless you ask; junk files are skipped and bad file names reported up front."],
-    ] as Features,
-    about: "About",
     compare: "Compare formats",
     compareLabel: "Format comparison",
     format: "Format",
     credits: "Credits",
     upstream: (app: string) =>
-      `Upstream's numbers: what the authors of ampr_emu and Lazy_AMPR report, not measured by ${app}; they vary by game. ampr_emu 0.4.2.1 is an upstream test build; known issue: some games crash when saving.`,
-    bundled: "LZ4 packed folders run on ampr_emu 0.4.2.1 by drakmor (GPL-3.0), bundled unmodified. Source:",
+      `Upstream's numbers: what the authors of ampr_emu and Lazy_AMPR report, not measured by ${app}; they vary by game.`,
+    bundled: "ampr_emu by drakmor (GPL-3.0), which ampr-emu-ng forks. Forge no longer bundles it: it replaces a game's ampr_emu with ampr-emu-ng unless Settings keeps it. Source:",
     lazy: "The packing strategy builds on Lazy_AMPR by Nazky:",
-    ng: "zstd and LZ4 packs run on ampr-emu-ng. Source:",
+    ng: "ZSTD and LZ4 packs run on ampr-emu-ng (GPL-3.0-or-later), the one AMPR runtime bundled, unmodified. Source:",
     logo: "The logo is by Xxcco:",
     unrar:
       ".rar archives are read with the bundled UnRAR library by Alexander Roshal (extract only, under the UnRAR license).",
     language: "Language",
     system: "System",
     notifications: "Notify when a job finishes",
-    notificationsHint: "Shows on the console for Convert, Pack and Transfer jobs.",
+    notificationsHint: "Shows on the console when a build, pack or transfer job ends.",
     notificationsFailed: "Couldn't change notifications.",
   },
   // Edit.tsx
@@ -188,7 +145,6 @@ const en = {
     leftoversNote: (app: string) =>
       `Unfinished outputs, usually from interrupted jobs. Remove only the ones you recognize, and only when no job is running; ${app} never deletes them itself.`,
     checked: (n: number) => `Folders checked (${num(n)})`,
-    /** Edit's folds under the game card. */
     facts: "Game facts",
     explorer: "Game files",
     howTitle: "How this works",
@@ -205,7 +161,6 @@ const en = {
     upTip: "Up one folder",
     name: "Name",
     size: "Size",
-    /** The row actions' column header (screen readers only). */
     actions: "Actions",
     items: (n: number) => `${num(n)} ${plural(n, { one: "item", other: "items" })}`,
     inFolder: (dirs: number, files: number) =>
@@ -213,11 +168,14 @@ const en = {
     matches: (n: number) => `${num(n)} ${plural(n, { one: "match", other: "matches" })}`,
     emptyFolder: "This folder is empty.",
     open: (name: string) => `Open ${name}`,
-    archiveNote: "Archives can be browsed but not edited. Convert it to a folder or an image first to change it.",
-    nasNote: "Games on a NAS can be browsed and extracted but not edited. Convert it or extract it to this device first to change it.",
+    archiveNote: "Archives can be browsed but not edited. Build a folder or an image from it first to change it.",
+    rebuildTimePkg: (t: string) => `Rebuild compresses the whole game again: about ${t} at ~26 MB/s on a PS5 (faster on a computer). Edit an unpacked copy instead to skip it.`,
+    rebuildTimePs5: (t: string) => `Rebuild writes the whole image again (about ${t} on this PS5).`,
+    rebuildTimeHost: (t: string) => `Rebuild writes the whole image again (about ${t} on this computer).`,
+    rebuildTimeAny: (t: string) => `Rebuild writes the whole image again (about ${t} on a PS5).`,
+    nasNote: "Games on a NAS can be browsed and extracted but not edited. Build it or extract it to this device first to change it.",
     patchNote: "This is a patch package: it holds only what the update changed. The files it carries whole are listed; they can be browsed and extracted but not edited.",
-    peerNote: "Games on another Forge can be browsed and extracted but not edited. Convert it or extract it to this device first to change it.",
-    /** The explorer's changes: none is made until Apply. */
+    peerNote: "Games on another Forge can be browsed and extracted but not edited. Build it or extract it to this device first to change it.",
     addFiles: "Add files",
     addFolder: "Add folder",
     pickAddFiles: "Choose files to add",
@@ -229,7 +187,6 @@ const en = {
     removeTip: "Delete (Delete key)",
     /** On a Mac the key marked delete is Backspace (Up a folder here). */
     removeTipMac: "Delete (fn+Delete)",
-    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
     extractItem: (name: string) => `Extract ${name}`,
     extractTip: "Copy it to a folder you choose",
     extractFolder: "Extract folder",
@@ -285,7 +242,6 @@ const en = {
     replace: "Replace",
     skip: "Skip",
     cancel: "Cancel",
-    /** How the changes go in (the pending bar), from core's check before Apply. */
     modeLabel: "How to apply",
     checking: "Checking how the changes can be applied",
     nothingToChange: "Nothing to change: the game stays as it is.",
@@ -300,7 +256,7 @@ const en = {
     inPlaceText: "Written into the image.",
     inPlaceNeeds: (need: string, free: string) => `Written into the image; needs ${need} of its ${free} free.`,
     noRoom: (need: string, free: string) => `The changes need ${need}, the image has ${free} free.`,
-    alwaysRebuilt: "ffpfsc and fpkg images are always rebuilt.",
+    alwaysRebuilt: "ffpfsc and FPKG images are always rebuilt.",
     rebuildText: "A new image is written beside it and replaces it once verified.",
     rebuildNeeds: (need: string, free: string) =>
       `A new image is written beside it (about ${need} free needed, ${free} free) and replaces it once verified.`,
@@ -330,11 +286,9 @@ const en = {
     uploading: (i: number, n: number, sent: string, total: string) => `Uploading file ${num(i)} of ${num(n)}: ${sent} of ${total}`,
     uploadLabel: "Upload",
     uploadCancelled: "Upload cancelled. Nothing in the game changed.",
-    applyRunning: "Applying the changes. Editing waits until the job below ends.",
+    applyRunning: "Applying the changes. Editing waits until the job ends (see Queue).",
     applyFailed: "The changes weren't applied:",
     applyRefused: "The changes can't be applied this way:",
-    applyCancelled: "The job was cancelled. Your changes are still listed here.",
-    folderPartly: "Part of them may already be in the folder: the files shown are what it holds now.",
     interrupted: "A previous edit of this image was interrupted. The image is put back as it was before your next changes are checked or applied.",
   },
   // JobList.tsx
@@ -356,8 +310,7 @@ const en = {
       finalize: "Finishing",
       install: "Installing",
     },
-    /** The job row's step list: short labels, one per stage id; ids with the same label next to
-     * each other are one step (preflight and check). */
+    /** The job row's step list: one label per stage id; equal neighbours are one step. */
     steps: {
       scan: "Reading",
       preflight: "Checking",
@@ -372,8 +325,8 @@ const en = {
       install: "Installing",
     },
     stepsLabel: "Steps",
-    /** Screen readers: a step's state (the current one is `aria-current`). */
     stepDone: (s: string) => `${s}, done`,
+    stepFailed: (s: string) => `${s}, failed`,
     stepLater: (s: string) => `${s}, not started yet`,
     packingWriting: "Packing and writing",
     rate: { read: "read", compress: "compress", pack: "pack", write: "write" },
@@ -381,19 +334,16 @@ const en = {
     showFinder: "Show in Finder",
     showExplorer: "Show in Explorer",
     showFolder: "Show in folder",
-    /** A Pack tab job's tag; a zstd pack with its level. */
     packTag: {
       lz4Pack: (level: string) => `LZ4 pack · ${level}`,
       lz4Unpack: "LZ4 unpack",
-      zstdPack: (level: string) => `zstd pack · ${level}`,
+      zstdPack: (level: string) => `ZSTD pack · ${level}`,
       level: (n: number) => `level ${num(n)}`,
-      zstdUnpack: "zstd unpack",
+      zstdUnpack: "ZSTD unpack",
       withRules: (tag: string) => `${tag} · custom rules`,
     },
-    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "Edit",
     editRebuild: "Edit · rebuild",
-    /** A transfer job's tag (Connect's copy job). */
     transfer: "Transfer",
     extract: "Extract",
     job: (id: number) => `Job ${id}`,
@@ -413,7 +363,6 @@ const en = {
     from: "from ",
     left: (d: string) => `${d} left`,
     inStep: (time: string) => `${time} in this step`,
-    result: (bytes: string, n: number) => `${bytes}, ${num(n)} ${plural(n, { one: "file", other: "files" })} →`,
     outputPath: "Output path",
     sourceDeleted: (v: string) => `Source deleted: ${v}`,
     sourceKept: (v: string) => `Source kept: ${v}`,
@@ -436,60 +385,27 @@ const en = {
     log: (n: number) => `Log (${num(n)})`,
     logLabel: "Log",
   },
-  // Library.tsx
+  // Storage text shared by Files.tsx, Packages.tsx, Edit.tsx and common.tsx (FreeSpace)
   library: {
-    pickTitle: "Choose a Library folder",
-    scanningIn: (name: string) => `Scanning ${name}`,
-    scanning: "Scanning",
-    cantScanFolder: "Can't scan this folder",
-    chooseAnother: "Choose another folder",
-    pickPrompt: "Choose a folder with your library to scan",
-    choose: "Choose folder",
-    cantScan: "Can't scan the Library:",
     cantDelete: "Can't delete:",
     deleted: (path: string) => `Deleted ${path}`,
-    truncated: "Scan limit reached. This list may be incomplete.",
-    limits: "The scan stops at six folder levels and after about 15 seconds of scanning.",
-    noRoots: "No folders are available to scan.",
-    none: "No games found. The scan checks up to six levels deep and skips system folders. Other sources can still be chosen in Edit or Convert.",
-    skipped: "Skipped locations and files",
-    library: "Library",
     storageTip: "Free space on the console's internal storage (/data)",
     free: (free: string, total: string) => (
       <>
         Free <b>{free}</b> of {total}
       </>
     ),
-    refresh: "Refresh",
     cards: "Card view",
     list: "List view",
-    games: "Games",
-    edit: (n: string) => `Edit ${n}`,
-    convert: (n: string) => `Convert ${n}`,
     remove: (n: string) => `Delete ${n}`,
     deleting: (n: string) => `Deleting ${n}`,
-    lz4Tip: "LZ4 asset packs",
-    zstdTip: "zstd asset packs",
     showAs: "Show as",
-    kinds: "Show kind",
-    all: "All",
-    lz4Chip: "LZ4",
-    zstdChip: "zstd",
-    countIn: (n: number, path: ReactNode) => (
-      <>
-        <b>{num(n)}</b> {plural(n, { one: "game in", other: "games in" })} {path}
-      </>
-    ),
   },
-  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  // Storage.tsx, Files.tsx: the Storage tab (File explorer | Package installer)
   storage: {
     views: "Storage view",
-    library: "Library",
     files: "File explorer",
     title: "File explorer",
-    pickTitle: "Choose a folder to browse",
-    pickPrompt: "Choose a folder to browse its files",
-    choose: "Choose folder",
     roots: "Drives",
     location: "Location",
     folders: "Folders",
@@ -523,7 +439,6 @@ const en = {
     moveTitle: (n: string) => `Move ${n} to`,
     remove: (n: string) => `Delete ${n}`,
     removeTip: "Delete (Delete key)",
-    /** On a Mac the key marked delete is Backspace (Up a folder here). */
     removeTipMac: "Delete (fn+Delete)",
     cantDelete: "Can't delete:",
     cantRename: "Can't rename:",
@@ -534,49 +449,32 @@ const en = {
     moved: (path: string) => `Moved to ${path}`,
     devices: "Devices",
     thisDevice: "This device",
-    otherDevice: "Move to stays on one device: drag it onto another device's tab to copy it there.",
-    dropCopy: (folder: string) => `Drop to copy into ${folder}`,
+    otherDevice: "Move to stays on one device: the Transfer screen copies between devices.",
+    loadingDevices: "Loading devices",
+    noDevice: "No device connected",
+    noDeviceHint: "Pair a PS5 or a computer, or add a NAS, to manage its files here.",
+    openConnect: "Open Connect",
     dropMove: (folder: string) => `Drop to move into ${folder}`,
     cantCopy: "Can't copy:",
     copyNoFolder: "Open a folder on that device first.",
-    copyOne: (name: string, to: string) => `Copying ${name} to ${to}. The transfer is listed under Connect.`,
+    copyOne: (name: string, to: string) => `Copying ${name} to ${to}. The transfer is listed in Queue.`,
     copyMany: (n: number, to: string) =>
       plural(n, {
-        one: `Copying ${num(n)} item to ${to}. The transfer is listed under Connect.`,
-        other: `Copying ${num(n)} items to ${to}. The transfer is listed under Connect.`,
+        one: `Copying ${num(n)} item to ${to}. The transfer is listed in Queue.`,
+        other: `Copying ${num(n)} items to ${to}. The transfer is listed in Queue.`,
       }),
-    openConnect: "Open Connect",
   },
-  // Pack.tsx
+  // build/ (Build's pack settings and checks), JobList.tsx's pack tags
   pack: {
-    title: "Pack",
     help: "How pack works",
-    engine: "Kind of packs",
-    engines: { zstd: "zstd", lz4: "LZ4" } satisfies Record<Engine, string>,
-    actions: { pack: "Pack", unpack: "Unpack" } satisfies Record<PackAction, string>,
-    info: (e: Engine, packed: boolean): string =>
-      e === "zstd"
-        ? packed
-          ? "Writes the zstd packs back as plain files."
-          : "Packs the game's assets into zstd volumes."
-        : packed
-          ? "Writes the LZ4 packs back as plain files."
-          : "Some games may not start. Packs the game's assets into LZ4 volumes.",
-    noAmprRuntime: "This game has no AMPR runtime: Pack injects ampr-emu-ng.",
-    strategy: (s: "everything" | "compatibility") => `Packing strategy: ${s === "everything" ? "pack everything except system files" : "compatibility LZ4 strategy"}.`,
     patch: "A patch package can't be packed.",
     additionalContent: "Additional content (no eboot.bin) can't be packed.",
-    unreadable: "Can't start: the source couldn't be read (see Source).",
-    blocked: (a: PackAction, first: string, more: number) =>
-      `Can't ${a}: ${first}${more > 0 ? ` (and ${num(more)} more, see Source)` : ""}.`,
-    target: "Target",
-    packFolder: (e: Engine): string => `Recommended. Fastest, lowest latency: a new game folder, its assets in ${e === "zstd" ? "zstd" : "LZ4"} packs.`,
     levels: { fast: "Fast", medium: "Medium", max: "Max" } satisfies Record<PackLevel, string>,
     levelNotes: {
       zstd: {
-        fast: { tone: "good", text: "Recommended. zstd 5: quick, good size." },
-        medium: { text: "zstd 9: smaller, slower." },
-        max: { text: "zstd 19: smallest; much slower, more memory." },
+        fast: { tone: "good", text: "Recommended. ZSTD 5: quick, good size." },
+        medium: { text: "ZSTD 9: smaller, slower." },
+        max: { text: "ZSTD 19: smallest; much slower, more memory." },
       },
       lz4: {
         fast: { tone: "good", text: "Recommended. LZ4 default: quickest." },
@@ -584,29 +482,8 @@ const en = {
         max: { text: "LZ4 HC 12: smallest, slowest." },
       },
     } satisfies Record<Engine, Record<PackLevel, Note>>,
-    runtime: "Runtime",
-    runtimeNotes: {
-      ng: { tone: "good", text: "Recommended. Reads zstd and LZ4 packs." },
-      ampr_emu: { text: "Upstream ampr_emu." },
-    } satisfies Record<Lz4Runtime, Note>,
-    ngNote: "Needs ampr-emu-ng: Pack installs it in fakelib/. Turn off ShadowMount+'s fakelib update, or it replaces the runtime.",
-    installsRuntime: (version: string) => `No ampr_emu here: Pack installs ampr_emu ${version}.`,
     freshIndex: (state: "stale" | "damaged" | "missing") =>
-      `${state === "stale" ? "ampr_emu.index is out of date" : state === "damaged" ? "ampr_emu.index is damaged" : "No ampr_emu.index"}: Pack writes a fresh one.`,
-    direct: "Packs straight into the image; reads the game twice.",
-    unpackFolder: "A new game folder with plain files.",
-    unpackHint: (n: number | null) =>
-      n === null
-        ? "Writes the packed files back as plain files."
-        : `Writes ${num(n)} packed ${plural(n, { one: "file", other: "files" })} back as plain files.`,
-    likelyFail: (fmt: string): ReactNode => <>
-      Likely to fail as <b>{fmt}</b>: it refuses file names listed in Source.
-    </>,
-    collides: (a: PackAction, folder: boolean) => `A job is already writing this ${folder ? "folder" : "file"}: ${a === "pack" ? "Pack" : "Unpack"} needs another name.`,
-    already: (a: PackAction, fmt: string): ReactNode => <>
-      Already writing this game as <b>{fmt}</b>; {a === "pack" ? "Pack" : "Unpack"} again makes a second copy.
-    </>,
-    source: "Source",
+      `${state === "stale" ? "ampr_emu.index is out of date" : state === "damaged" ? "ampr_emu.index is damaged" : "No ampr_emu.index"}: packing writes a fresh one.`,
     rules: {
       title: "Custom rules (TOML)",
       titleWith: (name: string) => `Custom rules (TOML): ${name}`,
@@ -622,32 +499,32 @@ const en = {
     close: "Close",
     body: () => (
       <>
-        <h3>zstd</h3>
+        <h3>ZSTD</h3>
         <ol>
-          <li>Packs the game's assets into zstd volumes, into a folder or an image.</li>
-          <li><b>Fast</b> (zstd 5) is quick; <b>Medium</b> (9) and <b>Max</b> (19) are smaller, slower.</li>
-          <li>A packed game shows <b>Unpack</b>: the plain files come back.</li>
+          <li>Packs the game's assets into ZSTD volumes, into a folder or an image.</li>
+          <li><b>Fast</b> (ZSTD 5) is quick; <b>Medium</b> (9) and <b>Max</b> (19) are smaller, slower.</li>
+          <li>For a ZSTD-packed game, <b>None</b> unpacks it: the plain files come back.</li>
         </ol>
 
         <h3>LZ4</h3>
         <ol>
           <li><b>Some games may not start.</b> Keep a copy.</li>
           <li>Packs into LZ4 volumes, into a folder or an image: <b>Fast</b> (LZ4), <b>Medium</b> (HC 9), <b>Max</b> (HC 12).</li>
-          <li>Runtime: <b>ampr-emu-ng</b> (default) or upstream <b>ampr_emu</b>.</li>
-          <li>A packed game shows <b>Unpack</b>.</li>
+          <li>Runs on ampr-emu-ng, as ZSTD packs do.</li>
+          <li>For an LZ4-packed game, <b>None</b> unpacks it.</li>
         </ol>
 
         <h3>ampr-emu-ng</h3>
         <ol>
-          <li>Reads zstd and LZ4 packs; Pack installs it in fakelib/.</li>
+          <li>The one AMPR runtime Forge bundles. It reads ZSTD and LZ4 packs; packing installs it in fakelib/.</li>
+          <li>A build replaces a game's ampr_emu with it, unless Settings keeps ampr_emu. An FPKG carries no runtime: the console's loader provides it.</li>
           <li>Turn off ShadowMount+'s fakelib update, or it replaces the runtime and the game can't read its packs.</li>
         </ol>
 
         <h3>Packing strategy</h3>
         <ol>
-          <li><b>Pack everything except system files</b> (zstd, and LZ4 with ampr-emu-ng): every file but eboot.bin, executables and modules, sce_sys, sce_module, fakelib and .ini files (dlc_emu.ini stays editable); ampr-emu-ng serves the rest, audio and video included.</li>
-          <li><b>Compatibility LZ4 strategy</b> (LZ4 with ampr_emu): configs, media and the other files a game reads directly stay loose.</li>
-          <li>Pack only: under <b>Custom rules (TOML)</b>, pick a profile in the format of ampr_pack.py and Lazy_AMPR, on this device or another one.</li>
+          <li><b>Pack everything except system files</b> (ZSTD and LZ4): every file but eboot.bin, executables and modules, sce_sys, sce_module, fakelib and .ini files (dlc_emu.ini stays editable); ampr-emu-ng serves the rest, audio and video included.</li>
+          <li>When packing, under <b>Custom rules (TOML)</b>, pick a profile in the format of ampr_pack.py and Lazy_AMPR, on this device or another one.</li>
           <li>The last matching rule wins; system files always stay loose. Wrong rules can leave a game that won't start.</li>
         </ol>
       </>
@@ -673,12 +550,21 @@ const en = {
     cantList: "Can't open this folder:",
     cancel: "Cancel",
     chooseFolder: "Choose this folder",
-    netOnlyHere: "Archives and fpkg open from this device only.",
-    shortcuts: "Shortcuts",
-    addShortcut: "Add shortcut",
-    removeShortcut: "Remove shortcut",
-    shortcutsFull: "9 shortcuts at most: remove one first.",
-    removeShortcutNamed: (name: string) => `Remove shortcut ${name}`,
+    netOnlyHere: "Archives and FPKG open from this device only.",
+  },
+  // bookmarks.tsx: the bookmarked folders (Transfer and the File explorer)
+  bookmarks: {
+    label: "Bookmarks",
+    add: "Bookmark this folder",
+    remove: "Remove bookmark",
+    removeNamed: (name: string) => `Remove bookmark ${name}`,
+    full: "9 bookmarks at most",
+  },
+  // DeviceTabs.tsx
+  deviceTabs: {
+    add: "Add a device",
+    offline: "Offline",
+    offlineNamed: (name: string) => `${name} · Offline`,
   },
   // common.tsx
   common: {
@@ -717,8 +603,8 @@ const en = {
     noAmpr: "eboot.bin does not import libSceAmpr",
     traceRuntime: "Old LZ4 trace runtime",
     noRuntime: "No runtime",
-    packed: (kind: "LZ4" | "zstd") => `Packed (${kind})`,
-    zstdKept: "zstd asset packs: a conversion keeps them",
+    packed: (kind: "LZ4" | "ZSTD") => `Packed (${kind})`,
+    zstdKept: "ZSTD asset packs: a conversion keeps them",
     damaged: "Damaged packs",
     unpacked: "Unpacked",
     packedDetail: (files: number, volumes: number, percent: number | null) =>
@@ -729,13 +615,16 @@ const en = {
       damaged: "ampr_emu.index damaged: a conversion rewrites it",
       missing: "no ampr_emu.index: a conversion writes one",
     } satisfies Record<"stale" | "damaged" | "missing", string>,
-    /** What a conversion does to the runtime; for "keep", the game's own version. */
-    runtimeAction: (a: "install" | "replace" | "keep", version: string) =>
+    /** What a conversion does to the runtime; "keepIfPacks": an ampr_emu build in an LZ4-packed
+     * game, with Settings' replace switch off. */
+    runtimeAction: (a: "install" | "replace" | "keep" | "keepIfPacks"): string =>
       a === "install"
-        ? `a conversion installs the bundled ampr_emu ${version}`
+        ? "a conversion installs the bundled ampr-emu-ng"
         : a === "replace"
-          ? `a conversion replaces the runtime with the bundled ampr_emu ${version}`
-          : `a conversion keeps it`,
+          ? "a conversion replaces the runtime with the bundled ampr-emu-ng"
+          : a === "keep"
+            ? "a conversion keeps it (Settings)"
+            : "a conversion keeps it if it reads LZ4 packs, else replaces it with ampr-emu-ng",
     backportLibs: (exclusive: boolean, n: number) =>
       `${exclusive ? "fakelib2/, mounted alone" : "fakelib/"}, ${num(n)} backport ${plural(n, { one: "library", other: "libraries" })}`,
     findings: "Preflight findings",
@@ -789,11 +678,11 @@ const en = {
   password: {
     title: "This archive needs a password",
     text: "Enter its password to open it.",
-    wrong: "The password is not correct.",
+    wrong: "The password is not correct. Check it and try again.",
     label: "Password",
     cancel: "Cancel",
     unlock: "Unlock",
-    checking: "Checking…",
+    checking: "Checking",
   },
   // main-http.tsx
   launch: {
@@ -824,38 +713,6 @@ const en = {
   },
   // target.tsx
   target: {
-    /** One line under a target picker: which one to pick, and when. */
-    format: {
-      folder: { text: "Unpack an image or package back into a plain game folder." },
-      exfat: {
-        text: "For games that misbehave as ffpkg and only run like external-drive content. Also opens on a Mac or PC.",
-      },
-      ffpkg: { text: "The PS5's own file system (UFS2). Writable mounts possible." },
-      ffpfs: {
-        text: "The PS5's PFS file system, uncompressed. File names must be plain ASCII.",
-      },
-      ffpfsc: {
-        text: "Smallest: a compressed container around one image, always mounted read-only.",
-      },
-      pkg: { tone: "good", text: "Recommended. Runs like a native game, but only if your firmware allows it." },
-      lz4: {
-        text: "A game folder with its assets packed into LZ4 volumes, which the bundled AMPR emulator (ampr_emu) unpacks while the game runs.",
-      },
-    } satisfies Record<Format, Note>,
-    /** The inner `.ffpkg`'s line: the format's own, less what a read-only `.ffpfsc` doesn't give. */
-    innerFfpkg: { text: "The PS5's own file system (UFS2)." } as Note,
-    innerExfat: { tone: "good", text: "Recommended. The most stable image inside a compressed container." } as Note,
-    level0: { text: "No compression: every block stored as it is. The file is as large as the image." } as Note,
-    levelDefault: {
-      tone: "good",
-      text: "Recommended (zlib's default). 1 builds about 3× faster with a file about 3% larger; 9 is barely smaller.",
-    } as Note,
-    levelLow: {
-      text: "Builds faster than 6 (level 1 about 3×); the file comes out larger (level 1 about 3%).",
-    } as Note,
-    levelHigh: {
-      text: "Barely smaller than 6 (level 9 by 0.04%), but compressing takes longer (level 9 about 25%), with every core busy throughout.",
-    } as Note,
     kraken: {
       fast: { label: "Fast", note: { tone: "good", text: "Recommended. The quickest build." } },
       balanced: {
@@ -890,7 +747,7 @@ const en = {
     badName: "A name can't be blank, start with a dot, end with a dot or a space, or hold control characters.",
     tooLong: (bytes: number, max: number, folder: boolean) =>
       `Too long: ${bytes} bytes${folder ? "" : " before the extension"}, at most ${max} (UTF-8).`,
-    pkgExt: (ext: string) => `Ends in .${ext}, but fpkg is saved as .pkg: the extension picks the driver.`,
+    pkgExt: (ext: string) => `Ends in .${ext}, but FPKG is saved as .pkg: the extension picks the driver.`,
     otherExt: (ext: string, target: string) =>
       `Ends in .${ext}, but the target is ${target}: the extension picks the driver.`,
     extractInto: "Extract into this folder",
@@ -904,7 +761,7 @@ const en = {
     inDir: (dir: string) => `in ${dir}`,
     generate: "Generate name based on content",
   },
-  // Formats.tsx (About's Output names) and target.tsx's name pattern: generated output names
+  // Settings.tsx (Output names) and target.tsx's name pattern: generated output names
   naming: {
     title: "Output names",
     template: "Name template",
@@ -920,7 +777,6 @@ const en = {
     versionOut: "The version is left out to make room.",
     cut: "The name is cut at 63 bytes.",
     idOnly: "The template's own text fills the 63 bytes, so the title ID names the output.",
-    limit: "ShadowMount+ can't mount an image whose name is longer than 63 bytes (58 for ffpfsc), so a longer name has its title cut first.",
     errors: {
       long: (max: number) => `A template is at most ${max} bytes.`,
       open: "A { has no closing }.",
@@ -941,7 +797,8 @@ const en = {
     later: "Later",
     updating: "Updating…",
     updatingNote: "The new version is downloading. This page reloads into it by itself.",
-    downloading: "Downloading in your browser: unpack the archive and replace this copy.",
+    downloading: "The download is opening in your browser: replace this copy with the downloaded file (on a Mac, drag the app from the .dmg to Applications).",
+    downloadingCli: "The download is opening in your browser: replace the ps5-dump-forge CLI with the downloaded file, or run ps5-dump-forge update --install on the computer running it.",
     failed: (v: string) => `Couldn't update to v${v}`,
     timeout: (v: string) => `v${v} didn't start within a minute. If it was downloaded, stop Dump Forge and open it again to finish the update.`,
     retry: "Retry",
@@ -971,7 +828,6 @@ const en = {
     all: "All",
     onlineOf: (n: number, total: number) => `${num(n)} of ${num(total)} online`,
     sendFilesTo: (name: string) => `Send files to ${name}`,
-    details: (name: string) => `Details of ${name}`,
     userIs: (user: string) => `user ${user}`,
     nearby: "Nearby",
     nearbyNone: "No new devices found",
@@ -999,7 +855,6 @@ const en = {
     connectTo: "Connect",
     probing: (address: string) => `Checking ${address}`,
     pairing: "Pairing",
-    /** The Pair dialog while the other device's user decides. */
     waitingFor: (address: string) => `Waiting for ${address} to allow the pairing`,
     checkNumber: "Check number",
     checkHint: "It must match the number the other device shows.",
@@ -1008,7 +863,6 @@ const en = {
     pairBusy: "The other device has other pairing requests waiting. Try again in a minute.",
     alreadyPaired: "That device already has this one saved. Forget it there first, then pair again.",
     tooManyAttempts: "Too many refused requests. Try again in 10 minutes.",
-    /** The prompt on the device asked to pair. */
     pairPromptTitle: (name: string) => `Pair with ${name}?`,
     pairPromptBody: (name: string, platform: string, ip: string) =>
       `${name} (${platform}, ${ip}) wants to pair with this device. A paired device can read this device's files and add new ones.`,
@@ -1038,12 +892,7 @@ const en = {
     passwordNone: "None",
     edit: "Edit",
     nasForgetNote: "Forget removes this NAS and its saved password from this device.",
-    pickSendFiles: "Files to send",
-    pickSendFolder: "Folder to send",
-    pickSaveTo: "Where to save it",
     thisBrowser: "This browser",
-    browserHint: "Files from this phone or computer go into a folder on this device, and a file from this device is saved by this browser.",
-    uploadTo: "Folder to upload into",
     uploadPick: "Choose files to upload",
     uploading: (name: string, i: number, n: number) => `Uploading ${name} (${num(i)} of ${num(n)})`,
     uploaded: "Upload finished",
@@ -1054,30 +903,17 @@ const en = {
         one: `${num(done)} of ${num(n)} files was uploaded and stays on this device.`,
         other: `${num(done)} of ${num(n)} files were uploaded and stay on this device.`,
       }),
-    cantStart: "Can't start the transfer:",
     cantUpload: "Can't upload:",
-    pickDownload: "File to download",
-    transferIntro: "Send files or a folder from any device into a folder here, on a paired device or on a NAS. The transfer runs as a job in the job list.",
     send: "Send",
-    sendWhat: "What to send",
-    sendTo: "Send to",
-    /** Under Send to while no other device (paired Forge or NAS) is online: the button is off. */
-    sendNeedsDevice: "Connect another device first: pair a Forge or add a NAS.",
-    nothingChosen: "Nothing chosen yet",
-    chooseFiles: "Choose files",
-    chooseFolder: "Choose a folder",
-    startTransfer: "Start",
-    uploadHere: "Upload to this device",
     downloadHere: "Download from this device",
-    consoleNoFiles: "The console's browser can't pick files: open this page on a phone or computer.",
     wholeRoot: "A whole device, share or drive can't be sent: choose a folder inside it.",
-    helpPhone: "Scan the QR code to open this page on a phone. There, Upload to this device and Download from this device in File Transfer move the phone's files.",
+    helpPhone: "Scan the QR code to open this page on a phone. There, Transfer uploads the phone's files to this device and downloads this device's files to the phone.",
     /** How to connect: short paragraphs, in order (no headings). */
     help: [
       "Connect links Dump Forge on your PS5 and computers on the same network.",
       "To pair, run Autodiscovery and choose Pair under Nearby, or type an address under Add a device, then allow it on the other device. Allow it only when both screens show the same check number.",
       "A NAS (SMB, FTP, NFS) is added the same way. Paired devices and NAS devices are game sources and outputs; their games aren't edited there.",
-      "File Transfer copies files and folders between any of them. A name that already exists there is replaced only after you confirm.",
+      "Transfer, in the side menu, copies files and folders between any of them. A name that already exists there is replaced only after you confirm.",
     ] as string[],
     helpSecurity: "Nothing sent between devices is encrypted: anyone on your network can read it. A saved NAS password is kept on this device unencrypted. Use Connect on your home network only.",
     helpSpeed: "Speed test, in a paired device's row or its details, sends 128 MiB to it and fetches 128 MiB back, nothing written to disk, and shows the network's speed each way.",
@@ -1118,10 +954,8 @@ const en = {
     content: { game: "Game", patch: "Patch", additional_content: "Additional content", unknown: "Unknown" },
     install: "Install",
     installName: (name: string) => `Install ${name}`,
-    started: (name: string) => `Installing ${name}. The job is listed below.`,
-    /** The job row's tag. */
+    started: (name: string) => `Installing ${name}. The job is listed in Queue.`,
     tag: "Install",
-    /** The confirm dialog. */
     title: "Install this package?",
     titleOn: (device: string) => `Install this package on ${device}?`,
     file: "File",
@@ -1133,11 +967,275 @@ const en = {
     reinstall: "If this game is already installed, the PS5 deletes the installed copy before it installs this one.",
     cancel: "Cancel",
     confirm: "Install",
-    /** Connect: an online paired PS5's row. */
     installPkg: "Install pkg",
     installPkgOn: (device: string) => `Install a package on ${device}`,
     pickTitle: "Choose a package to install",
-    sent: (device: string) => `${device} is installing the package. The job is listed below.`,
+    sent: (device: string) => `${device} is installing the package. The job is listed in Queue.`,
+  },
+  // Build's and Edit's Restore metadata online switch (build/options.tsx, Edit.tsx)
+  metadata: {
+    tag: "Metadata",
+    cant: "Can't restore the metadata:",
+    label: "Restore metadata online",
+    buildHint: "Before the build, downloads this version's param.json, pictures, sound and PlayGo tables from Sony's update server and puts them into the output where they differ. The game itself isn't changed. Needs the internet; without it the build goes on as is.",
+    buildSummary: "Puts Sony's metadata into the output (the game isn't changed)",
+    editHint: "Applies this version's param.json, pictures, sound and PlayGo tables from Sony's update server to this game, with your changes, where they differ: a folder is changed directly, an exfat or ffpkg in place, an ffpfs, ffpfsc or FPKG rebuilt. Needs the internet; if the download fails, nothing is changed.",
+    editOnly: "Sony's metadata for this version, applied to this game",
+    editAlso: "Sony's metadata for this version is applied too, downloaded first.",
+    editConfirm: "Apply Sony's metadata?",
+    editConfirmText: "The metadata is downloaded first; if that fails, nothing is changed.",
+  },
+  // App.tsx: the side rail
+  rail: {
+    build: "Build",
+    settings: "Settings",
+    queue: "Queue",
+    transfer: "Transfer",
+    collapse: "Collapse menu",
+    expand: "Expand menu",
+  },
+  // Queue.tsx
+  queue: {
+    empty: "No jobs yet. Builds, edits, transfers and installs show up here.",
+    counts: (running: number, queued: number, failed: number, done: number): string =>
+      [
+        running && `${num(running)} running`,
+        queued && `${num(queued)} queued`,
+        failed && `${num(failed)} failed`,
+        done && `${num(done)} done`,
+      ]
+        .filter(Boolean)
+        .join(", ") || "Nothing to show",
+    retryFailed: (n: number): string => (n > 0 ? `Retry failed (${num(n)})` : "Retry failed"),
+    retrying: (i: number, n: number) => `Retrying ${num(i)} of ${num(n)}`,
+    clearFinished: "Clear finished",
+    filters: { all: "All", running: "Running", failed: "Failed", done: "Done" },
+    filterLabel: "Show",
+    noneShown: "No jobs match this filter.",
+  },
+  // Settings.tsx
+  settings: {
+    appearance: "Appearance",
+    theme: "Theme",
+    themeHint: "Dark suits a TV; light a bright room.",
+    dark: "Dark",
+    light: "Light",
+    scheme: "Colour scheme",
+    schemeHint: "The accent colour across the app.",
+    schemes: { abyss: "Abyss", ember: "Ember", moss: "Moss", cobalt: "Cobalt", dusk: "Dusk", rose: "Rose", sand: "Sand", volt: "Volt", mono: "Mono" },
+    advanced: "Advanced options",
+    advancedOpen: "Always show advanced options",
+    advancedHint:
+      "Shows every pack and format, with no More, and keeps every fold open. Turn it off to keep Build short.",
+    bundled: (version: string) => `${version} (bundled)`,
+    replaceAmprEmu: "Replace ampr_emu with ampr-emu-ng",
+    languageHint: "The system's languages until you choose one.",
+    notificationsGroup: "PS5",
+  },
+  // JobList.tsx: a finished job's result
+  result: {
+    file: "Output",
+    type: "Type",
+    size: "Size",
+    files: "Files",
+    time: "Time",
+    verified: "Verified",
+    verifiedFast: "Verified (fast)",
+    verifiedFull: "Verified (full)",
+    notVerified: "No check reported",
+    checks: "Checks:",
+    copy: "Copy details",
+    copied: "Copied",
+    copyFailed: "Can't copy here",
+    ofSource: (pct: number) => `${num(pct, 1)}% of the game's files`,
+    filesN: (n: number) => plural(n, { one: `${num(n)} file`, other: `${num(n)} files` }),
+    to: "written to",
+    took: (d: string) => `took ${d}`,
+    kinds: {
+      pkg: "FPKG: installable on a PS5 with FPKG support",
+      exfat: "exfat image: ShadowMount+ mounts it, writable",
+      ffpkg: "ffpkg image (UFS2): ShadowMount+ mounts it, writable",
+      ffpfs: "ffpfs image (PFS): ShadowMount+ mounts it",
+      ffpfsc: "ffpfsc image (compressed PFS): ShadowMount+ mounts it read-only",
+      folder: "Game folder",
+    } as Record<string, string | undefined>,
+    zstdFolder: "ZSTD packed folder",
+    lz4Folder: "LZ4 packed folder",
+    withPacks: (image: string, kind: string) => `${image}, files in ${kind} packs`,
+    edited: (what: string) => `${what}, changed in place`,
+    rebuilt: (what: string) => `${what}, rebuilt`,
+    extracted: "Extracted files",
+    transferred: "Copied files",
+    installed: "Package handed to the PS5's installer",
+  },
+  // JobList.tsx: the log panel
+  log: {
+    lines: (n: number, of?: number): string =>
+      of === undefined
+        ? plural(n, { one: `${num(n)} line`, other: `${num(n)} lines` })
+        : plural(of, { one: `${num(n)} of ${num(of)} line`, other: `${num(n)} of ${num(of)} lines` }),
+    filter: "Filter",
+    follow: "Auto-scroll",
+    copy: "Copy",
+    copied: "Copied",
+    copyFailed: "Copy failed",
+    save: "Save",
+    clear: "Clear",
+    cleared: "Cleared",
+  },
+  // common.tsx: the source card's fact chips
+  sourceChips: {
+    sdk: (v: string) => `SDK ${v}`,
+    firmware: (v: string) => `FW ${v}+`,
+  },
+  // prefs.tsx: Advanced's badge
+  advanced: {
+    changed: "Changed",
+    defaults: "Defaults",
+  },
+  // build/*: the Build screen
+  build: {
+    summary: "Summary",
+    addToQueue: "Add to queue",
+    queued: "Added to the queue",
+    openQueue: "Open Queue",
+    space: (free: string, dir: string, needed: string): ReactNode => (
+      <>
+        {free} free in <span className="path">{dir}</span>, about {needed} needed
+      </>
+    ),
+    needed: (needed: string) => `About ${needed} needed`,
+    spaceRaw: "Room is checked as if nothing compressed.",
+    estimate: "estimate",
+    advanced: "Advanced options",
+    // options.tsx
+    options: "Options",
+    fastVerify: "Fast verification: every structure checked, a sample of the data read back.",
+    fullVerify: "Full verification: every byte is read back.",
+    deleted: "The source is deleted after a successful build. No undo.",
+    // backport.tsx
+    zstdBackport:
+      "This game's assets are ZSTD packed and its ZSTD index lists the backport: build it once with Packs: None, then remove the backport.",
+    lz4Backport:
+      "This game's assets are LZ4 packed and its LZ4 manifest lists the backport: build it once with Packs: None, then remove the backport.",
+    backportLeftOut: (n: number) =>
+      plural(n, {
+        one: `${num(n)} backport library is left out of fakelib/.`,
+        other: `${num(n)} backport libraries are left out of fakelib/.`,
+      }),
+    // packs.tsx and fields.tsx; `engine` is "zstd" or "LZ4"
+    packsTitle: "Target",
+    packs: "Packs",
+    more: "More",
+    moreTip: "More formats",
+    cards: {
+      folder: "Plain files, copy anywhere, ShadowMount+ runs it",
+      pkg: "Installs on the PS5 like a game package",
+      exfat: "Mounts with ShadowMount+ and opens on a PC",
+      ffpkg: "UFS2 image for ShadowMount+, writable mounts possible",
+      ffpfs: "PFS image, uncompressed, ASCII file names only",
+      ffpfsc: "Smallest image: compressed, always mounted read-only",
+      lz4: "Assets packed with LZ4, plain folder",
+    } satisfies Record<Format, string>,
+    zstdFolderCard: "Assets packed with ZSTD, plain folder",
+    packCards: {
+      nonePlain: "The game's files as they are",
+      unpack: "Writes the packs back as plain files",
+      keepZstd: "The ZSTD packs are kept byte for byte",
+      keepLz4: "The LZ4 packs are kept byte for byte",
+      zstd: "Smaller game, faster loading, with ampr-emu-ng",
+      repackZstd: "Decodes the LZ4 packs, packs again with ZSTD",
+      lz4: "Packs assets with LZ4, with ampr-emu-ng",
+      repackLz4: "Decodes the ZSTD packs, packs again with LZ4",
+    },
+    naming: "Output: the name is being made",
+    output: (name: string, dir: string): ReactNode => (
+      <>
+        Output: <b className="path">{name}</b> in <span className="path">{dir}</span>
+      </>
+    ),
+    choices: { none: "None", zstd: "ZSTD", lz4: "LZ4" },
+    levelLabel: (level: string, engine: string, n: number) => `${level}, ${engine} ${n}`,
+    levelTip: (engine: string, n: number, note: string) => `${engine} ${n}. ${note}`,
+    sumKeepZstd: "The ZSTD packs are kept byte for byte.",
+    sumKeepLz4: "The LZ4 packs are kept byte for byte.",
+    sumKeepPlain: "No packs are made: the game's files are converted as they are.",
+    sumUnpack: (engine: string) => `The ${engine} packs are written back as plain files.`,
+    sumPack: (engine: string, level: string) => `The game's files are packed into ${engine} volumes (${level}).`,
+    sumRepack: (from: string, to: string, level: string) => `The ${from} packs are decoded and packed again with ${to} (${level}).`,
+    sumRules: (name: string) => `Custom rules ${name} pick which files are packed.`,
+    sumInside: (format: string, level: number) => `Inside: ${format}, zlib level ${level}.`,
+    ngInstalled: "ampr-emu-ng is installed at fakelib/libSceAmpr.sprx.",
+    /** `old`: the game's runtime with its version, e.g. "ampr_emu 0.4.2.1". */
+    ngReplaced: (old: string) => `The game's ${old} is replaced with ampr-emu-ng.`,
+    ngReplacedTrace: "The game's old trace runtime is replaced with ampr-emu-ng.",
+    ngKept: (old: string) => `The game's ${old} is kept.`,
+    /** An LZ4-packed game kept as it is, with the replace switch off. */
+    /** `v`: the game's ampr-emu-ng version with a leading space, or empty. */
+    ngUpdated: (v: string) => `The game's ampr-emu-ng${v} is replaced with the bundled one.`,
+    ngSame: (v: string) => `The game's ampr-emu-ng${v} is kept.`,
+    pkgNoRuntime: "The AMPR runtime is left out of the FPKG: the console's loader provides it.",
+    // Build.tsx: the result line under the target
+    recommended: "Recommended",
+    resultTitle: "About, after the build",
+    resultNow: "Game now",
+    resultCustomRules: "custom rules: no estimate",
+    // backport.tsx: the Backport step
+    backportTitle: "Backport",
+    backportNone: "No backport in this game.",
+    backportPlain: "Only for a plain conversion: no packs made or unpacked.",
+  },
+  // TransferPane.tsx: one device's pane of the Transfer screen
+  transfer: {
+    pane: (device: string) => `Files on ${device}`,
+    roots: "Drives",
+    location: "Location",
+    up: "Up",
+    upTip: "Up one folder",
+    refresh: "Refresh",
+    filter: "Filter by name",
+    filterLabel: "Filter this folder by name",
+    inFolder: (dirs: number, files: number) =>
+      `${num(dirs)} ${dirs === 1 ? "folder" : "folders"}, ${num(files)} ${files === 1 ? "file" : "files"}`,
+    matches: (n: number) => plural(n, { one: `${num(n)} match`, other: `${num(n)} matches` }),
+    firstOf: (max: number, n: number) => `first ${num(max)} of ${num(n)}`,
+    truncated: "This folder holds more than 10,000 entries: only the first 10,000 are listed.",
+    name: "Name",
+    size: "Size",
+    select: (name: string) => `Select ${name}`,
+    open: (name: string) => `Open ${name}`,
+    selected: (n: number) => plural(n, { one: `${num(n)} item selected`, other: `${num(n)} items selected` }),
+    clear: "Clear",
+    clearTip: "Clear the selection",
+    dragItems: (n: number) => plural(n, { one: `${num(n)} item`, other: `${num(n)} items` }),
+    dropHere: (path: string) => `Drop to send to ${path}`,
+    notHere: "Open a folder to send files here.",
+    emptyFolder: "This folder is empty.",
+    noMatch: (f: string) => `Nothing here matches “${f}”.`,
+    noRoots: "No drives are available to browse.",
+    cantList: "Can't open this folder:",
+    loading: "Loading",
+    link: "Link",
+    linkTip: "A link: it can be opened, but not selected",
+    mounted: "Mounted",
+    mountedTip: "Mounted by ShadowMount+: stop the game and turn ShadowMount+ off to select it",
+    // Transfer.tsx: the Transfer screen
+    withTitle: "Transfer with",
+    loadingDevices: "Loading devices",
+    noneTitle: "No device to transfer with",
+    noneHint: "Pair another Dump Forge or add a NAS under Connect, or turn on a saved one.",
+    openConnect: "Open Connect",
+    deviceOffline: (device: string) => `${device} is offline. Its files show again once it is back.`,
+    copyTo: (n: number, device: string) =>
+      plural(n, { one: `Copy ${num(n)} item to ${device}`, other: `Copy ${num(n)} items to ${device}` }),
+    copyNoFolder: (device: string) => `Open a folder on ${device} to copy into.`,
+    installOn: (device: string) => `Install on ${device}`,
+    dropFiles: "Drop files here to upload them",
+    uploadInto: (folder: string) => `They go into ${folder}, the folder shown on this device.`,
+    uploadNoFolder: "Open a folder on this device to upload into.",
+    foldersLeftOut: (names: string) => `Folders aren't uploaded, only files: ${names}.`,
+    downloadFiles: (n: number) => plural(n, { one: `Download ${num(n)} file`, other: `Download ${num(n)} files` }),
+    downloadNone: "Select files on this device to download them (folders aren't downloaded).",
   },
   // api.ts: prettyDuration, whole per language (CJK writes 5分30秒, no spaces)
   duration: { s: (s: number) => `${s} s`, ms: (m: number, s: number) => `${m} min ${s} s`, hm: (h: number, m: number) => `${h} h ${m} min` },

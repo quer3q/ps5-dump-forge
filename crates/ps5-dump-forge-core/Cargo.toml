@@ -29,6 +29,7 @@ ps5-dump-forge-smb.workspace = true
 ps5-dump-forge-ftp.workspace = true
 ps5-dump-forge-nfs.workspace = true
 ps5-dump-forge-patch.workspace = true
+ps5-dump-forge-updater.workspace = true
 
 [dev-dependencies]
 ps5-dump-forge-ftp = { workspace = true, features = ["fake"] }

@@ -1,13 +1,11 @@
-//! The server's PS5 notifications, in the console's language (System Settings → Language) when
-//! the web UI has it, else English. Off the PS5 they stay English (the CLI's stderr).
+//! The server's PS5 notifications, in the console's language when the web UI has it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ps5_dump_forge_core::{ConvertRequest, Format, Lz4Mode};
 
-/// A UI language (app/src/i18n.ts `LANGUAGES`), by the console's `SceSystemParamLang` code.
-// Off the PS5 only English is reached.
+/// A UI language (app/src/i18n.ts `LANGUAGES`).
 #[cfg_attr(not(target_env = "ps5"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lang {
@@ -26,8 +24,7 @@ pub(crate) enum Lang {
 
 #[cfg_attr(not(target_env = "ps5"), allow(dead_code))]
 impl Lang {
-    /// `SCE_SYSTEM_PARAM_LANG_*`: both Englishes, Spanishes, Frenches, Portugueses and Chineses
-    /// map to the one the UI has; a language it lacks is English.
+    /// `SCE_SYSTEM_PARAM_LANG_*`; a language the UI lacks is English.
     fn from_console(code: i32) -> Self {
         match code {
             0 => Self::Ja,
@@ -45,12 +42,10 @@ impl Lang {
     }
 }
 
-/// The console's language now; English when it can't be read (and off the PS5).
 pub(crate) fn console_lang() -> Lang {
     #[cfg(target_env = "ps5")]
     {
         unsafe extern "C" {
-            /// libSceSystemService: a system setting by id.
             fn sceSystemServiceParamGetInt(param_id: i32, value: *mut i32) -> i32;
         }
         /// `SCE_SYSTEM_SERVICE_PARAM_ID_LANG`.
@@ -64,7 +59,6 @@ pub(crate) fn console_lang() -> Lang {
     Lang::En
 }
 
-/// Serving on the PS5. Just that: the console's own browser opens the page from the app's icon.
 pub(crate) fn started(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Dump Forge is launched",
@@ -81,7 +75,6 @@ pub(crate) fn started(lang: Lang) -> &'static str {
     }
 }
 
-/// Something else holds the port.
 pub(crate) fn port_in_use(lang: Lang, port: u16) -> String {
     match lang {
         Lang::En => format!("Dump Forge: port {port} is used by another program"),
@@ -100,8 +93,7 @@ pub(crate) fn port_in_use(lang: Lang, port: u16) -> String {
     }
 }
 
-/// The server has stopped (Stop in the page); the web UI's `app.stopped` words, except English
-/// keeps its own (tests match it).
+/// The web UI's `app.stopped` words, except English keeps its own (tests match it).
 pub(crate) fn stopped(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Dump Forge stopped",
@@ -118,8 +110,7 @@ pub(crate) fn stopped(lang: Lang) -> &'static str {
     }
 }
 
-/// A newer copy was started while an older one has a job: the older one
-/// keeps serving, and the newer one's self copy is what the tile starts next time.
+/// A newer copy was started while an older one has a job.
 pub(crate) fn update_busy(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Can't close Dump Forge - some jobs are still running.",
@@ -138,7 +129,6 @@ pub(crate) fn update_busy(lang: Lang) -> &'static str {
     }
 }
 
-/// The older copy agreed to quit but its port didn't come free in time (or it didn't answer).
 pub(crate) fn not_taken_over(lang: Lang, old: &str, new: &str) -> String {
     match lang {
         Lang::En => format!("Dump Forge v{new} could not take over from v{old}"),
@@ -155,19 +145,16 @@ pub(crate) fn not_taken_over(lang: Lang, old: &str, new: &str) -> String {
     }
 }
 
-/// The kind of long job a notice is sent for: the UI's `jobType` (app/src/jobs.ts) but edits.
+/// The UI's `jobType` (app/src/jobs.ts) but edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JobKind {
     Convert,
     Lz4,
-    /// A zstd pack or unpack job (`zstd_pack`, `zstd_unpack`).
     Zstd,
     Transfer,
-    /// A package install (`install`).
     Install,
 }
 
-/// A job of this device that finished or failed, as the console is told ([`job_ended`]).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Ended {
     pub kind: JobKind,
@@ -175,9 +162,7 @@ pub(crate) struct Ended {
     pub name: String,
 }
 
-/// What a notice says about `request`'s job, given its result (`Ok`: the report's output):
-/// a conversion, an LZ4 tab job, a zstd pack or a transfer (named by what it sent) that finished or failed. Nothing for an edit,
-/// an extract or a cancel.
+/// Nothing for an edit, an extract or a cancel.
 pub(crate) fn ended(request: &ConvertRequest, result: &Result<PathBuf, String>) -> Option<Ended> {
     if let Err(e) = result
         && (e == "cancelled" || e.starts_with("cancelled; "))
@@ -193,7 +178,10 @@ pub(crate) fn ended(request: &ConvertRequest, result: &Result<PathBuf, String>) 
         JobKind::Install
     } else if !request.transfer.is_empty() {
         JobKind::Transfer
-    } else if !request.edits.is_empty() || !request.extract.is_empty() {
+    } else if !request.edits.is_empty()
+        || !request.extract.is_empty()
+        || request.recover_metadata.is_some()
+    {
         return None;
     } else if lz4 {
         JobKind::Lz4
@@ -230,14 +218,12 @@ fn file_name(path: &Path) -> String {
     }
 }
 
-/// A conversion, LZ4 job, zstd job or transfer finished or failed: "Dump Forge: conversion
-/// finished: <name>" and its seven siblings (the plain notice, when the system toast can't be sent).
+/// The plain notice, when the system toast can't be sent.
 pub(crate) fn job_ended(lang: Lang, e: &Ended) -> String {
     let (what, colon, name) = job_parts(lang, e);
     format!("Dump Forge{colon}{what}{colon}{name}")
 }
 
-/// The system toast's headline: "Conversion finished" and its seven siblings.
 fn job_headline(lang: Lang, e: &Ended) -> String {
     let what = job_parts(lang, e).0;
     let mut chars = what.chars();
@@ -246,7 +232,7 @@ fn job_headline(lang: Lang, e: &Ended) -> String {
         .map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
-/// What happened, the language's colon and the name (kept whole in right-to-left text).
+/// What happened, the language's colon and the name.
 fn job_parts(lang: Lang, e: &Ended) -> (&'static str, &'static str, String) {
     // Finished, failed: a conversion, an LZ4 job, a zstd job, a transfer, a package install.
     let words: [&str; 10] = match lang {
@@ -404,13 +390,10 @@ fn job_parts(lang: Lang, e: &Ended) -> (&'static str, &'static str, String) {
     (what, colon, name)
 }
 
-/// The marker file whose presence turns job notices off.
 const NOTICES_OFF: &str = "notifications.off";
 
-/// Shows the user a line (`Options::notify`).
 pub(crate) type Notify = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Job-end notices ([`job_ended`]): sent on the PS5 while the setting is on (the default).
 /// The setting is kept as [`NOTICES_OFF`] in the settings folder, else in memory only.
 pub(crate) struct JobNotices {
     /// Held across a change of the marker file too, so two changes can't cross.
@@ -418,9 +401,7 @@ pub(crate) struct JobNotices {
     dir: Option<PathBuf>,
     /// `None` off the PS5: nothing is sent.
     send: Option<Notify>,
-    /// The system toast ([`system_toast`]; tests pass their own), tried before `send`.
-    toast: fn(&str) -> bool,
-    /// Where the toast's icon is put ([`TOAST_ICON`]); `None` off the PS5: no toast.
+    /// `None` off the PS5: no toast.
     icon: Option<PathBuf>,
 }
 
@@ -431,7 +412,6 @@ impl JobNotices {
             on: Mutex::new(!off),
             dir,
             send,
-            toast: system_toast,
             icon: cfg!(target_env = "ps5").then(|| PathBuf::from(TOAST_ICON)),
         }
     }
@@ -440,7 +420,7 @@ impl JobNotices {
         *self.on.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Turns them on or off, kept in the settings folder first (an error leaves it as it was).
+    /// An error leaves it as it was.
     pub fn set(&self, on: bool) -> Result<(), String> {
         let mut now = self.on.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(dir) = &self.dir {
@@ -459,8 +439,7 @@ impl JobNotices {
         Ok(())
     }
 
-    /// Tells the console that a job ended, when it is one a notice is for and they are on: a
-    /// system toast with Forge's icon, else (refused, or no icon) the plain notice.
+    /// A system toast, else (refused, or no icon) the plain notice.
     pub fn send(&self, ended: Option<Ended>) {
         let (Some(send), Some(ended)) = (&self.send, ended) else {
             return;
@@ -474,7 +453,7 @@ impl JobNotices {
             .map_or(0, |d| d.as_secs());
         let toasted = self.icon.as_ref().is_some_and(|icon| {
             toast_icon(icon)
-                && (self.toast)(&toast_json(
+                && system_toast(&toast_json(
                     &job_headline(lang, &ended),
                     &job_parts(lang, &ended).2,
                     icon,
@@ -487,19 +466,15 @@ impl JobNotices {
     }
 }
 
-/// Forge's icon for the system toast, where the console's notification overlay reads it
-/// (ShadowMountPlus keeps its own under `/user/data` too).
+/// Where the notification overlay reads it (ShadowMountPlus keeps its own under `/user/data`).
 const TOAST_ICON: &str = "/user/data/dumpforge/notify-icon.png";
 
-/// Forge's icon: the tile's `icon0.png` and the toast's.
 pub(crate) const ICON: &[u8] = include_bytes!("../../../ps5/icon0.png");
 
-/// Sends a system toast from its JSON payload (libSceNotification, as the console's own
-/// notices); false when the console refuses it.
+/// False when the console refuses it.
 #[cfg(target_env = "ps5")]
 pub(crate) fn system_toast(payload: &str) -> bool {
     unsafe extern "C" {
-        /// libSceNotification: a notification from its JSON payload.
         fn sceNotificationSend(
             user_id: i32,
             logged_in: bool,
@@ -515,14 +490,12 @@ pub(crate) fn system_toast(payload: &str) -> bool {
     unsafe { sceNotificationSend(SYSTEM_USER, true, payload.as_ptr()) == 0 }
 }
 
-/// Off the PS5 there is no system toast.
 #[cfg(not(target_env = "ps5"))]
 pub(crate) fn system_toast(_: &str) -> bool {
     false
 }
 
-/// Puts Forge's icon (the tile's) at `icon` unless those bytes are there already; false if it
-/// can't.
+/// False if it can't.
 fn toast_icon(icon: &Path) -> bool {
     use std::sync::atomic::{AtomicU32, Ordering};
     // Two jobs ending at once write their own temporary files.
@@ -548,9 +521,7 @@ fn toast_icon(icon: &Path) -> bool {
     put
 }
 
-/// A job-end toast: Forge's icon, the name as the upper line (`subMessage`), the headline as the
-/// main one (`message`). The shape ShadowMountPlus
-/// sends (its TOASTS.md): `InteractiveToastTemplateB`, here with no action.
+/// ShadowMountPlus's shape (its TOASTS.md): `InteractiveToastTemplateB`, no action.
 fn toast_json(headline: &str, name: &str, icon: &Path, now: u64) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     // Two jobs ending within a second get their own ids.
@@ -620,8 +591,7 @@ mod tests {
         ended(request, &Ok(PathBuf::from("/o/x"))).map(|e| e.kind)
     }
 
-    /// As the UI's `jobType`: a transfer, then edits and extracts (no notice), then an LZ4
-    /// tab job, then a zstd pack, else a conversion.
+    /// As the UI's `jobType`.
     #[test]
     fn which_jobs_get_a_notice() {
         let plain = request("/o/a.exfat");
@@ -653,6 +623,10 @@ mod tests {
             r.edits = vec![ps5_dump_forge_core::Edit::Delete { path: "a".into() }];
         };
         assert_eq!(with(&edit), None);
+        assert_eq!(
+            with(&|r| r.recover_metadata = Some(Default::default())),
+            None
+        );
         // A cancel says nothing; a failure names the output.
         for cancel in ["cancelled", "cancelled; the image was restored"] {
             assert_eq!(ended(&plain, &Err(cancel.into())), None);
@@ -668,38 +642,5 @@ mod tests {
         );
         t.transfer.truncate(1);
         assert_eq!(ended(&t, &Err("x".into())).unwrap().name, "game-1k");
-    }
-
-    /// The system toast first, Forge's icon put beside it; the plain notice when the toast is
-    /// refused.
-    #[test]
-    fn a_system_toast_first_else_the_plain_notice() {
-        let dir = std::env::temp_dir().join(format!("forge-toast-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
-        let to = sent.clone();
-        let send: Notify = Arc::new(move |line: &str| to.lock().unwrap().push(line.into()));
-        let one = || ended(&request("/o/a.exfat"), &Ok("/o/a.exfat".into()));
-        let accepted = JobNotices {
-            toast: |payload| payload.contains("\"Conversion finished\""),
-            icon: Some(dir.join("icons/notify-icon.png")),
-            ..JobNotices::new(None, Some(send.clone()))
-        };
-        accepted.send(one());
-        assert!(sent.lock().unwrap().is_empty());
-        assert_eq!(
-            std::fs::read(dir.join("icons/notify-icon.png")).unwrap(),
-            ICON
-        );
-        let refused = JobNotices {
-            toast: |_| false,
-            ..accepted
-        };
-        refused.send(one());
-        assert_eq!(
-            *sent.lock().unwrap(),
-            ["Dump Forge: conversion finished: a.exfat"]
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

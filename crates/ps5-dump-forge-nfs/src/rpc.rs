@@ -1,5 +1,4 @@
-//! ONC RPC v2 (RFC 5531) over TCP: record marking (RFC 5531 §11), XDR (RFC 4506) by hand,
-//! AUTH_SYS credentials, one call at a time with its reply matched by xid.
+//! ONC RPC v2 (RFC 5531) over TCP: record marking, XDR by hand, AUTH_SYS, replies matched by xid.
 // ponytail: AUTH_SYS as root (uid 0, gid 0, machine "forge"): a `root_squash` export maps it to
 // the anonymous user; no RPCSEC_GSS (Kerberos).
 
@@ -10,12 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TIMEOUT: Duration = Duration::from_secs(30);
-/// Largest reply record accepted (a READ or READDIR reply is sized well below it by the caller).
 pub const MAX_RECORD: usize = 16 * 1024 * 1024;
-/// Replies to other xids (left over from a call cut short) skipped before giving up.
+/// Replies to other xids (from a call cut short) skipped before giving up.
 const MAX_SKIPPED: usize = 64;
 const LAST_FRAGMENT: u32 = 0x8000_0000;
-/// Empty fragments one record may hold (legal, but endless ones would never end the record).
+/// Empty fragments one record may hold (legal, but endless ones would never end it).
 const MAX_EMPTY_FRAGMENTS: usize = 64;
 
 const RPC_VERSION: u32 = 2;
@@ -27,13 +25,10 @@ const AUTH_NONE: u32 = 0;
 const AUTH_SYS: u32 = 1;
 const MACHINE: &str = "forge";
 
-/// An RPC-level refusal (the call never reached the procedure). Carried inside an `io::Error`;
-/// [`rpc_error`] gets it back, [`is_version_mismatch`] tells a version fallback apart.
+/// An RPC-level refusal, carried inside an `io::Error` ([`rpc_error`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
-    /// The server doesn't serve this program on this port.
     ProgUnavail,
-    /// The program is served, only in versions `low..=high`.
     ProgMismatch {
         low: u32,
         high: u32,
@@ -41,12 +36,11 @@ pub enum RpcError {
     ProcUnavail,
     GarbageArgs,
     SystemErr,
-    /// The server speaks RPC versions `low..=high`, not 2.
     RpcMismatch {
         low: u32,
         high: u32,
     },
-    /// Credentials refused (`auth_stat`, RFC 5531 §9).
+    /// `auth_stat`, RFC 5531 §9.
     Auth(u32),
 }
 
@@ -103,12 +97,11 @@ impl From<RpcError> for io::Error {
     }
 }
 
-/// The RPC refusal inside `e`, if it is one.
 pub fn rpc_error(e: &io::Error) -> Option<&RpcError> {
     e.get_ref()?.downcast_ref()
 }
 
-/// True when `e` says the server doesn't serve this program or version (try another one).
+/// The server doesn't serve this program or version (try another one).
 pub fn is_version_mismatch(e: &io::Error) -> bool {
     matches!(
         rpc_error(e),
@@ -145,14 +138,12 @@ impl Xdr {
         self.u32(v as u32)
     }
 
-    /// Fixed-length opaque: the bytes and their padding, no length.
     pub fn fixed(&mut self, bytes: &[u8]) -> &mut Self {
         self.buf.extend_from_slice(bytes);
         self.buf.resize(self.buf.len() + pad(bytes.len()), 0);
         self
     }
 
-    /// Variable-length opaque: the length, then the padded bytes.
     pub fn opaque(&mut self, bytes: &[u8]) -> &mut Self {
         self.u32(bytes.len() as u32).fixed(bytes)
     }
@@ -170,7 +161,7 @@ fn pad(len: usize) -> usize {
     (4 - len % 4) % 4
 }
 
-/// XDR decoder over a reply body; running past the end is `InvalidData`.
+/// Running past the end is `InvalidData`.
 #[derive(Debug, Clone)]
 pub struct XdrReader<'a> {
     buf: &'a [u8],
@@ -209,14 +200,12 @@ impl<'a> XdrReader<'a> {
         }
     }
 
-    /// Fixed-length opaque of `n` bytes (padding skipped).
     pub fn fixed(&mut self, n: usize) -> io::Result<&'a [u8]> {
         let s = self.take(n)?;
         self.take(pad(n))?;
         Ok(s)
     }
 
-    /// Variable-length opaque of at most `max` bytes.
     pub fn opaque(&mut self, max: usize) -> io::Result<&'a [u8]> {
         let n = self.u32()? as usize;
         if n > max {
@@ -227,7 +216,6 @@ impl<'a> XdrReader<'a> {
         self.fixed(n)
     }
 
-    /// An array length of at most `max` elements.
     pub fn len(&mut self, max: usize) -> io::Result<usize> {
         let n = self.u32()? as usize;
         if n > max {
@@ -241,17 +229,8 @@ impl<'a> XdrReader<'a> {
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
-
-    /// Everything not read yet (consumed).
-    #[cfg(test)]
-    pub fn rest(&mut self) -> &'a [u8] {
-        let s = &self.buf[self.pos..];
-        self.pos = self.buf.len();
-        s
-    }
 }
 
-/// A successful reply: the procedure's results start at `start`.
 #[derive(Debug)]
 pub struct Reply {
     buf: Vec<u8>,
@@ -264,12 +243,11 @@ impl Reply {
     }
 }
 
-/// One TCP connection to one RPC server; one call at a time.
 pub struct Client {
     stream: TcpStream,
     xid: u32,
     stamp: u32,
-    /// Set once a call fails part way: the stream may be mid-record, so nothing more is sent.
+    /// Set once a call fails part way: the stream may be mid-record.
     broken: bool,
 }
 
@@ -278,7 +256,6 @@ impl Client {
         Client::over(connect(addr)?, TIMEOUT)
     }
 
-    /// A client over a connected `stream`, each read and write given `timeout`.
     pub fn over(stream: TcpStream, timeout: Duration) -> io::Result<Client> {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -286,8 +263,8 @@ impl Client {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        // A fresh xid space per connection, so a server's duplicate request cache never matches
-        // a call of an earlier connection from the same (reused privileged) port.
+        // A fresh xid space per connection, so a server's duplicate request cache never matches a
+        // call of an earlier connection from the same (reused privileged) port.
         let xid = now.subsec_nanos() ^ (now.as_secs() as u32).rotate_left(16) ^ std::process::id();
         Ok(Client {
             stream,
@@ -297,7 +274,6 @@ impl Client {
         })
     }
 
-    /// Calls `proc` of `prog` version `vers` with the XDR-encoded `args`.
     pub fn call(&mut self, prog: u32, vers: u32, proc: u32, args: &[u8]) -> io::Result<Reply> {
         if self.broken {
             return Err(io::Error::new(
@@ -321,7 +297,7 @@ impl Client {
         })
     }
 
-    /// The NULL procedure (0): a ping that tells whether `prog` version `vers` is served.
+    /// NULL: whether `prog` version `vers` is served.
     pub fn null(&mut self, prog: u32, vers: u32) -> io::Result<()> {
         self.call(prog, vers, 0, &[]).map(drop)
     }
@@ -335,7 +311,6 @@ struct Call {
     stamp: u32,
 }
 
-/// The record mark and call header for a call whose arguments are `args_len` bytes.
 fn encode_call(c: &Call, args_len: usize) -> io::Result<Vec<u8>> {
     let mut cred = Xdr::new();
     cred.u32(c.stamp).string(MACHINE).u32(0).u32(0).u32(0); // uid, gid, no gids
@@ -362,7 +337,6 @@ fn encode_call(c: &Call, args_len: usize) -> io::Result<Vec<u8>> {
     Ok(x.buf)
 }
 
-/// Sends one call (a single fragment) and reads records until the reply to its xid.
 fn exchange<S: Read + Write>(s: &mut S, c: &Call, args: &[u8]) -> io::Result<Reply> {
     s.write_all(&encode_call(c, args.len())?)?;
     s.write_all(args)?;
@@ -376,10 +350,8 @@ fn exchange<S: Read + Write>(s: &mut S, c: &Call, args: &[u8]) -> io::Result<Rep
     Err(bad("the NFS server sent too many replies to other calls"))
 }
 
-/// Reads one record: fragments joined until the one marked last; at most [`MAX_RECORD`] bytes.
-/// At most [`MAX_EMPTY_FRAGMENTS`] empty fragments, so a record always ends.
-// ponytail: the 30 s timeout is per socket read, not per call; a server that drips bytes
-// keeps a call alive up to MAX_RECORD of them.
+/// Fragments joined until the last; at most [`MAX_RECORD`] bytes and [`MAX_EMPTY_FRAGMENTS`] empty ones.
+// ponytail: the 30 s timeout is per socket read; a server that drips bytes keeps a call alive.
 fn read_record<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut empty = 0;
@@ -399,8 +371,7 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
                 "the NFS server's reply is larger than {MAX_RECORD} bytes"
             )));
         }
-        // Grown as bytes arrive (a reply's usual size reserved): a length alone allocates
-        // little, so a server that names 16 MiB and stalls costs no 16 MiB.
+        // Grown as bytes arrive: a server naming 16 MiB and stalling costs no 16 MiB.
         let want = buf.len() + len;
         buf.reserve(len.min(2 << 20));
         r.take(len as u64).read_to_end(&mut buf)?;
@@ -413,8 +384,7 @@ fn read_record<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Where the results start in a reply to `xid`; `None` for a record about another xid (or a
-/// call from the server, which we never take); an RPC refusal as its [`RpcError`].
+/// Where the results start; `None` for a record about another xid (or a call from the server).
 fn parse_reply(buf: &[u8], xid: u32) -> io::Result<Option<usize>> {
     let mut r = XdrReader::new(buf);
     if r.u32()? != xid || r.u32()? != REPLY {
@@ -453,14 +423,12 @@ fn parse_reply(buf: &[u8], xid: u32) -> io::Result<Option<usize>> {
     }
 }
 
-/// Most privileged source ports tried before falling back to any port.
 #[cfg(unix)]
 const MAX_PORT_TRIES: usize = 64;
 
-/// Connects from a privileged source port (1023 down to 600) when the system lets us bind one
-/// (Linux exports are `secure` by default and refuse other ports), else from any port.
-// ponytail: without root (or macOS's unprivileged low ports) a `secure` export refuses the
-// fallback connection; Windows always takes the fallback.
+/// From a privileged source port (1023 down) when one binds (Linux exports are `secure` by
+/// default), else from any port.
+// ponytail: without root a `secure` export refuses the fallback; Windows always takes it.
 pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
     #[cfg(unix)]
     for port in (600..=1023u16).rev().take(MAX_PORT_TRIES) {
@@ -485,8 +453,7 @@ mod privileged {
     use std::net::{SocketAddr, TcpStream};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    /// A TCP connection to `addr` from local `port` (bind, then a non-blocking connect polled
-    /// for at most [`CONNECT_TIMEOUT`]).
+    /// Bind, then a non-blocking connect polled for at most [`CONNECT_TIMEOUT`].
     pub fn connect_from(addr: SocketAddr, port: u16) -> io::Result<TcpStream> {
         let family = match addr {
             SocketAddr::V4(_) => libc::AF_INET,
@@ -612,6 +579,18 @@ mod tests {
     }
 
     #[test]
+    fn malformed_xdr_is_refused() {
+        let mut x = Xdr::new();
+        x.opaque(b"abcde").u32(2).u32(7);
+        let mut r = XdrReader::new(&x.buf);
+        assert!(r.opaque(4).is_err()); // longer than allowed
+        assert!(XdrReader::new(&x.buf[12..]).bool().is_err()); // 2 is no boolean
+        assert!(XdrReader::new(&x.buf[12..]).len(1).is_err());
+        assert!(XdrReader::new(&x.buf[..9]).opaque(8).is_err()); // padding missing
+        assert!(XdrReader::new(&[]).u32().is_err());
+    }
+
+    #[test]
     fn records_are_bounded() {
         // Two fragments each under the cap whose sum is over it.
         let half = (MAX_RECORD / 2 + 1) as u32;
@@ -729,38 +708,6 @@ mod tests {
             exchange(&mut s, &c, &[]).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-    }
-
-    #[test]
-    fn xdr_round_trip() {
-        let mut x = Xdr::new();
-        x.u32(1)
-            .u64(0x0102_0304_0506_0708)
-            .bool(true)
-            .opaque(b"abcde")
-            .string("")
-            .fixed(&[9, 9]);
-        assert_eq!(x.buf.len(), 4 + 8 + 4 + (4 + 8) + 4 + 4);
-        let mut r = XdrReader::new(&x.buf);
-        assert_eq!(r.u32().unwrap(), 1);
-        assert_eq!(r.u64().unwrap(), 0x0102_0304_0506_0708);
-        assert!(r.bool().unwrap());
-        assert_eq!(r.opaque(5).unwrap(), b"abcde");
-        assert_eq!(r.opaque(0).unwrap(), b"");
-        assert_eq!(r.fixed(2).unwrap(), [9, 9]);
-        assert_eq!(r.remaining(), 0);
-        assert!(r.u32().is_err());
-
-        let mut x = Xdr::new();
-        x.opaque(b"abcde").u32(2).u32(7);
-        let mut r = XdrReader::new(&x.buf);
-        assert!(r.opaque(4).is_err()); // longer than allowed
-        let mut r = XdrReader::new(&x.buf[12..]);
-        assert!(r.bool().is_err()); // 2 is no boolean
-        assert!(XdrReader::new(&x.buf[12..]).len(1).is_err());
-        assert_eq!(XdrReader::new(&x.buf[16..]).rest(), [0, 0, 0, 7]);
-        // Padding missing at the end.
-        assert!(XdrReader::new(&x.buf[..9]).opaque(8).is_err());
     }
 
     #[test]

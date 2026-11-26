@@ -1,22 +1,13 @@
-// How generated output names are made (About's Output names, by user decision): one template
-// string with the tokens `{title}`, `{title_id}`, `{version}`, `{pack}`, `{region}`, `{fw}` and any text around
-// them, kept in `localStorage` `forge.naming` beside the language and the shortcuts. A port of
-// core's `naming_problem` and of its substitution and cleanup (`inspect.rs` `parse_naming`,
-// `NameParts::render`). Unreadable, invalid or missing storage is the default, never an error.
-// No runtime imports, so plain-node checks can load it.
+// Generated output names (issue #33): one template in `localStorage` `forge.naming`; a port of core's `naming_problem` and `NameParts::render`. Unreadable or invalid storage is the default. No runtime imports (plain-node checks).
 
-/** One token of a naming template. */
 export type NamePart = "title" | "title_id" | "version" | "pack" | "region" | "fw";
 
 const KEY = "forge.naming";
 
-/** Every token, in the order the About card's chips list them. */
 export const PARTS: NamePart[] = ["title", "title_id", "version", "pack", "region", "fw"];
 
-/** Core's default (`naming` null). */
 export const DEFAULT_NAMING = "[{title}]-[{title_id}]";
 
-/** Core's template limit, in UTF-8 bytes. */
 export const MAX_NAMING = 128;
 
 /** Why core refuses a template (`naming_problem`), one kind per message. */
@@ -30,7 +21,6 @@ export type NamingProblem =
   | { kind: "control" }
   | { kind: "needsName" };
 
-/** A template's text (one character each, NFC) and its tokens, in order. */
 type Piece = { text: string } | { part: NamePart };
 
 const FORBIDDEN = '/\\:*?"<>|';
@@ -77,12 +67,7 @@ export function namingProblem(template: string): NamingProblem | null {
   return Array.isArray(p) ? null : p;
 }
 
-/**
- * `template` with each token's value (`value`; an empty one is left out), cleaned up as core
- * does, the template's own text only: an empty `[]` or `()` removed until none is left, a run
- * of one separator (`-`, `_`, a space) as one, `-`, `_`, `.` and spaces trimmed at both ends.
- * An invalid template gives "".
- */
+/** Values substituted, then only the template's own text cleaned as core does (empty `[]`/`()`, separator runs, ends trimmed); an invalid template gives "". */
 export function render(template: string, value: (p: NamePart) => string): string {
   const parsed = parse(template);
   if (!Array.isArray(parsed)) return "";
@@ -113,7 +98,6 @@ export function render(template: string, value: (p: NamePart) => string): string
     .join("");
 }
 
-/** `v` when it is a template core takes, else null. */
 export function valid(v: unknown): string | null {
   return typeof v === "string" && !namingProblem(v) ? v : null;
 }
@@ -130,7 +114,6 @@ function read(): string {
 let current: string | null = null;
 const listeners = new Set<() => void>();
 
-/** The template in force (read from storage once). */
 export function getNaming(): string {
   return (current ??= read());
 }
@@ -155,7 +138,6 @@ export function subscribeNaming(l: () => void): () => void {
 /** ShadowMountPlus's limit on an image name without its extension (58 for `.ffpfsc`). */
 export const STEM_MAX = 63;
 
-/** UTF-8 bytes, as the limit counts them. */
 export const bytes = (s: string) => new TextEncoder().encode(s).length;
 
 /** `s` within `max` UTF-8 bytes, cut at a character boundary, no `.` or space left at its end
@@ -169,7 +151,6 @@ export function cutBytes(s: string, max: number): string {
   return out.replace(/[. ]+$/, "");
 }
 
-/** The About card's example game (`pack` as a zstd Pack names it). */
 export const SAMPLE: Record<NamePart, string> = {
   title: "Astro Bot",
   title_id: "PPSA01234",
@@ -179,5 +160,4 @@ export const SAMPLE: Record<NamePart, string> = {
   fw: "7.00",
 };
 
-/** `n` as core's `naming` (`null`: core's default). */
 export const template = (n: string): string | null => (n === DEFAULT_NAMING ? null : n);

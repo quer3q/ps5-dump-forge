@@ -12,17 +12,18 @@
 //! the console could not read back. The compressed image goes to a spool file first, because
 //! the outer image's geometry depends on its final length.
 
-use std::borrow::Cow;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::crypto::Hasher;
-use crate::kraken::{self, Half};
+use crate::kraken::{self, Half, Part};
 use crate::plan::{self, Plan};
 use crate::{format_err, Result};
 
 const UBLOCK: u64 = 0x4_0000;
 const WINDOW: u64 = 0x4_0000;
+/// The `fidx` type byte of an entry that starts a stretch with no stored data.
+const GAP_TYPE: u8 = 0x40;
 
 /// What a block holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,10 +171,12 @@ fn pipeline_local<T: Send, U: Send>(
         let (tx_out, rx_out) = sync_channel::<(u64, Result<U>)>(depth);
         let rx_in = Arc::new(Mutex::new(rx_in));
         let work = &work;
+        let lane = crate::workshop::Lane::current();
         for _ in 0..threads {
             let rx_in = Arc::clone(&rx_in);
             let tx_out = tx_out.clone();
             s.spawn(move || loop {
+                lane.enter();
                 let next = rx_in.lock().map(|rx| rx.recv());
                 match next {
                     Ok(Ok((i, item))) => {
@@ -388,7 +391,7 @@ pub fn compress(
             let Some(t) = next.next() else {
                 return Ok(None);
             };
-            if cancel.load(Ordering::Relaxed) {
+            if crate::workshop::checkpoint(cancel) {
                 return Err(crate::Error::Cancelled);
             }
             let bytes = match (&t.owner, &t.source) {
@@ -425,7 +428,7 @@ pub fn compress(
         |(t, bytes)| {
             // A stop asked for while the pool is full ends the blocks still queued, not only the
             // reading: each one would otherwise be compressed and checked first.
-            if cancel.load(Ordering::Relaxed) {
+            if crate::workshop::checkpoint(cancel) {
                 return Err(crate::Error::Cancelled);
             }
             // Stored (`Level::Stored`, or `PS5UPLOAD_FPKG_KRAKEN_STORE=1` through the build, see
@@ -577,9 +580,20 @@ fn anchor_record(position: u64) -> u128 {
 /// The descriptor for `image`, with `fidx` its boundary table: each file's logical start in
 /// afid order, then the data end, the metadata base and the mount size.
 pub fn layout(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
-    let blob = assemble(image, file_starts)?;
-    // Read it back the way the console will, and require exactly the blocks we stored.
-    let walked = describe(&blob)?;
+    let entries: Vec<(u64, u8)> = file_starts.iter().map(|&s| (s, 0)).collect();
+    layout_entries(image, &entries)
+}
+
+/// [`layout`] with each `fidx` entry's type given: a [`GAP_TYPE`] entry starts a stretch no block
+/// covers, the way Sony's own descriptors leave one (ours never do; the tests do).
+fn layout_entries(image: &KrakenImage, entries: &[(u64, u8)]) -> Result<Vec<u8>> {
+    let blob = assemble(image, entries)?;
+    // Read it back the way the console will, and require exactly the blocks we stored (a gap's
+    // sparse zero blocks are no stored block).
+    let walked: Vec<DescribedBlock> = describe(&blob)?
+        .into_iter()
+        .filter(|w| !w.is_sparse())
+        .collect();
     if walked.len() != image.blocks.len() {
         return format_err("the descriptor does not walk back to its blocks");
     }
@@ -599,8 +613,8 @@ pub fn layout(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
     Ok(blob)
 }
 
-/// The descriptor bytes [`layout`] checks before returning them.
-fn assemble(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
+/// The descriptor bytes [`layout_entries`] checks before returning them.
+fn assemble(image: &KrakenImage, entries: &[(u64, u8)]) -> Result<Vec<u8>> {
     // Bit 66 of a record says the next record is an anchor. It is how a reader tells the two
     // apart — nothing in an anchor itself does — so it is set before every anchor, and two
     // anchors never follow each other.
@@ -663,7 +677,7 @@ fn assemble(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
     }
 
     let ublocks = image.mount_size.div_ceil(UBLOCK);
-    let files = file_starts.len() + 3;
+    let files = entries.len() + 3;
     let outer_blocks = image.image_len.div_ceil(crate::BLOCK);
     let records = recs.len();
     if records < 2 || records - 2 > 0xFF_FFFF || ublocks > 0xFF_FFFF {
@@ -687,7 +701,7 @@ fn assemble(image: &KrakenImage, file_starts: &[u64]) -> Result<Vec<u8>> {
     blob.extend_from_slice(&word0.to_le_bytes());
     blob.extend_from_slice(&word1.to_le_bytes());
     blob.resize(blob.len() + outer_blocks as usize * 8, 0);
-    let mut fidx: Vec<(u64, u8)> = file_starts.iter().map(|&s| (s, 0)).collect();
+    let mut fidx: Vec<(u64, u8)> = entries.to_vec();
     fidx.push((image.data_end, 0));
     fidx.push((image.meta_base, 0));
     fidx.push((image.mount_size, 0x40));
@@ -740,6 +754,19 @@ pub struct DescribedBlock {
     pub mode_bits: u8,
     /// The block's byte shuffle, an index into [`SHUFFLES`] (0: none).
     pub shuffle: u8,
+}
+
+impl DescribedBlock {
+    /// Whether this is a sparse block: the whole sentinel, nothing stored and no flags.
+    pub fn is_sparse(&self) -> bool {
+        self.stored_len == 0
+            && self.stored_at == 0
+            && self.even_len == 0
+            && !self.even_lz
+            && !self.odd_lz
+            && self.mode_bits == 0
+            && self.shuffle == 0
+    }
 }
 
 /// The PFSv3 byte shuffles (LibProsperoPkg's 13 concrete `PfsShufflePattern`s, `None` first),
@@ -804,6 +831,22 @@ fn deshuffle(data: &mut [u8], pattern: u8) -> Result<()> {
 /// truncated or corrupt one is a [`crate::Error::Format`], never a panic. Each block it returns
 /// is at most 256 KiB long.
 pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
+    let mut out = Vec::new();
+    describe_each(blob, |b| {
+        out.push(b);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// [`describe`], handing each block to `each` in mount order as the walk finds it instead of
+/// collecting them, so a caller keeping its own compact form never holds both lists. The
+/// same checks run; an error from `each` stops the walk and is returned. A failed walk may
+/// have handed some blocks over already.
+pub fn describe_each(
+    blob: &[u8],
+    mut each: impl FnMut(DescribedBlock) -> Result<()>,
+) -> Result<()> {
     let word = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap());
     if blob.len() < 16 {
         return format_err("descriptor too short");
@@ -849,10 +892,15 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
         })
         .collect();
     let mount = entries.last().map_or(0, |e| e.0);
-    // The mount's end must be what the ublock count says, and no boundary may lie past it:
-    // sparse extents are filled from these, so a forged size could otherwise ask for
-    // millions of zero blocks from a tiny descriptor.
-    if mount.div_ceil(UBLOCK) != ublocks || entries.iter().any(|e| e.0 > mount) {
+    if let Some(e) = entries.iter().find(|e| e.0 > mount) {
+        return format_err(format!(
+            "a file boundary at {:#x} lies past the mount's end {mount:#x}",
+            e.0
+        ));
+    }
+    // The mount's end must be what the ublock count says: sparse extents are filled up to it,
+    // so a forged size could otherwise ask for millions of zero blocks from a tiny descriptor.
+    if mount.div_ceil(UBLOCK) != ublocks {
         return format_err("the boundary table disagrees with the mount's size");
     }
     let mut bounds: Vec<u64> = entries.iter().map(|e| e.0).collect();
@@ -866,22 +914,39 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
             .copied()
             .unwrap_or(mount)
     };
-    // A boundary of kind 0x40 before the mount's end opens a sparse extent: up to the next
-    // boundary nothing is stored and no record describes it; it reads as zeros. (The mount's
-    // end carries the same kind.) Seen in a third-party package's 256 KiB hole between files.
+    // An entry of type 0x40 before the mount's end opens a sparse extent: up to the next
+    // boundary nothing is stored and no record describes it; it reads as zeros (Sony's Astro Bot
+    // has 1,988 of them; a third-party package a 256 KiB hole between files; the last entry, the
+    // mount's end, carries the same type). Where an ordinary entry starts at the same offset,
+    // that one wins.
+    let mut ordinary: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.1 != GAP_TYPE)
+        .map(|e| e.0)
+        .collect();
+    ordinary.sort_unstable();
     let mut sparse: Vec<(u64, u64)> = entries
         .iter()
-        .filter(|e| e.1 == 0x40 && e.0 < mount)
+        .filter(|e| e.1 == GAP_TYPE && e.0 < mount && ordinary.binary_search(&e.0).is_err())
         .map(|e| (e.0, next_bound(e.0)))
         .collect();
     sparse.sort_unstable();
     sparse.dedup_by_key(|s| s.0);
-    let fill = |logical: &mut u64, out: &mut Vec<DescribedBlock>| {
+    // Where the sparse extents starting at `at` (if any) end.
+    let past_sparse = |mut at: u64| {
+        while let Ok(i) = sparse.binary_search_by_key(&at, |s| s.0) {
+            at = sparse[i].1;
+        }
+        at
+    };
+    // Zero blocks for the sparse extents starting at `logical`, each of at most 256 KiB and
+    // none crossing a boundary.
+    let fill = |logical: &mut u64, each: &mut dyn FnMut(DescribedBlock) -> Result<()>| {
         while let Ok(i) = sparse.binary_search_by_key(logical, |s| s.0) {
             let end = sparse[i].1;
             while *logical < end {
                 let len = (end - *logical).min(UBLOCK);
-                out.push(DescribedBlock {
+                each(DescribedBlock {
                     logical: *logical,
                     len,
                     stored_at: 0,
@@ -891,10 +956,11 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
                     odd_lz: false,
                     mode_bits: 0,
                     shuffle: 0,
-                });
+                })?;
                 *logical += len;
             }
         }
+        Ok::<(), crate::Error>(())
     };
     // The three bytes before the records read `00 00 04` in every plain build measured (Sony's,
     // LibProsperoPkg's at 128 and 256 KiB blocks, ours). Other builders carry other values
@@ -907,7 +973,6 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
         x[..9].copy_from_slice(&blob[rec_at + i * 9..rec_at + i * 9 + 9]);
         u128::from_le_bytes(x)
     };
-    let mut out = Vec::new();
     let (mut cursor, mut logical) = (0u64, 0u64);
     let mut next_is_anchor = true; // index 0 is the start anchor
                                    // The previous record's bits 68–71: the low nibble of this record's key (see `layout`).
@@ -929,7 +994,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
             }
             continue;
         }
-        fill(&mut logical, &mut out);
+        fill(&mut logical, &mut each)?;
         if strict && i > 0 && nibble != logical & 0xF {
             return format_err(format!(
                 "record {i}: the exact start's low nibble disagrees (the console would read the \
@@ -941,6 +1006,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
                 "record {i}: a block starts at {logical:#x}, at or past the mount's end {mount:#x}"
             ));
         }
+        let bound = next_bound(logical);
         if (logical % WINDOW) >> 4 != f(0, 14) {
             return format_err(format!("record {i}: logical offset disagrees"));
         }
@@ -949,13 +1015,19 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
         // size (128 KiB measured, LibProsperoPkg's `--block-size 128`) says so only by where
         // that record starts within its window (bits 0..13, to 16 bytes; the nibble the record
         // before it carries makes it exact). Its padding region still uses 256 KiB blocks.
-        // ponytail: a block before a sparse extent whose next record lies more than a window
-        // past it could be cut short; no such layout has been seen.
-        let cap = logical + (next_bound(logical).min(mount) - logical).min(UBLOCK);
+        let cap = logical + (bound.min(mount) - logical).min(UBLOCK);
         // The record after an anchor is never one, and the sentinel (the last) is no block.
         let next = if f(66, 1) == 1 { i + 2 } else { i + 1 };
-        let len = if next + 1 < records {
-            let at16 = (logical & !(WINDOW - 1)) | ((rec(next) as u64 & 0x3FFF) << 4);
+        let after_cap = past_sparse(cap);
+        let next_key = rec(next.min(records - 1)) as u64 & 0x3FFF;
+        // A next record where the full-length block would leave off says nothing: that also
+        // keeps a block before a sparse stretch whole, whatever the stretch's length does to
+        // the window offset (Sony's Astro Bot has 1,988 of them). A plain build's carried nibble
+        // settles the last 16 bytes.
+        let leaves_off_at_cap = next_key == (after_cap % WINDOW) >> 4
+            && (!strict || (rec(next - 1) >> 68) as u64 & 0xF == after_cap & 0xF);
+        let len = if next + 1 < records && !leaves_off_at_cap {
+            let at16 = (logical & !(WINDOW - 1)) | (next_key << 4);
             let at16 = if at16 <= logical & !0xF {
                 at16 + WINDOW
             } else {
@@ -1009,7 +1081,7 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
                 ))
             })?,
         };
-        out.push(DescribedBlock {
+        each(DescribedBlock {
             logical,
             len,
             stored_at: cursor,
@@ -1019,17 +1091,17 @@ pub fn describe(blob: &[u8]) -> Result<Vec<DescribedBlock>> {
             odd_lz: f(36, 1) == 1,
             mode_bits: f(32, 5) as u8,
             shuffle,
-        });
+        })?;
         cursor = end;
         logical += len;
     }
-    fill(&mut logical, &mut out);
+    fill(&mut logical, &mut each)?;
     if logical != mount {
         return format_err(format!(
             "blocks tile to {logical:#x}, the mount is {mount:#x}"
         ));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode block `b` of a stored image. `b` comes from [`describe`]; one built by hand is
@@ -1044,13 +1116,7 @@ pub fn decode_described<'a>(image: &'a [u8], b: &DescribedBlock) -> Result<Vec<u
     }
     // A sparse block (see [`DescribedBlock`]) is zeros; only the whole sentinel counts.
     if b.stored_len == 0 {
-        let sparse = b.stored_at == 0
-            && b.even_len == 0
-            && !b.even_lz
-            && !b.odd_lz
-            && b.mode_bits == 0
-            && b.shuffle == 0;
-        if !sparse {
+        if !b.is_sparse() {
             return format_err("a block stored in no bytes is not a sparse block");
         }
         return Ok(vec![0; b.len as usize]);
@@ -1071,29 +1137,28 @@ pub fn decode_described<'a>(image: &'a [u8], b: &DescribedBlock) -> Result<Vec<u
         .ok_or_else(|| crate::Error::Format("a block runs past the image".into()))?;
     let even_logical = b.len.min(kraken::HALF as u64);
     let (e, o) = src.split_at((b.even_len as usize).min(src.len()));
-    // An LZ flag selects the chunk decoder. A non-LZ half is either an exact-size raw
-    // copy or a bare entropy array; its literal-mode bit does not apply to that array.
-    let half = |bytes: &'a [u8], len: u64, is_lz: bool, delta: bool| -> Result<_> {
-        Ok(if is_lz || bytes.len() as u64 == len {
-            (Cow::Borrowed(bytes), is_lz, delta)
+    // A half flagged LZ is an LZ chunk; one stored as long as it decodes is raw; one shorter
+    // without the LZ flag is a bare entropy array (Sony's all-zero halves, #493: reading those
+    // as LZ refused them as "chunk too short"). Its literal-mode bit does not apply to that array.
+    let half = |bytes: &'a [u8], is_lz: bool, delta: bool, logical: u64| {
+        if is_lz && delta {
+            Part::LzDelta(bytes)
+        } else if is_lz {
+            Part::Lz(bytes)
+        } else if (bytes.len() as u64) < logical {
+            Part::Entropy(bytes)
         } else {
-            let array = kraken::decode_entropy_half(bytes, len as usize)?;
-            (Cow::Owned(array), false, false)
-        })
+            Part::Raw(bytes)
+        }
     };
-    let mut halves = vec![half(e, even_logical, b.even_lz, b.mode_bits & 1 != 0)?];
+    let mut halves = vec![half(e, b.even_lz, b.mode_bits & 1 != 0, even_logical)];
     if b.len > kraken::HALF as u64 {
-        halves.push(half(
-            o,
-            b.len - kraken::HALF as u64,
-            b.odd_lz,
-            b.mode_bits & 0b1000 != 0,
-        )?);
+        let odd_logical = b.len - kraken::HALF as u64;
+        halves.push(half(o, b.odd_lz, b.mode_bits & 0b1000 != 0, odd_logical));
     } else if !o.is_empty() {
         return format_err("kraken: unexpected odd half");
     }
-    let parts: Vec<_> = halves.iter().map(|(h, lz, d)| (&h[..], *lz, *d)).collect();
-    let mut data = kraken::decode_parts(&parts, b.len as usize)?;
+    let mut data = kraken::decode_parts(&halves, b.len as usize)?;
     deshuffle(&mut data, b.shuffle)?;
     Ok(data)
 }
@@ -1175,6 +1240,60 @@ mod tests {
             hex(rec(6))[..8],
             [0x23, 0xc3, 0xb2, 0x81, 0x02, 0x00, 0xd6, 0x06]
         );
+    }
+
+    /// Sony's descriptors mark a stretch with no stored data by a `fidx` entry of type 0x40 (Astro
+    /// Bot has 1,988, each one 256 KiB): no record describes it, and the walk gives it as zero
+    /// blocks. Read as a stored block, everything after the first one was placed 256 KiB late.
+    #[test]
+    fn a_gap_entry_has_no_record_and_reads_as_zeros() {
+        let blocks = vec![
+            b(
+                0,
+                0x40000,
+                0,
+                &[(0x100, true), (0x80, true)],
+                Owner::File(0),
+            ),
+            // 0x40000..0x80000: the gap, no block.
+            b(0x80000, 0x230, 0x180, &[(0x230, false)], Owner::File(2)),
+            b(0x80230, 0x1000, 0x3b0, &[(0x40, true)], Owner::File(3)),
+            b(
+                0x81230,
+                0x3edd0,
+                0x3f0,
+                &[(0x30, true), (0x30, true)],
+                Owner::Gap,
+            ),
+            b(
+                0xc0000,
+                0x40000,
+                0x10000,
+                &[(0x200, true), (0x200, true)],
+                Owner::Meta,
+            ),
+        ];
+        let img = image_of(blocks.clone(), 0x100000, 0x81230, 0xc0000);
+        let entries = [(0, 0), (0x40000, GAP_TYPE), (0x80000, 0), (0x80230, 0)];
+        let blob = layout_entries(&img, &entries).unwrap();
+        let d = describe(&blob).unwrap();
+        assert_eq!(
+            d.iter()
+                .filter(|b| b.is_sparse())
+                .map(|b| (b.logical, b.len))
+                .collect::<Vec<_>>(),
+            [(0x40000, 0x40000)]
+        );
+        let d: Vec<_> = d.into_iter().filter(|b| !b.is_sparse()).collect();
+        assert_eq!(d.len(), blocks.len());
+        for (want, got) in blocks.iter().zip(&d) {
+            assert_eq!(got.logical, want.logical);
+            assert_eq!(got.len, u64::from(want.len));
+            assert_eq!(got.stored_at, want.stored_at);
+        }
+        // The same entry as an ordinary file start is a stretch with a block missing.
+        let plain: Vec<(u64, u8)> = entries.iter().map(|&(o, _)| (o, 0)).collect();
+        assert!(layout_entries(&img, &plain).is_err());
     }
 
     /// A descriptor to corrupt: two files and a metadata region.
@@ -1310,270 +1429,6 @@ mod tests {
         );
     }
 
-    /// A descriptor whose boundary `idx` is turned into a sparse extent (kind 0x40).
-    fn with_kind(mut blob: Vec<u8>, idx: usize, kind: u8) -> Vec<u8> {
-        let w1 = u64::from_le_bytes(blob[8..16].try_into().unwrap());
-        let outer = (w1 & 0xFF_FFFF) as usize;
-        blob[16 + outer * 8 + idx * 6 + 5] = kind;
-        blob
-    }
-
-    #[test]
-    fn a_sparse_extent_reads_as_zero_blocks() {
-        // Files at 0 and 0x100 + 0x50000 (a 0x50000-byte hole between: one full and one partial
-        // 256 KiB zero block), each one raw block of 0x100 bytes stored back to back.
-        let hole = 0x5_0000u64;
-        let b0 = b(0, 0x100, 0, &[(0x100, false)], Owner::File(0));
-        let b2 = b(
-            0x100 + hole,
-            0x100,
-            0x100,
-            &[(0x100, false)],
-            Owner::File(2),
-        );
-        let mount = 0x200 + hole;
-        let image = image_of(vec![b0, b2], mount, mount, mount);
-        let starts = [0, 0x100, 0x100 + hole];
-        // Unmarked, the hole is refused.
-        assert!(describe(&assemble(&image, &starts).unwrap()).is_err());
-        // Marked 0x40, it is two zero blocks (0x40000 + 0x10000) between the real ones.
-        let walked = describe(&with_kind(assemble(&image, &starts).unwrap(), 1, 0x40)).unwrap();
-        let spans: Vec<_> = walked
-            .iter()
-            .map(|b| (b.logical, b.len, b.stored_len))
-            .collect();
-        assert_eq!(
-            spans,
-            [
-                (0, 0x100, 0x100),
-                (0x100, 0x4_0000, 0),
-                (0x4_0100, 0x1_0000, 0),
-                (0x100 + hole, 0x100, 0x100)
-            ]
-        );
-        assert_eq!(
-            decode_described(&[], &walked[1]).unwrap(),
-            vec![0; 0x4_0000]
-        );
-    }
-
-    /// A descriptor of many small sparse extents walks in O(n log n): one boundary looked up
-    /// per extent and per record, not a scan of the table each (which took ~1.5 h to open a
-    /// forged descriptor of ~5.6 M boundaries).
-    #[test]
-    fn many_sparse_boundaries_walk_quickly() {
-        const N: u64 = 100_000;
-        let b0 = b(0, 0x100, 0, &[(0x100, false)], Owner::File(0));
-        let mount = 0x100 + N * 0x10;
-        let image = image_of(vec![b0], mount, mount, mount);
-        let starts: Vec<u64> = (0..=N)
-            .map(|i| if i == 0 { 0 } else { 0xF0 + i * 0x10 })
-            .collect();
-        let mut blob = assemble(&image, &starts).unwrap();
-        for idx in 1..=N as usize {
-            blob = with_kind(blob, idx, 0x40);
-        }
-        let started = std::time::Instant::now();
-        let walked = describe(&blob).unwrap();
-        let took = started.elapsed();
-        assert_eq!(walked.len(), N as usize + 1);
-        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
-    }
-
-    /// Only the whole sentinel (nothing stored, no flags) is a sparse block.
-    #[test]
-    fn a_block_stored_in_no_bytes_is_sparse_only_without_flags() {
-        let sparse = DescribedBlock {
-            logical: 0,
-            len: 0x100,
-            stored_at: 0,
-            even_len: 0,
-            stored_len: 0,
-            even_lz: false,
-            odd_lz: false,
-            mode_bits: 0,
-            shuffle: 0,
-        };
-        assert_eq!(decode_described(&[], &sparse).unwrap(), vec![0; 0x100]);
-        for bad in [
-            DescribedBlock {
-                even_len: 8,
-                ..sparse.clone()
-            },
-            DescribedBlock {
-                even_lz: true,
-                ..sparse.clone()
-            },
-            DescribedBlock {
-                stored_at: 0x10,
-                ..sparse.clone()
-            },
-        ] {
-            assert!(decode_described(&[0; 0x100], &bad).is_err(), "{bad:?}");
-        }
-    }
-
-    /// A mount's end forged far past the ublock count would ask a sparse tail for millions of
-    /// zero blocks; the boundary table is refused instead.
-    #[test]
-    fn a_forged_mount_end_is_refused() {
-        let b0 = b(0, 0x100, 0, &[(0x100, false)], Owner::File(0));
-        let image = image_of(vec![b0], 0x100, 0x100, 0x100);
-        let mut blob = assemble(&image, &[0]).unwrap();
-        let w0 = u64::from_le_bytes(blob[0..8].try_into().unwrap());
-        let w1 = u64::from_le_bytes(blob[8..16].try_into().unwrap());
-        let (files, outer) = ((w0 & 0xFF_FFFF) as usize + 1, (w1 & 0xFF_FFFF) as usize);
-        let at = 16 + outer * 8 + (files - 1) * 6;
-        blob[at..at + 6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x40]);
-        let e = describe(&blob).unwrap_err();
-        assert!(
-            matches!(&e, crate::Error::Format(m) if m.contains("boundary table disagrees")),
-            "{e:?}"
-        );
-    }
-
-    /// The real encoder's eight-byte zero half: five-byte array header followed by
-    /// an old sparse, single-symbol Huffman table, with no LZ seed or framing.
-    #[test]
-    fn bare_entropy_halves_are_decoded_without_lz_or_delta() {
-        let zero = [0x27, 0xff, 0xfc, 0, 3, 0, 0x40, 0];
-        let mut image = zero.repeat(2);
-        let block = DescribedBlock {
-            logical: 0,
-            len: kraken::BLOCK as u64,
-            stored_at: 0,
-            even_len: 8,
-            stored_len: 16,
-            even_lz: false,
-            odd_lz: false,
-            // Literal-mode bits are immaterial for non-LZ halves.
-            mode_bits: 0b01101,
-            shuffle: 0,
-        };
-        assert_eq!(
-            decode_described(&image, &block).unwrap(),
-            vec![0; kraken::BLOCK]
-        );
-        // Symbol 0xab instead of zero, still an 18-bit sparse table.
-        image[6] = 0x6a;
-        image[7] = 0xc0;
-        let out = decode_described(&image, &block).unwrap();
-        assert!(out[..kraken::HALF].iter().all(|&b| b == 0xab));
-        assert!(out[kraken::HALF..].iter().all(|&b| b == 0));
-        let mut malformed = block.clone();
-        malformed.len -= 1;
-        assert!(decode_described(&image, &malformed).is_err());
-        malformed = block.clone();
-        malformed.even_len = 7;
-        assert!(decode_described(&image, &malformed).is_err());
-        image.push(0);
-        malformed = block;
-        malformed.stored_len += 1;
-        assert!(decode_described(&image, &malformed).is_err());
-    }
-
-    /// A real block from a third-party package: an LZ even half and a bare zero odd half.
-    #[test]
-    fn a_real_lz_even_and_bare_zero_odd_block_decodes() {
-        let image = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x87, 0x00, 0x00, 0x0a, 0x04, 0x74,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x7c, 0x05, 0xfd,
-            0x00, 0x00, 0x01, 0x8f, 0x00, 0x00, 0x02, 0xff, 0xff, 0xee, 0x70, 0x00, 0x3d, 0x95,
-            0xa0, 0xc0, 0x33, 0x02, 0x27, 0xff, 0xfc, 0x00, 0x03, 0x00, 0x40, 0x00,
-        ];
-        let block = DescribedBlock {
-            logical: 0,
-            len: kraken::BLOCK as u64,
-            stored_at: 0,
-            even_len: 0x2e,
-            stored_len: 0x36,
-            even_lz: true,
-            odd_lz: false,
-            mode_bits: 0b00110,
-            shuffle: 0,
-        };
-        let out = decode_described(&image, &block).unwrap();
-        assert_eq!(out.len(), kraken::BLOCK);
-        assert!(out[kraken::HALF..].iter().all(|&b| b == 0));
-    }
-
-    /// The file digests the hasher thread takes are each file's SHA3, as the serial loop took
-    /// them: several files, one over many blocks, an empty one, the generated keystone.
-    #[test]
-    fn the_file_digests_are_each_files_sha3() {
-        let sizes = [
-            ("eboot.bin", 4000u64),
-            ("data/big.bin", 1_300_000),
-            ("data/empty.bin", 0),
-            ("data/small.bin", 5000),
-            ("sce_sys/param.json", 197),
-        ];
-        let files: Vec<crate::source::SourceFile> = sizes
-            .iter()
-            .map(|(p, s)| crate::source::SourceFile {
-                path: (*p).to_string(),
-                size: *s,
-            })
-            .collect();
-        let plan = plan::build(&files).unwrap();
-        let data = |path: &str, size: u64| -> Vec<u8> {
-            // Scrambled, so the stored image spans many blocks.
-            let salt = path.len() as u64;
-            (0..size)
-                .map(|i| {
-                    let x = (i ^ salt << 40).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    ((x ^ x >> 29).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 56) as u8
-                })
-                .collect()
-        };
-        let keystone: Vec<u8> = (0..plan::KEYSTONE_LEN).map(|i| i as u8).collect();
-        let metadata = vec![0u8; (plan.ndblock * crate::BLOCK - plan.meta_base) as usize];
-        let mut spool = std::io::Cursor::new(Vec::new());
-        let mut read = |p: &str, off: u64, len: usize| -> Result<Vec<u8>> {
-            let size = sizes.iter().find(|(q, _)| *q == p).unwrap().1;
-            Ok(data(p, size)[off as usize..off as usize + len].to_vec())
-        };
-        let cancel = AtomicBool::new(false);
-        let image = compress(
-            &plan,
-            &metadata,
-            &keystone,
-            &mut read,
-            &mut spool,
-            crate::BLOCK,
-            true,
-            3,
-            kraken::Level::Fast,
-            &cancel,
-            &mut |_, _| {},
-        );
-        let image = image.unwrap();
-        // The stored blocks' digests, taken as they were written, are those of the spool's
-        // blocks from `base` on.
-        let spooled = spool.into_inner();
-        assert_eq!(spooled.len() as u64, crate::BLOCK + image.image_len);
-        let expected: Vec<([u8; 32], u32)> = spooled[crate::BLOCK as usize..]
-            .chunks(crate::BLOCK as usize)
-            .map(|b| (crate::crypto::sha3(b), crate::crypto::crc32c(b)))
-            .collect();
-        assert!(expected.len() > 1);
-        assert!(image.block_digests.as_ref() == Some(&expected));
-        for (afid, &fi) in plan.afid_order.iter().enumerate() {
-            let f = &plan.files[fi];
-            let bytes = if f.generated {
-                keystone.clone()
-            } else {
-                data(&f.path, f.size)
-            };
-            assert_eq!(
-                image.file_digests[afid],
-                crate::crypto::sha3(&bytes),
-                "{}",
-                f.path
-            );
-        }
-    }
-
     /// Where `blob`'s three-byte field before the records starts.
     fn field_at(blob: &[u8]) -> usize {
         let w0 = u64::from_le_bytes(blob[0..8].try_into().unwrap());
@@ -1605,24 +1460,6 @@ mod tests {
         }
     }
 
-    /// The shuffle-pattern table (header bits 28..31, 8 B a pattern) sits between the outer
-    /// digests and `fidx`.
-    #[test]
-    fn a_shuffle_table_moves_the_boundary_table() {
-        let blob = sample_descriptor();
-        let blocks = describe(&blob).unwrap();
-        let w0 = u64::from_le_bytes(blob[0..8].try_into().unwrap());
-        for patterns in [1usize, 3, 15] {
-            let table: Vec<_> = (0..patterns).map(|p| entry(SHUFFLES[1 + p % 12])).collect();
-            let shuffled = with_table(&blob, &table);
-            assert_eq!(describe(&shuffled).unwrap(), blocks, "{patterns} patterns");
-            // Read as if there were none, the table is taken for boundaries.
-            let mut unmarked = shuffled.clone();
-            unmarked[..8].copy_from_slice(&w0.to_le_bytes());
-            assert!(describe(&unmarked).is_err());
-        }
-    }
-
     /// A shuffle table entry: the pattern's field sizes, zero-padded to 8 bytes.
     fn entry(fields: &[u8]) -> [u8; 8] {
         let mut e = [0u8; 8];
@@ -1640,6 +1477,24 @@ mod tests {
         out.extend(table.iter().flatten());
         out.extend_from_slice(&blob[tables_end..]);
         out
+    }
+
+    /// The shuffle-pattern table (header bits 28..31, 8 B a pattern) sits between the outer
+    /// digests and `fidx`.
+    #[test]
+    fn a_shuffle_table_moves_the_boundary_table() {
+        let blob = sample_descriptor();
+        let blocks = describe(&blob).unwrap();
+        let w0 = u64::from_le_bytes(blob[0..8].try_into().unwrap());
+        for patterns in [1usize, 3, 15] {
+            let table: Vec<_> = (0..patterns).map(|p| entry(SHUFFLES[1 + p % 12])).collect();
+            let shuffled = with_table(&blob, &table);
+            assert_eq!(describe(&shuffled).unwrap(), blocks, "{patterns} patterns");
+            // Read as if there were none, the table is taken for boundaries.
+            let mut unmarked = shuffled.clone();
+            unmarked[..8].copy_from_slice(&w0.to_le_bytes());
+            assert!(describe(&unmarked).is_err());
+        }
     }
 
     /// The forward shuffle, as LibProsperoPkg's engine documents it: per 64 KiB unit, every
@@ -1813,6 +1668,46 @@ mod tests {
         assert_eq!(walked, expected);
     }
 
+    /// A block before a sparse stretch stays whole even when the stretch's length puts the next
+    /// record's window offset inside the block, which alone would read as a short block.
+    #[test]
+    fn a_sparse_stretch_does_not_cut_the_block_before_it() {
+        let blocks = vec![
+            b(0, 0x8000, 0, &[(0x100, true)], Owner::File(0)),
+            // 0x8000..0x44000: the gap, no block. 0x44000 is 0x4000 into its window.
+            b(0x44000, 0x1000, 0x100, &[(0x40, true)], Owner::File(2)),
+            b(
+                0x45000,
+                0x3b000,
+                0x140,
+                &[(0x30, true), (0x30, true)],
+                Owner::Gap,
+            ),
+            b(
+                0x80000,
+                0x40000,
+                0x10000,
+                &[(0x200, true), (0x200, true)],
+                Owner::Meta,
+            ),
+        ];
+        let img = image_of(blocks.clone(), 0xc0000, 0x45000, 0x80000);
+        let entries = [(0, 0), (0x8000, GAP_TYPE), (0x44000, 0)];
+        let blob = layout_entries(&img, &entries).unwrap();
+        let walked: Vec<_> = describe(&blob)
+            .unwrap()
+            .iter()
+            .map(|b| (b.logical, b.len))
+            .collect();
+        let mut expected: Vec<_> = blocks
+            .iter()
+            .map(|b| (b.logical, u64::from(b.len)))
+            .collect();
+        // The gap reads as one zero block.
+        expected.insert(1, (0x8000, 0x3c000));
+        assert_eq!(walked, expected);
+    }
+
     /// A block record's bits 44..47 name its pattern: 0 none, k the table's pattern k - 1 (an
     /// all-zero entry is none too). An index past the table and an unknown entry are refused.
     #[test]
@@ -1865,5 +1760,279 @@ mod tests {
             ..block
         };
         assert!(decode_described(&stored, &unknown).is_err());
+    }
+
+    /// `starts` as ordinary `fidx` entries.
+    fn plain(starts: &[u64]) -> Vec<(u64, u8)> {
+        starts.iter().map(|&s| (s, 0)).collect()
+    }
+
+    /// A descriptor whose boundary `idx` is turned into a sparse extent (kind 0x40).
+    fn with_kind(mut blob: Vec<u8>, idx: usize, kind: u8) -> Vec<u8> {
+        let w1 = u64::from_le_bytes(blob[8..16].try_into().unwrap());
+        let outer = (w1 & 0xFF_FFFF) as usize;
+        blob[16 + outer * 8 + idx * 6 + 5] = kind;
+        blob
+    }
+
+    #[test]
+    fn a_sparse_extent_reads_as_zero_blocks() {
+        // Files at 0 and 0x100 + 0x50000 (a 0x50000-byte hole between: one full and one partial
+        // 256 KiB zero block), each one raw block of 0x100 bytes stored back to back.
+        let hole = 0x5_0000u64;
+        let b0 = b(0, 0x100, 0, &[(0x100, false)], Owner::File(0));
+        let b2 = b(
+            0x100 + hole,
+            0x100,
+            0x100,
+            &[(0x100, false)],
+            Owner::File(2),
+        );
+        let mount = 0x200 + hole;
+        let image = image_of(vec![b0, b2], mount, mount, mount);
+        let starts = [0, 0x100, 0x100 + hole];
+        // Unmarked, the hole is refused.
+        assert!(describe(&assemble(&image, &plain(&starts)).unwrap()).is_err());
+        // Marked 0x40, it is two zero blocks (0x40000 + 0x10000) between the real ones.
+        let walked = describe(&with_kind(
+            assemble(&image, &plain(&starts)).unwrap(),
+            1,
+            0x40,
+        ))
+        .unwrap();
+        let spans: Vec<_> = walked
+            .iter()
+            .map(|b| (b.logical, b.len, b.stored_len))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (0, 0x100, 0x100),
+                (0x100, 0x4_0000, 0),
+                (0x4_0100, 0x1_0000, 0),
+                (0x100 + hole, 0x100, 0x100)
+            ]
+        );
+        assert_eq!(
+            decode_described(&[], &walked[1]).unwrap(),
+            vec![0; 0x4_0000]
+        );
+    }
+
+    /// A descriptor of many small sparse extents walks in O(n log n): one boundary looked up
+    /// per extent and per record, not a scan of the table each (which took ~1.5 h to open a
+    /// forged descriptor of ~5.6 M boundaries).
+    #[test]
+    fn many_sparse_boundaries_walk_quickly() {
+        const N: u64 = 100_000;
+        let b0 = b(0, 0x100, 0, &[(0x100, false)], Owner::File(0));
+        let mount = 0x100 + N * 0x10;
+        let image = image_of(vec![b0], mount, mount, mount);
+        let starts: Vec<u64> = (0..=N)
+            .map(|i| if i == 0 { 0 } else { 0xF0 + i * 0x10 })
+            .collect();
+        let mut blob = assemble(&image, &plain(&starts)).unwrap();
+        for idx in 1..=N as usize {
+            blob = with_kind(blob, idx, 0x40);
+        }
+        let started = std::time::Instant::now();
+        let walked = describe(&blob).unwrap();
+        let took = started.elapsed();
+        assert_eq!(walked.len(), N as usize + 1);
+        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+    }
+
+    /// Only the whole sentinel (nothing stored, no flags) is a sparse block.
+    #[test]
+    fn a_block_stored_in_no_bytes_is_sparse_only_without_flags() {
+        let sparse = DescribedBlock {
+            logical: 0,
+            len: 0x100,
+            stored_at: 0,
+            even_len: 0,
+            stored_len: 0,
+            even_lz: false,
+            odd_lz: false,
+            mode_bits: 0,
+            shuffle: 0,
+        };
+        assert_eq!(decode_described(&[], &sparse).unwrap(), vec![0; 0x100]);
+        for bad in [
+            DescribedBlock {
+                even_len: 8,
+                ..sparse.clone()
+            },
+            DescribedBlock {
+                even_lz: true,
+                ..sparse.clone()
+            },
+            DescribedBlock {
+                stored_at: 0x10,
+                ..sparse.clone()
+            },
+        ] {
+            assert!(decode_described(&[0; 0x100], &bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A mount's end forged far past the ublock count would ask a sparse tail for millions of
+    /// zero blocks; the boundary table is refused instead.
+    #[test]
+    fn a_forged_mount_end_is_refused() {
+        let b0 = b(0, 0x100, 0, &[(0x100, false)], Owner::File(0));
+        let image = image_of(vec![b0], 0x100, 0x100, 0x100);
+        let mut blob = assemble(&image, &plain(&[0])).unwrap();
+        let w0 = u64::from_le_bytes(blob[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(blob[8..16].try_into().unwrap());
+        let (files, outer) = ((w0 & 0xFF_FFFF) as usize + 1, (w1 & 0xFF_FFFF) as usize);
+        let at = 16 + outer * 8 + (files - 1) * 6;
+        blob[at..at + 6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x40]);
+        let e = describe(&blob).unwrap_err();
+        assert!(
+            matches!(&e, crate::Error::Format(m) if m.contains("boundary table disagrees")),
+            "{e:?}"
+        );
+    }
+
+    /// The real encoder's eight-byte zero half: five-byte array header followed by
+    /// an old sparse, single-symbol Huffman table, with no LZ seed or framing.
+    #[test]
+    fn bare_entropy_halves_are_decoded_without_lz_or_delta() {
+        let zero = [0x27, 0xff, 0xfc, 0, 3, 0, 0x40, 0];
+        let mut image = zero.repeat(2);
+        let block = DescribedBlock {
+            logical: 0,
+            len: kraken::BLOCK as u64,
+            stored_at: 0,
+            even_len: 8,
+            stored_len: 16,
+            even_lz: false,
+            odd_lz: false,
+            // Literal-mode bits are immaterial for non-LZ halves.
+            mode_bits: 0b01101,
+            shuffle: 0,
+        };
+        assert_eq!(
+            decode_described(&image, &block).unwrap(),
+            vec![0; kraken::BLOCK]
+        );
+        // Symbol 0xab instead of zero, still an 18-bit sparse table.
+        image[6] = 0x6a;
+        image[7] = 0xc0;
+        let out = decode_described(&image, &block).unwrap();
+        assert!(out[..kraken::HALF].iter().all(|&b| b == 0xab));
+        assert!(out[kraken::HALF..].iter().all(|&b| b == 0));
+        let mut malformed = block.clone();
+        malformed.len -= 1;
+        assert!(decode_described(&image, &malformed).is_err());
+        malformed = block.clone();
+        malformed.even_len = 7;
+        assert!(decode_described(&image, &malformed).is_err());
+        image.push(0);
+        malformed = block;
+        malformed.stored_len += 1;
+        assert!(decode_described(&image, &malformed).is_err());
+    }
+
+    /// A real block from a third-party package: an LZ even half and a bare zero odd half.
+    #[test]
+    fn a_real_lz_even_and_bare_zero_odd_block_decodes() {
+        let image = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x87, 0x00, 0x00, 0x0a, 0x04, 0x74,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x7c, 0x05, 0xfd,
+            0x00, 0x00, 0x01, 0x8f, 0x00, 0x00, 0x02, 0xff, 0xff, 0xee, 0x70, 0x00, 0x3d, 0x95,
+            0xa0, 0xc0, 0x33, 0x02, 0x27, 0xff, 0xfc, 0x00, 0x03, 0x00, 0x40, 0x00,
+        ];
+        let block = DescribedBlock {
+            logical: 0,
+            len: kraken::BLOCK as u64,
+            stored_at: 0,
+            even_len: 0x2e,
+            stored_len: 0x36,
+            even_lz: true,
+            odd_lz: false,
+            mode_bits: 0b00110,
+            shuffle: 0,
+        };
+        let out = decode_described(&image, &block).unwrap();
+        assert_eq!(out.len(), kraken::BLOCK);
+        assert!(out[kraken::HALF..].iter().all(|&b| b == 0));
+    }
+
+    /// The file digests the hasher thread takes are each file's SHA3, as the serial loop took
+    /// them: several files, one over many blocks, an empty one, the generated keystone.
+    #[test]
+    fn the_file_digests_are_each_files_sha3() {
+        let sizes = [
+            ("eboot.bin", 4000u64),
+            ("data/big.bin", 1_300_000),
+            ("data/empty.bin", 0),
+            ("data/small.bin", 5000),
+            ("sce_sys/param.json", 197),
+        ];
+        let files: Vec<crate::source::SourceFile> = sizes
+            .iter()
+            .map(|(p, s)| crate::source::SourceFile {
+                path: (*p).to_string(),
+                size: *s,
+            })
+            .collect();
+        let plan = plan::build(&files).unwrap();
+        let data = |path: &str, size: u64| -> Vec<u8> {
+            // Scrambled, so the stored image spans many blocks.
+            let salt = path.len() as u64;
+            (0..size)
+                .map(|i| {
+                    let x = (i ^ salt << 40).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    ((x ^ x >> 29).wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 56) as u8
+                })
+                .collect()
+        };
+        let keystone: Vec<u8> = (0..plan::KEYSTONE_LEN).map(|i| i as u8).collect();
+        let metadata = vec![0u8; (plan.ndblock * crate::BLOCK - plan.meta_base) as usize];
+        let mut spool = std::io::Cursor::new(Vec::new());
+        let mut read = |p: &str, off: u64, len: usize| -> Result<Vec<u8>> {
+            let size = sizes.iter().find(|(q, _)| *q == p).unwrap().1;
+            Ok(data(p, size)[off as usize..off as usize + len].to_vec())
+        };
+        let cancel = AtomicBool::new(false);
+        let image = compress(
+            &plan,
+            &metadata,
+            &keystone,
+            &mut read,
+            &mut spool,
+            crate::BLOCK,
+            true,
+            3,
+            kraken::Level::Fast,
+            &cancel,
+            &mut |_, _| {},
+        );
+        let image = image.unwrap();
+        // The stored blocks' digests, taken as they were written, are those of the spool's
+        // blocks from `base` on.
+        let spooled = spool.into_inner();
+        assert_eq!(spooled.len() as u64, crate::BLOCK + image.image_len);
+        let expected: Vec<([u8; 32], u32)> = spooled[crate::BLOCK as usize..]
+            .chunks(crate::BLOCK as usize)
+            .map(|b| (crate::crypto::sha3(b), crate::crypto::crc32c(b)))
+            .collect();
+        assert!(expected.len() > 1);
+        assert!(image.block_digests.as_ref() == Some(&expected));
+        for (afid, &fi) in plan.afid_order.iter().enumerate() {
+            let f = &plan.files[fi];
+            let bytes = if f.generated {
+                keystone.clone()
+            } else {
+                data(&f.path, f.size)
+            };
+            assert_eq!(
+                image.file_digests[afid],
+                crate::crypto::sha3(&bytes),
+                "{}",
+                f.path
+            );
+        }
     }
 }

@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
-# Run the ps5-dump-forge-core and ps5-dump-forge-server tests on real FreeBSD filesystems: UFS2,
-# FAT32 (msdosfs) and a nullfs view over UFS (the PS5's /data can be one), to exercise the core's
-# FreeBSD paths and the server's file handling (canonical paths, symlinks, roots) there.
-#
-# The tests are cross-compiled for aarch64-unknown-freebsd in Docker (Rust + clang/lld against a
-# FreeBSD 14.4 base.txz sysroot), packed with a runner into a tar file, and the tar is attached
-# as a raw read-only virtio disk to the same FreeBSD 14.4 arm64 VM scripts/fsck-ufs.sh boots
-# (qemu TCG in Docker, expect on the serial console, throwaway overlay; no guest networking).
-# In the guest each volume is a fresh 1 GiB md device mounted at $T, and the test binaries run
-# there with TMPDIR=$T. Integration tests use the compile-time CARGO_TARGET_TMPDIR instead, so
-# the build runs with CARGO_TARGET_DIR=/forge and $T is that build's tmp dir,
-# /forge/aarch64-unknown-freebsd/tmp (checked against the built binary).
+# Run the core and server tests on real FreeBSD filesystems: UFS2, FAT32 and nullfs over UFS (the
+# PS5's /data can be one). Cross-compiled for aarch64-unknown-freebsd in Docker, attached as a
+# read-only disk to fsck-ufs.sh's FreeBSD 14.4 VM (qemu TCG, no guest networking); each volume a
+# fresh 1 GiB md mounted at $T = CARGO_TARGET_TMPDIR (/forge/aarch64-unknown-freebsd/tmp).
 #
 #   scripts/test-freebsd.sh
 #   FREEBSD_TESTS_UFS='scan' FREEBSD_VOLUMES='ufs nullfs' scripts/test-freebsd.sh
@@ -28,11 +20,8 @@
 # FREEBSD_VOLUMES       volumes to run, in order (default 'ufs fat nullfs').
 # FREEBSD_TIMEOUT       seconds for the whole VM session before the run fails (default 3600).
 #
-# Cache: $PS5_FORGE_CACHE (default ~/.cache/ps5-dump-forge): the ~2 GB VM qcow2 (shared with
-# fsck-ufs.sh), base.txz (~150 MB, checked against the release MANIFEST) and the sysroot
-# extracted from it. Build output, cargo's registry and the full VM log (vm.log) go to
-# target/freebsd/. Exit status 0 only when the guest prints the PASS sentinel, i.e. every
-# selected test on every volume passed (never qemu's exit status alone).
+# Cache: $PS5_FORGE_CACHE (default ~/.cache/ps5-dump-forge): the VM qcow2, base.txz and its
+# sysroot. Build output and vm.log go to target/freebsd/. Exit 0 only on the guest's PASS sentinel.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -180,8 +169,6 @@ while read -r kind name exe; do
 done < <(jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test)
   | "\(.target.kind[0]) \(.target.name) \(.executable)"' /tmp/build.json)
 [ -n "$all" ] || { echo "no test executables built" >&2; exit 1; }
-# Integration tests put their fixtures under the compile-time CARGO_TARGET_TMPDIR: the
-# volume under test is mounted exactly there.
 T=/forge/aarch64-unknown-freebsd/tmp
 for b in core serve; do
   grep -qa "$T" "$stage/$b" || { echo "$b test binary does not embed $T" >&2; exit 1; }

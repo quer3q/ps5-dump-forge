@@ -1,9 +1,5 @@
-//! In-place editing of a Forge-built UFS2 image (`.ffpkg`): the read side. [`Volume::open`] reads
-//! the superblock, checks it is the one geometry Forge's writer produces, and loads every cylinder
-//! group with its bitmaps and summary, cross-checked against the totals.
-//!
-//! The cylinder group blocks (64 KiB each) and the summary area are held in memory whole, within
-//! [`MEMORY_LIMIT`].
+//! In-place editing of a Forge-built UFS2 image (`.ffpkg`). [`Volume::open`] checks it is the one
+//! geometry Forge's writer makes and holds every cylinder group and the summary within [`MEMORY_LIMIT`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -26,18 +22,14 @@ use crate::tree::{DIRBLKSIZ, DT_DIR, DT_REG, MAXDIRSIZE, MAXPATHLEN, bad_compone
 // ponytail: 128 MiB holds 2048 groups (~32 TiB at Forge's group sizes); past it, rebuild.
 pub const MEMORY_LIMIT: u64 = 128 << 20;
 
-/// `fs_flags` bits. Unclean / needs fsck: refused as not cleanly unmounted. Soft updates,
-/// the SU journal, gjournal and metadata check hashes change what is on disk: another tool.
-/// Every other bit (TRIM, ACLs, multilabel, ...) the console's kernel may set on an
-/// `image_rw=` mount, so it passes.
+/// `fs_flags` bits refused: unclean, and soft updates, SUJ, gjournal and check hashes (they
+/// change what is on disk). Other bits (TRIM, ACLs, ...) a console mount may set pass.
 const FS_UNCLEAN: u32 = 0x01;
 const FS_NEEDSFSCK: u32 = 0x04;
 const FS_FLAGS_UPDATED: u32 = 0x80;
 const CHANGES_LAYOUT: u32 = 0x02 | 0x08 | 0x40 | 0x200; // DOSOFTDEP, SUJ, GJOURNAL, METACKHASH
 
-/// Superblock fields (name, offset, bytes) that must equal what the writer puts there for
-/// the image's geometry: block/fragment sizes, shifts and masks, disk-address conversion,
-/// the group layout, the summary area and the file-size limits.
+/// Superblock fields (name, offset, bytes) that must equal what the writer puts there.
 const GEOMETRY_FIELDS: [(&str, usize, usize); 35] = [
     ("fs_sblkno", 8, 4),
     ("fs_cblkno", 12, 4),
@@ -79,9 +71,7 @@ const GEOMETRY_FIELDS: [(&str, usize, usize); 35] = [
 /// One cylinder group: its header block as on disk, and where its maps start in it.
 #[derive(Debug, Clone)]
 pub struct Group {
-    /// The whole cg block (`fs_cgsize` = 64 KiB), as read.
     pub raw: Vec<u8>,
-    /// `cg_cs`.
     pub cs: Csum,
     /// Offsets in `raw`: inode map, free-block map, cluster summary, cluster map.
     pub iusedoff: usize,
@@ -96,43 +86,34 @@ pub struct Group {
 #[derive(Debug, Clone)]
 pub struct Volume {
     pub(crate) geom: Geom,
-    /// The primary superblock (`fs_sbsize` bytes at [`SBLOCK_UFS2`]), as read.
     pub sb: Vec<u8>,
-    /// Every cylinder group, by index.
     pub groups: Vec<Group>,
     /// The summary area (`fs_cs`, one per group), as read.
     pub summary: Vec<Csum>,
-    /// `fs_cstotal`.
     pub total: Csum,
-    /// [`MEMORY_LIMIT`] (lowered by tests).
     limit: u64,
     /// What [`plan`]'s ops changed so far; reads see it.
     changes: Changes,
 }
 
-/// The planned change set. Group blocks, the summary and the totals are changed in place in
-/// [`Volume`] (`groups`, `summary`, `total`); inodes and directory chunks are kept here as
-/// modified copies, each written once. Blocks this plan frees are not reused by it.
+/// The planned change set: group blocks and counts change in [`Volume`]; inodes and directory
+/// chunks are kept here as copies, each written once. Freed blocks are not reused.
 #[derive(Debug, Clone, Default)]
 struct Changes {
-    /// Rewritten inodes (256 B) and directory chunks (512 B), by image byte offset; reads
-    /// overlay them.
+    /// Rewritten inodes and directory chunks, by image byte offset; reads overlay them.
     meta: BTreeMap<u64, Vec<u8>>,
     /// Groups whose block (maps, `cg_cs`) changed.
     groups: BTreeSet<u64>,
-    /// Folder listings already read, by directory inode, kept current as ops change them,
-    /// so a plan lists each folder once.
+    /// Folder listings already read, by directory inode, kept current as ops change them.
     listings: BTreeMap<u64, Vec<Node>>,
     /// Bytes the above hold, and what a folder delete's stack holds: charged to the budget.
     bytes: u64,
     /// New file data, in free space (never overlapping anything the image or the plan uses).
     data: Vec<Write>,
-    /// New indirect blocks, by block number: written into free space beside `data`; block
-    /// maps read them here (a file this plan added may be replaced or deleted by a later op).
+    /// New indirect blocks, by block number, in free space; block maps read them here.
     fresh: BTreeMap<u64, Vec<u8>>,
-    /// Each group's free-block map as it was before this plan freed a block in it, with every
-    /// later free cleared: a block is taken only when free in both, so blocks this plan frees
-    /// (its own new ones included) are never reused by it.
+    /// Each group's free map before this plan's first free in it, later frees cleared: a block
+    /// is taken only when free in both, so freed blocks are never reused.
     pristine: BTreeMap<u64, Vec<u8>>,
     /// Blocks this plan freed (free now, not takeable).
     freed: u64,
@@ -141,14 +122,11 @@ struct Changes {
     short: u64,
     /// New inodes the plan lacks (it is then refused).
     short_inodes: u64,
-    /// Folders a Put or Mkdir needed but the plan lacked room for (already counted in
-    /// `short`/`short_inodes`), so each is counted once.
+    /// Folders not made for want of room, so each is counted once.
     missing: BTreeSet<String>,
-    /// Per folder, the room left in the growth block(s) the plan lacked (already counted in
-    /// `short`), so later entries in that folder count no more until it is used up.
+    /// Per folder, the room left in growth blocks the plan lacked (counted in `short`).
     pending: BTreeMap<u64, Pending>,
-    /// Per folder, where [`Volume::find_slot`] starts looking (so adding n entries to one
-    /// folder reads it about once, not n times).
+    /// Per folder, where [`Volume::find_slot`] starts looking.
     // ponytail: not charged to the budget; at most one per folder listed, which is.
     hints: BTreeMap<u64, Hint>,
     /// Every scan from the first chunk (tests compare the plans).
@@ -192,9 +170,7 @@ fn too_big(total: u64) -> Vec<String> {
     )]
 }
 
-/// The primary superblock's geometry, if it is the one Forge's writer lays out for its
-/// `fs_size`: every fixed field newfs sets for `-O 2 -b 65536 -f 65536 -m 0 -S 4096`, and
-/// the fpg/ipg/ncg [`Geom::new`] computes at one of the densities the writer uses.
+/// The primary superblock's geometry, if it is the one Forge's writer lays out for its `fs_size`.
 fn check_superblock(sb: &[u8], file_len: u64) -> Result<Geom, Vec<String>> {
     let f32 = |at: usize| le32(sb, at).unwrap_or(0);
     let f64 = |at: usize| le64(sb, at).unwrap_or(0);
@@ -253,8 +229,7 @@ pub(crate) fn bit(raw: &[u8], base: usize, i: u64) -> bool {
         .is_some_and(|b| b & (1 << (i % 8)) != 0)
 }
 
-/// The cluster summary of a free map of `n` blocks: `sum[k]` counts the free runs of
-/// length `k` (runs of [`CONTIGSUMSIZE`] or more in the last slot); slot 0 is unused.
+/// The cluster summary of a free map of `n` blocks: `sum[k]` counts free runs of length `k`.
 pub(crate) fn cluster_sum(raw: &[u8], base: usize, n: u64) -> [u32; CONTIGSUMSIZE as usize + 1] {
     let mut sum = [0u32; CONTIGSUMSIZE as usize + 1];
     let mut run = 0u64;
@@ -270,9 +245,8 @@ pub(crate) fn cluster_sum(raw: &[u8], base: usize, n: u64) -> [u32; CONTIGSUMSIZ
     sum
 }
 
-/// Parses and checks cylinder group `c`: the header the writer lays out for this geometry,
-/// `cg_cs` against the maps, the cluster map and summary against the free map, and no
-/// metadata block marked free.
+/// Parses and checks cylinder group `c`: header, counts and cluster maps against the free map,
+/// no metadata block marked free.
 fn read_group(g: &Geom, c: u64, raw: Vec<u8>) -> Result<Group, Vec<String>> {
     let bad = |why: String| damaged(format!("cylinder group {c}: {why}"));
     let f32 = |at: usize| u64::from(le32(&raw, at).unwrap_or(0));
@@ -330,8 +304,7 @@ fn read_group(g: &Geom, c: u64, raw: Vec<u8>) -> Result<Group, Vec<String>> {
     if (0..ROOTINO).any(|i| c == 0 && !bit(&raw, iusedoff, i)) {
         return Err(bad("reserved inodes 0 and 1 are free".into()));
     }
-    // Blocks no allocation may take: group 0 from block 0 through the summary area, the
-    // others their backup superblock, cg block and inodes.
+    // Blocks no allocation may take: each group's metadata, group 0's through the summary.
     let (meta_lo, meta_hi) = match c {
         0 => (0, g.dblkno + g.csblocks),
         _ => (SBLKNO, g.dblkno),
@@ -371,9 +344,7 @@ fn read_group(g: &Geom, c: u64, raw: Vec<u8>) -> Result<Group, Vec<String>> {
     })
 }
 
-/// Every allocated inode is a file or a folder, and each group's `cs_ndir` counts its
-/// folders. Reads the inode blocks holding allocated inodes, one 64 KiB block at a time
-/// (within [`peak`]: the summary area is dropped first).
+/// Every allocated inode is a file or a folder, and each group's `cs_ndir` counts its folders.
 fn count_dirs(image: &mut File, g: &Geom, groups: &[Group]) -> io::Result<Result<(), Vec<String>>> {
     let mut block = vec![0u8; BSIZE as usize];
     for (c, grp) in (0u64..).zip(groups) {
@@ -414,23 +385,20 @@ fn count_dirs(image: &mut File, g: &Geom, groups: &[Group]) -> io::Result<Result
     Ok(Ok(()))
 }
 
-/// What an open volume keeps: the superblock, every group (its block and its `Group`) and
-/// the decoded summary.
+/// What an open volume keeps: the superblock, every group and the decoded summary.
 fn held(g: &Geom) -> u64 {
     let per_group = BSIZE + (size_of::<Group>() + size_of::<Csum>()) as u64;
     (SBLOCKSIZE as u64).saturating_add(g.ncg.saturating_mul(per_group))
 }
 
-/// The most [`Volume::open`] holds at once: [`held`] plus the raw summary area while it is
-/// decoded.
+/// The most [`Volume::open`] holds at once: [`held`] plus the raw summary area.
 fn peak(g: &Geom) -> u64 {
     held(g).saturating_add(g.csblocks.saturating_mul(BSIZE))
 }
 
 impl Volume {
-    /// Reads and checks the primary superblock, every cylinder group and the summary area.
-    /// `Ok(Err(findings))` when the image can't be edited in place: another tool's geometry,
-    /// not cleanly unmounted, damaged counts, or metadata past [`MEMORY_LIMIT`].
+    /// Reads and checks the superblock, every group and the summary. `Ok(Err(findings))`: another
+    /// tool's geometry, not clean, damaged counts, or metadata past [`MEMORY_LIMIT`].
     pub fn open(image: &mut File) -> io::Result<Result<Volume, Vec<String>>> {
         Self::open_within(image, MEMORY_LIMIT)
     }
@@ -509,12 +477,10 @@ impl Volume {
         }))
     }
 
-    /// `fs_size`, in 64 KiB blocks.
     pub fn blocks(&self) -> u64 {
         self.geom.size
     }
 
-    /// `fs_ncg`, `fs_fpg`, `fs_ipg`.
     pub fn cylinder_groups(&self) -> u64 {
         self.geom.ncg
     }
@@ -542,7 +508,6 @@ impl Volume {
         self.total.nbfree * BSIZE
     }
 
-    /// Free inodes (`fs_cstotal.cs_nifree`).
     pub fn free_inodes(&self) -> u64 {
         self.total.nifree
     }
@@ -566,11 +531,9 @@ pub enum Kind {
 pub struct Inode {
     pub ino: u64,
     pub kind: Kind,
-    /// `di_mode`, type bits included.
     pub mode: u16,
     pub nlink: u16,
     pub size: u64,
-    /// `di_blocks`, in 512-byte units.
     pub blocks: u64,
     pub db: [u64; NDADDR as usize],
     pub ib: [u64; 3],
@@ -584,8 +547,7 @@ pub struct Run {
     pub len: u64,
 }
 
-/// Every block an inode owns: its data as runs in logical order (holes left out), and its
-/// indirect blocks.
+/// Every block an inode owns: data runs in logical order (no holes) and indirect blocks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockMap {
     pub data: Vec<Run>,
@@ -600,7 +562,6 @@ impl BlockMap {
         (r.lbn <= lbn).then(|| r.block + (lbn - r.lbn))
     }
 
-    /// Data + indirect blocks.
     pub fn owned(&self) -> u64 {
         self.data.iter().map(|r| r.len).sum::<u64>() + self.indirect.len() as u64
     }
@@ -651,8 +612,7 @@ fn other_tool_io(ino: u64, why: impl std::fmt::Display) -> io::Error {
 }
 
 impl Volume {
-    /// Reads `buf` at image byte `offset` as the plan has changed it: the planned inodes and
-    /// directory chunks laid over the image's bytes.
+    /// Reads `buf` at image byte `offset` with the planned inodes and chunks laid over it.
     fn read_planned(&self, image: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         read_at(image, offset, buf)?;
         let end = offset + buf.len() as u64;
@@ -704,8 +664,7 @@ impl Volume {
             .is_some_and(|grp| bit(&grp.raw, grp.iusedoff, ino % g.ipg))
     }
 
-    /// Reads inode `ino`: it must be in range and allocated, a file or a folder without
-    /// extended attributes, its size within what the format allows.
+    /// Reads inode `ino`: in range, allocated, a file or folder without extended attributes.
     pub fn inode(&self, image: &mut File, ino: u64) -> io::Result<Inode> {
         let g = &self.geom;
         if ino < ROOTINO || ino >= g.ipg.saturating_mul(g.ncg) {
@@ -738,9 +697,8 @@ impl Volume {
         bit(&grp.raw, grp.freeoff, rel).then_some("free in the block map")
     }
 
-    /// Every block `ino` owns: pointers within `fs_size` on allocated non-metadata blocks,
-    /// none past the size, none twice, `di_blocks` equal to the count, a directory without
-    /// holes. The map is charged to the budget.
+    /// Every block `ino` owns, checked (allocated, not metadata, none twice, `di_blocks` right,
+    /// a directory without holes) and charged to the budget.
     pub fn block_map(&self, image: &mut File, ino: &Inode) -> io::Result<BlockMap> {
         let mut m = Mapper {
             vol: self,
@@ -783,10 +741,8 @@ impl Volume {
         Ok(map)
     }
 
-    /// Every entry of directory `dir` (whose parent is `parent`) but `.` and `..`, in disk
-    /// order, each checked; a directory without both `.` and `..` is damaged. One block is
-    /// read at a time. `f` gets each entry and the bytes the scan itself holds (the block
-    /// map's capacity and the block), so it can charge its own beside them.
+    /// Every checked entry of directory `dir` but `.` and `..` (both required), one block at a
+    /// time; `f` gets each entry and the bytes the scan holds, to charge its own beside them.
     fn scan_dir(
         &self,
         image: &mut File,
@@ -875,17 +831,14 @@ impl Volume {
         }
     }
 
-    /// The entries of the directory at game path `dir` (`""` is the root), `.` and `..`
-    /// left out, in disk order.
+    /// The entries of the directory at game path `dir`, in disk order.
     pub fn list(&self, image: &mut File, dir: &str) -> io::Result<Vec<Node>> {
         let (inode, parent) = self.dir_at(image, dir)?;
         self.list_dir(image, &inode, parent)
     }
 
-    /// The checked entries of directory `inode` (whose parent is `parent`): every record
-    /// valid, `.` and `..` present, no name twice. Charged to the budget beside the scan's
-    /// own block map and block: per entry slot (by capacity) its raw record, its `Node` and
-    /// a sort slot, plus each name twice.
+    /// The checked entries of directory `inode`: records valid, `.` and `..` present, no name
+    /// twice; charged to the budget.
     fn list_dir(&self, image: &mut File, inode: &Inode, parent: u64) -> io::Result<Vec<Node>> {
         type Raw = (u64, u8, Vec<u8>, u64, u16);
         let per = (size_of::<Raw>() + size_of::<Node>() + size_of::<&str>()) as u64;
@@ -926,10 +879,8 @@ impl Volume {
         Ok(out)
     }
 
-    /// The node at game path `path` (`/`-separated, compared byte for byte: UFS2 names are
-    /// case-sensitive), or `None` when it does not exist (or a parent is a file). Each folder
-    /// on the way is read whole through [`Self::list_dir`], so a damaged or ambiguous folder
-    /// is an error, never a match.
+    /// The node at game path `path` (case-sensitive), or `None` when it does not exist (or a
+    /// parent is a file); a damaged folder on the way is an error, never a match.
     pub fn lookup(&self, image: &mut File, path: &str) -> io::Result<Option<Node>> {
         if path.split('/').any(str::is_empty) {
             return Err(io::Error::new(
@@ -957,12 +908,10 @@ impl Volume {
     }
 }
 
-/// Byte offset of `fs_cstotal` (`cs_ndir`, `cs_nbfree`, `cs_nifree`, `cs_nffree`: i64 each)
-/// and of `fs_clean` in a superblock.
+/// Byte offsets of `fs_cstotal` (four i64) and `fs_clean` in a superblock.
 const CSTOTAL_AT: u64 = 1008;
 const CLEAN_AT: u64 = 209;
-/// The most links an inode may have: FreeBSD 11's `LINK_MAX` (the console's kernel; later
-/// releases allow 65500).
+/// The most links an inode may have: FreeBSD 11's `LINK_MAX` (the console's kernel).
 const LINK_MAX: u16 = 32767;
 
 impl Volume {
@@ -1014,8 +963,7 @@ impl Volume {
         self.summary_mut(c)?.nbfree += 1;
         self.total.nbfree += 1;
         self.changes.freed += 1;
-        // A block this plan took after the copy and frees now is not takeable either: it
-        // still holds a free-space write of this plan.
+        // A block this plan took and frees now still holds a free-space write: not takeable.
         if let Some(m) = self.changes.pristine.get_mut(&c)
             && let Some(b) = m.get_mut((rel / 8) as usize)
         {
@@ -1054,8 +1002,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Whether block `rel` of group `c` may be taken: free now and never freed by this plan
-    /// (the group's copy: its map before the first free, each later free cleared in it).
+    /// Whether block `rel` of group `c` may be taken: free now and never freed by this plan.
     fn takeable(&self, c: u64, rel: u64) -> bool {
         let Some(grp) = usize::try_from(c).ok().and_then(|i| self.groups.get(i)) else {
             return false;
@@ -1064,10 +1011,8 @@ impl Volume {
             && self.changes.pristine.get(&c).is_none_or(|m| bit(m, 0, rel))
     }
 
-    /// Free runs to take `n` blocks from, in slot order (`lbn` = slot): the first run of `n`
-    /// takeable blocks when there is one, else the takeable runs in block order until they
-    /// hold `n` (fewer when the image hasn't that many). The runs are charged before they
-    /// grow and stay charged: the caller releases [`Self::map_bytes`].
+    /// Free runs to take `n` blocks from: one run of `n` when there is one, else runs in block
+    /// order. They stay charged: the caller releases [`Self::map_bytes`].
     // ponytail: a linear scan of every group's map, twice at worst, per new file.
     fn free_runs(&mut self, n: u64) -> io::Result<BlockMap> {
         let g = self.geom;
@@ -1132,8 +1077,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Takes `n` blocks ([`Self::free_runs`]) as runs in slot order (`lbn` = slot), still
-    /// charged ([`Self::map_bytes`]). Without room for them: counted in `short`, `None`.
+    /// Takes `n` blocks ([`Self::free_runs`]). Without room: counted in `short`, `None`.
     fn take_blocks(&mut self, n: u64) -> io::Result<Option<BlockMap>> {
         if n > self.total.nbfree.saturating_sub(self.changes.freed) {
             self.changes.short += n;
@@ -1156,10 +1100,8 @@ impl Volume {
         Ok(Some(map))
     }
 
-    /// Takes a free inode (the first, never one this plan freed), its group's
-    /// `cg_initediblk` raised over it when past (the inodes it then covers must be zero, as
-    /// the writer leaves them: the kernel writes none past it). None free:
-    /// counted in `short_inodes`, `None`.
+    /// Takes the first free inode this plan didn't free, raising `cg_initediblk` over it (the
+    /// inodes it then covers must be zero). None free: counted in `short_inodes`, `None`.
     fn take_inode(&mut self, image: &mut File, dir: bool) -> io::Result<Option<u64>> {
         let g = self.geom;
         let mut found = None;
@@ -1169,7 +1111,7 @@ impl Volume {
             }
             let free = (0..g.ipg).find(|&rel| {
                 let ino = c * g.ipg + rel;
-                // By ruling, inodes this plan freed are not reused, the same as blocks.
+                // Inodes this plan freed are not reused, the same as blocks.
                 ino >= ROOTINO
                     && !bit(&grp.raw, grp.iusedoff, rel)
                     && !self.changes.meta.contains_key(&self.inode_offset(ino))
@@ -1218,11 +1160,8 @@ impl Volume {
         Ok(Some(ino))
     }
 
-    /// New blocks for `len` bytes of `data`, laid out as the writer lays out a file (its slot
-    /// sequence: the direct blocks, then each indirect block right before the blocks it
-    /// maps) over the blocks taken, one run when a run that long is free. The data (the last
-    /// block's tail zeroed) and the indirect blocks are planned into free space. No room:
-    /// counted in `short`, `None`.
+    /// New blocks for `len` bytes of `data` in the writer's slot order, data and indirect blocks
+    /// planned into free space. No room: counted in `short`, `None`.
     fn put_data(&mut self, len: u64, data: &Data) -> io::Result<Option<Ptrs>> {
         let n = len.div_ceil(BSIZE);
         let total = total_slots(n).ok_or_else(|| io::Error::other("internal error: too big"))?;
@@ -1234,8 +1173,7 @@ impl Volume {
                 .ok_or_else(|| io::Error::other("internal error: slot out of range"))
         };
         let segs = segments(n);
-        // The segments and one indirect block's scratch; the map is charged already
-        // (`take_blocks`), both released at the end.
+        // The segments and one indirect block's scratch, released at the end.
         let held = (segs.capacity() * size_of::<Seg>()) as u64 + BSIZE;
         self.charge(held)?;
         for seg in segs {
@@ -1325,9 +1263,8 @@ impl Volume {
         Ok(())
     }
 
-    /// The node at game path `path` as the plan has left it, resolved against the cached
-    /// listings (each folder on the way listed once per plan); `None` when it does not exist
-    /// or a parent is a file. `path` has no empty component.
+    /// The node at game path `path` as the plan has left it; `None` when it does not exist or a
+    /// parent is a file.
     fn resolve(&mut self, image: &mut File, path: &str) -> io::Result<Option<Node>> {
         let (mut dir, mut parent) = (ROOTINO, ROOTINO);
         let mut parts = path.split('/').peekable();
@@ -1352,8 +1289,7 @@ impl Volume {
         Ok(None)
     }
 
-    /// Image byte offset of directory `dir`'s chunk holding byte `offset`, and that chunk's
-    /// offset in the directory.
+    /// Image byte offset of `dir`'s chunk holding byte `offset`, and its offset in `dir`.
     fn chunk_at(&self, image: &mut File, dir: u64, offset: u64) -> io::Result<(u64, u64)> {
         let inode = self.inode(image, dir)?;
         let map = self.block_map(image, &inode)?;
@@ -1364,9 +1300,8 @@ impl Volume {
         Ok((p * BSIZE + chunk % BSIZE, chunk))
     }
 
-    /// Removes `node`'s entry from its directory as the kernel does: merged into the entry
-    /// before it in its chunk (`d_reclen`), or, first in its chunk, left as an unused entry
-    /// (`d_ino` 0). The cached listing follows.
+    /// Removes `node`'s entry as the kernel does: merged into the entry before it, or, first in
+    /// its chunk, left unused (`d_ino` 0).
     fn remove_entry(&mut self, image: &mut File, node: &Node) -> io::Result<()> {
         let (at, chunk) = self.chunk_at(image, node.parent, node.offset)?;
         let mut b = vec![0u8; DIRBLKSIZ];
@@ -1412,10 +1347,8 @@ impl Volume {
         Ok(())
     }
 
-    /// The first entry of directory `dir` with `need` bytes of room past its own record (an
-    /// unused first entry of a chunk: its whole `d_reclen`), as the plan has left it. One
-    /// block is read at a time, charged beside the directory's block map. The scan starts at
-    /// the folder's [`Hint`] when no chunk before it has the room, and leaves a new one.
+    /// The first entry of directory `dir` with `need` bytes of room past its own record, from
+    /// the folder's [`Hint`] on; leaves a new one.
     fn find_slot(&mut self, image: &mut File, dir: u64, need: usize) -> io::Result<Option<Slot>> {
         let inode = self.inode(image, dir)?;
         let map = self.block_map(image, &inode)?;
@@ -1487,17 +1420,14 @@ impl Volume {
         Ok(None)
     }
 
-    /// Directory `dir`'s chunk at `chunk` may have more room now: [`Self::find_slot`] looks
-    /// there again.
+    /// Directory `dir`'s chunk at `chunk` may have more room now.
     fn room_at(&mut self, dir: u64, chunk: u64) {
         if let Some(h) = self.changes.hints.get_mut(&dir) {
             h.chunk = h.chunk.min(chunk);
         }
     }
 
-    /// The room `node`'s removal leaves in the entry before it in its chunk (that entry's
-    /// slack plus `node`'s `d_reclen`, as [`Self::remove_entry`] merges them); 0 when `node`
-    /// is first in its chunk (it then stays an unused entry of its own `d_reclen`).
+    /// The room `node`'s removal leaves in the entry before it; 0 when it is first in its chunk.
     fn room_freed(&self, image: &mut File, node: &Node) -> io::Result<usize> {
         let (at, chunk) = self.chunk_at(image, node.parent, node.offset)?;
         let mut b = vec![0u8; DIRBLKSIZ];
@@ -1528,9 +1458,7 @@ impl Volume {
         Ok(0)
     }
 
-    /// Writes an entry for `node`'s inode named `name` into `slot` of directory `dir` (the
-    /// entry there shortened to what it uses, or an unused one taken whole) and adds it to
-    /// the cached listing, in disk order.
+    /// Writes an entry for `node`'s inode named `name` into `slot` of directory `dir`.
     fn insert_entry(
         &mut self,
         image: &mut File,
@@ -1581,8 +1509,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Renames `node`'s entry where it is (`name` fits its `d_reclen`); the cached listing
-    /// follows.
+    /// Renames `node`'s entry where it is (`name` fits its `d_reclen`).
     fn rename_entry(&mut self, image: &mut File, node: &Node, name: &str) -> io::Result<()> {
         let (at, chunk) = self.chunk_at(image, node.parent, node.offset)?;
         let mut b = vec![0u8; DIRBLKSIZ];
@@ -1628,9 +1555,8 @@ impl Volume {
         self.relink_dir(image, dir, false)
     }
 
-    /// Raises (`up`) or lowers directory `dir`'s link count by one (a folder in it came or
-    /// went); cached nodes follow. Past [`LINK_MAX`] or below 2 is damage: [`Self::rename`]
-    /// refuses a move that would go past it first.
+    /// Raises (`up`) or lowers directory `dir`'s link count by one; past [`LINK_MAX`] or below
+    /// 2 is damage.
     fn relink_dir(&mut self, image: &mut File, dir: u64, up: bool) -> io::Result<()> {
         let inode = self.inode(image, dir)?;
         let nlink = match up {
@@ -1652,8 +1578,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Frees inode `inode` and every block it owns (holes have none), the inode zeroed as
-    /// fsck expects of a free one. Its block map is charged while it is held.
+    /// Frees inode `inode` and every block it owns, the inode zeroed as fsck expects.
     fn free_inode(&mut self, image: &mut File, inode: &Inode) -> io::Result<()> {
         if inode.kind == Kind::File && inode.nlink != 1 {
             // Its blocks would stay referenced by the other names.
@@ -1679,11 +1604,8 @@ impl Volume {
         self.plan_meta(self.inode_offset(inode.ino), vec![0; DINODE as usize])
     }
 
-    /// Deletes the file or folder at `path`: its entry removed, a folder's parent link
-    /// dropped, then its inode and blocks freed, and for a folder everything under it (folders
-    /// waiting to be listed kept on a stack, not recursed, charged to the budget; the entries
-    /// inside freed folders are left as they are: their blocks are free).
-    /// `Ok(Err(finding))` when the op does not apply.
+    /// Deletes `path`: its entry removed, then its inode and blocks freed, everything under a
+    /// folder too (a stack charged to the budget). `Ok(Err(finding))` when it does not apply.
     fn delete(&mut self, image: &mut File, path: &str) -> io::Result<Result<(), String>> {
         if path.split('/').any(str::is_empty) {
             return Ok(Err(format!("{path:?}: bad path")));
@@ -1702,8 +1624,7 @@ impl Volume {
         while let Some((ino, parent)) = stack.pop() {
             let inode = self.inode(image, ino)?;
             if inode.kind == Kind::Dir {
-                // A folder this plan listed already: its cached listing, kept current and
-                // charged since (what entries it lost stays charged until the plan ends).
+                // A folder this plan listed already: its cached listing.
                 let (list, bytes) = match self.changes.listings.remove(&ino) {
                     Some(list) => {
                         let bytes = Self::listing_bytes(&list, list.capacity());
@@ -1737,15 +1658,11 @@ impl Volume {
         Ok(Ok(()))
     }
 
-    /// Renames or moves `from` to `to` (compared byte for byte: UFS2 names are case-sensitive):
-    /// in its own entry when the name fits its `d_reclen` and the folder stays, else a new
-    /// entry in the target folder's first slot with room, then the old one removed (in its own
-    /// folder, when only the room the old entry frees fits it: removed first, then placed); a
-    /// folder moved between parents gets its `..` repointed and both parents' link counts
-    /// follow. `Ok(Err(finding))` when the op does not apply; nothing is planned then.
-    // ponytail: no room in the target folder's blocks is a finding (folder growth: 4c); times
-    // are left as they are; only `to`'s own length is checked against MAXPATHLEN here (core
-    // checks every resulting path, for all formats).
+    /// Renames or moves `from` to `to`: in its own entry when the name fits and the folder stays,
+    /// else a new entry placed and the old removed; a moved folder's `..` and both parents'
+    /// link counts follow. `Ok(Err(finding))` when it does not apply; nothing is planned then.
+    // ponytail: times are left as they are; only `to`'s own length is checked against
+    // MAXPATHLEN here (core checks every resulting path).
     fn rename(&mut self, image: &mut File, from: &str, to: &str) -> io::Result<Result<(), String>> {
         if let Some(p) = [from, to]
             .into_iter()
@@ -1820,13 +1737,9 @@ impl Volume {
         Ok(Ok(()))
     }
 
-    /// Adds the file `path` (`len` bytes of `data`) into its folder (made with its parents when
-    /// missing, [`Self::ensure_dir`]; grown when full), or replaces the
-    /// file there: new blocks first ([`Self::put_data`]), then the inode (a new one as the
-    /// writer makes it, or the old one rewritten: its name, inode number and times kept),
-    /// then a replaced file's old blocks freed (old data is never overwritten). Without room
-    /// for its blocks or inode the op is counted ([`Changes::short`]) and goes no further.
-    /// `Ok(Err(finding))` when the op does not apply; nothing is planned then.
+    /// Adds or replaces the file `path` (`len` bytes of `data`): new blocks first, then the inode
+    /// (a replaced one keeps its number and times), then the old blocks freed (never
+    /// overwritten). No room: counted. `Ok(Err(finding))` when it does not apply.
     fn put(
         &mut self,
         image: &mut File,
@@ -1919,8 +1832,7 @@ impl Volume {
         Ok(())
     }
 
-    /// [`Self::put`] of a new file `name` into folder `dir`: an inode as the writer makes it
-    /// (mode 0100777, root:root, its fixed times), then its entry.
+    /// [`Self::put`] of a new file `name` into folder `dir`: an inode as the writer makes it.
     fn add(
         &mut self,
         image: &mut File,
@@ -1976,11 +1888,8 @@ impl Volume {
         Ok(Ok(()))
     }
 
-    /// The folder at game path `dir` (`""`: the root) as (inode, its parent), made with its
-    /// parents when missing ([`Self::new_dir`]). `Ok(Ok(None))`: a folder on the way was
-    /// not made for want of room (by this op or an earlier one); each folder below it is
-    /// counted once. `Ok(Err(finding))`: a part of the path is a file, a bad name, or a
-    /// folder that can't take another entry.
+    /// The folder at game path `dir` as (inode, its parent), made with its parents when missing.
+    /// `Ok(Ok(None))`: not made for want of room. `Ok(Err(finding))`: a file, bad name or full folder.
     fn ensure_dir(
         &mut self,
         image: &mut File,
@@ -2035,8 +1944,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Counts what a new file (`dir`: folder) of `blocks` blocks takes in a plan already
-    /// short of room: its inode and blocks are taken (or counted missing), nothing written.
+    /// Counts a new file's (`dir`: folder's) inode and blocks in a plan already short of room.
     fn count_new(&mut self, image: &mut File, dir: bool, blocks: u64) -> io::Result<()> {
         self.take_inode(image, dir)?;
         self.count_blocks(blocks)
@@ -2051,10 +1959,8 @@ impl Volume {
         Ok(())
     }
 
-    /// Makes folder `name` (game path `path`) in directory `dir` (whose parent is `up`) as
-    /// the writer makes one: an inode (mode 040777, nlink 2, root:root, its fixed times,
-    /// `di_dirdepth` one past its parent's) and one block whose first chunk holds `.` and
-    /// `..`; then its entry, and `dir`'s nlink + 1. `Ok(Ok(None))`: no room (counted).
+    /// Makes folder `name` in directory `dir` as the writer makes one (inode, a block with `.`
+    /// and `..`), then its entry and `dir`'s nlink + 1. `Ok(Ok(None))`: no room (counted).
     fn new_dir(
         &mut self,
         image: &mut File,
@@ -2146,10 +2052,8 @@ impl Volume {
         }
     }
 
-    /// Appends one empty chunk (`d_ino` 0, `d_reclen` 512) to directory `dir`, as the kernel
-    /// grows a folder: inside its last block while it has room, else in a new block (a new
-    /// single indirect block first at the 13th). `Room::Short` when no block is free
-    /// (counted), `Room::Full` past the single indirect block.
+    /// Appends one empty chunk to directory `dir` as the kernel grows a folder. `Room::Short`:
+    /// no block free (counted); `Room::Full`: past the single indirect block.
     // ponytail: a folder past 12 + 8192 blocks (512 MiB of entries) is not grown.
     fn grow_dir(&mut self, image: &mut File, dir: u64, need: usize) -> io::Result<Room> {
         let inode = self.inode(image, dir)?;
@@ -2213,8 +2117,7 @@ impl Volume {
             put(&mut b, 24, &blocks.to_le_bytes())?;
             let bytes = Self::map_bytes(&map);
             self.changes.bytes = self.changes.bytes.saturating_sub(bytes);
-            // Only its first chunk is written (below): bytes past the folder's size are
-            // never read, and each later chunk is written whole when the folder grows.
+            // Only its first chunk is written: later chunks are written whole as the folder grows.
             p * BSIZE
         };
         let size = size + DIRBLKSIZ as u64;
@@ -2267,9 +2170,8 @@ impl Pending {
     }
 }
 
-/// Where [`Volume::find_slot`] starts in a folder: the entries in its chunks before byte
-/// `chunk` have at most `below` bytes of room each (rooms there only shrink until
-/// [`Volume::room_at`] moves `chunk` back), so a larger entry is looked for from `chunk` on.
+/// Where [`Volume::find_slot`] starts in a folder: chunks before `chunk` have at most `below`
+/// bytes of room per entry.
 #[derive(Debug, Clone, Copy, Default)]
 struct Hint {
     chunk: u64,
@@ -2377,11 +2279,8 @@ impl Volume {
         std::iter::once(SBLOCK_UFS2).chain(backups).collect()
     }
 
-    /// The change set as live writes, between two writes of `fs_clean` in every superblock
-    /// copy: the first clears it, the last sets it, after `fs_cstotal`. In between: directory
-    /// chunks (entries removed before their inodes are freed), inodes, group blocks (`cg_cs`
-    /// and the cluster summary renewed from the maps), the changed `fs_cs` entries.
-    /// No change, no writes.
+    /// The change set as writes: free-space data first, then the live ones between two writes of
+    /// `fs_clean` in every superblock (cleared, then set): directory chunks, inodes, groups, `fs_cs`.
     fn writes(mut self) -> io::Result<Vec<Write>> {
         let c = &self.changes;
         if c.meta.is_empty() && c.groups.is_empty() {
@@ -2444,25 +2343,20 @@ impl Volume {
     }
 }
 
-/// Plans the writes that apply `ops` to the image, in order (each op sees the ones before
-/// it), reading it only. An op that does not apply (a missing path, a path through a file)
-/// is a finding; so is an image Forge can't edit in place ([`Volume::open`]'s findings).
-/// Blocks the plan frees are not reused by it; the image never grows.
+/// Plans the writes that apply `ops` in order, reading the image only. An op that does not
+/// apply is a finding, and so is an image Forge can't edit in place.
 pub fn plan(image: &mut File, ops: &[Op]) -> Result<Vec<Write>, Vec<String>> {
     plan_sized(image, ops).0
 }
 
-/// What a plan allocates in the image's free space and what it had: `needed` counts every
-/// block it takes (file data, indirect blocks, new and grown directories), those it lacked
-/// room for too; `free` the free blocks when the volume was opened. Bytes.
+/// Bytes a plan allocates (`needed`, the unmet ones too) and those free at open (`free`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Space {
     pub needed: u64,
     pub free: u64,
 }
 
-/// [`plan`], with the [`Space`] the plan counted (`None` when the volume could not be read or
-/// was not planned).
+/// [`plan`], with the [`Space`] it counted (`None` when the volume was not planned).
 pub fn plan_sized(
     image: &mut File,
     ops: &[Op],
@@ -2488,8 +2382,7 @@ fn plan_volume(
     let free = v.total.nbfree;
     let mut findings = Vec::new();
     for op in ops {
-        // Once the plan is short of room, later ops may fail only because of it (a file left
-        // out): their findings are dropped, the no-room finding stands for them.
+        // Once short of room, later ops' findings are dropped: the no-room finding stands for them.
         let short = v.changes.short > 0 || v.changes.short_inodes > 0;
         let done = match op {
             Op::Delete { path } => v.delete(image, path).map_err(fail)?,
@@ -2537,9 +2430,8 @@ struct Dirent<'a> {
     reclen: u16,
 }
 
-/// Checks the entries of one DIRBLKSIZ chunk at directory offset `base` and hands each in
-/// use to `f`. `seen` counts the entries so far: the first two
-/// of a directory must be `.` (`dir`) and `..` (`parent`) at offsets 0 and 12.
+/// Checks one chunk's entries at directory offset `base`, each in use handed to `f`; the first
+/// two of a directory must be `.` and `..`.
 fn scan_chunk(
     dir: u64,
     parent: u64,
@@ -2617,8 +2509,7 @@ struct Mapper<'a> {
     left: u64,
 }
 
-/// Elements to reserve before a push onto a vector of `len` of `cap`: none while there is
-/// room, else as many again (at least 4), so the capacity charged is the capacity held.
+/// Elements to reserve before a push: none while there is room, else as many again (at least 4).
 fn room(len: usize, cap: usize) -> usize {
     if len < cap { 0 } else { cap.max(4) }
 }

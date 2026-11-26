@@ -1,32 +1,13 @@
 //! Forward-only exFAT image writer (512 B sectors, 64 KiB clusters) for ShadowMountPlus `.exfat` images.
 //!
-//! Frozen interface (ps5-dump-forge-core depends on it): `plan` validates names and sizes the image
-//! without reading file data; `write` streams the files into `out` in offset order.
+//! `plan` validates names and sizes the image without reading file data; `write` streams the
+//! files into `out` in offset order, never behind the cursor (so it can feed a `.ffpfsc`).
+//! Ported from MkPFS `exfat_writer.py`/`_exfat_upcase.py`; names use the real up-case table.
 //!
-//! Ported from MkPFS (PSBrew, GPL-3.0) `exfat_writer.py` and `_exfat_upcase.py`, checked
-//! against the Microsoft exFAT specification. Differences from the port: names are
-//! validated and hashed through the real up-case table (MkPFS upcases ASCII only), the
-//! serial is derived from the manifest instead of fixed, the image is sized like the
-//! user's known-good `exfat.sh` (free spare for `image_rw=` mounts) instead of tight, macOS
-//! junk is left out by path, and file data comes from a [`SourceTree`] instead of a folder.
-//!
-//! Because every size is known up front, the whole image is laid out before the first
-//! byte is written, and nothing is ever written behind the cursor — so the same stream
-//! can later go straight into a `.ffpfsc` container. The image, by offset:
-//!
-//! | Sectors / clusters | What |
-//! |---|---|
-//! | sectors 0..12 | main boot region (boot sector, 8 extended boot sectors, OEM, reserved, checksum) |
-//! | sectors 12..24 | backup boot region, identical |
-//! | sector 128.. | the FAT, padded to a cluster |
-//! | cluster 2.. | allocation bitmap, up-case table, root directory |
-//! | then | the tree in pre-order: a directory, then everything under it |
-//! | last | free clusters: the spare of the default size, plus `Options::free_bytes` |
-//!
-//! Every allocation is one contiguous run, so each stream carries `NoFatChain`, and the FAT
-//! still holds an explicit chain for every run so a driver that ignores the flag reads the
-//! same bytes. The root directory, bitmap and up-case table have no flag to set and rely
-//! on their chains.
+//! Layout: sectors 0..12 main boot region, 12..24 backup, 128.. the FAT; cluster 2.. bitmap,
+//! up-case table, root; then the tree in pre-order; then the free clusters. Every run is
+//! contiguous (`NoFatChain`) yet chained in the FAT, so a driver ignoring the flag reads the
+//! same bytes; the root, bitmap and up-case table rely on their chains.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -56,9 +37,7 @@ pub(crate) const MAX_CLUSTERS: u64 = (1 << 32) - 11;
 /// A directory's DataLength may not exceed 256 MiB.
 pub(crate) const MAX_DIR_BYTES: u64 = 256 << 20;
 pub(crate) const ENTRY: usize = 32;
-/// The OEM Parameters record (spec §3.3) a maker's mark goes in: GUID
-/// {182B1321-1B2D-441D-BECA-28B704837CA0}, ours, in the on-disk order (first three fields
-/// little-endian), then 32 bytes of ASCII.
+/// Our OEM Parameters GUID {182B1321-1B2D-441D-BECA-28B704837CA0} in on-disk order (spec §3.3).
 pub const MAKER_GUID: [u8; 16] = [
     0x21, 0x13, 0x2B, 0x18, 0x2D, 0x1B, 0x1D, 0x44, 0xBE, 0xCA, 0x28, 0xB7, 0x04, 0x83, 0x7C, 0xA0,
 ];
@@ -82,11 +61,9 @@ pub(crate) const NO_FAT_CHAIN: u8 = 0x02;
 pub struct Options {
     /// Extra free space (bytes) beyond what the files need, for `image_rw=` mounts.
     pub free_bytes: u64,
-    /// Volume label (ps5-dump-forge-core passes the title ID), at most 11 UTF-16 units; a longer
-    /// one is rejected by `plan`. `None` writes an empty label entry, as mkfs.exfat does.
+    /// Volume label (core passes the title ID), at most 11 UTF-16 units; `None`: an empty label.
     pub label: Option<String>,
-    /// Maker's mark: printable ASCII, at most 32 bytes, written to the first OEM Parameters
-    /// record under [`MAKER_GUID`]; `plan` rejects anything else. `None` leaves sector 9 zero.
+    /// Maker's mark: printable ASCII, at most 32 bytes, under [`MAKER_GUID`] in sector 9.
     pub maker: Option<String>,
 }
 
@@ -97,8 +74,7 @@ pub struct Layout {
     pub image_size: u64,
     /// File-data bytes `write` copies: the `total` its progress reports against.
     pub data_bytes: u64,
-    /// Source paths left out as macOS junk (`.DS_Store`, `._*`, `.fseventsd`,
-    /// `.Spotlight-V100`, `.Trashes`), for the caller's log.
+    /// Source paths left out as macOS junk, for the caller's log.
     pub skipped: Vec<String>,
     geo: Geometry,
     /// Node 0 is the root directory.
@@ -178,7 +154,6 @@ pub struct Report {
 }
 
 /// Validate names and lay the image out. Fails with every offending path listed.
-/// Checks `cancel` between steps.
 pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Result<Layout> {
     check_cancel(cancel)?;
     let mut problems = Vec::new();
@@ -306,8 +281,7 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
     })
 }
 
-/// Write the image described by `layout` into `out` (empty: a fresh file the caller owns,
-/// fsyncs and renames, or a `.ffpfsc` stream). `progress(done, total)` counts file-data bytes.
+/// Write the image described by `layout` into an empty `out`. `progress` counts file-data bytes.
 pub fn write<W: Write + Seek>(
     tree: &mut dyn SourceTree,
     layout: &Layout,
@@ -386,8 +360,7 @@ pub fn write<W: Write + Seek>(
     sink.w.flush()?;
     let end = sink.pos;
     drop(sink);
-    // The free tail: one zero byte at the end extends the image (sparse on a fresh file,
-    // zero-filled by a stream).
+    // One zero byte at the end extends the image over the free tail (sparse on a fresh file).
     if end > layout.image_size {
         return Err(err(format!(
             "internal error: exFAT writer reached byte {end} of a {}-byte image",
@@ -402,8 +375,7 @@ pub fn write<W: Write + Seek>(
     Ok(report)
 }
 
-/// Adds `path` (a file when `size` is set, else a directory) and its parent directories,
-/// recording every name that cannot go into the image.
+/// Adds `path` (a file when `size` is set) and its parents, recording every bad name.
 fn add_path(
     nodes: &mut Vec<Node>,
     index: &mut HashMap<String, usize>,
@@ -447,8 +419,7 @@ fn add_path(
     }
 }
 
-/// Sorts a directory's children by name (deterministic output) and reports names that
-/// are one name to the case-insensitive volume.
+/// Sorts a directory's children by name and reports case-insensitive clashes.
 fn sort_and_check_collisions(nodes: &mut [Node], dir: usize, problems: &mut Vec<String>) {
     let mut kids = std::mem::take(&mut nodes[dir].children);
     kids.sort_by(|&a, &b| nodes[a].name.cmp(&nodes[b].name));
@@ -483,9 +454,8 @@ fn heap_order(nodes: &[Node]) -> Vec<usize> {
     order
 }
 
-/// 32-byte entries a directory holds, plus one left unused: a full last cluster has no
-/// end-of-directory record, and the vendored reader then runs on into the next cluster
-/// of the root (which it reads by contiguity). One spare slot costs a cluster at most.
+/// 32-byte entries a directory holds, plus one unused: the vendored reader runs past a full
+/// last cluster (no end-of-directory record) into the next one.
 fn dir_entries(nodes: &[Node], dir: usize) -> u64 {
     let root = if dir == 0 { 3 } else { 0 }; // label, bitmap, up-case
     let sets: u64 = nodes[dir]
@@ -502,11 +472,9 @@ fn dir_entries(nodes: &[Node], dir: usize) -> u64 {
     root + sets + 1
 }
 
-/// The image size the user's known-good `exfat.sh` (after upstream `mkexfat_macos.sh`)
-/// gives a tree: data rounded to clusters + FAT + bitmap + 256 B per entry + 32 MiB of
-/// fixed metadata, plus 0.5 % spare clamped to 64..512 MiB, never under the raw bytes
-/// plus 64 MiB, rounded up to 1 MiB. The spare is the free space `image_rw=` mounts
-/// write into, so images are deliberately not tight. `dirs` counts the root, as `find -type d`.
+/// The size upstream `mkexfat_macos.sh` gives a tree: clusters, FAT, bitmap, 256 B per entry and
+/// 32 MiB, plus 0.5 % spare (64..512 MiB) for `image_rw=`, at least raw + 64 MiB, to 1 MiB.
+/// `dirs` counts the root.
 fn default_size(files: u64, dirs: u64, bytes: u64, alloc: u64) -> Result<u64> {
     const MIB: u64 = 1 << 20;
     let clusters = alloc / CLUSTER;
@@ -529,10 +497,8 @@ struct Volume {
     image: u64,
 }
 
-/// Lays out a volume of exactly `image` bytes (a multiple of 64 KiB) holding `content`
-/// clusters, or the smallest one that holds them if that is larger. The FAT is sized for
-/// every cluster the image could hold, which may leave it a little longer than the
-/// cluster count needs: FatLength is a lower bound in the spec, and mkfs.exfat does the same.
+/// Lays out a volume of `image` bytes holding `content` clusters (grown if too small). The FAT
+/// may be a little longer than needed: FatLength is a lower bound, as mkfs.exfat does.
 fn size_volume(content: u64, image: u64) -> Result<Volume> {
     let fat_sectors = |clusters: u64| {
         ((clusters + 2) * 4)
@@ -589,8 +555,7 @@ fn serial(tree: &dyn SourceTree, opts: &Options, image_size: u64) -> u32 {
     h
 }
 
-/// Byte offset of the first macOS-junk component of `path`, if it has one. The upstream
-/// scanners filter these already; this keeps them out of the image whatever the source.
+/// Byte offset of the first macOS-junk component of `path`, if any.
 fn junk_at(path: &str) -> Option<usize> {
     let mut at = 0;
     for part in path.split('/') {
@@ -667,8 +632,7 @@ fn boot_region(layout: &Layout) -> Vec<u8> {
             0xAA55_0000,
         );
     }
-    // Sector 9 (OEM parameters): the maker's record, the other nine null (zero GUID); sector
-    // 10 (reserved) stays zero.
+    // Sector 9: the maker's record, the other nine OEM records null; sector 10 stays zero.
     if let Some(m) = &layout.maker {
         let at = OEM_SECTOR * SECTOR as usize;
         r[at..at + 16].copy_from_slice(&MAKER_GUID);
@@ -693,8 +657,7 @@ pub(crate) fn boot_checksum(bytes: &[u8]) -> u32 {
         })
 }
 
-/// The FAT: media and reserved entries, a chain per run, zero for free clusters, padded
-/// to its declared length.
+/// The FAT: media and reserved entries, a chain per run, zero for free clusters, padded.
 fn write_fat<W: Write>(sink: &mut Sink<W>, layout: &Layout) -> Result<()> {
     let g = &layout.geo;
     let start = sink.pos;
@@ -740,8 +703,7 @@ fn write_bitmap<W: Write>(sink: &mut Sink<W>, g: &Geometry) -> Result<()> {
     sink.zeros_to(cluster_offset(g, FIRST_CLUSTER as u32 + g.bitmap_clusters))
 }
 
-/// A directory's entry sets, one at a time; the caller zero-fills the rest of its
-/// clusters (end of directory).
+/// A directory's entry sets; the caller zero-fills the rest of its clusters.
 fn write_dir<W: Write>(sink: &mut Sink<W>, layout: &Layout, dir: usize) -> Result<()> {
     let g = &layout.geo;
     let node = &layout.nodes[dir];
@@ -864,9 +826,8 @@ fn copy_file<W: Write>(
     Ok(())
 }
 
-/// The output with its position, so every region can assert it starts where the plan
-/// put it — the guarantee that the writer never goes back. It also checks `cancel` every
-/// `CHUNK` bytes, so long metadata runs (FAT, bitmap, zero fill) stay cancellable.
+/// The output with its position, so each region asserts it starts where planned (never back);
+/// checks `cancel` every `CHUNK` bytes.
 struct Sink<'a, W: Write> {
     w: BufWriter<&'a mut W>,
     pos: u64,
@@ -931,9 +892,8 @@ fn too_big() -> Error {
     err("the tree is too large for an exFAT volume with 64 KiB clusters")
 }
 
-/// The maker's mark of an image this crate wrote, from its main boot region: `None` for
-/// any other exFAT (not 512-byte sectors at byte 0, a bad boot checksum, which the spec
-/// says voids the OEM parameters, or no record under [`MAKER_GUID`]).
+/// The maker's mark of an image this crate wrote: `None` for any other exFAT (other sectors,
+/// a bad boot checksum, which voids the OEM parameters, or no [`MAKER_GUID`] record).
 pub fn read_maker<R: Read + Seek>(r: &mut R) -> std::io::Result<Option<String>> {
     let mut b = vec![0u8; BOOT_REGION];
     r.seek(SeekFrom::Start(0))?;

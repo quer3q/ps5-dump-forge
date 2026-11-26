@@ -1,0 +1,50 @@
+/* Build's Target step (the prototype's chosen "Format step" layout): big chips, the recommended
+   dot, colour-coded levels, and the result size in a panel beside the choices. */
+.screen.build .build-step-head .b-head-btn { margin-inline-start: auto; }
+/* The result panel takes the choices' full height and only its content's width. */
+.screen.build .b-split { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 20px; align-items: stretch; }
+.screen.build .b-choices { display: grid; gap: 14px; min-width: 0; }
+.screen.build .b-field > .label { display: block; margin: 0 0 6px; }
+.screen.build .b-chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.screen.build button.b-chip {
+  position: relative; height: 36px; padding: 0 14px; border-radius: var(--radius); font-size: 13.5px; font-weight: 600; gap: 8px;
+  background: var(--inset); color: var(--fg); border: 1.5px solid transparent;
+}
+.screen.build button.b-chip:hover:not(:disabled, [aria-disabled="true"], [aria-pressed="true"]) { background: var(--control-hover); }
+.screen.build button.b-chip[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.screen.build button.b-chip .icon { width: 17px; height: 17px; }
+/* Recommended (None, FPKG): a plain 8px green dot after the label; the meaning is its tooltip and
+   ", recommended" for screen readers. */
+.screen.build .b-best { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.screen.build button.b-more { color: var(--muted); }
+.screen.build button.b-more .icon { transition: transform var(--dur); }
+.screen.build button.b-more.open .icon { transform: rotate(180deg); }
+.screen.build button.b-lv.b-green { --lv: var(--ok); --lv-bg: var(--ok-bg); }
+.screen.build button.b-lv.b-yellow { --lv: var(--warn); --lv-bg: var(--warn-bg); }
+.screen.build button.b-lv.b-red { --lv: var(--danger); --lv-bg: var(--danger-bg); }
+.screen.build button.b-lv.b-gray { --lv: var(--muted); --lv-bg: var(--raise); }
+.screen.build button.b-lv .icon { color: var(--lv); }
+.screen.build button.b-lv[aria-pressed="true"] { background: var(--lv-bg); color: var(--lv); border-color: var(--lv); }
+.screen.build .b-result {
+  background: var(--inset); border-radius: var(--radius-lg); padding: 14px 16px;
+  display: flex; gap: 16px; min-width: 200px; min-height: 150px;
+}
+/* The gauge: its full height the larger of game now and the build, the fill the build (amber when larger, a tick at now). */
+.screen.build .b-track { flex: none; width: 14px; border-radius: 999px; background: var(--raise); position: relative; overflow: hidden; }
+.screen.build .b-fill { position: absolute; left: 0; right: 0; bottom: 0; background: linear-gradient(var(--accent), #3d6bff); transition: height 0.4s var(--ease-out); }
+.screen.build .b-fill.over { background: linear-gradient(var(--warn), #c98a1c); }
+.screen.build .b-tick { position: absolute; left: 0; right: 0; height: 2px; background: var(--fg); }
+.screen.build .b-col { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+.screen.build .b-result .b-k { font-size: 12px; color: var(--muted); }
+.screen.build .b-result .b-now { font-weight: 600; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.screen.build .b-result .b-big { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.screen.build .b-result .tag { margin-top: 6px; }
+/* One column once the choices would get narrow: the open rail takes ~250px of the viewport. */
+@media (max-width: 999px) { html:not(.rail-collapsed) .screen.build .b-split { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .screen.build .b-split { grid-template-columns: 1fr; } }
+.screen.build hr.b-sep { border: 0; border-top: 1px solid var(--line); margin: 18px 0 16px; }
+/* Backport: why the switch is off. */
+.screen.build .b-why { font-size: 12.5px; margin: 6px 0 0; }
+/* A switch row with a "Recommended" notice at its end (Restore metadata online). */
+.screen.build .field.b-has-rec { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.screen.build .b-rec { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--ok); white-space: nowrap; }

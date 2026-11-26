@@ -1,0 +1,253 @@
+diff --git a/ps5upload-fpkg/src/build.rs b/ps5upload-fpkg/src/build.rs
+index fbe5c4b43d8879a50969fe5eb783881ff44135ea..2f7145d14d60ea826565bfc16aed36067dca81c1 100644
+--- a/ps5upload-fpkg/src/build.rs
++++ b/ps5upload-fpkg/src/build.rs
+@@ -343,6 +343,19 @@ fn enter(control: &mut BuildControl, stage: Stage) {
+     }
+ }
+ 
++/// How often [`BuildControl::files`] hears from a per-file pass: every this many files, and
++/// at its first and last.
++const FILES_EVERY: u64 = 256;
++
++/// `done` of the `total` files of `stage`'s per-file pass, passed on when [`FILES_EVERY`] says.
++fn files_done(control: &mut BuildControl, stage: Stage, done: u64, total: u64) {
++    if done.is_multiple_of(FILES_EVERY) || done == total {
++        if let Some(f) = control.files.as_deref_mut() {
++            f(stage, done, total);
++        }
++    }
++}
++
+ /// Optional controls an asynchronous caller supplies: byte progress, stages and cancellation.
+ #[derive(Default)]
+ pub struct BuildControl<'a> {
+@@ -353,6 +366,13 @@ pub struct BuildControl<'a> {
+     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+     /// Called as each [`Stage`] begins.
+     pub stage: Option<&'a mut dyn FnMut(Stage)>,
++    /// Files visited of a stage's per-file pass, as `(stage, done, total)`: the SELF header
++    /// checks of [`Stage::Check`] and the module marks of [`Stage::Plan`], at most one small
++    /// read each. Every file of the pass counts, those it skips without a read included
++    /// (`fakelib/` and files under 32 bytes in check; generated and under 4 bytes in plan), so
++    /// `done` ends at `total`. Called at the pass's first file, every 256 files and once all
++    /// are visited, never after a stop.
++    pub files: Option<&'a mut dyn FnMut(Stage, u64, u64)>,
+     /// Seed for a fast self-check, which sweeps a sample of the data blocks instead of all of
+     /// them (see [`verify::verify_streaming_sampled`]); `None` sweeps every block.
+     pub sample: Option<u64>,
+@@ -705,9 +725,11 @@ fn prepare_with(
+         std::collections::HashMap::new();
+     // This walk opens every file of the game; on a big title on Windows (where each open is
+     // slow) it took ~14 minutes with the stage showing nothing (a 156 GiB Ghost of Yotei
+-    // report read as "stuck at Check source"). Report how far it got, as the share of the
++    // report read as "stuck at Check source"). Report how far it got: in files visited to a
++    // caller that counts them (`control.files`, 256 files a call), else as the share of the
+     // game's bytes walked, the unit the stage row already shows; a folder reads the headers
+     // several files at a time (`read_heads`), which hides most of the per-open cost.
++    let total = files.len() as u64;
+     let walk_total: u64 = files.iter().map(|f| f.size).sum();
+     // A backport's `fakelib/` holds newer system libraries the game loads in place of the
+     // console's own; working releases ship some with the PS4 signature, and every one of
+@@ -731,21 +753,28 @@ fn prepare_with(
+             walked_upto.push(acc);
+         }
+     }
+-    let heads = {
++    let mut heads: Vec<Vec<u8>> = Vec::with_capacity(checked.len());
++    let mut from = 0usize;
++    for first in (0..files.len()).step_by(FILES_EVERY as usize) {
++        check_cancel(control)?;
++        files_done(control, Stage::Check, first as u64, total);
++        let to = checked.partition_point(|&i| i < first + FILES_EVERY as usize);
+         let mut last_report = std::time::Instant::now();
++        let counted = control.files.is_some();
+         let bytes_cb = &mut control.bytes;
+         let cancel = control.cancel;
+         let mut on_progress = |n: usize| -> bool {
+-            if last_report.elapsed() >= std::time::Duration::from_millis(250) {
++            if !counted && last_report.elapsed() >= std::time::Duration::from_millis(250) {
+                 last_report = std::time::Instant::now();
+                 if let Some(cb) = bytes_cb.as_deref_mut() {
+-                    cb(walked_upto[n.min(checked.len())], walk_total);
++                    cb(walked_upto[(from + n).min(checked.len())], walk_total);
+                 }
+             }
+             !crate::workshop::checkpoint_opt(cancel)
+         };
+-        tree.read_heads(&checked_paths, 0x20, &mut on_progress)?
+-    };
++        heads.extend(tree.read_heads(&checked_paths[from..to], 0x20, &mut on_progress)?);
++        from = to;
++    }
+     for (&i, header) in checked.iter().zip(heads.iter()) {
+         let f = &mut files[i];
+         let path = f.path.clone();
+@@ -756,6 +785,8 @@ fn prepare_with(
+             f.size = repair.new_size(f.size);
+         }
+     }
++    check_cancel(control)?;
++    files_done(control, Stage::Check, total, total);
+     // The declared size class, from everything but `param.json` itself.
+     let unpacked: u64 = files
+         .iter()
+@@ -960,15 +991,19 @@ fn prepare_with(
+     check_cancel(control)?;
+     progress(&format!("planning {}", tree.describe()));
+     let mut plan = plan::build_tree(&files, tree.empty_dirs(), request.kraken)?;
+-    // Another read per file; once stopped, the rest are skipped and the check below reports it.
+-    let cancel = control.cancel;
+-    plan.mark_modules(|path| {
+-        !stopped(cancel)
++    // Another read per file, the files `Plan::mark_modules` would ask about (see
++    // `PlannedFile::may_be_module`); every file counts as visited.
++    let total = plan.files.len() as u64;
++    for (done, f) in plan.files.iter_mut().enumerate() {
++        check_cancel(control)?;
++        files_done(control, Stage::Plan, done as u64, total);
++        f.module = f.may_be_module()
+             && tree
+-                .read_range(path, 0, 4)
+-                .is_ok_and(|head| plan::is_module_header(&head))
+-    });
++                .read_range(&f.path, 0, 4)
++                .is_ok_and(|head| plan::is_module_header(&head));
++    }
+     check_cancel(control)?;
++    files_done(control, Stage::Plan, total, total);
+     // Refuse an over-large source here, before a single byte is read.
+     if plan.ndblock > outer_write::max_inner_blocks() {
+         return format_err(format!(
+diff --git a/ps5upload-fpkg/src/plan.rs b/ps5upload-fpkg/src/plan.rs
+index 4e89d8a3eb890375bc86fd88dc2015fbf046c42b..5fd65a37084bd4d7c641ab0bc84efceedf94ab12 100644
+--- a/ps5upload-fpkg/src/plan.rs
++++ b/ps5upload-fpkg/src/plan.rs
+@@ -130,11 +130,19 @@ impl Plan {
+     /// `sceSblACMgrGetFsSandboxType(.../eboot.bin) failed. 0x80020016` (FW 5.10 Phat).
+     pub fn mark_modules(&mut self, mut is_module: impl FnMut(&str) -> bool) {
+         for f in &mut self.files {
+-            f.module = !f.generated && f.size >= 4 && is_module(&f.path);
++            f.module = f.may_be_module() && is_module(&f.path);
+         }
+     }
+ }
+ 
++impl PlannedFile {
++    /// Whether [`Plan::mark_modules`] asks about this file: not generated, and long enough
++    /// for a module's 4-byte magic.
++    pub fn may_be_module(&self) -> bool {
++        !self.generated && self.size >= 4
++    }
++}
++
+ /// Whether a file's first bytes are an executable's: a PS5 or PS4 SELF (fake-signed or
+ /// genuine) or a plain ELF.
+ pub fn is_module_header(head: &[u8]) -> bool {
+diff --git a/ps5upload-fpkg/tests/prepared.rs b/ps5upload-fpkg/tests/prepared.rs
+index bc0f5baf22fe2ce408c3fe0aa2f295a39b07ec53..f4dc76e20a059f46124ee71263c0186a43aed2e7 100644
+--- a/ps5upload-fpkg/tests/prepared.rs
++++ b/ps5upload-fpkg/tests/prepared.rs
+@@ -517,6 +517,74 @@ fn a_known_ampr_answer_is_taken_instead_of_a_scan() {
+     assert!(!has_index(Some(false), &mut tree));
+ }
+ 
++/// The per-file passes of the check and plan stages are counted per file visited, those they
++/// skip without a read included: from 0 to every file, a call per 256 files rather than one
++/// per file, and no final count once stopped.
++#[test]
++fn the_check_and_plan_files_are_counted() {
++    use build::Stage;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    let src = TempDir::new("files-counted");
++    write_tree(src.path());
++    // Too short for a SELF header (check) and, half of them, for a module mark (plan).
++    for i in 0..600 {
++        let path = src.path().join(format!("data/many/{i:03}.bin"));
++        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++        std::fs::write(path, vec![i as u8; if i % 2 == 0 { 2 } else { 8 }]).unwrap();
++    }
++    let calls = |seen: &[(Stage, u64, u64)], stage: Stage| -> Vec<(u64, u64)> {
++        seen.iter()
++            .filter(|(s, _, _)| *s == stage)
++            .map(|&(_, done, total)| (done, total))
++            .collect()
++    };
++    let mut tree = FolderSource::open(src.path()).unwrap();
++    let mut seen: Vec<(Stage, u64, u64)> = Vec::new();
++    let mut on_files = |stage: Stage, done: u64, total: u64| seen.push((stage, done, total));
++    let mut control = BuildControl {
++        files: Some(&mut on_files),
++        ..BuildControl::default()
++    };
++    build::prepare(&mut tree, &request(src.path()), &mut control).unwrap();
++    for stage in [Stage::Check, Stage::Plan] {
++        let calls = calls(&seen, stage);
++        let total = calls[0].1;
++        assert!(total > 600, "{stage:?}: {calls:?}");
++        let want: Vec<(u64, u64)> = (0..total)
++            .step_by(256)
++            .chain([total])
++            .map(|done| (done, total))
++            .collect();
++        assert_eq!(calls, want, "{stage:?}");
++    }
++    let last_check = seen.iter().rposition(|(s, _, _)| *s == Stage::Check);
++    let first_plan = seen.iter().position(|(s, _, _)| *s == Stage::Plan);
++    assert!(last_check < first_plan);
++
++    // Stopped during plan: the pass ends where it stopped, without its final count.
++    let cancel = AtomicBool::new(false);
++    let mut seen: Vec<(Stage, u64, u64)> = Vec::new();
++    let mut on_files = |stage: Stage, done: u64, total: u64| {
++        seen.push((stage, done, total));
++        if stage == Stage::Plan && done == 256 {
++            cancel.store(true, Ordering::Relaxed);
++        }
++    };
++    let mut control = BuildControl {
++        files: Some(&mut on_files),
++        cancel: Some(&cancel),
++        ..BuildControl::default()
++    };
++    let result = build::prepare(&mut tree, &request(src.path()), &mut control);
++    assert!(matches!(result, Err(ps5upload_fpkg::Error::Cancelled)));
++    let plan = calls(&seen, Stage::Plan);
++    assert_eq!(
++        plan.iter().map(|c| c.0).collect::<Vec<_>>(),
++        [0, 256],
++        "{plan:?}"
++    );
++}
++
+ /// An LZ4-packed folder's own index also lists the files inside its packs, and ampr_emu checks
+ /// each record it opens against the pack manifest: the package carries it byte for byte. The
+ /// same folder without packs gets one generated anew; a packed one whose index is missing or
+diff --git a/ps5upload-fpkg/tests/scale.rs b/ps5upload-fpkg/tests/scale.rs
+index f6812d930b7b4ce2a6953e3d9e5bf352263b9f12..44cb3f58aec73efe0efed1b399e3d1b662137be9 100644
+--- a/ps5upload-fpkg/tests/scale.rs
++++ b/ps5upload-fpkg/tests/scale.rs
+@@ -120,6 +120,7 @@ fn the_streaming_writer_reports_progress() {
+         bytes: Some(&mut |done, total| samples.push((done, total))),
+         cancel: None,
+         sample: None,
++        files: None,
+     };
+     let report = build::build_controlled(
+         &request(source.path(), out.path()),
+@@ -577,6 +578,7 @@ fn a_cancelled_build_leaves_nothing_behind() {
+         bytes: None,
+         cancel: Some(&cancel),
+         sample: None,
++        files: None,
+     };
+     let error = match build::build_controlled(
+         &request(source.path(), out.path()),
+@@ -612,6 +614,7 @@ fn a_stop_during_verify_ends_the_build() {
+             bytes: None,
+             cancel: Some(&cancel),
+             sample,
++            files: None,
+         };
+         let error = match build::build_controlled(
+             &request(source.path(), out.path()),

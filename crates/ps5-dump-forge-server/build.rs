@@ -1,15 +1,7 @@
-//! Embeds the web UI bundle (`npm run build:http` in `app/` writes `app/dist-http`) as
-//! `static ASSETS: &[(&str, bool, &[u8])]` in `$OUT_DIR/assets.rs`: each file by its path
-//! relative to the bundle, `/`-separated, then whether its bytes are a gzip stream (a file under
-//! `assets/` gzip shrinks by 5% or more: scripts, styles, locales; `http.rs` sends it as it is
-//! to a client that takes gzip, decoded to any other) and the bytes. `index.html` and the
-//! AppCache manifest stay plain: small, and the console's browser fetches them first. `FORGE_WEB_DIST` points elsewhere. Without a bundle, a
-//! placeholder page is embedded so `cargo test` never needs node, unless `FORGE_REQUIRE_WEB=1`
-//! (`ps5/build.sh`), which makes it a build error.
-//!
-//! For the PS5 payload, `FORGE_SELF_ELF` names stage 1's ELF (`ps5/build.sh`), embedded as the
-//! self-copy blob in `$OUT_DIR/self_elf.rs` (`static SELF_ELF: Option<&[u8]>`, layout in
-//! `src/self_copy.rs`): `None` without it, and on every other target.
+//! Embeds `app/dist-http` (or `FORGE_WEB_DIST`) as `ASSETS: &[(path, gzipped, bytes)]`: an
+//! `assets/` file gzip shrinks by 5% or more is stored gzipped. Without a bundle a placeholder
+//! page, so `cargo test` never needs node, unless `FORGE_REQUIRE_WEB=1`.
+//! On the PS5, `FORGE_SELF_ELF` (stage 1's ELF) becomes `SELF_ELF` (layout: `src/self_copy.rs`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,8 +15,7 @@ fn main() {
     let dist = std::env::var_os("FORGE_WEB_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest.join("../../app/dist-http"));
-    // A path that doesn't exist yet reruns this script on every build, so a bundle built
-    // later is picked up.
+    // A path that doesn't exist yet reruns this every build, so a later bundle is picked up.
     println!("cargo:rerun-if-changed={}", dist.display());
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
 
@@ -78,8 +69,7 @@ fn main() {
     std::fs::write(out.join("self_elf.rs"), self_elf(&out)).unwrap();
 }
 
-/// `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256 of the ELF, one zstd frame
-/// (level 22: 4.4 MB where zlib's best took 5.6).
+/// Level 22: 4.4 MB where zlib's best took 5.6.
 fn self_elf(out: &Path) -> String {
     println!("cargo:rerun-if-env-changed=FORGE_SELF_ELF");
     let none = "static SELF_ELF: Option<&[u8]> = None;\n".to_string();
@@ -111,7 +101,7 @@ fn self_elf(out: &Path) -> String {
     format!("static SELF_ELF: Option<&[u8]> = Some(include_bytes!({file:?}));\n")
 }
 
-/// Every regular file under `dir` (dotfiles left out), named relative to the bundle.
+/// Dotfiles left out.
 fn walk(dir: &Path, prefix: &str, files: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

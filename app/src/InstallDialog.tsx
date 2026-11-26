@@ -1,5 +1,4 @@
-// The one "Install this package?" question, shared by the Package installer, the File
-// explorer's Install and Connect's Install pkg, and the install job it starts on this device.
+// The one "Install this package?" question and the install job it starts on this device.
 
 import { api, prettyBytes, type ConvertRequest, type PackageContent } from "./api";
 import { Modal, openOverlay } from "./common";
@@ -8,8 +7,7 @@ import { Icon } from "./icons";
 import type { Action } from "./jobs";
 import { readable } from "./peers";
 
-/** What the question shows; any fact left out is not shown (a File explorer row knows only
- * its name and size, Connect's pick only its path). */
+/** What the question shows; a fact left out is not shown. */
 export interface InstallInfo {
   path: string;
   size?: number | null;
@@ -22,7 +20,6 @@ export interface InstallInfo {
   device?: string;
 }
 
-/** Asks before installing; true: Install. Cancel is first and focused. */
 export function confirmInstall(info: InstallInfo): Promise<boolean> {
   return new Promise((resolve) => {
     let yes = false;
@@ -56,8 +53,7 @@ export function installRequest(path: string): ConvertRequest {
   };
 }
 
-/** Asks, then starts an install job of `info.path` on this device (the PS5); false: cancelled.
- * Rejects with the start's error. */
+/** Asks, then starts an install job here (the PS5); false: cancelled; rejects with the start's error. */
 export async function installHere(info: InstallInfo, dispatch: (a: Action) => void): Promise<boolean> {
   if (!(await confirmInstall(info))) return false;
   const request = installRequest(info.path);
@@ -70,7 +66,6 @@ function InstallDialog(props: { info: InstallInfo; close: () => void; onYes: () 
   const t = useMessages().install;
   const i = props.info;
   const title = gameTitle(i.title_names, i.title_name ?? null);
-  // [label, value, a path]: only the facts known.
   const known: [string, string | null | undefined, boolean][] = [
     [t.file, readable(i.path), true],
     [t.game, title, false],
@@ -79,8 +74,7 @@ function InstallDialog(props: { info: InstallInfo; close: () => void; onYes: () 
     [t.size, typeof i.size === "number" ? prettyBytes(i.size) : null, false],
   ];
   const facts = known.filter((f): f is [string, string, boolean] => !!f[1]);
-  // A patch or an add-on installs beside the game; a game (or a package Forge can't read) may
-  // replace the one installed.
+  // A patch or an add-on installs beside the game; a game (or an unreadable package) may replace the one installed.
   const reinstall = i.content !== "patch" && i.content !== "additional_content";
   return (
     <Modal close={props.close} className="modal card" role="alertdialog" labelledBy="inst-title" describedBy="inst-text">

@@ -106,17 +106,17 @@ small files), `game-lz4` (AMPR, ~17 MB), `game-small` (~13 MB), and each server'
 | 11 | extract on B into A | the edited files written onto the peer, hashed |
 | 12 | LZ4 pack on B | AMPR game packed into an `.ffpkg` on the console |
 | 13 | LZ4 pack peer → peer | two-pass pack of `game-lz4` from a peer into a peer folder, unpacked and hashed |
-| 14 | browser upload/download | File Transfer's Upload to / Download from this device: `connect/upload` in 8 MiB chunks, 4 at once; `connect/download` |
+| 14 | browser upload/download | the Transfer screen's This browser pane (upload, Download N files): `connect/upload` in 8 MiB chunks, 4 at once; `connect/download` |
 | 15 | cancel a transfer | nothing half-written left on the peer |
 | 16 | refusals | editing/deleting peer paths, a `.pkg` source on a peer, taken names, escaping the share root |
 | 17 | job slots | a transfer (1k files) beside a convert; a transfer of the converting game refused |
 | 18 | NAS saved | guest NAS saved on both, online, its shares and game listed over SMB |
-| 19 | NAS games, refusals | the console converts (`.ffpkg`) and copies a NAS game; A copies one, hashed; no edit or delete on a share |
+| 19 | NAS games, refusals | the console converts (`.ffpkg`) and copies a NAS game; A copies one, hashed; no edit, a share root not deleted (NAS folders can be deleted now) |
 | 20 | NAS outputs | A writes an `.exfat`, an fpkg (streamed: digested as written, nothing staged here) and a transfer onto the share's `out`; each converted back here and hashed against the source; forgotten on both |
 | 21 | FTP saved, fpkg | FTP server saved on both with a login, online, listed; the console converts its game; A writes an fpkg onto it (the rewrite probe, `REST` + `STOR`), extracted and compared |
-| 22 | FTP outputs | the console writes an `.exfat` and a transfer onto it, hashed; no edit or delete there |
+| 22 | FTP outputs | the console writes an `.exfat` and a transfer onto it, hashed; no edit, its root not deleted |
 | 23 | FTP stale session | after the server closed both Forges' idle sessions (`421`), a transfer from it on each side logs in again; forgotten on both |
-| 24 | NFSv3 | saved on both (no login), online, export and game listed; the console converts its game; A writes an `.ffpkg` onto `out`, hashed; no edit or delete; forgotten |
+| 24 | NFSv3 | saved on both (no login), online, export and game listed; the console converts its game; A writes an `.ffpkg` onto `out`, hashed; no edit, the export not deleted; forgotten |
 | 25 | NFSv4.1 | the same against Ganesha (the image fetched with `docker cp`) |
 | 26 | forget, pair again | asking while B still has A refused (already paired); forgotten on both, paired again: one entry per side |
 

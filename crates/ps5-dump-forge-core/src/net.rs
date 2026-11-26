@@ -1,6 +1,5 @@
-//! Paths on another device: a paired Forge (`flink://`) or a server (`ftp://`, `smb://`, `nfs://`), all
-//! served through [`crate::remote`]. Everything that treats them apart from a local path asks
-//! here, so every scheme is read and refused alike.
+//! Paths on another device (`flink://`, `ftp://`, `smb://`, `nfs://`), served by
+//! [`crate::remote`]; every check that treats them apart from a local path is here.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -11,12 +10,11 @@ use ps5upload_fpkg::source::SourceTree;
 
 use crate::remote::is_remote;
 
-/// Whether `path` is on another device (`flink://`, `ftp://`, `smb://` or `nfs://`).
 pub fn is_network(path: &Path) -> bool {
     is_remote(path)
 }
 
-/// An error unless `path` is local: what changes a source can't change one on another device.
+/// An error unless `path` is local: what changes a source can't change one elsewhere.
 pub fn refuse(path: &Path, what: &str) -> anyhow::Result<()> {
     if crate::remote::is_nas(path) {
         bail!(
@@ -34,10 +32,8 @@ pub fn refuse(path: &Path, what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Why an output can't go to `path`, when it is on another device.
-// A conversion's output goes to another device through `remote::output_path`, an Extract
-// through `remote::RemoteDir`; what reaches here is a default output beside a game on another
-// device (or an in-place job's), which isn't offered.
+/// Why an output can't go to `path` on another device: only a default output beside a remote
+/// game reaches here (real remote outputs go through `remote::output_path`/`RemoteDir`).
 pub(crate) fn output_refusal(path: &Path) -> Option<String> {
     is_remote(path).then(|| {
         format!(
@@ -56,17 +52,14 @@ pub(crate) fn exists(path: &Path) -> bool {
     }
 }
 
-/// Whether a network path is a folder ([`is_network`] paths only).
 pub(crate) fn is_dir(path: &Path) -> anyhow::Result<bool> {
     crate::remote::is_dir(path)
 }
 
-/// (length, modification time) of a network path, for [`crate::convert::SourceStamp`].
 pub(crate) fn seen(path: &Path) -> anyhow::Result<(u64, Option<SystemTime>)> {
     crate::remote::seen(path)
 }
 
-/// The source at a network path (junk filtering is the caller's).
 pub(crate) fn open(
     path: &Path,
     kind: crate::convert::Kind,
@@ -75,12 +68,10 @@ pub(crate) fn open(
     crate::remote::open(path, kind, cancel)
 }
 
-/// The file `rel` under the network folder `path` when it is a file of at most `max` bytes.
 pub(crate) fn read_small(path: &Path, rel: &str, max: u64) -> anyhow::Result<Option<Vec<u8>>> {
     crate::remote::read_small(path, rel, max)
 }
 
-/// One folder of a network path, as [`crate::list_dir`] lists a local one.
 pub(crate) fn list_dir(path: &Path) -> anyhow::Result<crate::Listing> {
     crate::remote::list_dir(path)
 }
@@ -101,8 +92,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// A minimal game (as tests/core.rs's): a file longer than a read window, an empty file,
-    /// an empty folder and junk.
+    /// A minimal game: a file longer than a read window, an empty file, an empty folder, junk.
     fn game(root: &std::path::Path) -> Vec<u8> {
         put(root, "eboot.bin", b"\x7fELF fake eboot");
         put(
@@ -200,8 +190,7 @@ mod tests {
             convert(&request(&out, "folder", &back)).unwrap();
             assert_eq!(std::fs::read(back.join("data/big.bin")).unwrap(), big);
         }
-        // A .pkg too, the builder writing through the peer (its in-place spool and self-check
-        // read it back there); its bytes, converted back here, hold the game.
+        // A .pkg too, the builder writing and reading back through the peer.
         let out = root.join("out/game.pkg").url();
         let report = convert(&request(&src, "pkg", &out)).unwrap();
         assert!(report.checks.iter().any(|c| c.starts_with("published")));

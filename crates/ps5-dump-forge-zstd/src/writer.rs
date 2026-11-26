@@ -1,5 +1,5 @@
-//! Bounded chunk-parallel writer for selected files of a `SourceTree`.
-//! The caller chooses packed files and writes loose files separately.
+//! Bounded chunk-parallel writer for the packed files of a `SourceTree`; loose files are the
+//! caller's.
 
 use std::cell::RefCell;
 use std::io::{Seek, SeekFrom, Write};
@@ -18,8 +18,8 @@ use crate::{
     volume_name,
 };
 
-/// The caller owns creation, durability, and cleanup of output files. `reopen`
-/// changes only a volume's first 64 bytes after its final count is known.
+/// The caller owns creation, durability and cleanup; `reopen` rewrites only a volume's first 64
+/// bytes.
 pub trait PackOutput {
     type W: Write + Seek;
     fn create(&mut self, name: &str) -> Result<Self::W>;
@@ -51,9 +51,8 @@ pub(crate) fn read_chunk<S: SourceTree + ?Sized>(
 }
 
 thread_local! {
-    /// Each pool thread's zstd context and its level, kept from chunk to chunk (a context
-    /// costs far more to set up than a small chunk takes to compress). The pool is the
-    /// pack's own, so the contexts end with it.
+    /// Each pool thread's zstd context and level, kept across chunks (setup costs more than a small
+    /// chunk).
     static CONTEXT: RefCell<Option<(u8, CCtx<'static>)>> = const { RefCell::new(None) };
 }
 
@@ -74,11 +73,8 @@ fn context(level: u8) -> Result<CCtx<'static>> {
     Ok(context)
 }
 
-/// Compresses `raw` as one frame into `frame` (its capacity, `raw.len()`, the most a kept
-/// frame may take): false once the frame can't be smaller than `raw`. The chunk goes in
-/// with "continue" and the frame is closed with "end", as zstd's streaming encoder does,
-/// so a whole 256 KiB chunk ends in an empty last block, byte for byte the frames this
-/// writer always made (`ZSTD_compress2` would flag its second block last, 3 bytes less).
+/// Compresses `raw` as one frame into `frame` (capacity `raw.len()`); false once it can't be
+/// smaller. "continue" then "end", as the streaming encoder, so frames stay byte-identical.
 fn compress(context: &mut CCtx, raw: &[u8], frame: &mut Vec<u8>) -> Result<bool> {
     context
         .reset(ResetDirective::SessionOnly)
@@ -105,9 +101,8 @@ fn compress(context: &mut CCtx, raw: &[u8], frame: &mut Vec<u8>) -> Result<bool>
     }
 }
 
-/// One zstd frame per chunk: content size and checksum on, no dictionary, and a
-/// window of at most one chunk so the runtime's 256 KiB window limit accepts it.
-/// A frame that is not smaller than the chunk is dropped and the chunk stored raw.
+/// One zstd frame per chunk: content size and checksum, no dictionary, window ≤ one chunk; not
+/// smaller is stored raw.
 pub(crate) fn encode_chunk(raw: Vec<u8>, level: u8) -> Result<(Codec, Vec<u8>)> {
     let mut frame = Vec::with_capacity(raw.len());
     let smaller = CONTEXT.with_borrow_mut(|slot| {
@@ -126,12 +121,14 @@ pub(crate) fn encode_chunk(raw: Vec<u8>, level: u8) -> Result<(Codec, Vec<u8>)> 
     }
 }
 
-/// Most compression threads a pack uses, one per chunk of a batch. At most two batches are
-/// held raw (one compressing, the next read meanwhile: 16 MiB) and one encoded (8 MiB), beside
-/// the zstd contexts, at most 32 x 5.75 MiB (184 MiB
-/// at levels 16..=22 with the 256 KiB window; 72 MiB at level 5).
-// ponytail: 32, not every core of a bigger machine, so the contexts stay well inside a job's
-// 512 MiB.
+/// The bytes one chunk takes in a volume at `level`, as [`pack`] encodes it. For size estimates.
+pub fn stored_len(raw: Vec<u8>, level: u8) -> Result<usize> {
+    encode_chunk(raw, level).map(|(_, b)| b.len())
+}
+
+/// Most compression threads a pack uses; contexts at most 32 x 5.75 MiB at levels 16..=22, plus two
+/// raw and one encoded batch.
+// ponytail: 32, not every core of a bigger machine, so the contexts stay inside a job's 512 MiB.
 pub const MAX_THREADS: usize = 32;
 
 /// The pool a pack compresses on: `threads` workers (0: every core), at most [`MAX_THREADS`].
@@ -147,9 +144,8 @@ pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool> {
         .map_err(|error| bad(format!("compression threads: {error}")))
 }
 
-/// Where a pack run reports: raw bytes done so far (each packed file counts twice, once per
-/// pass, a pass it skips included), and the flag that stops it between batches with
-/// [`Error::Cancelled`].
+/// Where a pack run reports: raw bytes done (each packed file counts twice, once per pass) and the
+/// cancel flag.
 struct Progress<'a> {
     done: u64,
     report: &'a mut dyn FnMut(u64),
@@ -190,9 +186,8 @@ fn raw_bytes(raw: &[Vec<u8>]) -> u64 {
     raw.iter().map(|data| data.len() as u64).sum()
 }
 
-/// Compresses `file` from offset 0, one chunk per thread of `pool` at a time, while this
-/// thread (the only one that reads `source`) reads the next batch. `consume` sees each batch
-/// in index order with its raw byte count.
+/// Compresses `file`, one chunk per pool thread, while this thread reads the next batch; `consume`
+/// sees batches in order.
 fn compressed<S: SourceTree + ?Sized>(
     source: &mut S,
     file: &SourceFile,
@@ -265,7 +260,6 @@ struct Volumes<'a, O: PackOutput> {
 }
 
 impl<O: PackOutput> Volumes<'_, O> {
-    /// One encoded chunk, `data` as stored.
     fn put(&mut self, codec: Codec, data: &[u8]) -> Result<()> {
         let size = data.len() as u64;
         if size == 0 || size > CHUNK_SIZE {
@@ -329,9 +323,7 @@ impl<O: PackOutput> Volumes<'_, O> {
     }
 }
 
-/// Packs one file in one pass: every chunk compressed, a chunk zstd doesn't shrink kept raw.
-/// No file is store-only (the old rule stored a file saving under 1% whole and raw; dropped
-/// on this branch: the chunk rule already keeps incompressible data raw).
+/// Packs one file in one pass: a chunk zstd doesn't shrink is kept raw.
 fn pack_file<S: SourceTree + ?Sized, O: PackOutput>(
     source: &mut S,
     file: &SourceFile,
@@ -351,8 +343,7 @@ fn pack_file<S: SourceTree + ?Sized, O: PackOutput>(
             for (codec, data) in encoded {
                 volumes.put(codec, &data)?;
             }
-            // Read and compressed once; progress still counts each file twice (core's estimate).
-            progress.add(2 * bytes);
+            progress.add(bytes);
             Ok(())
         },
     )?;
@@ -364,8 +355,8 @@ fn pack_file<S: SourceTree + ?Sized, O: PackOutput>(
     })
 }
 
-/// Writes only `files`, which must be entries from `source.files()`. The caller
-/// handles loose files and output cleanup on error. Compresses on every core (at most [`MAX_THREADS`]).
+/// Writes only `files` (entries of `source.files()`); the caller handles loose files and cleanup.
+/// Every core, at most [`MAX_THREADS`].
 pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
     source: &mut S,
     files: &[SourceFile],
@@ -383,10 +374,8 @@ pub fn pack<S: SourceTree + ?Sized, O: PackOutput>(
     )
 }
 
-/// [`pack`], reporting the raw bytes done so far to `progress` after each batch (each file
-/// counts twice, so they end at twice the packed bytes) and stopping with [`Error::Cancelled`]
-/// once `cancel` is set. `threads` compress (0: every core), at most [`MAX_THREADS`], one per
-/// chunk of a batch. The output does not depend on `threads`.
+/// [`pack`] with `progress` (raw bytes, twice per file), `cancel` and `threads` (0: every core);
+/// the output doesn't depend on `threads`.
 pub fn pack_with<S: SourceTree + ?Sized, O: PackOutput>(
     source: &mut S,
     files: &[SourceFile],
@@ -399,7 +388,6 @@ pub fn pack_with<S: SourceTree + ?Sized, O: PackOutput>(
     pack_run(source, files, level, threads, output, progress, cancel)
 }
 
-/// An output that keeps nothing, for [`measure`].
 struct Nowhere;
 
 impl Write for Nowhere {
@@ -430,10 +418,8 @@ impl PackOutput for Nowhere {
     }
 }
 
-/// [`pack_with`] without writing: the same compression, every chunk's codec and stored size
-/// recorded, no byte kept. The [`Index`] it returns (a fresh archive ID) is what
-/// [`crate::tree::PackedTree`] serves the packs from; memory is the index (16 B per chunk)
-/// and the compression's own.
+/// [`pack_with`] without writing: codecs and stored sizes recorded, no byte kept;
+/// [`crate::tree::PackedTree`] serves from the [`Index`].
 pub fn measure<S: SourceTree + ?Sized>(
     source: &mut S,
     files: &[SourceFile],
@@ -518,7 +504,6 @@ fn pack_run<S: SourceTree + ?Sized, O: PackOutput>(
 mod tests {
     use super::*;
 
-    /// The streaming encoder the writer used before it kept one context per thread.
     fn streamed(raw: &[u8], level: u8) -> Vec<u8> {
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), i32::from(level)).unwrap();
         encoder.window_log(u32::from(CHUNK_SHIFT)).unwrap();
@@ -579,7 +564,6 @@ mod tests {
 
     const CHUNK: usize = CHUNK_SIZE as usize;
 
-    /// An in-memory source that counts the bytes read from each file.
     struct Mem {
         files: Vec<SourceFile>,
         bytes: HashMap<String, Vec<u8>>,
@@ -638,7 +622,6 @@ mod tests {
         }
     }
 
-    /// Deterministic incompressible bytes (xorshift64).
     fn noise(len: usize, mut state: u64) -> Vec<u8> {
         (0..len)
             .map(|_| {
@@ -660,7 +643,6 @@ mod tests {
         parts.concat()
     }
 
-    /// Compressible, incompressible and mixed files.
     fn sample() -> Vec<(String, Vec<u8>)> {
         let edge = |zeros: usize| {
             let mut last = noise(CHUNK, 9);
@@ -690,8 +672,8 @@ mod tests {
         ]
     }
 
-    /// A volume file that keeps only its first `HEAD` bytes and tracks its length, so a
-    /// volume can sit near `VOLUME_LIMIT` without 4 GiB of memory.
+    /// A volume file keeping only its first `HEAD` bytes, so it can sit near `VOLUME_LIMIT` in
+    /// little memory.
     #[derive(Default)]
     struct Sparse {
         head: Vec<u8>,
@@ -731,7 +713,6 @@ mod tests {
         }
     }
 
-    /// Finished volumes by name, and every name created, in order.
     #[derive(Default)]
     struct SparseOutput {
         done: HashMap<String, Sparse>,
@@ -829,7 +810,7 @@ mod tests {
                 &mut output,
                 &mut |done| {
                     last = done;
-                    if done == 2 * total {
+                    if done == total {
                         cancel.store(true, Ordering::Relaxed);
                     }
                 },
@@ -837,7 +818,7 @@ mod tests {
             );
             assert!(matches!(result, Err(Error::Cancelled)));
             // The flag went up only at the very end.
-            assert_eq!(last, 2 * total);
+            assert_eq!(last, total);
             assert!(!output.0.contains_key("ampr_zstd.index"));
         }
     }

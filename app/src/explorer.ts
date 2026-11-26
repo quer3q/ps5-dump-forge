@@ -1,9 +1,6 @@
-// The Edit tab's file tree, pure (no runtime imports: `scripts/check-explorer.mjs` runs it in
-// plain node). Built from an inspection's `files` and `empty_dirs`; game paths are relative and
-// `/`-separated, as core lists them.
+// Edit's file tree, pure (no runtime imports: `scripts/check-explorer.mjs` runs it in plain node).
 
-/** What a pending change did to an entry (the explorer's badges): added where nothing was, put
- * over a file, or moved or renamed (`from`: its path in the game as it is now). */
+/** A pending change's badge (`from` on a node: its path in the game as it is now). */
 export type Mark = "new" | "replaced" | "renamed";
 
 export interface FileNode {
@@ -20,13 +17,12 @@ export interface DirNode {
   children: Map<string, TreeNode>;
   mark?: Mark;
   from?: string;
-  /** Added from a listing that was cut short: more of its contents arrive on Apply. */
+  /** Added from a listing cut short: more arrives on Apply. */
   host?: boolean;
 }
 
 export type TreeNode = FileNode | DirNode;
 
-/** One row of a listing: the node and its game path. */
 export interface Entry {
   path: string;
   node: TreeNode;
@@ -36,8 +32,7 @@ export function emptyDir(name: string): DirNode {
   return { kind: "dir", name, children: new Map() };
 }
 
-/** The game's tree. A path through a file (core never lists one) keeps the file and drops the
- * deeper path. */
+/** The game's tree. A path through a file (core never lists one) keeps the file. */
 export function buildTree(files: { path: string; size: number }[], emptyDirs: string[]): DirNode {
   const root = emptyDir("");
   for (const d of emptyDirs) ensureDir(root, split(d));
@@ -51,7 +46,6 @@ export function buildTree(files: { path: string; size: number }[], emptyDirs: st
   return root;
 }
 
-/** A game path's components (empty ones dropped). */
 export function split(path: string): string[] {
   return path.split("/").filter((p) => p !== "");
 }
@@ -60,7 +54,7 @@ export function join(dir: string, name: string): string {
   return dir === "" ? name : `${dir}/${name}`;
 }
 
-/** The folder at `path` ("" = the root); null when it is missing or a file. */
+/** The folder at `path` ("" = the root); null when missing or a file. */
 export function findDir(root: DirNode, path: string): DirNode | null {
   let dir = root;
   for (const p of split(path)) {
@@ -85,21 +79,17 @@ function ensureDir(root: DirNode, parts: string[]): DirNode | null {
   return dir;
 }
 
-/** Folders first, then files; by name, numbers in order ("2" before "10"), case only breaking
- * ties so the order is stable. */
+/** Folders first, then files; natural order ("2" before "10"), case only breaking ties. */
 export function compareNodes(a: TreeNode, b: TreeNode): number {
   if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
   return COLLATOR.compare(a.name, b.name) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 }
 const COLLATOR = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 
-/** The folder's own entries, in display order. */
 export function listDir(dir: DirNode, path: string): Entry[] {
   return [...dir.children.values()].sort(compareNodes).map((node) => ({ path: join(path, node.name), node }));
 }
 
-/** Folders first, then files; within each, by path one component at a time, as `compareNodes`
- * orders names. */
 export function compareEntries(a: Entry, b: Entry): number {
   if (a.node.kind !== b.node.kind) return a.node.kind === "dir" ? -1 : 1;
   const pa = a.path.split("/");
@@ -111,10 +101,7 @@ export function compareEntries(a: Entry, b: Entry): number {
   return pa.length - pb.length;
 }
 
-/**
- * Everything at or below the folder `path` whose path from that folder contains `query`
- * (case-insensitive): folders first, then files, each by path (`compareEntries`).
- */
+/** Everything below `path` whose relative path contains `query` (case-insensitive), sorted. */
 export function search(dir: DirNode, path: string, query: string): Entry[] {
   const q = query.trim().toLowerCase();
   const out: Entry[] = [];
@@ -132,45 +119,32 @@ export function search(dir: DirNode, path: string, query: string): Entry[] {
   return out.sort(compareEntries);
 }
 
-/**
- * Where keyboard focus goes after the explorer shows a folder: the row of `want` ("" = the
- * first row; a path not listed = the first row), or null when the folder has no rows, so the
- * grid itself takes focus and its keys (Backspace, Alt+Up) still work.
- */
+/** Focus after showing a folder: `want`'s row, else the first; null with no rows (the grid takes focus). */
 export function focusIndex(entries: Entry[], want: string): number | null {
   if (entries.length === 0) return null;
   const i = want === "" ? 0 : entries.findIndex((e) => e.path === want);
   return Math.max(i, 0);
 }
 
-/** The path's parent ("" for a top-level entry or the root). */
 export function parentOf(path: string): string {
   const i = path.lastIndexOf("/");
   return i < 0 ? "" : path.slice(0, i);
 }
 
-// ---------- Pending changes ----------
-// The Edit tab's changes fold over the inspected tree the way core's `edit.rs` folds `Edit`s
-// (same order, same refusals); core's preflight stays the authority, this is the preview.
+// ---------- Pending changes: core's `edit.rs` fold (same order, same refusals); core's preflight decides ----------
 
-/** What an add brings in: one file, or a folder's files and empty folders (paths relative to
- * it; junk left out, as core's scanner does). `truncated`: the listing was cut short, so more
- * of the folder arrives on Apply than the preview shows. */
+/** What an add brings: a file, or a folder's files and empty folders (junk left out); `truncated`: listing cut short. */
 export type Payload =
   | { kind: "file"; size: number }
   | { kind: "dir"; files: { path: string; size: number }[]; emptyDirs: string[]; truncated?: boolean };
 
-/** One pending change, as core's `Edit` (an add says what it brings, not where from). */
 export type Change =
   | { op: "add"; to: string; what: Payload }
   | { op: "delete"; path: string }
   | { op: "rename"; from: string; to: string }
   | { op: "mkdir"; path: string };
 
-/** Why a change does not apply (it then changes nothing), as core's preflight says it:
- * `invalid` not a game path, `missing` not in the game, `exists` already there, `file` a file is
- * in the way (the path or a parent), `folder` a folder is where a file goes, `into` a folder
- * moved into itself. */
+/** Why a change does not apply (it then changes nothing), as core's preflight says it. */
 export interface Finding {
   why: "invalid" | "missing" | "exists" | "file" | "folder" | "into";
   path: string;
@@ -178,22 +152,18 @@ export interface Finding {
 
 export interface Folded {
   tree: DirNode;
-  /** Per change, in order: why it does not apply (empty: it does). */
   findings: Finding[][];
 }
 
-/** A game path core takes: relative, `/`-separated, no empty, `.` or `..` component, no `\` or
- * NUL. */
+/** A game path core takes: relative, `/`-separated, no empty, `.` or `..` part, no `\` or NUL. */
 export function validPath(path: string): boolean {
   return !/[\\\0]/.test(path) && path.split("/").every((c) => c !== "" && c !== "." && c !== "..");
 }
 
-/** One entry's name (Rename): a game path of one component. */
 export function validName(name: string): boolean {
   return !name.includes("/") && validPath(name);
 }
 
-/** `origin`: a base entry's path before any change; `added`: put by an add. */
 interface FState {
   size: number;
   origin?: string;
@@ -204,7 +174,6 @@ interface DState {
   host?: boolean;
 }
 
-/** Every proper ancestor of `path`, outermost first ("a/b/c": "a", "a/b"). */
 function ancestors(path: string): string[] {
   const parts = path.split("/");
   const out: string[] = [];
@@ -214,12 +183,10 @@ function ancestors(path: string): string[] {
 
 const baseName = (path: string) => path.slice(path.lastIndexOf("/") + 1);
 
-/** core's `State`: every file by game path, every folder (each file's and folder's parents too). */
 class State {
   files = new Map<string, FState>();
   dirs = new Map<string, DState>();
 
-  /** `dir` and its parents; `st` is merged into `dir`'s own state. */
   addDir(dir: string, st: DState = {}) {
     for (const a of ancestors(dir)) if (!this.dirs.has(a)) this.dirs.set(a, {});
     this.dirs.set(dir, { ...this.dirs.get(dir), ...st });
@@ -234,14 +201,12 @@ class State {
     return this.files.has(path) || this.dirs.has(path);
   }
 
-  /** A file at a parent of `path` (or at `path` itself, with `itself`). */
   blocked(path: string, itself: boolean): Finding | null {
     const at = itself ? [...ancestors(path), path] : ancestors(path);
     const a = at.find((p) => this.files.has(p));
     return a === undefined ? null : { why: "file", path: a };
   }
 
-  /** Everything under folder `dir`, taken out (`dir` itself too); paths relative to it. */
   takeDir(dir: string): { files: [string, FState][]; dirs: [string, DState][] } {
     const pre = `${dir}/`;
     const files: [string, FState][] = [...this.files].filter(([k]) => k.startsWith(pre)).map(([k, v]) => [k.slice(pre.length), v]);
@@ -390,15 +355,13 @@ function replay(files: { path: string; size: number }[], emptyDirs: string[], ch
   return { state: s, findings };
 }
 
-/** Names core's folder scanner leaves out (`scan.rs` `is_junk`): macOS, Windows and Spotlight
- * leftovers. */
+/** Names core's folder scanner leaves out (`scan.rs` `is_junk`). */
 export function isJunk(name: string): boolean {
   return name.startsWith("._") || JUNK.has(name.toLowerCase());
 }
 const JUNK = new Set([".ds_store", ".fseventsd", ".spotlight-v100", ".trashes", "thumbs.db", "desktop.ini", "system volume information"]);
 
-/** A dropped folder's contents (paths relative to it) as core's scanner would read that folder:
- * junk left out, with what is inside it, and a folder left holding nothing listed as empty. */
+/** A dropped folder's contents as core's scanner reads them: junk out, a folder left empty listed as empty. */
 export function withoutJunk(
   files: { path: string; size: number }[],
   emptyDirs: string[],
@@ -414,31 +377,23 @@ export function withoutJunk(
   return { files: kept, emptyDirs: [...dirs].filter((d) => !busy.has(d)).sort() };
 }
 
-/** Something to add into a folder: its name, what it brings, and where it comes from (the
- * caller's, carried as it is). */
 export interface AddItem<S> {
   name: string;
   what: Payload;
   src: S;
 }
 
-/** A change an add plan queues: core's shape plus the add's source; `only`: a folder of which
- * only the listed contents go in (some were skipped), not the whole folder. */
+/** A queued add change plus its source; `only`: just the listed contents of a folder go in. */
 export type Planned<S> = Change & { src?: S; only?: boolean };
 
 export interface AddPlan<S> {
-  /** The paths the adds land on (relative to the folder), in order, once each: a file there that
-   * would be replaced, or a file and a folder in each other's way. An earlier item of the same
-   * batch counts like anything already there. */
+  /** The paths the adds land on, once each (an earlier item of the batch counts as already there). */
   clashes: string[];
-  /** The changes for an answer. Replace: a file over a file replaces it, one kind over the
-   * other deletes the old first, a folder onto a folder merges. Skip: whatever clashes stays out
-   * (of a folder, only those paths). */
+  /** Replace: over a file replaces, the other kind is deleted first, folder onto folder merges. Skip: clashes stay out. */
   changes(answer: "replace" | "skip"): Planned<S>[];
 }
 
-/** Plans adding `items` (in order) into folder `dir` of the game after `changes`, folding each
- * as core will, so later items see earlier ones. */
+/** Plans adding `items` into `dir` after `changes`, folding each as core will. */
 export function planAdds<S>(
   files: { path: string; size: number }[],
   emptyDirs: string[],
@@ -495,9 +450,7 @@ export function planAdds<S>(
   return { clashes: run("replace").clashes, changes: (answer) => run(answer).out };
 }
 
-/** The pending changes: `gen` counts sources (a new source, or the same one read again, starts
- * a new generation with no changes), so an action that started for an older one queues
- * nothing. Each action's changes share a batch, which Undo takes back whole. */
+/** The pending changes: an older `gen`'s action queues nothing; Undo takes a batch back whole. */
 export interface PendingState<C> {
   gen: number;
   next: number;
@@ -521,8 +474,7 @@ export function pendingReducer<C>(s: PendingState<C>, a: PendingAction<C>): Pend
   }
 }
 
-/** core's `Edit`, as an edit job takes it (api.ts's `Edit`; no import, so node can check this
- * file): an add names the path core reads. */
+/** core's `Edit` (api.ts's; no import, so node can check this file). */
 export type CoreEdit =
   | { op: "add"; from: string; to: string }
   | { op: "delete"; path: string }
@@ -531,14 +483,7 @@ export type CoreEdit =
 
 const under = (p: string, q: string) => p === q || p.startsWith(`${q}/`);
 
-/**
- * Core's edits for `changes`, in order. An add is one add of its source, except a folder that
- * goes in file by file (`perFile`: a browser's folder, uploaded one file at a time; or `only`:
- * some of it was skipped): one add per listed file and a new folder per empty one; such a
- * folder with nothing in it is a new folder, unless one is there already. `from(src, rel, to)`:
- * the path core reads (`rel`: the file inside a folder source, null for the source itself),
- * awaited one at a time in order (uploads run one by one).
- */
+/** Core's edits for `changes`: a `perFile` or `only` folder goes file by file; `from` awaited in order (uploads run one by one). */
 export async function toEdits<S>(
   files: { path: string; size: number }[],
   emptyDirs: string[],
@@ -571,12 +516,7 @@ export async function toEdits<S>(
   return out;
 }
 
-/**
- * What can be checked before Apply when some adds come from files that exist only once they
- * are uploaded (`later`): the other changes, in order, when none of them depends on an upload
- * (touches a path an upload adds or replaces, its folders or anything inside it). When one does,
- * `changes` is null: nothing is checked until the uploads are in. `left`: the uploaded files.
- */
+/** What can be checked before the uploads (`later`): null when a change depends on an upload; `left`: uploaded files. */
 export function checkable<S>(changes: readonly Planned<S>[], later: (src: S) => boolean): { changes: Planned<S>[] | null; left: number } {
   const ups: string[] = []; // game paths uploads bring, so far
   const kept: Planned<S>[] = [];
@@ -596,10 +536,7 @@ export function checkable<S>(changes: readonly Planned<S>[], later: (src: S) => 
   return { changes: dependent ? null : kept, left };
 }
 
-/** Where Apply stages each upload: `<tag>-<k>/<game path>` for the k-th, so no two staged paths
- * are the same or inside each other (a file `assets` then a folder holding `assets/x.bin`).
- * `tag` is new for each Apply, so two at once (another tab or viewer, the same source) never
- * replace each other's files. */
+/** Staging path `<tag>-<k>/<game path>` per upload: never equal or nested; `tag` is new per Apply. */
 export function stagingNames(tag = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`): (to: string) => string {
   let k = 0;
   return (to) => `${tag}-${++k}/${to}`;

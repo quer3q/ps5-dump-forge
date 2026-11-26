@@ -1,11 +1,9 @@
-// The Edit tab's Apply: core's check of the pending changes (debounced; how they can go in: in
-// place, rebuilt beside the image, or not at all), the mode shown in the pending bar, the
-// confirmation, and the request an edit job takes. The web page's dropped files are uploaded on
-// Apply, so the check before it leaves them out (and says so); Apply checks again once they are in.
+// The Edit tab's Apply: core's check of the changes, the mode, the confirmation, the edit request.
+// A browser's files are uploaded on Apply: the check before it leaves them out.
 
 import { useEffect, useRef, useState } from "react";
 
-import { api, errorText, prettyBytes, type ConvertRequest, type EditCheck, type Format, type Inspection } from "./api";
+import { api, errorText, prettyBytes, prettyDuration, runtimePlatform, type ConvertRequest, type RuntimePlatform, type EditCheck, type Format, type Inspection } from "./api";
 import { Modal, openOverlay, Prose } from "./common";
 import type { AddSource, Pending } from "./EditChanges";
 import { checkable, toEdits, type CoreEdit } from "./explorer";
@@ -19,14 +17,12 @@ export type Mode = "in_place" | "rebuild";
 /** A browser's files: on the server only once uploaded (Apply). A path is read by core itself. */
 export const uploaded = (src: AddSource) => !("path" in src);
 
-/** The path core reads for an add from a host path (`rel`: a file inside that folder), joined
- * by the platform's separators. */
+/** The path core reads for an add from a host path (`rel`: a file inside that folder). */
 export function hostPath(src: { path: string }, rel: string | null): string {
   return rel === null ? src.path : rel.split("/").reduce((dir, name) => joinPath(dir, name), src.path);
 }
 
-/** An edit job: the source changed in place (or, `rebuild`, an image rebuilt beside it and
- * swapped in). `output` and `format` are ignored by core; the job row names the source. */
+/** An edit job (`output` and `format` are ignored by core). */
 export function editRequest(source: string, kind: string, edits: CoreEdit[], rebuild: boolean): ConvertRequest {
   return {
     source,
@@ -41,11 +37,8 @@ export function editRequest(source: string, kind: string, edits: CoreEdit[], reb
   };
 }
 
-/** Core's answer for one list of changes (`for`, and the `nonce` it was asked under). `check`
- * null with no error: nothing could be checked before Apply (only uploads, or `deferred`: other
- * changes depend on them), or `nothing`: the changes leave the source as it is (an empty folder
- * dropped onto one that is there); `left`: the uploaded files the check left out. `full`:
- * Apply's own check with the uploads in, kept until the changes change. */
+/** Core's answer for `for` under `nonce`. `check` null with no error: only uploads (or `deferred` on them),
+ * or `nothing` to change; `left`: uploads the check left out; `full`: Apply's own check with them in. */
 export interface CheckState {
   for: readonly Pending[];
   nonce: number;
@@ -57,8 +50,7 @@ export interface CheckState {
   full?: boolean;
 }
 
-/** Core's check of `changes`, ~500 ms after the last change; the latest answer wins. `nonce`:
- * asked again when it changes (a job ended, Check again). Off while `enabled` is false. */
+/** Core's check, ~500 ms after the last change; the latest answer wins; a new `nonce` asks again. */
 export function useEditCheck(
   source: string | null,
   ins: Inspection | null,
@@ -103,8 +95,7 @@ export function useEditCheck(
   return { state, current, settle };
 }
 
-/** Which ways the changes can go in. With no check (only uploads, checked on Apply): what the
- * format allows. A folder is only ever changed directly. */
+/** Which ways the changes can go in; with no check, what the format allows. */
 export function modes(state: CheckState, kind: string): { inPlace: boolean; rebuild: boolean } {
   const c = state.check;
   if (kind === "folder") return { inPlace: c ? c.in_place.length === 0 : true, rebuild: false };
@@ -112,13 +103,56 @@ export function modes(state: CheckState, kind: string): { inPlace: boolean; rebu
   return { inPlace: c.in_place.length === 0, rebuild: c.rebuild.length === 0 };
 }
 
-/** The mode Apply uses: `want` when both work, else the one that does; null when neither does
- * (or there is no answer for these changes yet). */
+/** `want` when both work, else the one that does; null when neither (or no answer yet). */
 export function chosenMode(state: CheckState | null, current: boolean, kind: string, want: Mode): Mode | null {
   if (!state || !current || state.error !== null || state.nothing) return null;
   const m = modes(state, kind);
   if (m.inPlace && m.rebuild) return want;
   return m.inPlace ? "in_place" : m.rebuild ? "rebuild" : null;
+}
+
+// Rates measured for issue #43. ponytail: fixed rates, not this device's own.
+const REBUILD_PS5_PKG = 26e6; // bytes/s: a .pkg's Kraken on a PS5
+const REBUILD_RATE: Record<RuntimePlatform, number> = { ps5: 60e6, host: 200e6 };
+
+let platformOnce: Promise<RuntimePlatform> | null = null;
+function usePlatform(): RuntimePlatform | null {
+  const [p, setP] = useState<RuntimePlatform | null>(null);
+  useEffect(() => {
+    let live = true;
+    (platformOnce ??= runtimePlatform()).then(
+      (v) => live && setP(v),
+      () => {
+        platformOnce = null; // the next mount asks again
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
+  return p;
+}
+
+/** Issue #43: how long a rebuild takes, said before Apply. `size`: the game's bytes. */
+function RebuildTime(props: { kind: string; size: number }) {
+  const platform = usePlatform();
+  const t = useMessages().edit;
+  if (props.size <= 0) return null;
+  const pkg = props.kind === "pkg";
+  const time = (rate: number) => prettyDuration((props.size / rate) * 1000);
+  const text = pkg
+    ? t.rebuildTimePkg(time(REBUILD_PS5_PKG))
+    : platform === "ps5"
+      ? t.rebuildTimePs5(time(REBUILD_RATE.ps5))
+      : platform
+        ? t.rebuildTimeHost(time(REBUILD_RATE[platform]))
+        : t.rebuildTimeAny(time(REBUILD_RATE.ps5));
+  return (
+    <p className="note-line warn">
+      <Icon name="warn" />
+      <span>{text}</span>
+    </p>
+  );
 }
 
 /** Core's findings, each once; a scrolling box, so it takes focus (`label` names it). */
@@ -130,12 +164,7 @@ export const Lines = ({ lines, label }: { lines: string[]; label: string }) => (
   </ul>
 );
 
-/**
- * The pending bar's mode: In place ("written into the image; needs N of its M free"), Rebuild
- * needed (why, and what a rebuild needs beside the image), Can't apply (core's findings), or for
- * a folder Changed directly; when both ways work, a choice (In place first). While core is
- * asked, the last answer stays with "Checking".
- */
+/** The pending bar's mode: In place, Rebuild needed, Can't apply, Changed directly, or a choice. */
 export function ModeBox(props: {
   kind: string;
   state: CheckState | null;
@@ -144,6 +173,8 @@ export function ModeBox(props: {
   onWant: (m: Mode) => void;
   onRetry: () => void;
   disabled?: boolean;
+  /** The game's bytes, for the rebuild's time. */
+  size?: number;
 }) {
   const t = useMessages().edit;
   const { state, kind } = props;
@@ -235,6 +266,7 @@ export function ModeBox(props: {
           ))}
         </div>
         <p className="muted edit-mode-text">{chosen === "in_place" ? inPlaceText : rebuildText}</p>
+        {chosen === "rebuild" && <RebuildTime kind={kind} size={props.size ?? 0} />}
       </>
     );
   } else if (m.inPlace) {
@@ -257,6 +289,7 @@ export function ModeBox(props: {
         </p>
         {kind !== "ffpfsc" && kind !== "pkg" && why.length > 0 && <Lines lines={why} label={t.rebuildNeeded} />}
         <p className="muted edit-mode-text">{rebuildText}</p>
+        <RebuildTime kind={kind} size={props.size ?? 0} />
       </>
     );
   }
@@ -269,9 +302,8 @@ export function ModeBox(props: {
   );
 }
 
-/** "Apply N changes?": what the mode does, no undo, close the game first; Cancel (focused) /
- * Apply. True: apply. */
-export function confirmApply(o: { n: number; mode: Mode; folder: boolean; name: string; restores: boolean }): Promise<boolean> {
+/** "Apply N changes?" (Cancel focused); true: apply. */
+export function confirmApply(o: { n: number; mode: Mode; folder: boolean; name: string; restores: boolean; metadata?: boolean }): Promise<boolean> {
   return new Promise((resolve) => {
     let yes = false;
     openOverlay(
@@ -296,10 +328,12 @@ function ApplyDialog(props: {
   folder: boolean;
   name: string;
   restores: boolean;
+  metadata?: boolean;
   close: () => void;
   onYes: () => void;
 }) {
   const t = useMessages().edit;
+  const mm = useMessages().metadata;
   const name = <span className="path">{props.name}</span>;
   return (
     <Modal close={props.close} className="modal card" role="alertdialog" labelledBy="ap-title" describedBy="ap-text">
@@ -307,10 +341,11 @@ function ApplyDialog(props: {
         <span className="head-icon warn">
           <Icon name="warn" />
         </span>
-        <h2 id="ap-title">{t.applyTitle(props.n)}</h2>
+        <h2 id="ap-title">{props.n === 0 && props.metadata ? mm.editConfirm : t.applyTitle(props.n)}</h2>
       </div>
       <div id="ap-text">
         <p>{props.mode === "rebuild" ? t.applyRebuild(name) : t.applyInPlace(name)}</p>
+        {props.metadata && <p className="muted">{mm.editConfirmText}</p>}
         {props.restores && <p className="muted">{t.applyRestores}</p>}
         <p className="muted">{props.folder ? t.closeFolder : t.closeImage}</p>
       </div>

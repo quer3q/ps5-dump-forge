@@ -1,12 +1,7 @@
-//! Entries read straight out of an archive, in whatever order the caller asks, with nothing
-//! unpacked to disk. A session decodes the archive front to back on its own thread (UnRAR and
-//! sevenz-rust2 push their data through callbacks) and hands over the asked-for entry's bytes
-//! through a bounded queue, skipping the entries before it. An entry the session has already
-//! gone past starts a new session from the archive's start: cheap for a non-solid archive (a
-//! skip reads headers only), a decode of everything before it for a solid one. Two things keep
-//! a pass of small reads over many entries (a header of each, a package builder's check) off
-//! that path: an unfinished entry with little left is read to its end and the session goes on,
-//! and the first bytes of every entry decoded from its start are kept and served again.
+//! Entries read straight out of an archive in any order, nothing unpacked: a session decodes front
+//! to back on its own thread, skipping to the asked-for entry; one gone past restarts from the
+//! start. An unfinished entry with little left is drained, and every entry's first bytes are kept,
+//! so passes of small reads stay in one session.
 
 use super::*;
 use std::{
@@ -19,11 +14,9 @@ use std::{
 /// Chunks in flight from a session (each at most 64 KiB).
 const QUEUE: usize = 64;
 
-/// The most of an unfinished entry read to its end (and dropped) to go on to a later entry in
-/// the same session.
-// ponytail: 64 MiB decoded and thrown away against a restart's walk of headers up to the next
-// entry (thousands in a big archive), or a solid archive's re-decode of everything before it;
-// a bigger rest restarts.
+/// The most of an unfinished entry drained to reach a later entry in the same session.
+// ponytail: 64 MiB thrown away beats a restart's header walk or a solid re-decode; a bigger rest
+// restarts.
 const DRAIN_MAX: u64 = 64 << 20;
 
 /// The first bytes of every entry kept once decoded (a header check reads 4 to 32 of them).
@@ -37,16 +30,13 @@ pub struct Reader {
     password: Option<String>,
     listing: Arc<Listing>,
     sizes: HashMap<String, u64>,
-    /// Files listed as empty: no read ever asks for them, so a session decodes each it goes
-    /// past, and one that holds data fails it.
+    /// Files listed as empty: a session decodes each it passes, and one holding data fails it.
     empty: Arc<HashSet<String>>,
-    /// The caller's cancel flag: every wait for the session checks it.
     cancel: Arc<AtomicBool>,
     session: Option<Session>,
-    /// The first bytes (up to [`HEAD`]) of each entry decoded from its start; an entry of at
-    /// most [`HEAD`] bytes only whole, once its end (and the archive's check of it) came.
+    /// Each entry's first bytes (up to [`HEAD`]) decoded from its start; a short entry only once
+    /// its end and check came.
     heads: HashMap<String, Vec<u8>>,
-    /// Sessions started.
     sessions: u64,
 }
 
@@ -62,18 +52,15 @@ struct Session {
     target: Option<mpsc::SyncSender<String>>,
     data: Option<mpsc::Receiver<Msg>>,
     stop: Arc<AtomicBool>,
-    /// Entries this session went past (skipped or served).
     passed: Arc<Mutex<HashSet<String>>>,
-    /// The entry asked for, its size, the bytes of it handed out, and whether its end (and
-    /// with it the archive's own check of it: a CRC, a checksum) has come.
+    /// The entry asked for, its size, bytes handed out, and whether its end (and the archive's
+    /// check) came.
     current: String,
     size: u64,
     at: u64,
     ended: bool,
-    /// The current entry's first bytes handed out, up to [`HEAD`].
     head: Vec<u8>,
     cancel: Arc<AtomicBool>,
-    /// What the last chunk had left over.
     pending: Vec<u8>,
     pending_at: usize,
     thread: Option<JoinHandle<()>>,
@@ -81,8 +68,8 @@ struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Both queues closed: a producer waiting on either stops, then lets go of the archive
-        // (and of UnRAR's lock) before the next session opens it.
+        // Both queues closed: a producer stops and lets go of the archive (and UnRAR's lock) before
+        // the next session.
         self.stop.store(true, Ordering::Relaxed);
         self.target = None;
         self.data = None;
@@ -93,8 +80,8 @@ impl Drop for Session {
 }
 
 impl Reader {
-    /// `listing` is the archive's own ([`list`] with the same password); `cancel` stops a
-    /// read that waits on the archive (a long skip through solid data) with `Cancelled`.
+    /// `listing` is [`list`]'s with the same password; `cancel` stops a waiting read with
+    /// `Cancelled`.
     pub fn new(
         path: &Path,
         password: Option<&str>,
@@ -128,8 +115,7 @@ impl Reader {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, ArchiveError> {
-        // Its head, kept: the bytes a read gives, the session left where it is (a stop still
-        // stops, as a read through the session would).
+        // Its head, kept: served without moving the session.
         if let Some(h) = self.heads.get(entry) {
             if let Err(e) = check(&self.cancel) {
                 self.session = None;
@@ -161,13 +147,12 @@ impl Reader {
                 continue;
             }
             let s = self.session.as_mut().expect("moved to the entry");
-            // Sized once (what is left of the entry, at most `len`): grown in steps, every read
-            // would leave a trail of freed large blocks behind.
+            // Sized once: growing it in steps leaves a trail of freed large blocks.
             let left = usize::try_from(s.size.saturating_sub(s.at)).unwrap_or(usize::MAX);
             let mut out = Vec::with_capacity(len.min(left));
             match s.fill(&mut out, len, &mut self.heads)? {
-                // At the entry's end, its end comes first: the archive's check of it fails
-                // the read that completes it, not a later one nobody makes.
+                // At the entry's end, its end comes first: the archive's check fails the read that
+                // completes it.
                 true if s.at >= s.size && !s.ended => {
                     if !s.fill(&mut Vec::new(), 1, &mut self.heads)? || !s.ended {
                         return Err(corrupt(&format!(
@@ -177,8 +162,8 @@ impl Reader {
                     return Ok(out);
                 }
                 true => return Ok(out),
-                // A forward walk that missed it (a ZIP or 7z skip records nothing): once more,
-                // from the archive's start.
+                // A forward walk that missed it (a ZIP or 7z skip records nothing): again from the
+                // start.
                 false if !fresh => {
                     self.start(entry)?;
                     fresh = true;
@@ -197,7 +182,6 @@ impl Reader {
             if s.at > offset || (s.ended && offset < s.at) {
                 return Ok(false);
             }
-            // Ahead in this entry: read up to it.
             let mut skip = offset - s.at;
             while skip > 0 && !s.ended {
                 let mut gone = Vec::with_capacity(skip.min(1 << 20) as usize);
@@ -208,7 +192,6 @@ impl Reader {
             }
             return Ok(true);
         }
-        // Another entry, not gone past (else a new session, with nothing read in vain)...
         if s.passed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -216,8 +199,7 @@ impl Reader {
         {
             return Ok(false);
         }
-        // ...once the current one is done: read to its end (and its end taken) when little of
-        // it is left.
+        // ...once the current one is done: drained when little is left.
         if !s.ended {
             if s.size.saturating_sub(s.at) > DRAIN_MAX {
                 return Ok(false);
@@ -248,11 +230,9 @@ impl Reader {
         s.at = 0;
         s.ended = false;
         s.head.clear();
-        // Then up to `offset` in it.
         self.moved_to(entry, offset)
     }
 
-    /// A new session from the archive's start, serving `entry` first.
     fn start(&mut self, entry: &str) -> Result<(), ArchiveError> {
         self.session = None;
         self.sessions += 1;
@@ -305,9 +285,8 @@ impl Reader {
 }
 
 impl Session {
-    /// Appends up to `len` bytes of the current entry to `out`, fewer at its end, keeping its
-    /// head in `heads` once known. False: the session went to the archive's end without the
-    /// entry.
+    /// Appends up to `len` bytes of the current entry to `out`, keeping its head; false at the
+    /// archive's end without it.
     fn fill(
         &mut self,
         out: &mut Vec<u8>,
@@ -365,12 +344,10 @@ struct Feed {
     target: Option<String>,
     stop: Arc<AtomicBool>,
     empty: Arc<HashSet<String>>,
-    /// An empty file being decoded in passing (never handed out).
     checking: Option<String>,
 }
 
 impl Feed {
-    /// The entry asked for, waiting for the reader to ask; `None` once the reader is gone.
     fn target(&mut self) -> Option<&str> {
         if self.target.is_none() {
             match self.target_rx.recv() {
@@ -394,8 +371,8 @@ impl Sink for Feed {
         true
     }
     fn wants(&mut self, p: &str) -> bool {
-        // A ZIP record or a 7z block's entries, before any decoding: the target, and an empty
-        // file to check.
+        // A ZIP record or a 7z block's entries, before decoding: the target, and an empty file to
+        // check.
         let wanted = self.target().is_some_and(|t| t == p) || self.empty.contains(p);
         if !wanted {
             self.pass(p);
@@ -441,7 +418,6 @@ impl Sink for Feed {
 mod tests {
     use super::*;
 
-    /// A STORED zip of `files`, written to a fresh temporary folder.
     fn zip(name: &str, files: &[(String, Vec<u8>)]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("forge-archive-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -487,9 +463,8 @@ mod tests {
         path
     }
 
-    /// A pass of head reads over every entry in archive order runs in one session (an entry
-    /// with more than [`DRAIN_MAX`] left still restarts); then heads in any order come from
-    /// what was kept, and every byte matches the entry.
+    /// A pass of head reads in archive order runs in one session; heads in any order then come from
+    /// what was kept.
     #[test]
     fn head_reads_drain_and_are_kept() {
         let mut files: Vec<(String, Vec<u8>)> = (0..200u32)

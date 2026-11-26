@@ -38,8 +38,7 @@ pub(crate) fn already_smp(path: &Path) -> Option<String> {
         .then(|| format!("{}: {ALREADY_SMP}", path.display()))
 }
 
-/// The version in the maker's mark of an `.exfat` (`exfat`) or `.ffpkg` image; `None` when
-/// it has none or can't be read (inspect goes on without it).
+/// The version in the maker's mark of an `.exfat` (`exfat`) or `.ffpkg` image, if readable.
 fn maker_version<R: Read + Seek>(r: &mut R, exfat: bool) -> Option<String> {
     let mark = if exfat {
         ps5_dump_forge_exfat::read_maker(r)
@@ -275,6 +274,12 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
             size: f.size,
         })
         .collect();
+    let file_bytes = match (&archive, kind) {
+        (Some(a), _) => Some(a.archive_bytes),
+        (None, Kind::Folder) => None,
+        (None, _) if net => crate::net::seen(path).ok().map(|s| s.0),
+        (None, _) => std::fs::metadata(path).ok().map(|m| m.len()),
+    };
     Ok(Inspection {
         kind: kind.name().to_string(),
         describe: tree.describe(),
@@ -295,6 +300,7 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
         cover,
         param_json: info.param_json,
         total_bytes: files.iter().fold(0u64, |s, f| s.saturating_add(f.size)),
+        file_bytes,
         files,
         empty_dirs: tree.empty_dirs().to_vec(),
         details,
@@ -315,8 +321,8 @@ pub(crate) fn inspect(path: &Path, password: Option<&str>) -> anyhow::Result<Ins
 /// The most an archive's inspection unpacks into memory.
 const ARCHIVE_READ_BUDGET: u64 = 256 << 20;
 
-/// An archive's game folder as inspecting sees it: its listing, and the bytes
-/// [`archive_reads`] chose; reading past those fails, so a check that needs more says so.
+/// An archive's game folder as inspecting sees it: its listing and the bytes [`archive_reads`]
+/// chose (reading past those fails).
 struct ArchiveTree {
     files: Vec<SourceFile>,
     dirs: Vec<String>,
@@ -435,10 +441,9 @@ fn game_files(listing: &ps5_dump_forge_archive::Listing, root: &str) -> Vec<Sour
 /// The largest `ampr_emu.index` an archive's inspection reads (for [`Lz4Facts::index`]).
 const MAX_ARCHIVE_INDEX: u64 = 16 << 20;
 
-/// What inspecting an archive unpacks, path → bytes from its start: whole metadata, cover,
-/// `eboot.bin`, `fakelib*/` and the LZ4 manifest, then `ampr_emu.index` (optional: it must not
-/// displace `eboot.bin`, which decides AMPR), then other executables smallest first, each only
-/// while the sum stays within [`ARCHIVE_READ_BUDGET`].
+/// What inspecting an archive unpacks, path → bytes from its start: metadata, cover,
+/// `eboot.bin`, `fakelib*/`, the LZ4 manifest, then `ampr_emu.index`, then other executables
+/// smallest first, within [`ARCHIVE_READ_BUDGET`].
 fn archive_reads(files: &[SourceFile]) -> BTreeMap<String, u64> {
     use ps5_dump_forge_lz4::{INDEX, MANIFEST, format::PAK_HEADER};
     let lower = |f: &SourceFile| f.path.to_ascii_lowercase();
@@ -481,8 +486,7 @@ fn archive_reads(files: &[SourceFile]) -> BTreeMap<String, u64> {
     keep
 }
 
-/// The LZ4 facts of a source; a damaged manifest becomes a finding. `None` without libSceAmpr
-/// or any LZ4 artifact.
+/// The LZ4 facts of a source; a damaged manifest becomes a finding.
 fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz4Facts> {
     use crate::lz4::{IndexState, RuntimeAction};
     use ps5_dump_forge_lz4::runtime::RuntimeKind;
@@ -516,25 +520,24 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
     let artifact = holds_packs
         || size(tree, JOURNAL).is_some()
         || size(tree, INDEX).is_some()
-        || matches!(
-            kind,
-            RuntimeKind::ForgeRelease | RuntimeKind::ForgeTrace | RuntimeKind::Zstd
-        );
+        || kind != RuntimeKind::None; // any runtime file: a `.pkg` leaves it out
     if !imports_ampr && !artifact {
         return None;
     }
-    // As a plain conversion sees it (`lz4::plain`): a runtime it installs or replaces is
-    // compared at the release runtime's size.
-    // A zstd-packed game keeps its index too, and gets the zstd runtime (`lz4::plain`).
+    // As a plain conversion sees it (`lz4::plain`), with `replace_ampr_emu` on and off.
     let zstd_packed = !holds_packs && crate::zstd_pack::packed(tree);
-    let action = if zstd_packed {
-        rt.zstd_action()
-    } else {
-        rt.action(imports_ampr, holds_packs)
+    let action_for = |replace: bool| {
+        if zstd_packed {
+            rt.ng_action()
+        } else {
+            rt.action(imports_ampr, holds_packs, replace)
+        }
     };
-    let index = if holds_packs || zstd_packed || action == RuntimeAction::Untouched {
-        None
-    } else {
+    let (action, keep_action) = (action_for(true), action_for(false));
+    let mut index_of = |action: RuntimeAction| {
+        if holds_packs || zstd_packed || action == RuntimeAction::Untouched {
+            return None;
+        }
         let files = crate::lz4::plain_listing(tree.files(), action);
         match crate::lz4::index_state(tree, &files) {
             Ok(IndexState::Ok(_)) => Some("ok"),
@@ -544,12 +547,19 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
             Err(_) => None,
         }
     };
-    // Only an AMPR title's runtime is the user's concern (`lz4::Runtime::action`).
-    let name = |a: RuntimeAction| match a {
-        _ if !imports_ampr => None,
+    let index = index_of(action);
+    let keep_index = if keep_action == action {
+        index
+    } else {
+        index_of(keep_action)
+    };
+    // An AMPR title's runtime, and any game's that gets ampr-emu-ng (zstd-packed, every Pack).
+    let name = |a: RuntimeAction, matters: bool| match a {
+        _ if !matters => None,
         RuntimeAction::Install => Some("install"),
         RuntimeAction::Replace => Some("replace"),
         RuntimeAction::Keep => Some("keep"),
+        RuntimeAction::Omit => Some("omit"),
         RuntimeAction::Untouched => None,
     };
     let runtime = match kind {
@@ -565,25 +575,28 @@ fn lz4_facts(tree: &mut dyn SourceTree, findings: &mut Vec<String>) -> Option<Lz
         manifest_error,
         runtime: runtime.to_string(),
         shipped_runtime_version: ps5_dump_forge_lz4::runtime::VERSION,
-        runtime_action: name(action),
-        // Unpack (a packed source) writes no packs; Pack with ampr_emu (`lz4::prepare`). Pack
-        // with ampr-emu-ng keeps it where `runtime` is `zstd`, else installs it.
-        pack_runtime_action: name(if holds_packs {
-            rt.action(imports_ampr, false)
+        runtime_action: name(action, imports_ampr || zstd_packed),
+        keep_runtime_action: name(keep_action, imports_ampr || zstd_packed),
+        // Unpack (a packed source) writes no packs (`lz4::prepare`); Pack gets ampr-emu-ng.
+        unpack_runtime_action: if holds_packs || zstd_packed {
+            name(rt.action(imports_ampr, false, true), imports_ampr)
         } else {
-            rt.pack_action(crate::Lz4Runtime::AmprEmu)
-        }),
+            None
+        },
+        pack_runtime_action: name(rt.ng_action(), true),
+        // Wherever a runtime is there, an AMPR title's or not.
+        pkg_runtime_action: (rt.pkg_action(imports_ampr) == RuntimeAction::Omit).then_some("omit"),
         runtime_version: rt.version,
         index,
+        keep_index,
     })
 }
 
-/// Manifests up to this size are parsed whole; a bigger (valid-looking) one is summed up from
-/// its header, so inspecting a hostile file never allocates its declared size.
+/// Manifests up to this size are parsed whole; a bigger one is summed up from its header, so a
+/// hostile file never allocates its declared size.
 const FULL_PARSE_BYTES: u64 = 64 << 20;
 
-/// The manifest's counts, reading the 128-byte header first. The bool is true when the
-/// manifest was too big to parse and only the header counts are known.
+/// The manifest's counts, header first; true when only the header counts are known.
 fn read_manifest(tree: &mut dyn SourceTree, limit: u64) -> Result<(Lz4Packed, bool), String> {
     use ps5_dump_forge_lz4::MANIFEST;
     use ps5_dump_forge_lz4::format::{self as f, u32_at, u64_at};
@@ -641,8 +654,7 @@ fn read_manifest(tree: &mut dyn SourceTree, limit: u64) -> Result<(Lz4Packed, bo
     Ok((packed_counts(&m), false))
 }
 
-/// Counts from a sound manifest; the percentage is stored bytes of the packed files over
-/// their logical bytes (loose files and metadata are not in either).
+/// Counts from a sound manifest; the percentage is stored over logical bytes of packed files.
 fn packed_counts(m: &reader::Manifest) -> Lz4Packed {
     let (mut packed_files, mut stored, mut logical) = (0u64, 0u64, 0u64);
     for f in m.files.iter().filter(|f| f.packed()) {
@@ -682,16 +694,14 @@ fn pfs_facts(what: &str, h: &PfsHeader, details: &mut Vec<String>, findings: &mu
     }
 }
 
-/// A file under a top-level `fakelib/` or `fakelib2/`, any case, as the package builder and
-/// ShadowMountPlus see them.
+/// A file under a top-level `fakelib/` or `fakelib2/`, any case.
 pub(crate) fn is_fakelib(path: &str) -> bool {
     path.split_once('/').is_some_and(|(top, _)| {
         top.eq_ignore_ascii_case("fakelib") || top.eq_ignore_ascii_case("fakelib2")
     })
 }
 
-/// The title in `param.json`'s default language (`localizedParameters`), else a bare
-/// `titleName` as hand-made files have.
+/// The title in `param.json`'s default language, else a bare `titleName`.
 pub(crate) fn title_name(param: &Value) -> Option<String> {
     let name = |v: &Value| v.get("titleName")?.as_str().map(str::to_string);
     let localized = param.get("localizedParameters");
@@ -705,9 +715,8 @@ pub(crate) fn title_name(param: &Value) -> Option<String> {
         .or_else(|| name(param))
 }
 
-/// The English title in `localizedParameters`: the default language's when it is English (an
-/// `en-GB` game keeps its own), else `en-US`, then `en-GB`, then any `en*`; a blank one doesn't
-/// count, so the default-language title still names the game.
+/// The English title in `localizedParameters`: the default language's when English, else
+/// `en-US`, `en-GB`, any `en*`; a blank one doesn't count.
 fn english_title(param: &Value) -> Option<String> {
     let localized = param.get("localizedParameters")?.as_object()?;
     let default =
@@ -725,8 +734,7 @@ fn english_title(param: &Value) -> Option<String> {
         })
 }
 
-/// Every `localizedParameters` title by language tag (`en-US`, `ru-RU`, ...), for the UI to
-/// pick the viewer's; `defaultLanguage` and entries without a string `titleName` are skipped.
+/// Every `localizedParameters` title by language tag (`en-US`, ...).
 pub(crate) fn title_names(param: &Value) -> BTreeMap<String, String> {
     let Some(localized) = param.get("localizedParameters").and_then(Value::as_object) else {
         return BTreeMap::new();
@@ -738,8 +746,8 @@ pub(crate) fn title_names(param: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// A BCD version word as the console shows it: `0x1160000000000000` is `11.60`,
-/// `0x0700…` is `7.00`; a 32-bit word that lost its leading zero (`0x9000038`) is `9.00`.
+/// A BCD version word as the console shows it: `0x1160000000000000` is `11.60`; a 32-bit word
+/// that lost its leading zero (`0x9000038`) is `9.00`.
 pub(crate) fn bcd(word: &str) -> Option<String> {
     let hex = word
         .strip_prefix("0x")
@@ -759,14 +767,12 @@ fn bcd_version(word: &str) -> String {
     bcd(word).unwrap_or_else(|| word.to_string())
 }
 
-/// The longest game name kept in a generated file name, in UTF-8 bytes. With the title id,
-/// extension, a `-N` and the job's `.part` suffix the name stays well inside 255
-/// bytes (APFS) and 255 UTF-16 units after decomposition (HFS+, exFAT, NTFS).
+/// The longest game name kept in a generated file name, in UTF-8 bytes (well inside 255 bytes
+/// and UTF-16 units with the rest of the name).
 const MAX_NAME_BYTES: usize = 100;
 
 /// `name` as part of a file name any destination accepts: letters, digits, spaces and
-/// `-_.,'()&+!` kept, anything else (separators, `:*?"<>|`, ™, ®) dropped, spaces
-/// collapsed, NFC, at most [`MAX_NAME_BYTES`], no dot or space at either end.
+/// `-_.,'()&+!` kept, spaces collapsed, NFC, at most [`MAX_NAME_BYTES`], trimmed.
 fn file_safe(name: &str) -> String {
     let kept: String = name
         .nfc()
@@ -783,8 +789,7 @@ fn file_safe(name: &str) -> String {
     cut.trim_matches(|c| c == '.' || c == ' ').to_string()
 }
 
-/// Windows reads `CON.anything` as the console device, whatever the extension; likewise
-/// `COM0`-`COM9`, `LPT0`-`LPT9` and their superscript `¹²³` forms.
+/// Windows reads `CON.anything` as the console device; likewise `COM0`-`COM9`, `LPT0`-`LPT9`.
 fn is_reserved_on_windows(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).trim_end();
     let upper = stem.to_ascii_uppercase();
@@ -867,8 +872,7 @@ fn pkg_header(path: &Path) -> anyhow::Result<(Vec<String>, Option<String>)> {
     Ok((details, id))
 }
 
-/// The content id in a container's first 0x64 bytes; `None` without the `\x7FCNT` magic or a
-/// printable id.
+/// The content id in a container's first 0x64 bytes, if it has the magic and a printable id.
 fn content_id(cnt: &[u8]) -> Option<String> {
     if &cnt[..4] != b"\x7FCNT" {
         return None;
@@ -881,14 +885,10 @@ fn content_id(cnt: &[u8]) -> Option<String> {
     (!id.is_empty() && id.chars().all(|c| c.is_ascii_graphic())).then_some(id)
 }
 
-/// The source's name by the `naming` template (`None`: [`crate::DEFAULT_NAMING`],
-/// `[GAME_NAME]-[TITLE_ID]`, e.g. `[Astro Bot]-[PPSA01234].ffpkg`; tokens and cleanup:
-/// [`Template`]); `pack` for `{pack}`, and [`Format::Lz4`] is LZ4 Pack into a folder. With
-/// nothing left it is [`default_output`]'s name. An empty `dir` is the folder holding the
-/// source. `password`: an archive's (else its listing or `param.json` may be locked).
-/// ponytail: the source is opened again (a folder scanned, a package's image walked) for
-/// every generated name, each format or folder change; metadata only, cache it per source
-/// if a big game makes that slow.
+/// The source's name by the `naming` template ([`Template`]); `pack` for `{pack}`. With
+/// nothing left it is [`default_output`]'s name. An empty `dir` is the source's folder.
+/// ponytail: the source is opened again for every generated name; cache it per source if a big
+/// game makes that slow.
 pub(crate) fn generated_output(
     source: &Path,
     format: Format,
@@ -903,6 +903,8 @@ pub(crate) fn generated_output(
     let dir = &output_dir(source, dir)?;
     let info = match Kind::of(source)? {
         Kind::Archive(_) => archive_info(source, password)?,
+        // param.json alone: a full scan took minutes for a 95k-file game on a PS5 USB drive (#74).
+        Kind::Folder => game_info(source, password).unwrap_or_default(),
         kind => {
             let mut tree = open_source(source, kind, &AtomicBool::new(false))?;
             preflight::input(tree.as_mut()).0
@@ -910,11 +912,9 @@ pub(crate) fn generated_output(
     };
     let parts = NameParts::of(&info, pack, template);
     let full = parts.stem(usize::MAX);
-    // Only a title or title id in the name identifies the game; without one (the template's
-    // text, a version) unrelated games would share a name.
+    // Only a title or title id identifies the game; without one unrelated games share a name.
     let named = !full.is_empty() && parts.identified();
-    // What a template that renders (or is cut) to nothing falls back to; looked up only then
-    // (a peer or NAS source answers a stat for it).
+    // The fallback when the template renders to nothing; looked up only then.
     let fallback_cell = std::cell::OnceCell::new();
     let fallback = || {
         fallback_cell
@@ -926,18 +926,14 @@ pub(crate) fn generated_output(
         (false, Some(f)) => f.clone(),
         (false, None) => default_stem(source, info.title_id.clone())?,
     };
-    // The name can't be edited while it is generated, so it never names something that
-    // exists or that a running job (`taken`) will publish: a rebuild becomes `-2`, `-3`, ...
-    // (publishing still never replaces, should something take the name meanwhile).
+    // Never a name that exists or that a running job (`taken`) will publish: `-2`, `-3`, ...
     for n in 1..=MAX_SUFFIX {
         let suffix = if n == 1 {
             String::new()
         } else {
             format!("-{n}")
         };
-        // Within the name limit (what ShadowMountPlus can mount): the version is left out when
-        // the rest doesn't fit even without the game name, then the game name is cut, then the
-        // rest; the suffix kept.
+        // Within ShadowMountPlus's limit: the version left out, then the title cut, then the rest.
         let max = preflight::stem_limit(format);
         let fit = |room: usize| {
             let fitted = match (stem.len() > room, named) {
@@ -945,9 +941,7 @@ pub(crate) fn generated_output(
                 (true, true) => parts.stem(room),
                 (true, false) => cut(&stem, room).trim_end_matches(['.', ' ']).to_string(),
             };
-            // The cut took the game away (a title of wide characters, or the template's own text
-            // filling the room before `{title_id}`): never an empty name, which would be the
-            // folder itself or a bare `.ext`, nor one unrelated games would share.
+            // The cut took the title away: never an empty name, nor one unrelated games share.
             let lost = fitted.is_empty() || named && !parts.kept_in(&fitted);
             match if lost { fallback() } else { None } {
                 Some(f) => cut(f, room).trim_end_matches(['.', ' ']).to_string(),
@@ -975,8 +969,7 @@ pub(crate) fn generated_output(
 /// One piece of a naming [`Template`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Token {
-    /// The English title (`localizedParameters` `en-US`, `en-GB`, then any `en*`), else the
-    /// default-language one.
+    /// The English title, else the default-language one.
     Title,
     TitleId,
     Version,
@@ -985,16 +978,9 @@ pub(crate) enum Token {
     Fw,
 }
 
-/// A parsed naming template: its own text and the tokens `{title}`, `{title_id}`,
-/// `{version}`, `{pack}`, `{region}`, `{fw}`, in order.
-///
-/// After the values go in, the name is cleaned up, in order: an empty `[]` or `()` is
-/// removed (again until none is left), a run of one separator (`-`, `_`, a space) becomes
-/// one, and `-`, `_`, `.` and spaces are trimmed from both ends. The cleanup touches only the
-/// template's own text, never a value's (a title keeps its own `--`). Examples:
-/// `[{title}]-[{title_id}]-[{version}]` without a version gives `[T]-[ID]`;
-/// `{title}-{version}-{pack}` without a version gives `T-zstd`; `{title} ({pack})` on a
-/// Convert gives `T`.
+/// A parsed naming template: its own text and the tokens, in order. After the values go in,
+/// only the template's own text is cleaned up: empty `[]`/`()` removed, a run of one separator
+/// (`-`, `_`, space) collapsed, `-_.` and spaces trimmed at the ends.
 /// ponytail: a spaced separator like ` - ` can double (`T - - zstd`) when a value is missing.
 pub(crate) struct Template(Vec<Result<char, Token>>);
 
@@ -1062,8 +1048,7 @@ pub(crate) fn parse_naming(template: &str) -> Result<Template, String> {
     Ok(Template(pieces))
 }
 
-/// A [`Template`] with the values the source has: the game's title made file-safe, the title
-/// id, the version (when file-safe) and the pack kind; a missing one is empty.
+/// A [`Template`] with the values the source has; a missing one is empty.
 struct NameParts {
     template: Template,
     title: String,
@@ -1125,10 +1110,8 @@ impl NameParts {
         }
     }
 
-    /// The name within `max` bytes, empty with no value at all: when it is too long the title
-    /// is cut (at a character boundary, no trailing `.` or space; left out if nothing of it
-    /// fits), but first the version is left out when the name doesn't fit even without the
-    /// title; then the whole is cut.
+    /// The name within `max` bytes: first the version left out if it doesn't fit even without
+    /// the title, then the title cut (at a char boundary), then the whole.
     fn stem(&self, max: usize) -> String {
         let fits_without_title = self.render("", &self.version).len() <= max;
         let version = if fits_without_title {
@@ -1151,8 +1134,7 @@ impl NameParts {
         cut(&name, max).trim_end_matches(['.', ' ']).to_string()
     }
 
-    /// Whether the name holds the title or the title id: the template has the token and the
-    /// source the value.
+    /// Whether the name holds the title or the title id.
     fn identified(&self) -> bool {
         self.template.0.iter().any(|p| match p {
             Err(Token::Title) => !self.title.is_empty(),
@@ -1172,8 +1154,7 @@ impl NameParts {
         })
     }
 
-    /// The template with `title`, the title id, `version` and the pack kind in, cleaned up as
-    /// [`Template`] says (the template's own text only).
+    /// The template with the values in, cleaned up as [`Template`] says.
     fn render(&self, title: &str, version: &str) -> String {
         let mut pieces: Vec<Result<char, &str>> = (self.template.0.iter())
             .map(|p| match p {
@@ -1211,16 +1192,14 @@ impl NameParts {
                 Ok(c) => c.to_string(),
                 Err(v) => v.to_string(),
             })
-            // ponytail: the template's text and each value are NFC on their own, not the joined
-            // name, so a combining mark typed right after a value stays uncomposed; normalizing
-            // here would let the name shrink under the title's byte count in `stem`.
+            // ponytail: NFC per part, not the joined name (normalizing here could shrink the name
+            // under `stem`'s title count).
             .collect()
     }
 }
 
-/// Where a default or generated output goes: `dir`, or, when it is empty, the folder holding
-/// `source`, made absolute from the source's path. Never a bare relative name, which would
-/// land in the process's working directory (the PS5 payload's is wherever its loader left it).
+/// Where an output goes: `dir`, or, when it is empty, the source's folder made absolute (never
+/// the process's working directory).
 fn output_dir(source: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
     if !dir.as_os_str().is_empty() {
         return Ok(dir.to_path_buf());
@@ -1258,8 +1237,7 @@ fn with_extension(dir: &Path, name: &str, format: Format) -> PathBuf {
     }
 }
 
-/// `<TITLE_ID>.<ext>` (else the source's own name) in `dir`; an empty `dir` is the folder
-/// holding the source. `password`: an archive's.
+/// `<TITLE_ID>.<ext>` (else the source's own name) in `dir` (empty: the source's folder).
 pub(crate) fn default_output(
     source: &Path,
     format: Format,
@@ -1291,8 +1269,7 @@ fn default_stem(source: &Path, title_id: Option<String>) -> anyhow::Result<Strin
     })
 }
 
-/// The source's title id (and `param.json` where it is cheap), read as cheaply as each
-/// source allows: a package's header gives the title id without opening its image.
+/// The source's title id (and `param.json` where cheap), read as cheaply as each source allows.
 fn game_info(source: &Path, password: Option<&str>) -> anyhow::Result<GameInfo> {
     let kind = Kind::of(source)?;
     let info = match kind {

@@ -15,7 +15,7 @@ The complete corresponding source of every release is attached to that release a
 `vendor/ps5upload-pkg` (UFS2 reader, package inspection) are taken from ps5upload with a small
 local patch series (`vendor/patches/`, described in `vendor/README.md`).
 
-- Upstream: https://github.com/phantomptr/ps5upload, tag `v7.0.22` (`01afdf8`)
+- Upstream: https://github.com/phantomptr/ps5upload, tag `v12.6.30` (`4174eee`)
 - License: GNU General Public License, version 3 or (at your option) any later version.
   The GPL-3.0 text is in `LICENSE`.
 
@@ -155,95 +155,24 @@ OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 SUCH DAMAGE.
 ```
 
-## ampr_emu (GPL-3.0-or-later)
+## ampr-emu-ng (GPL-3.0-or-later)
 
-`vendor/ampr_emu/` holds the unmodified upstream 0.4.2.1 release binary `libSceAmpr.sprx`, which Forge
-embeds and installs into AMPR games (and on LZ4 Pack with runtime `ampr_emu`), and the tagged source archive
-`ampr_emu-0.4.2.1-src.tar.gz`, kept there as its corresponding source (the exact compile-time options of
-the release binary are not recorded; this is no claim of reproducibility). `vendor/ampr-emu-ng/` holds
-the ampr-emu-ng v0.4.1 release binaries (`libSceAmpr.sprx`, `libSceAmpr-debug.sprx`) and the tagged source
-archive `ampr-emu-ng-0.4.1-src.tar.gz` (https://github.com/quer3q/ampr-emu-ng, a Rust hard fork of
-ampr_emu, GPL-3.0-or-later) that reads zstd and LZ4 packs; Forge embeds the release `libSceAmpr.sprx` and installs it
-on zstd Pack and LZ4 Pack (runtime `ng`, the default); it compiles in libzstd (`zstd-sys` 2.1.2,
-BSD-3-Clause or GPL-2.0), `lz4_flex` 0.14.0 (MIT), `crc32fast` 1.5.3 and `cfg-if` 1.0.5 (MIT or
-Apache-2.0), `iced-x86` 1.21.0 (MIT), `lazy_static` 1.5.1 (MIT or Apache-2.0) and `spin` 0.9.9 (MIT).
-Forge's pack format code is written from the documented format and checked against upstream's Python
-tools (`scripts/check-lz4.sh`); no ampr_emu code is compiled into Forge.
+`vendor/ampr-emu-ng/` holds the ampr-emu-ng v0.5.1 release binary (`libSceAmpr.sprx`) and the tagged
+source archive `ampr-emu-ng-0.5.1-src.tar.gz` (https://github.com/quer3q/ampr-emu-ng, a Rust hard fork
+of drakmor's ampr_emu, GPL-3.0-or-later) that reads zstd and LZ4 packs; Forge embeds the release
+`libSceAmpr.sprx` and installs it into AMPR games and on zstd and LZ4 Pack. It compiles in libzstd
+(`zstd-sys` 2.1.3, BSD-3-Clause or GPL-2.0), `lz4_flex` 0.14.2 (MIT), `crc32fast` 1.5.5 and `cfg-if`
+1.0.5 (MIT or Apache-2.0), `iced-x86` 1.22.0 (MIT), `lazy_static` 1.5.1 (MIT or Apache-2.0) and
+`spin` 0.9.9 (MIT).
 Core's `fself.rs` is a Rust port of the fake-signed SELF layout that ampr-emu-ng's `tools/make_fself.py`
 (GPL-3.0-or-later) writes, checked byte for byte against that script's output.
 
-- Upstream: https://github.com/drakmor/ampr_emu, tag `0.4.2.1`, by drakmor
 - License: GNU General Public License, version 3 or (at your option) any later version.
 
-The runtimes contain these third-party parts (their sources are in the archive):
-
-- LZ4 1.10.0 (`third_party/lz4`), BSD 2-Clause. The license text, from the header of its `lz4.c`/`lz4.h`:
-
-```
-LZ4 - Fast LZ compression algorithm
-Copyright (C) 2011-2023, Yann Collet.
-
-BSD 2-Clause License (http://www.opensource.org/licenses/bsd-license.php)
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are
-met:
-
-    * Redistributions of source code must retain the above copyright
-notice, this list of conditions and the following disclaimer.
-    * Redistributions in binary form must reproduce the above
-copyright notice, this list of conditions and the following disclaimer
-in the documentation and/or other materials provided with the
-distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-You can contact the author at :
- - LZ4 homepage : http://www.lz4.org
- - LZ4 source repository : https://github.com/lz4/lz4
-```
-
-- HDE64 (Hacker Disassembler Engine 64 C), Copyright (c) 2008-2009 Vyacheslav Patkov, all rights reserved.
-  The archive's sources carry only the copyright line; the BSD terms are those published with MinHook
-  (https://github.com/TsudaKageyu/minhook/blob/master/LICENSE.txt), reproduced here:
-
-```
-Hacker Disassembler Engine 64 C
-Copyright (c) 2008-2009, Vyacheslav Patkov.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions
-are met:
-
- 1. Redistributions of source code must retain the above copyright
-    notice, this list of conditions and the following disclaimer.
- 2. Redistributions in binary form must reproduce the above copyright
-    notice, this list of conditions and the following disclaimer in the
-    documentation and/or other materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
-TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
-PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR
-CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
+Forge no longer ships drakmor's ampr_emu (https://github.com/drakmor/ampr_emu) and compiles in none of
+its code. Forge's LZ4 pack format code is written from the documented format; the dev-only
+`scripts/check-lz4.sh` checks it against ampr_emu 0.4.2.1's Python tools, read from a source archive
+the developer supplies (`AMPR_EMU_SRC`).
 
 [Lazy_AMPR](https://github.com/Nazky/Lazy_AMPR) is the reference workflow. No code or profile of it is
 included.
@@ -344,7 +273,7 @@ stated in each package's metadata.
 
 ## musl libc (MIT) and the GCC runtime libraries
 
-The static Linux CLI (`ps5-dump-forge-<version>-linux-x86-64-musl.tar.gz`, built by
+The static Linux CLI (`ps5-dump-forge-cli-<version>-linux-x86-64` and `-linux-arm64`, built by
 `scripts/release-linux-musl.sh` in the `rust:1.100.0-alpine` image) links
 [musl libc](https://musl.libc.org) statically:
 
@@ -366,7 +295,7 @@ The static Linux CLI (`ps5-dump-forge-<version>-linux-x86-64-musl.tar.gz`, built
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 It also links GCC's `libstdc++` and `libgcc` (for UnRAR's C++), under the GPL-3.0 with the GCC
-Runtime Library Exception. That tarball carries this file and `LICENSE` beside the binary.
+Runtime Library Exception. This file and `LICENSE` are in every release's source archives.
 
 ## Tauri and other dependencies
 

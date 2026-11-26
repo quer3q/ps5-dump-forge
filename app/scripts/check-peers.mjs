@@ -1,5 +1,4 @@
-// Checks src/peers.ts with a plain `node scripts/check-peers.mjs` (type stripping): saved NAS
-// paths shown by name (`nasPath`, the UI's path display) and in backend text (`readable`).
+// Checks src/peers.ts with a plain `node` (type stripping): `nasPath` and `readable`.
 
 import assert from "node:assert/strict";
 

@@ -101,8 +101,7 @@ fn chunks_of<'a>(index: &'a Index, path: &str) -> &'a [Chunk] {
     &index.chunks[first..first + count]
 }
 
-/// Test-only decoder: the index and every volume header checked, then each
-/// file rebuilt from its chunks (raw bytes, or one zstd frame each).
+/// Test-only decoder: index and volume headers checked, each file rebuilt from its chunks.
 fn unpack(packs: &HashMap<String, Vec<u8>>) -> Result<(Index, HashMap<String, Vec<u8>>)> {
     let bad = |what: String| Error::Format(what);
     let index = decode_index(&packs["ampr_zstd.index"]).map_err(|e| bad(e.to_string()))?;
@@ -160,8 +159,7 @@ fn packed_file_and_damaged_volume() {
 #[test]
 fn exact_chunk_empty_file_and_raw_fallback() {
     let exact: Vec<_> = (0..CHUNK).map(|i| (i / 100) as u8).collect();
-    // Compressible, incompressible, compressible: the file is not store-only,
-    // but its middle chunk does not shrink and must fall back to raw.
+    // Compressible, incompressible, compressible: the middle chunk falls back to raw.
     let mut mixed = vec![0u8; CHUNK];
     mixed.extend(noise(CHUNK, 0x9e37_79b9_7f4a_7c15));
     mixed.extend(vec![1u8; 1000]);
@@ -309,8 +307,8 @@ fn measured_packed_tree_reads_as_the_packs_pack_writes() {
     }
 }
 
-/// A packed file also on disk is never refused: an identical copy keeps the plain file, another
-/// (here another case and other bytes) is replaced by the packed copy under the index's name.
+/// A packed file also on disk: identical keeps the plain file, another case and bytes gets the
+/// packed copy.
 #[test]
 fn a_packed_file_also_on_disk_keeps_one_copy() {
     let a = noise(1000, 1);
@@ -330,8 +328,7 @@ fn a_packed_file_also_on_disk_keeps_one_copy() {
     assert!(tree.read("DATA/B.bin").is_err());
 }
 
-/// Two records folding to one path, one of them identical to the file on disk: both stay
-/// packed, so neither loses its contents to the other.
+/// Two records folding to one path, one identical to the disk file: both stay packed.
 #[test]
 fn records_folding_together_both_keep_their_packed_copy() {
     let a = noise(1000, 3);

@@ -1,5 +1,4 @@
-//! One folder's entries for a file browser ([`list_dir`]): the server's `list_dir` route and
-//! the app's Storage explorer; [`list_explorer`] for the explorer on the PS5.
+//! One folder's entries for a file browser ([`list_dir`]); [`list_explorer`] for the PS5's.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,7 +11,6 @@ pub const LIST_MAX: usize = 10_000;
 /// A folder's entries, folders first, then by name.
 #[derive(Debug, Clone, Serialize)]
 pub struct Listing {
-    /// The folder, canonical.
     pub path: PathBuf,
     /// The folder above it; `None` at a filesystem root.
     pub parent: Option<PathBuf>,
@@ -36,13 +34,11 @@ pub struct ListEntry {
     pub mounted: bool,
 }
 
-/// Lists `path`. Names that aren't UTF-8 and entries that can't be read are left out; links
-/// are followed and come back resolved, a dangling one as itself.
+/// Lists `path` (non-UTF-8 and unreadable entries left out), links resolved unless dangling.
 // ponytail: a truncated listing is the first 10,000 the folder yields, sorted, not the first
 // 10,000 by name.
 pub fn list_dir(path: &Path) -> io::Result<Listing> {
-    // A NAS share (`smb://host/share/...`; `smb://host` lists its shares) or a peer
-    // (`flink://<key_id>` lists its share root).
+    // A NAS share or a peer.
     if crate::net::is_network(path) {
         return crate::net::list_dir(path).map_err(|e| {
             let kind = e
@@ -97,9 +93,8 @@ pub fn list_dir(path: &Path) -> io::Result<Listing> {
     })
 }
 
-/// [`list_dir`] for the Storage explorer. On the PS5 ShadowMount+'s mount folder is never
-/// shown: `path` at or inside it is an `InvalidInput` error and entries that resolve into it
-/// are left out; an image it has mounted comes back `mounted`. Elsewhere it is [`list_dir`].
+/// [`list_dir`] for the Storage explorer; on the PS5 ShadowMount+'s mount folder hidden (an
+/// `InvalidInput` error inside it) and mounted images marked.
 pub fn list_explorer(path: &Path) -> io::Result<Listing> {
     #[cfg(target_os = "freebsd")]
     {
@@ -118,8 +113,7 @@ pub fn list_explorer(path: &Path) -> io::Result<Listing> {
     list_dir(path)
 }
 
-/// Whether `path` is ShadowMount+'s mount folder or inside it, as typed (components) or
-/// resolved.
+/// Whether `path` is ShadowMount+'s mount folder or inside it, as typed or resolved.
 pub(crate) fn smp_hidden(path: &Path) -> bool {
     use crate::library_roots::shadowmnt;
     shadowmnt(&path.components().collect::<PathBuf>())
@@ -134,9 +128,8 @@ fn smp_hidden_error() -> io::Error {
     )
 }
 
-/// The explorer's rule over a listing and ShadowMount+'s mounts (`Err`: they couldn't be
-/// read): entries in its mount folder left out, files of a mounted stem marked `mounted`
-/// (every image when the mounts couldn't be read: fails closed). Links are never marked.
+/// The explorer's rule: entries in the mount folder left out, files of a mounted stem marked
+/// (every image when the mounts couldn't be read: fails closed); links never marked.
 #[cfg(any(target_os = "freebsd", test))]
 fn smp_marked(mut listing: Listing, mounts: Result<Vec<(String, PathBuf)>, ()>) -> Listing {
     use crate::edit_job::smp_stem;

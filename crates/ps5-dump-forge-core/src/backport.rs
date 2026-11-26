@@ -1,12 +1,5 @@
 //! What a game's `fakelib/` holds, and leaving its backport out of a conversion.
-//!
-//! ShadowMountPlus mounts `fakelib/` (or `fakelib2/`) over the game's system libraries and
-//! says "Backport applied" for any of it. Most dumps carry homebrew emulators there, not a
-//! backport: each one names its project, in the file it reads from the game root
-//! (`ampr_emu.index`, `dlc_emu.ini`, `playgo_stub.dat`) or its build path (`dlc_emu`'s
-//! `libSceGameUpdate.sprx` has only that). The rest are system libraries from newer firmware:
-//! the backport proper. Removing it is only safe when `eboot.bin`'s SDK was left alone; a
-//! backport that lowered it can't be undone, its original values are gone.
+//!ShadowMountPlus overlays `fakelib/` (or `fakelib2/`) on the system libraries; most dumps carry emulators there, each naming its project in its files, the rest is the backport proper. Removing it is safe only while `eboot.bin`'s SDK was left alone.
 
 use std::collections::HashSet;
 
@@ -34,11 +27,8 @@ pub(crate) struct Fakelib {
     pub emulators: Vec<Emulator>,
 }
 
-/// The emulator `path` is, by its marker; `None` for a backport library. Fails closed: a
-/// file that can't be read whole counts as an emulator (`Other`), so it is kept.
-/// ponytail: `/app0/` is the homebrew signal (emulators read their own files from the game
-/// root); Sony system libraries are expected not to carry it, and one that does is kept, the
-/// safe side.
+/// The emulator `path` is, by its marker; `None` for a backport library. Fails closed: an unreadable file counts as an emulator.
+/// ponytail: `/app0/` is the homebrew signal; a Sony library carrying it is kept, the safe side.
 fn emulator(tree: &mut dyn SourceTree, path: &str, size: u64) -> Option<&'static str> {
     const OTHER: Option<&str> = Some("Other");
     let Some(len) = usize::try_from(size).ok().filter(|_| size <= MAX_SCAN) else {
@@ -75,10 +65,7 @@ pub(crate) fn classify(tree: &mut dyn SourceTree) -> Fakelib {
     found
 }
 
-/// Why the backport can't be removed: `eboot.bin`'s SDK is lower than `param.json`'s
-/// `sdkVersion` (the whole SDK word), or either is unreadable. `None`: removable.
-/// `eboot.bin` alone: a backport patches it first, untouched modules can't hide that, and
-/// other files (`sce_sys/about/right.sprx` is SDK 1.00) legitimately sit lower.
+/// Why the backport can't be removed: `eboot.bin`'s SDK (it alone: a backport patches it first) is lower than `param.json`'s `sdkVersion`, or either is unreadable.
 pub(crate) fn blocked(tree: &mut dyn SourceTree, param: Option<&Value>) -> Option<String> {
     let declared = param
         .and_then(|p| p.get("sdkVersion"))
@@ -114,8 +101,7 @@ pub(crate) fn blocked(tree: &mut dyn SourceTree, param: Option<&Value>) -> Optio
     })
 }
 
-/// `0x0900000000000000` (or the 32-bit `0x09000000`) as `0x09000000`: the word an
-/// executable's SDK compares with (BCD major.minor, then the build).
+/// `0x0900000000000000` (or 32-bit `0x09000000`) as `0x09000000`, the word an SDK compares with.
 fn sdk_word(word: &str) -> Option<u32> {
     let hex = word
         .strip_prefix("0x")
@@ -133,9 +119,7 @@ fn sdk_word(word: &str) -> Option<u32> {
     u32::from_str_radix(&hex[..8], 16).ok()
 }
 
-/// A source without some of its files. A top-level `fakelib`/`fakelib2` left with nothing in
-/// it goes too, empty folders inside included: an empty overlay would hide the console's
-/// own system libraries.
+/// A source without some of its files; a top-level `fakelib`/`fakelib2` left empty goes too (an empty overlay would hide the console's libraries).
 pub(crate) struct Without {
     inner: Box<dyn SourceTree>,
     files: Vec<SourceFile>,

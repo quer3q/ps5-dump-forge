@@ -97,6 +97,19 @@ pub fn open_remote(files: Arc<dyn RemoteFiles>, path: &str) -> Result<Box<dyn So
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    open_remote_as(files, path, size, &ext)
+}
+
+/// The file at `path` (`size` bytes) on `files`, read as the kind of image or package its
+/// extension `ext` names, whatever the file itself is called: an image written as
+/// `<name>.exfat.partial` is read back before it gets its name.
+pub fn open_remote_as(
+    files: Arc<dyn RemoteFiles>,
+    path: &str,
+    size: u64,
+    ext: &str,
+) -> Result<Box<dyn SourceTree>> {
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
     let label = format!("{ext} {path} on {}", files.label());
     let reader = || files.open(path).map_err(|e| io(path, e));
     match ext.as_str() {
@@ -107,8 +120,27 @@ pub fn open_remote(files: Arc<dyn RemoteFiles>, path: &str) -> Result<Box<dyn So
         )?)),
         "ffpfsc" => crate::source::ffpfsc_tree(&reader, &label),
         "ffpfs" => crate::pfs_source::open(reader()?, label),
+        "pkg" => {
+            let mut magic = [0u8; 4];
+            let ps4 = reader()?.read_exact(&mut magic).is_ok()
+                && crate::ps4_pkg::is_ps4_magic(&magic);
+            if ps4 {
+                return Ok(Box::new(crate::ps4_pkg::Ps4Package::open(
+                    reader()?,
+                    size,
+                    crate::crypto::DEFAULT_PASSCODE,
+                    label,
+                )?));
+            }
+            Ok(Box::new(crate::pkg_source::PkgSource::from_reader(
+                reader()?,
+                size,
+                crate::crypto::DEFAULT_PASSCODE,
+                label,
+            )?))
+        }
         _ => format_err(format!(
-            "{path} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc)"
+            "{path} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc) or debug package (.pkg)"
         )),
     }
 }

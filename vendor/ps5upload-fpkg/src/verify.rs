@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::cnt::{self, EntryDigest};
 use crate::crypto::sha3;
@@ -371,22 +371,48 @@ pub fn verify_streaming(
     passcode: &str,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Report> {
-    verify_streaming_controlled(path, passcode, progress, None)
+    verify_streaming_sampled(path, passcode, None, progress)
 }
 
-/// [`verify_streaming`], stopping with [`crate::Error::Cancelled`] once `cancel` is set. A
-/// verification reads the whole package (twice: the block sweep and the CRC table), minutes
-/// for a large game, so every block read checks the flag.
+/// [`verify_streaming`], with the data-block sweep sampled when given a `seed`: the structure
+/// (header, tables, inodes, indirect blocks, the playgo CRCs) is always checked in full, and
+/// only the per-block decrypt and SHA3 is limited to the first and last 8 MiB batch of blocks
+/// plus a seeded draw of about 1% of the batches (at most 128). `None` sweeps every block.
+pub fn verify_streaming_sampled(
+    path: &Path,
+    passcode: &str,
+    seed: Option<u64>,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Report> {
+    verify_streaming_controlled(path, passcode, seed, None, progress)
+}
+
+/// [`verify_streaming`] that stops with [`crate::Error::Cancelled`] once `cancel` is set: the
+/// Collection's copy check runs it on packages of 100+ GB.
+pub fn verify_streaming_cancellable(
+    path: &Path,
+    passcode: &str,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Report> {
+    verify_streaming_controlled(path, passcode, None, Some(cancel), progress)
+}
+
+/// [`verify_streaming_sampled`] that also stops with [`crate::Error::Cancelled`] once `cancel`
+/// is set. A verification reads the whole package (twice: the block sweep and the CRC table),
+/// minutes for a large game, so every block read checks the flag: a build's Stop ends its
+/// read-back too.
 pub fn verify_streaming_controlled(
     path: &Path,
     passcode: &str,
-    progress: &mut dyn FnMut(u64, u64),
+    seed: Option<u64>,
     cancel: Option<&AtomicBool>,
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Report> {
-    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+    if cancel.is_some_and(crate::workshop::checkpoint) {
         return Err(crate::Error::Cancelled);
     }
-    verify_file_controlled(PkgFile::open(path)?, passcode, progress, cancel)
+    verify_file_controlled(PkgFile::open(path)?, passcode, seed, cancel, progress)
 }
 
 /// Outer blocks the sweep reads per batch (8 MiB).
@@ -440,51 +466,14 @@ fn failing_blocks(
 /// [`verify_streaming_controlled`] over a package already open, e.g. through the handle it was
 /// just written with, so the bytes checked are that file's whatever its path now names.
 pub fn verify_file_controlled(
-    file: PkgFile,
-    passcode: &str,
-    progress: &mut dyn FnMut(u64, u64),
-    cancel: Option<&AtomicBool>,
-) -> Result<Report> {
-    verify_file_sampled(file, passcode, progress, cancel, None)
-}
-
-/// Which of `batches` 8 MiB batches a sampled sweep reads, ascending: the first, the last and
-/// a seeded 1% of the rest, at most 128 of them (1 GiB). The same for the same seed.
-fn sampled_batches(batches: u64, seed: u64) -> Vec<u64> {
-    let mut picked = vec![0, batches.saturating_sub(1)];
-    let rest = batches.saturating_sub(2);
-    // Ends included, at most 128 batches (1 GiB).
-    let want = (rest / 100).max(u64::from(rest > 0)).min(126);
-    // SplitMix64: small, and the same on every platform for the same seed.
-    let mut state = seed;
-    let mut next = || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    for _ in 0..want {
-        picked.push(1 + next() % rest);
-    }
-    picked.sort_unstable();
-    picked.dedup();
-    picked.retain(|&b| b < batches);
-    picked
-}
-
-/// [`verify_file_controlled`], with `sample: Some(seed)` reading only [`sampled_batches`] of
-/// the outer blocks and of the `playgo-chunk.crc` table (every structural check still runs);
-/// for a caller that checks the package's files itself.
-pub fn verify_file_sampled(
     mut file: PkgFile,
     passcode: &str,
-    progress: &mut dyn FnMut(u64, u64),
+    seed: Option<u64>,
     cancel: Option<&AtomicBool>,
-    sample: Option<u64>,
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Report> {
     let stop = || -> Result<()> {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        if cancel.is_some_and(crate::workshop::checkpoint) {
             return Err(crate::Error::Cancelled);
         }
         Ok(())
@@ -581,30 +570,46 @@ pub fn verify_file_sampled(
     // The sweep: every data block must reach the digest `imagedigs` carries — by decryption in
     // the native mode, as stored in the plaintext one.
     // Read a batch at a time and checked on every core.
-    let batches = count.div_ceil(SWEEP_BATCH);
-    let swept: Vec<u64> = match sample {
-        Some(seed) => sampled_batches(batches, seed),
-        None => (0..batches).collect(),
-    };
-    let sweep_blocks: u64 = swept
+    let mut bad = 0u64;
+    let mut done = 0u64;
+    // The game's data comes first; everything past it is the format's own (the layout
+    // descriptor, the superblock, every table and directory) and is always swept. Only the
+    // data is sampled; no pfs_image.dat found means every block is swept.
+    let uroot_bytes = read_block(&mut file, nodes[2].direct[0].block as u64)?;
+    let uroot = outer::OuterImage::parse_dirents(&uroot_bytes, nodes[2].size);
+    let data = uroot
         .iter()
-        .map(|b| (count - b * SWEEP_BATCH).min(SWEEP_BATCH))
-        .sum();
-    let (mut bad, mut done) = (0u64, 0u64);
-    for &b in &swept {
-        stop()?;
-        let first = b * SWEEP_BATCH;
-        let n = (count - first).min(SWEEP_BATCH);
-        let raw = file.read_at(fih.pfs_offset + first * BLOCK, (n * BLOCK) as usize)?;
-        bad += failing_blocks(&raw, first, sb_index, xts.as_ref(), &digests);
-        done += n;
-        progress(done * BLOCK, sweep_blocks * BLOCK);
-    }
-    progress(done * BLOCK, sweep_blocks * BLOCK);
-    let scope = match sample {
-        Some(seed) => format!(" (a sample of {done}, seed {seed})"),
-        None => String::new(),
+        .find(|d| d.name == "pfs_image.dat")
+        .and_then(|d| nodes.get(d.ino as usize))
+        .map_or(0, |n| (n.blocks as u64).min(count));
+    const BATCH: u64 = crate::sample::SLICE / BLOCK;
+    let batches = seed.map(|seed| crate::sample::pick(data.div_ceil(BATCH), seed, 128));
+    let span = |b: u64| b * BATCH..((b + 1) * BATCH).min(data);
+    let sweep = batches.as_ref().map_or(count, |v| {
+        v.iter().map(|b| span(*b).end - span(*b).start).sum::<u64>() + (count - data)
+    });
+    let runs: Vec<std::ops::Range<u64>> = match batches {
+        None => std::iter::once(0..count).collect(),
+        Some(v) => v
+            .into_iter()
+            .map(span)
+            .chain(std::iter::once(data..count))
+            .collect(),
     };
+    for run in runs {
+        let mut at = run.start;
+        while at < run.end {
+            stop()?;
+            let n = (run.end - at).min(SWEEP_BATCH);
+            let raw = file.read_at(fih.pfs_offset + at * BLOCK, (n * BLOCK) as usize)?;
+            bad += failing_blocks(&raw, at, sb_index, xts.as_ref(), &digests);
+            at += n;
+            done += n;
+            progress(done * BLOCK, sweep * BLOCK);
+        }
+    }
+    stop()?;
+    progress(done * BLOCK, sweep * BLOCK);
     r.push(
         if plaintext_mode {
             "outer blocks match their imagedigs entry"
@@ -612,12 +617,16 @@ pub fn verify_file_sampled(
             "outer blocks decrypt to their imagedigs entry"
         },
         bad == 0,
-        format!("{bad} of {count} failed{scope}"),
+        match seed {
+            None => format!("{} of {count} failed", bad),
+            Some(seed) => format!(
+                "{bad} of {sweep} sampled failed ({count} blocks, seed {seed}, policy {})",
+                crate::sample::POLICY
+            ),
+        },
     );
 
-    // The uroot dirents and the flat-path table, read on demand like everything else.
-    let uroot_bytes = read_block(&mut file, nodes[2].direct[0].block as u64)?;
-    let uroot = outer::OuterImage::parse_dirents(&uroot_bytes, nodes[2].size);
+    // The uroot dirents (read above) and the flat-path table.
     let names: Vec<String> = uroot.iter().map(|d| d.name.clone()).collect();
     r.push(
         "outer uroot holds pfs_image.dat and naps_pkg_layout.dat",
@@ -657,37 +666,15 @@ pub fn verify_file_sampled(
             match s.members.iter().find(|m| m.name == crc_name) {
                 Some(m) => {
                     let stored = file.read_at(m.offset, m.size as usize)?;
-                    let (ok, detail) = match sample {
+                    // Sampled with the sweep: the whole table would read the package again.
+                    let ok = match seed {
                         None => {
-                            let expected =
-                                si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?;
-                            (stored == expected, format!("{} bytes", m.size))
+                            stored
+                                == si::chunk_crc_table_controlled(&mut file, s.zip_start, cancel)?
                         }
-                        Some(seed) => {
-                            let batches = s.zip_start.div_ceil(si::CRC_BATCH * BLOCK);
-                            let picked = sampled_batches(batches, seed);
-                            let mut ok = stored.len() as u64 == s.zip_start.div_ceil(BLOCK) * 4;
-                            for &b in &picked {
-                                if !ok {
-                                    break;
-                                }
-                                stop()?;
-                                let start = b * si::CRC_BATCH * BLOCK;
-                                let len = (s.zip_start - start).min(si::CRC_BATCH * BLOCK);
-                                let at = (b * si::CRC_BATCH * 4) as usize;
-                                let crcs = si::batch_crcs(&mut file, start, len)?;
-                                ok = crcs.iter().enumerate().all(|(k, c)| {
-                                    stored.get(at + k * 4..at + k * 4 + 4) == Some(&c.to_le_bytes())
-                                });
-                            }
-                            let n = picked.len();
-                            (
-                                ok,
-                                format!("{} bytes, {n} of {batches} batches sampled", m.size),
-                            )
-                        }
+                        Some(seed) => si::chunk_crc_sampled(&mut file, s.zip_start, &stored, seed)?,
                     };
-                    r.push("si playgo-chunk.crc", ok, detail);
+                    r.push("si playgo-chunk.crc", ok, format!("{} bytes", m.size));
                 }
                 None => r.push("si playgo-chunk.crc", false, format!("{crc_name} missing")),
             }
@@ -695,30 +682,4 @@ pub fn verify_file_sampled(
         None => r.push("si zip present", false, "no trailing STORED ZIP"),
     }
     Ok(r)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sampled_batches;
-
-    #[test]
-    fn a_sample_holds_the_ends_and_one_percent() {
-        assert_eq!(sampled_batches(1, 7), [0]);
-        assert_eq!(sampled_batches(2, 7), [0, 1]);
-        assert_eq!(sampled_batches(3, 7), [0, 1, 2]);
-        let picked = sampled_batches(10_000, 42);
-        assert_eq!(
-            picked,
-            sampled_batches(10_000, 42),
-            "the same for the same seed"
-        );
-        assert_ne!(picked, sampled_batches(10_000, 43));
-        assert!(picked.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!((picked[0], *picked.last().unwrap()), (0, 9_999));
-        assert!((90..=102).contains(&picked.len()), "{}", picked.len());
-        assert!(
-            (0..64).all(|seed| sampled_batches(1_000_000, seed).len() <= 128),
-            "at most 128 batches, 1 GiB"
-        );
-    }
 }

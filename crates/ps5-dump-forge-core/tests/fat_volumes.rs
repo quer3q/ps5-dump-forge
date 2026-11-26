@@ -1,12 +1,6 @@
-//! Every target written onto real exFAT and FAT32 volumes (macOS `hdiutil`, no root needed).
-//! macOS's exFAT and FAT drivers give a new, empty file a placeholder inode and renumber it
-//! at its first write, which once made every image job refuse to publish its own `.part`;
-//! macOS's exFAT driver also has no `RENAME_EXCL`, so every publish there takes the checked
-//! rename.
-//!
-//! Ignored by default (it attaches disk images); CI's macOS leg runs it:
-//! `cargo test --release -p ps5-dump-forge-core --test fat_volumes -- --ignored`.
-//! When run, a setup or teardown failure fails the test rather than skipping it.
+//! Every target written onto real exFAT and FAT32 volumes (macOS `hdiutil`): their drivers
+//! renumber a new file's placeholder inode at its first write, and exFAT has no `RENAME_EXCL`.
+//! Ignored by default; CI's macOS leg runs it with `--ignored`. Setup failures fail the test.
 #![cfg(target_os = "macos")]
 
 use std::ffi::CString;
@@ -24,8 +18,7 @@ use ps5_dump_forge_core::{
     rename_no_replace, stale_parts,
 };
 
-/// An `hdiutil` volume attached at `base/mnt`. [`Volume::detach`] is the checked teardown;
-/// drop is the best-effort one for a failing test.
+/// An `hdiutil` volume attached at `base/mnt`; [`Volume::detach`] is the checked teardown.
 struct Volume {
     base: PathBuf,
     mnt: PathBuf,
@@ -79,8 +72,7 @@ impl Volume {
         vol
     }
 
-    /// Detaches the disk (retrying with `-force`), then deletes `base`. Never deletes
-    /// through a disk it could not detach.
+    /// Detaches the disk (retrying with `-force`), then deletes `base` (never through it).
     fn detach(&mut self) -> Result<(), String> {
         if let Some(device) = &self.device {
             let detach = |force: bool| {
@@ -238,12 +230,15 @@ fn request(source: &Path, format: Format, output: &Path) -> ConvertRequest {
         zstd_unpack: false,
         lz4_level: 0,
         lz4_runtime: Default::default(),
+        replace_ampr_emu: true,
         edits: Vec::new(),
         extract: Vec::new(),
         transfer: Vec::new(),
         replace: false,
         edit_rebuild: false,
         install: None,
+        recover_metadata: None,
+        restore_metadata: false,
         delete_source: false,
         pack_profile: None,
         archive_password: None,
@@ -258,8 +253,8 @@ enum Msg {
     Done(Result<JobReport, String>),
 }
 
-/// Runs one job to completion. With `pause`, the job is held at that stage's first progress
-/// while the closure runs (it may cancel the job), then released.
+/// Runs one job to completion; with `pause`, held at that stage's first progress while the
+/// closure runs.
 fn run(req: ConvertRequest, pause: Option<(&'static str, &AtPause)>) -> Result<JobReport, String> {
     const WAIT: Duration = Duration::from_secs(300);
     let (tx, rx) = mpsc::channel();
@@ -329,8 +324,7 @@ fn assert_clean(dir: &Path, what: &str) {
     }
 }
 
-/// The publish rename on this volume, called directly: an existing name, in any case, is
-/// never replaced, and a free one is taken.
+/// The publish rename on this volume, called directly: an existing name, in any case, is kept.
 fn renames_never_replace(mnt: &Path) {
     let root = mnt.join("rename");
     std::fs::create_dir(&root).unwrap();
@@ -365,8 +359,8 @@ fn renames_never_replace(mnt: &Path) {
     assert_clean(&root, "direct renames");
 }
 
-/// Something appears at the output (`taken`, created in `dir`) while the job holds at
-/// `finalize`: the publish fails, that entry is untouched and the job's part is gone.
+/// Something appears at the output while the job holds at `finalize`: the publish fails, the
+/// entry is untouched and the part is gone.
 fn output_taken_at_publish(
     src: &Path,
     format: Format,
@@ -418,8 +412,7 @@ fn every_target_publishes_on(name: &str, fs: &str, volname: &str, fstype: &str) 
     let mnt = vol.mnt.clone();
     renames_never_replace(&mnt);
 
-    // Cancelled once its bytes are written and fsynced: the part and its sidecar go,
-    // nothing is published.
+    // Cancelled once its bytes are written and fsynced: nothing is published.
     for (format, ext) in [
         (Format::Exfat, "exfat"),
         (Format::Ffpfsc, "ffpfsc"),
@@ -436,8 +429,7 @@ fn every_target_publishes_on(name: &str, fs: &str, volname: &str, fstype: &str) 
         assert_clean(&mnt, &format!("cancelled {ext}"));
     }
 
-    // Each image, then each image back to a folder. The part carries an xattr into the
-    // publish: its sidecar must follow it to the output name.
+    // Each image, then back to a folder; the part's xattr sidecar must follow it to the output.
     let publish = |req: ConvertRequest, what: &str| {
         let out = req.output.clone();
         let mark = |_: &Jobs, _: JobId| {
@@ -483,9 +475,8 @@ fn every_target_publishes_on(name: &str, fs: &str, volname: &str, fstype: &str) 
         assert!(back.join("data/empty").is_dir());
     }
 
-    // The output name taken while the job holds at `finalize`: same name, another case and
-    // a directory. The kernel's lookup refuses each before the driver's rename (exFAT too);
-    // finalize.rs's unit tests cover the checked rename's own check.
+    // The output name taken while the job holds at `finalize`: same name, another case and a
+    // directory (finalize.rs's unit tests cover the checked rename itself).
     let image = mnt.join("PPSA01234.exfat");
     let taken = mnt.join("taken");
     std::fs::create_dir(&taken).unwrap();

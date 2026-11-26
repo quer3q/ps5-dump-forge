@@ -9,7 +9,7 @@ use ps5upload_fpkg::source::SourceTree;
 
 #[test]
 fn a_kraken_package_reads_back_as_its_manifest() {
-    let built = build("kraken", 0, |_| {});
+    let built = build("kraken", |_| {});
     let mut source = FpkgSource::open(&built.path, None).unwrap();
     assert_matches(&mut source, &built);
     // The artwork the builder moved into the container is served from there.
@@ -33,7 +33,7 @@ fn a_kraken_package_reads_back_as_its_manifest() {
 
 #[test]
 fn a_native_package_needs_its_passcode() {
-    let built = build("native", 0, |r| {
+    let built = build("native", |r| {
         r.image_mode = ImageMode::Native;
         r.seed = Some([0x5A; 16]);
     });

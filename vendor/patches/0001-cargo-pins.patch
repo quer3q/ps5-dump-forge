@@ -1,5 +1,5 @@
 diff --git a/ps5upload-fpkg/Cargo.toml b/ps5upload-fpkg/Cargo.toml
-index 9b5c803..92cf9a4 100644
+index 0a73b92815164d278ce120276db060a8ebe51c36..74be07902578ad32923ec4a7c540e9e363859cec 100644
 --- a/ps5upload-fpkg/Cargo.toml
 +++ b/ps5upload-fpkg/Cargo.toml
 @@ -1,8 +1,8 @@
@@ -10,21 +10,153 @@ index 9b5c803..92cf9a4 100644
 -version.workspace = true
 +edition = "2021" # upstream ps5upload is 2021; kept to minimise the vendor diff
 +license = "GPL-3.0-or-later"
-+version = "7.0.22" # pinned upstream tag v7.0.22
++version = "12.6.30" # pinned upstream tag v12.6.30
  
  [dependencies]
- # Cross-platform OS randomness for the outer PFS seed. Opening /dev/urandom
-@@ -12,7 +12,7 @@ aes = "0.9"
- flate2 = "1"
+ unicode-normalization = "0.1"
+@@ -10,14 +10,12 @@ unicode-normalization = "0.1"
+ # directly meant Windows silently fell back to the clock. Already in the tree.
+ getrandom = "0.4"
+ aes = "0.9"
+-# zlib-rs on purpose: the `.ffpfsc` wrap route writes plain zlib streams the PS5 kernel
+-# decodes, and only zlib's encoder never emits the code-length run spanning the literal
+-# and distance tables that the kernel misreads (ffpfsc_compat). The engine build got
+-# this backend transitively through `zip`; a build of this crate alone would not.
+-flate2 = { version = "1", features = ["zlib-rs"] }
+-# Smallest .ffpfsc: libdeflate's near-optimal parser (level 12) on blocks zlib 9 shrank. Plain
+-# C built by `cc`, like the vendored unrar, on every release target.
+-libdeflater = "1.26"
++# Forge: upstream turns on flate2's `zlib-rs` here for its own `.ffpfsc` writer, which Forge
++# doesn't use. Features unify, so it would also move Forge's own `.ffpfsc` writer off
++# miniz_oxide; left off.
++flate2 = "1"
++# Forge: no `libdeflater` (upstream's `.ffpfsc` writer's encoder): libdeflate's C doesn't build
++# for the PS5 payload, whose SDK clang lacks the AVX-VNNI and VPCLMULQDQ intrinsics it uses.
  crc32fast = "1"
  # Raw LZ4 blocks for AMPR asset packs (already in the tree through smb2).
--lz4_flex = { version = "0.13", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
-+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] } # Forge's version (upstream 0.13): one copy in the lock
- # AMPR pack profiles (drakmor's TOML format).
- toml = "1"
- hmac = "0.13"
+ lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+@@ -35,5 +33,5 @@ sha3 = "0.12"
+ thiserror.workspace = true
+ 
+ [dev-dependencies]
+-# The exfat_read_bench example hashes files the way an image build's verify stage does.
++# fself.rs pins its signed output by BLAKE3 in a test.
+ blake3.workspace = true
+diff --git a/ps5upload-fpkg/examples/exfat_read_bench.rs b/ps5upload-fpkg/examples/exfat_read_bench.rs
+deleted file mode 100644
+index ddae5abaca9be43bca58c724a71dd20e653412f0..0000000000000000000000000000000000000000
+--- a/ps5upload-fpkg/examples/exfat_read_bench.rs
++++ /dev/null
+@@ -1,68 +0,0 @@
+-//! Times reading every file of an exFAT image back through the reader and hashing it, the way
+-//! an image build's verify stage does, once per chunk size.
+-//!
+-//! cargo run --release -p ps5upload-fpkg --example exfat_read_bench -- <image.exfat> [chunk KiB...]
+-//!
+-//! `EXFAT_BENCH_MAX_BYTES` caps how much of the image each pass reads.
+-
+-use ps5upload_fpkg::exfat::ExFatSource;
+-use ps5upload_fpkg::source::SourceTree;
+-use std::time::Instant;
+-
+-fn main() {
+-    let mut args = std::env::args().skip(1);
+-    let Some(path) = args.next() else {
+-        eprintln!("usage: exfat_read_bench <image.exfat> [chunk KiB...]");
+-        std::process::exit(2);
+-    };
+-    let mut chunks: Vec<u64> = args.map(|a| a.parse::<u64>().unwrap() << 10).collect();
+-    if chunks.is_empty() {
+-        chunks = vec![64 << 10, 1 << 20, 8 << 20, 32 << 20];
+-    }
+-    let cap: u64 = std::env::var("EXFAT_BENCH_MAX_BYTES")
+-        .ok()
+-        .and_then(|v| v.parse().ok())
+-        .unwrap_or(u64::MAX);
+-    let mode = std::env::var("EXFAT_BENCH_HASH").unwrap_or_else(|_| "single".into());
+-    for chunk in chunks {
+-        let mut tree = ExFatSource::open(std::path::Path::new(&path)).expect("open");
+-        let files = tree.files().to_vec();
+-        let start = Instant::now();
+-        let mut total = 0u64;
+-        let mut n = 0usize;
+-        'outer: for f in &files {
+-            let mut h = blake3::Hasher::new();
+-            let mut at = 0u64;
+-            while at < f.size {
+-                if total >= cap {
+-                    break 'outer;
+-                }
+-                let want = (f.size - at).min(chunk) as usize;
+-                let buf = tree.read_range(&f.path, at, want).expect("read");
+-                assert!(!buf.is_empty());
+-                match mode.as_str() {
+-                    "none" => {}
+-                    "rayon" => {
+-                        h.update_rayon(&buf);
+-                    }
+-                    _ => {
+-                        h.update(&buf);
+-                    }
+-                }
+-                at += buf.len() as u64;
+-                total += buf.len() as u64;
+-            }
+-            h.finalize();
+-            n += 1;
+-        }
+-        let secs = start.elapsed().as_secs_f64();
+-        println!(
+-            "hash {mode:<6} chunk {:>6} KiB: {} files, {:.2} GiB in {:.2} s = {:.0} MiB/s",
+-            chunk >> 10,
+-            n,
+-            total as f64 / (1u64 << 30) as f64,
+-            secs,
+-            total as f64 / (1u64 << 20) as f64 / secs
+-        );
+-    }
+-}
+diff --git a/ps5upload-fpkg/src/ffpfsc_block.rs b/ps5upload-fpkg/src/ffpfsc_block.rs
+index 2006c60c531509478fb2b543c2e1e95b0bfb0cb3..ccfc80f2895c6ff9cf5565a8d17ca23de74fd9b8 100644
+--- a/ps5upload-fpkg/src/ffpfsc_block.rs
++++ b/ps5upload-fpkg/src/ffpfsc_block.rs
+@@ -26,7 +26,6 @@
+ use std::io;
+ 
+ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+-use libdeflater::{CompressionLvl, Compressor};
+ 
+ use crate::ffpfsc_compat::console_safe;
+ 
+@@ -169,10 +168,23 @@ enum Pick {
+     Fallback,
+ }
+ 
++/// Forge: the encoder is flate2's, not libdeflate's (no `libdeflater`: its C doesn't build for
++/// the PS5 payload; Forge doesn't use this writer). Levels above 9 are taken as 9.
++struct Compressor(Compress);
++
++impl Compressor {
++    /// The whole of `input` as one zlib stream in `out`, or `Err` when it doesn't fit.
++    fn zlib_compress(&mut self, input: &[u8], out: &mut [u8]) -> Result<usize, ()> {
++        self.0.reset();
++        match self.0.compress(input, out, FlushCompress::Finish) {
++            Ok(Status::StreamEnd) => Ok(self.0.total_out() as usize),
++            _ => Err(()),
++        }
++    }
++}
++
+ fn compressor(level: u32) -> Compressor {
+-    // `check` keeps the level in libdeflate's range.
+-    let level = CompressionLvl::new(level as i32).unwrap_or_default();
+-    Compressor::new(level)
++    Compressor(Compress::new(Compression::new(level.min(9)), true))
+ }
+ 
+ impl BlockEncoder {
 diff --git a/ps5upload-pkg/Cargo.toml b/ps5upload-pkg/Cargo.toml
-index b09ceda..80f2678 100644
+index b09ceda0fea77472e1a178bf0185c04e805cd2d6..31f1336b592bc6023db5eb2a40b89440e4a34126 100644
 --- a/ps5upload-pkg/Cargo.toml
 +++ b/ps5upload-pkg/Cargo.toml
 @@ -1,8 +1,8 @@
@@ -35,7 +167,7 @@ index b09ceda..80f2678 100644
 -version.workspace = true
 +edition = "2021" # upstream ps5upload is 2021; kept to minimise the vendor diff
 +license = "GPL-3.0-or-later"
-+version = "7.0.22" # pinned upstream tag v7.0.22
++version = "12.6.30" # pinned upstream tag v12.6.30
  
  [dependencies]
  # PS3 NPDRM packages: SHA-1 keystream (debug) and AES-128 counter mode (retail).

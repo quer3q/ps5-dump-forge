@@ -1,20 +1,11 @@
-//! `.ffpfsc`: an inner image (`.exfat`, `.ffpkg` or `.ffpfs`) as a zlib PFSC container, the one
-//! file of a minimal PFS, built as the inner writer writes it, with no staged image.
+//! `.ffpfsc`: an inner image as a zlib PFSC container, the one file of a minimal PFS, built as the
+//! inner writer writes it into a [`Stream`]. The stream hands 64 KiB blocks to workers and writes
+//! replies in order, waiting on the oldest past `threads * 4`; every error comes back to the
+//! calling thread, which joins every worker.
 //!
-//! The inner writer writes into a [`Stream`] on the calling thread. The stream cuts 64 KiB
-//! blocks and hands each, with a one-shot reply channel, to worker threads over a bounded
-//! channel; it keeps the replies in submission order and, once `threads * 4` are pending,
-//! waits on the oldest and writes it to the output itself. So memory is bounded by that depth,
-//! nothing reorders, and an error anywhere (a worker's, the output's, the inner writer's)
-//! comes back to the calling thread, which joins every worker before it returns.
-//!
-//! In the output, by byte: blocks 0..6 are the PFS (header, inodes, super-root, path table,
-//! reserved, `uroot`), written last; at block 6 the PFSC header and its table of `n + 1`
-//! block offsets at `0x400`, written once the stream is done; the stored blocks from `data_at`
-//! (64 KiB, grown by whole blocks when the table outgrows `0x400..0x10000`). A block is kept
-//! compressed when that saves [`WrapOptions::min_block_gain`] percent and is shorter than 64 KiB
-//! (a reader tells the two apart by length alone), else stored raw. The container is kept even
-//! if it does not shrink: a stream cannot be re-read to store the image raw instead.
+//! Output: blocks 0..6 the PFS (written last); at block 6 the PFSC header and its `n + 1` offsets
+//! at `0x400`; the stored blocks from `data_at`. A block is kept compressed only when shorter than
+//! 64 KiB (readers tell the two apart by length) and saving [`WrapOptions::min_block_gain`].
 
 use std::collections::VecDeque;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
@@ -29,31 +20,26 @@ use ps5upload_fpkg::{Error, Result};
 use crate::image::{self, Sink};
 use crate::{BLOCK, check_cancel, err, now};
 
-/// Where the inner image's container starts: after header, inodes, super-root, path table,
-/// the reserved block and `uroot`.
+/// After header, inodes, super-root, path table, the reserved block and `uroot`.
 const FILE_BLOCK: u64 = 6;
 pub(crate) const PFSC_MAGIC: u32 = 0x4353_4650;
 const PFSC_VERSION_WORD: u32 = 6;
 pub(crate) const PFSC_HEADER_LEN: usize = 0x30;
 pub(crate) const PFSC_TABLE_AT: u64 = 0x400;
-/// Replies pending per worker before the stream waits on the oldest.
 const DEPTH_PER_WORKER: usize = 4;
 
-/// The app's default zlib level (see [`WrapOptions::level`]), zlib's own. On a 13 GB game
-/// (14 cores) level 6 took 16.3 s for 76.25% stored; 7: 17.3 s, 76.23%; 9: 20.4 s, 76.21%;
-/// 5: 13.7 s, 76.33%; 1: 5.7 s, 78.57%.
+/// zlib's own default. A 13 GB game (14 cores): 6 16.3 s 76.25%; 9 20.4 s 76.21%; 1 5.7 s 78.57%.
 pub const DEFAULT_LEVEL: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct WrapOptions {
-    /// zlib level, 0–9 as zlib numbers them: 0 stores every block raw, 1 is fastest, 9 the
-    /// smallest. Every level writes the same kind of zlib stream; only the size and time differ.
+    /// zlib level 0–9: 0 stores every block raw.
     pub level: u32,
     /// Percent a block must shrink by to be stored compressed (at most 90).
     pub min_block_gain: u8,
     /// Worker threads; 0 uses every core.
     pub threads: usize,
-    /// The PFS timestamp (seconds since 1970); `None` is now.
+    /// Seconds since 1970; `None` is now.
     pub time: Option<i64>,
 }
 
@@ -68,22 +54,17 @@ impl Default for WrapOptions {
     }
 }
 
-/// What was written.
 #[derive(Debug, Clone)]
 pub struct WrapReport {
     pub image_size: u64,
-    /// The inner image's length.
     pub raw_size: u64,
     /// The container's length (header, table, stored blocks).
     pub stored_size: u64,
-    /// 64 KiB blocks of the inner image.
     pub blocks: u64,
-    /// Of those, the ones stored compressed.
     pub compressed_blocks: u64,
 }
 
-/// Bytes between the container's start and its first block: 64 KiB, grown by whole blocks
-/// when the offset table outgrows `0x400..0x10000`.
+/// The container's start to its first block: 64 KiB, grown by whole blocks for a large table.
 fn data_at(raw_size: u64) -> Result<u64> {
     let table = raw_size
         .div_ceil(BLOCK)
@@ -95,8 +76,7 @@ fn data_at(raw_size: u64) -> Result<u64> {
     BLOCK.checked_add(extra).ok_or_else(too_big)
 }
 
-/// The largest `.ffpfsc` an inner image of `raw_size` bytes can make (every block stored
-/// raw), for preflight.
+/// The largest `.ffpfsc` (every block raw), for preflight.
 pub fn container_size_max(raw_size: u64) -> Result<u64> {
     let blocks = raw_size.div_ceil(BLOCK);
     (FILE_BLOCK * BLOCK)
@@ -105,21 +85,29 @@ pub fn container_size_max(raw_size: u64) -> Result<u64> {
         .ok_or_else(too_big)
 }
 
-/// One block as it is stored: padded to 64 KiB, then zlib when that saves `min_gain` percent.
+/// One block as stored: padded to 64 KiB, then zlib when that saves `min_gain` percent.
 fn encode_block(raw: &[u8], level: u32, min_gain: u8) -> io::Result<Vec<u8>> {
     let mut padded = raw.to_vec();
     padded.resize(BLOCK as usize, 0);
-    // Level 0 stores: its zlib stream is always longer than the block, so the block stays raw.
+    // Level 0's stream is always longer than the block, so it stays raw.
     if level == 0 || (min_gain >= 5 && level > 1 && incompressible(&padded)?) {
         return Ok(padded);
     }
     let z = zlib(&padded, level)?;
     let limit = BLOCK as usize * (100 - usize::from(min_gain)) / 100;
-    Ok(if z.len() < BLOCK as usize && z.len() <= limit {
+    // FW 13.60 misreads a code-length repeat run crossing into the distance lengths (~0.5% of
+    // miniz_oxide blocks): stored raw.
+    let safe = || ps5upload_fpkg::ffpfsc_compat::console_safe(&z);
+    Ok(if z.len() < BLOCK as usize && z.len() <= limit && safe() {
         z
     } else {
         padded
     })
+}
+
+/// The bytes one block (`raw`, at most 64 KiB) takes at `level` with the default gain; for estimates.
+pub fn block_stored_len(raw: &[u8], level: u32) -> io::Result<usize> {
+    encode_block(raw, level, WrapOptions::default().min_block_gain).map(|b| b.len())
 }
 
 fn zlib(block: &[u8], level: u32) -> io::Result<Vec<u8>> {
@@ -128,11 +116,8 @@ fn zlib(block: &[u8], level: u32) -> io::Result<Vec<u8>> {
     enc.finish()
 }
 
-/// Whether a block is not worth the level's full search: its bytes are spread almost evenly
-/// (over 7.9 bits each) and level 1 saves under 2%. Measured on ~24,000 blocks of three games
-/// (compressed game data, a Kraken package, an executable), it changed no keep/raw decision
-/// at levels 7 and 10 and saved 4–66% of the compression time, by how much data was
-/// already compressed. A block it misjudges is only stored raw, still valid.
+/// A block not worth the full search: over 7.9 bits of entropy per byte and level 1 saves under
+/// 2%. On ~24,000 blocks it changed no keep/raw decision and saved 4–66% of the time.
 // ponytail: thresholds from that sample; widen the corpus if a game ever compresses worse
 fn incompressible(block: &[u8]) -> io::Result<bool> {
     let mut counts = [0u32; 256];
@@ -151,10 +136,8 @@ fn incompressible(block: &[u8]) -> io::Result<bool> {
     Ok(bits > 7.9 && zlib(block, 1)?.len() * 100 > block.len() * 98)
 }
 
-/// Build a `.ffpfsc` holding `inner_name` (whose name tells SMP the filesystem) into `out`, an
-/// empty file (or a wrapper around one) the caller owns, fsyncs and renames. Every byte of the
-/// output is written through `out`, zeros included. `fill` writes the inner image into the
-/// [`Stream`]: exactly `raw_size` bytes, forward only. Returns what `fill` returned.
+/// Build a `.ffpfsc` holding `inner_name` into an empty `out`, every byte (zeros too) written
+/// through it. `fill` writes exactly `raw_size` bytes of the inner image into the [`Stream`].
 pub fn wrap<T, W: Write + Seek>(
     inner_name: &str,
     raw_size: u64,
@@ -192,7 +175,7 @@ fn wrap_with<T, W: Write + Seek>(
         return Err(err("the image inside a .ffpfsc cannot be empty"));
     }
     let time = opts.time.unwrap_or_else(now);
-    // The worst case must fit the PFS's 32-bit pointers before anything is written.
+    // The worst case must fit the PFS's 32-bit pointers.
     let data_at = data_at(raw_size)?;
     let max = container_size_max(raw_size)? - FILE_BLOCK * BLOCK;
     image::single(inner_name, raw_size, max, time)?;
@@ -210,7 +193,7 @@ fn wrap_with<T, W: Write + Seek>(
 
     let (filled, panicked) = std::thread::scope(|s| {
         let (work, queue) = mpsc::sync_channel::<Job>(limit);
-        // Only the workers hold the queue: once they are all gone, a submit fails at once.
+        // Only the workers hold the queue: once all are gone, a submit fails at once.
         let queue = Arc::new(Mutex::new(queue));
         let workers: Vec<_> = (0..threads)
             .map(|_| {
@@ -232,7 +215,6 @@ fn wrap_with<T, W: Write + Seek>(
             cancel,
         };
         let filled = fill(&mut stream).and_then(|t| Ok((t, stream.finish()?)));
-        // Closes the queue: idle workers see it and exit.
         drop(stream);
         let mut panicked = None;
         for w in workers {
@@ -258,7 +240,6 @@ fn wrap_with<T, W: Write + Seek>(
     };
     check_cancel(cancel)?;
 
-    // The container's header and table, then the PFS around it.
     let blocks = raw_size.div_ceil(BLOCK);
     let stored = offsets.last().copied().unwrap_or(data_at);
     out.seek(SeekFrom::Start(base))?;
@@ -280,8 +261,7 @@ fn wrap_with<T, W: Write + Seek>(
     sink.w.flush()?;
     drop(sink);
     let image_size = img.ndblock * BLOCK;
-    // The zero tail of the container's last block, written rather than `set_len`, so an output
-    // that bounds its unsynced data sees every byte.
+    // Written rather than `set_len`, so an output that bounds its unsynced data sees every byte.
     let end = base + stored;
     if end > image_size {
         return Err(err(format!(
@@ -318,11 +298,9 @@ fn pfsc_header(blocks: u64, data_at: u64) -> [u8; PFSC_HEADER_LEN] {
     h
 }
 
-/// A raw block and where its stored form goes.
 type Job = (Vec<u8>, Sender<io::Result<Vec<u8>>>);
 
-/// Takes blocks until the queue closes. A panic drops the reply sender, which the stream
-/// sees as a failed worker; the queue lock is never held across the encode.
+/// Takes blocks until the queue closes; a panic drops the reply sender (a failed worker).
 fn worker(queue: &Mutex<Receiver<Job>>, encode: &Encode) {
     loop {
         let next = match queue.lock() {
@@ -332,26 +310,19 @@ fn worker(queue: &Mutex<Receiver<Job>>, encode: &Encode) {
         let Ok((raw, reply)) = next else {
             return;
         };
-        // The stream may be gone already (an error elsewhere); nothing to tell it then.
         let _ = reply.send(encode(&raw));
     }
 }
 
-/// The inner image as it is written: forward-only `Write + Seek` on the calling thread.
-/// Seeking forward writes zeros (cancellable per block); `End(0)` is the current position;
-/// going back is an error.
+/// The inner image: forward-only `Write + Seek` (seeking forward writes zeros, back is an error).
 pub struct Stream<'a> {
     out: BufWriter<&'a mut dyn Write>,
     work: SyncSender<Job>,
-    /// Replies in submission order.
     pending: VecDeque<Receiver<io::Result<Vec<u8>>>>,
     limit: usize,
     raw_size: u64,
-    /// Inner-image bytes taken.
     pos: u64,
-    /// The block being cut.
     block: Vec<u8>,
-    /// Every block's start in the container, then the end.
     /// ponytail: 8 bytes per 64 KiB in memory (19 MB for a 150 GB image); spill to the output
     /// past that.
     offsets: Vec<u64>,
@@ -393,8 +364,7 @@ impl Stream<'_> {
         Ok(())
     }
 
-    /// Hands the cut block to the workers, first writing the oldest reply if the queue is at
-    /// its depth. The work channel holds at most what is pending, so the send never blocks.
+    /// Hands the cut block on, first writing the oldest reply at full depth (the send never blocks).
     fn submit(&mut self) -> io::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(io::Error::other("the .ffpfsc build was cancelled"));
@@ -430,8 +400,7 @@ impl Stream<'_> {
         Ok(())
     }
 
-    /// The last (padded) block, every pending reply, then the offsets and the count of
-    /// compressed blocks.
+    /// The last block and every pending reply; the offsets and compressed count.
     fn finish(&mut self) -> Result<(Vec<u64>, u64)> {
         if self.pos != self.raw_size {
             return Err(err(format!(
@@ -456,7 +425,6 @@ impl Write for Stream<'_> {
         Ok(buf.len())
     }
 
-    /// Blocks are written as their replies come; `wrap` drains the rest.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -500,8 +468,7 @@ mod tests {
         d
     }
 
-    /// Runs `f` on its own thread and fails the test if it does not return in time: every
-    /// failure path must join its workers and come back, never hang.
+    /// Fails if `f` hangs: every failure path must join its workers and return.
     fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -519,7 +486,6 @@ mod tests {
         }
     }
 
-    /// Writes `n` bytes of compressible data in odd-sized pieces.
     fn feed(s: &mut Stream<'_>, n: u64) -> Result<()> {
         let piece: Vec<u8> = (0..10_007u32).map(|i| (i % 7) as u8).collect();
         let mut left = n;
@@ -535,8 +501,7 @@ mod tests {
         encode_block(raw, 6, 5)
     }
 
-    /// Every level from 1 writes a block zlib reads back exactly; 0 keeps it raw. 10 is
-    /// refused before anything is written.
+    /// Levels 1..=9 round-trip through zlib, 0 stays raw, 10 is refused.
     #[test]
     fn every_level_round_trips() {
         let raw: Vec<u8> = (0..BLOCK as u32)

@@ -1,14 +1,10 @@
-// The http build's client for `ps5-dump-forge serve` (contract: ps5/README.md, "Web server"): plain
-// JSON over HTTP, and one poller over `GET /api/jobs` that turns snapshots into the app's job
-// events. Type imports only, so a plain `node` can drive it (scripts/check-poller.mjs,
-// scripts/smoke.mjs).
+// The http build's client for `ps5-dump-forge serve` (ps5/README.md): JSON over HTTP and one poller over `GET /api/jobs`. Type imports only, so plain `node` can drive it (scripts/check-poller.mjs).
 
 import type { DoneEvent, JobsRestore, LogEvent, ProgressEvent, SnapshotJob, StagesEvent } from "./api";
 import type { EventName, Unlisten } from "./transport";
 import type { UpdateTimeout } from "./update";
 
 export interface Status {
-  /** The last request failed at the network level; polling goes on with backoff. */
   offline: boolean;
 }
 
@@ -24,9 +20,7 @@ const POLL_TIMEOUT_MS = 15000;
 
 // ---------- the client's own messages ----------
 
-/** What the client itself says, by code. The page installs the words (`setClientText`, from
- * main-http.tsx, in the UI's language); until then the code is the text, which is what a plain
- * `node` check sees. */
+/** What the client itself says, by code; the page installs the words (`setClientText`), until then the code is the text. */
 export type ClientText = "unreachable" | "noPlatform" | "quitUnreachable" | "stillAnswering" | "gone" | "uploadIncomplete";
 
 let text: (code: ClientText) => string = (code) => code;
@@ -35,8 +29,7 @@ export function setClientText(f: (code: ClientText) => string): void {
   text = f;
 }
 
-/** The result of a job the page saw running, once the server's list no longer has it (its
- * 32-job history dropped it between two polls, so its real result was never seen). */
+/** A job the page saw running that the server's 32-job history dropped between two polls. */
 export const GONE: ClientText = "gone";
 
 // ---------- status, for the UI (useSyncExternalStore) ----------
@@ -61,8 +54,7 @@ export function watchStatus(w: () => void): Unlisten {
 
 // ---------- requests ----------
 
-/** A request that reached the server: its status and parsed JSON body. A network failure
- * rejects instead (fetch's TypeError, or an abort). */
+/** A network failure rejects instead (fetch's TypeError, or an abort). */
 async function request(
   method: "GET" | "POST",
   path: string,
@@ -96,29 +88,48 @@ function errorOf(data: unknown, status: number): string {
   return typeof e === "string" ? e : `HTTP ${status}`;
 }
 
-/** An api.ts command. Rejects with the server's `error` string (what errorText shows), as the
- * Tauri commands do. */
+/** api.rs `SHARED_READS`: asked again after a network error (`READ_TRIES`) or a 202, within `READ_RETRY_MS`. */
+const SHARED_READS = new Set([
+  "inspect",
+  "default_output",
+  "generated_output",
+  "package_scan",
+  "host_tree",
+  "pack_estimate",
+  "edit_check",
+]);
+const READ_TRIES = 10;
+const READ_RETRY_MS = 30 * 60 * 1000;
+
+/** Rejects with the server's `error` string, as the Tauri commands do. */
 export async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  // The page shows the output path itself; nothing on the console opens a file manager.
   if (cmd === "reveal") return undefined as T;
   if (cmd === "quit_app") return quit() as Promise<T>;
+  if (cmd === "bundled_ng_version") return serverNgVersion() as Promise<T>;
   let res;
-  try {
-    res = await request("POST", `/api/${cmd}`, args ?? {});
-  } catch {
-    setOffline(true);
-    kick();
-    throw text("unreachable");
+  const end = Date.now() + READ_RETRY_MS;
+  for (let asked = 0, failed = 0; ; asked++) {
+    try {
+      res = await request("POST", `/api/${cmd}${asked > 0 ? "?retry=1" : ""}`, args ?? {});
+      if (res.status === 202 && SHARED_READS.has(cmd) && Date.now() < end) continue;
+      break;
+    } catch {
+      // A long read can outlast the browser's request: ask again while the server answers; the retry joins that read or takes its reply (issue #74).
+      failed++;
+      const again = SHARED_READS.has(cmd) && failed < READ_TRIES && Date.now() < end && (await sessionInstance(5000)) !== null;
+      if (again) continue;
+      setOffline(true);
+      kick();
+      throw text("unreachable");
+    }
   }
   setOffline(false);
   if (res.status !== 200) throw errorOf(res.data, res.status);
-  // A job just started or was cancelled: show it without waiting for the next tick.
   if (cmd === "start_job" || cmd === "cancel_job") kick();
   return res.data as T;
 }
 
-/** A Connect command: `GET /api/connect/state`, else `POST /api/connect/<cmd>`. `nas_save`
- * answers `{id}`; this gives the bare id, as the Tauri command does. */
+/** `GET /api/connect/state`, else `POST /api/connect/<cmd>`; `nas_save`'s `{id}` as the bare id, as Tauri's. */
 export async function connectCall<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   let res;
   try {
@@ -132,15 +143,12 @@ export async function connectCall<T>(cmd: string, args?: Record<string, unknown>
   return (bare ? id : res.data) as T;
 }
 
-/** The upload route for `source` and `gamePath`. Each value is percent-encoded with
- * `encodeURIComponent` (a space is `%20`, `+` is `%2B`): the server decodes `%XX` only and keeps
- * `+` as it is, so `URLSearchParams`'s `+` for a space would name another path. */
+/** `encodeURIComponent`, not `URLSearchParams`: the server decodes `%XX` only and keeps `+` as it is. */
 export function uploadUrl(source: string, gamePath: string): string {
   return `/api/edit_upload?source=${encodeURIComponent(source)}&path=${encodeURIComponent(gamePath)}`;
 }
 
-/** `POST /api/edit_upload?source=&path=` with `file` as the raw body (XHR, for upload progress).
- * Resolves with the staged file's path; rejects as `call` does, or with "aborted" on `signal`. */
+/** XHR, for upload progress; rejects as `call` does, or with "aborted" on `signal`. */
 export function upload(
   source: string,
   gamePath: string,
@@ -156,16 +164,11 @@ function pathOf(data: Record<string, unknown>): string {
   throw errorOf(data, 200);
 }
 
-/** A phone upload's chunk, and how many go at once: 4 in a browser (by user decision; it runs about 6
- * requests per host, and the page's own polls need room), where FLINK's lanes between devices are 8. */
+/** 4 chunks in flight in a browser (about 6 requests per host; the page's polls need room). */
 const CHUNK = 8 << 20;
 const PARALLEL = 4;
 
-/** Connect's phone upload: `file` into the server's folder `dir` as `name` (`POST
- * /api/connect/upload?dir=&name=&id=&offset=&size=`, `PARALLEL` chunks in flight; the server puts
- * them together by offset); resolves with the file's path. `replace` (the user confirmed it) adds
- * `replace=1` to every chunk: a file already at that name is replaced. A failure or abort cancels
- * the rest and drops the server's part (`cancel=1`). */
+/** Chunks put together by offset on the server; a failure or abort cancels the rest and drops its part (`cancel=1`). */
 export async function connectUpload(
   dir: string,
   name: string,
@@ -210,12 +213,10 @@ export async function connectUpload(
   return path;
 }
 
-/** Connect's phone download of the server's file `path` (a link the browser saves). */
 export function connectDownloadUrl(path: string): string {
   return `/api/connect/download?path=${encodeURIComponent(path)}`;
 }
 
-/** `POST url` with `file` as the raw body (XHR, for upload progress); resolves with the reply. */
 function postFile(
   url: string,
   file: Blob,
@@ -261,36 +262,38 @@ let address: string | null = null;
 let platform: "host" | "ps5" | null = null;
 let notifications: boolean | null = null;
 let version: string | null = null;
+let ngVersion: string | null = null;
+let cliAsset: string | null = null;
 let debugBuild = false;
 
-/** The server's `host:port` from its session's `url` (the console's own address, never the
- * viewer's `location`), once `serverSession` read it; null before, or when it has none. */
+/** The server's own address from its session's `url`, never the viewer's `location`. */
 export function serverAddress(): string | null {
   return address;
 }
 
-/** A bring-up build of the payload (session `debug`): the page links its input probe. */
 export function serverDebug(): boolean {
   return debugBuild;
 }
 
-/** `GET /api/session`: its path separator (`"/"` or `"\\"`) and address (`serverAddress`),
- * null where it doesn't answer or says nothing usable. */
+/** Its path separator and address; null where it doesn't answer or says nothing usable. */
 export async function serverSession(): Promise<{ separator: string | null; address: string | null }> {
   try {
     const res = await request("GET", "/api/session", undefined, 3000);
     const s = res.status === 200 ? (res.data as { separator?: unknown; url?: unknown } | null) : null;
     const sep = s?.separator;
-    // `http://<ip>:<port>`; a server that couldn't tell its IP says so in words: none then.
     const host = typeof s?.url === "string" ? /^https?:\/\/([\w.:[\]-]+)\/?$/.exec(s.url)?.[1] : undefined;
     address = host ?? null;
-    // Only the server's own word counts (never the browser's OS or URL); a valid one is kept.
+    // Only the server's own word counts (never the browser's OS or URL).
     const plat = (s as { platform?: unknown } | null)?.platform;
     if (plat === "host" || plat === "ps5") platform = plat;
     const on = (s as { notifications?: unknown } | null)?.notifications;
     if (typeof on === "boolean") notifications = on;
     const ver = (s as { version?: unknown } | null)?.version;
     if (typeof ver === "string") version = ver;
+    const ng = (s as { bundled_ng_version?: unknown } | null)?.bundled_ng_version;
+    if (typeof ng === "string") ngVersion = ng;
+    const cli = (s as { cli_asset?: unknown } | null)?.cli_asset;
+    if (typeof cli === "string") cliAsset = cli;
     debugBuild = (s as { debug?: unknown } | null)?.debug === true;
     return { separator: sep === "/" || sep === "\\" ? sep : null, address };
   } catch {
@@ -298,51 +301,50 @@ export async function serverSession(): Promise<{ separator: string | null; addre
   }
 }
 
-/** The server's platform from its session, cached once valid; an unknown one retries the
- * session once, then rejects (so no PS5-only choice is ever shown by accident). */
+async function serverNgVersion(): Promise<string | null> {
+  if (ngVersion === null) await serverSession();
+  return ngVersion;
+}
+
+/** Cached once valid; an unknown one retries the session once, then rejects (no PS5-only choice by accident). */
 export async function serverPlatform(): Promise<"host" | "ps5"> {
   if (platform === null) await serverSession();
   if (platform === null) throw text("noPlatform");
   return platform;
 }
 
-/** The About switch's value from the PS5 session, read afresh (another viewer may have changed
- * it); absent on a host or an older server. */
+/** Read afresh (another viewer may have changed it). */
 export async function serverNotifications(): Promise<boolean | null> {
   notifications = null;
   await serverSession();
   return platform === "ps5" ? notifications : null;
 }
 
-/** Save the About switch and use the server's answer as its new value. */
 export async function setServerNotifications(on: boolean): Promise<boolean> {
   const answer = await call<{ on: boolean }>("notifications", { on });
   if (typeof answer?.on !== "boolean") throw new Error("Invalid notification setting reply");
   return answer.on;
 }
 
-/** The update the page may offer: the PS5's payload (`ps5.elf`) at the session's version; null
- * for `serve` on a computer or a session without a version. Rejects as `serverPlatform`. */
+/** The PS5's payload, or on a computer the CLI's own file (session `cli_asset`); null when none. */
 export async function serverUpdateTarget(): Promise<{ version: string; asset: string } | null> {
   const p = await serverPlatform();
-  if (p !== "ps5" || !version) return null;
-  // Installable only through elfldr: no toast while it doesn't answer (or the server predates
-  // the route). Never marks the page offline.
+  if (!version) return null;
+  if (p !== "ps5") return cliAsset ? { version, asset: cliAsset } : null;
+  // Installable only through elfldr: no toast while it doesn't answer; never marks the page offline.
   try {
     const res = await request("GET", "/api/elfldr", undefined, 3000);
     return res.status === 200 && (res.data as { up?: unknown } | null)?.up === true
-      ? { version, asset: "ps5.elf" }
+      ? { version, asset: "ps5-dump-forge-{v}-ps5.elf" }
       : null;
   } catch {
     return null;
   }
 }
 
-/** How long `selfUpdate` waits in all, from the request: download, start and takeover. */
 export const UPDATE_WAIT_MS = 60000;
 const UPDATE_TIMEOUT: UpdateTimeout = "update-timeout";
 
-/** The session's `instance`, or null when it doesn't answer with one. */
 async function sessionInstance(ms: number): Promise<string | null> {
   try {
     const res = await request("GET", "/api/session", undefined, ms);
@@ -353,10 +355,7 @@ async function sessionInstance(ms: number): Promise<string | null> {
   }
 }
 
-/** `POST /api/self_update`: elfldr downloads and starts `v`, which takes over from this server.
- * Resolves once a new `instance` answers the session; rejects with the server's error, or
- * `UPDATE_TIMEOUT` once `UPDATE_WAIT_MS` has passed since the request. A network error during
- * the call or the wait is expected (the old server exits): it waits on. */
+/** Resolves once a new `instance` answers the session; a network error meanwhile is expected (the old server exits). */
 export async function selfUpdate(v: string): Promise<void> {
   const end = Date.now() + UPDATE_WAIT_MS;
   const left = () => end - Date.now();
@@ -378,7 +377,6 @@ export async function selfUpdate(v: string): Promise<void> {
 
 let started = false;
 
-/** Start polling, once, at page load. */
 export function start(): void {
   if (started) return;
   started = true;
@@ -394,13 +392,11 @@ function emit(event: EventName, payload: unknown) {
 }
 
 export function listen<T>(event: EventName, f: (payload: T) => void): Promise<Unlisten> {
-  // The browser window closes on its own; jobs keep running on the server.
   if (event === "close-requested") return Promise.resolve(() => {});
   let set = listeners.get(event);
   if (!set) listeners.set(event, (set = new Set()));
   const g = f as (payload: unknown) => void;
   set.add(g);
-  // A new job list subscribed (the app mounted): rebuild it whole.
   if (event === "jobs://restore") {
     seen = null;
     kick();
@@ -414,13 +410,12 @@ export function listen<T>(event: EventName, f: (payload: T) => void): Promise<Un
 
 interface Seen {
   progress: string;
-  /** The job's stage list was known (sent once, when it first is). */
   stages: boolean;
   logTotal: number;
   done: boolean;
 }
 
-/** What each job last looked like; null: the next snapshot rebuilds the whole list. */
+/** Null: the next snapshot rebuilds the whole list. */
 let seen: Map<number, Seen> | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let inFlight = false;
@@ -437,11 +432,7 @@ function remember(j: SnapshotJob): Seen {
   };
 }
 
-/** Feed one snapshot into the app's events: the stage list once it is known, progress when it
- * changed, only the log lines it
- * hasn't seen (by `log_total`), done once. A job it never saw is restored whole; so is the
- * whole list after `seen` was reset. A job missing from the list is dropped from `seen`; one
- * it never saw finish gets a done event with `GONE`. */
+/** One snapshot into the app's events: stages once, progress when changed, unseen log lines, done once; a job gone unfinished ends `GONE`. */
 function diff(snap: JobsSnapshot): void {
   if (seen === null) {
     seen = new Map(snap.jobs.map((j) => [j.id, remember(j)]));
@@ -452,7 +443,6 @@ function diff(snap: JobsSnapshot): void {
   for (const j of snap.jobs) {
     const was = seen.get(j.id);
     seen.set(j.id, remember(j));
-    // New to the page (another browser's Build, or ours before start_job answered): restored whole.
     if (!was) {
       fresh.push(j);
       continue;
@@ -460,8 +450,9 @@ function diff(snap: JobsSnapshot): void {
     if (j.stages?.length > 0 && !was.stages)
       emit("job://stages", { kind: "stages", job: j.id, stages: j.stages } satisfies StagesEvent);
     if (j.progress && JSON.stringify(j.progress) !== was.progress) {
-      const { stage, done, total } = j.progress;
-      emit("job://progress", { kind: "progress", job: j.id, stage, done, total } satisfies ProgressEvent);
+      const { stage, done, total, stage_done, stage_total, bytes_per_s, stage_started_ms } = j.progress;
+      const event = { kind: "progress" as const, job: j.id, stage, done, total, stage_done, stage_total, bytes_per_s, stage_started_ms };
+      emit("job://progress", event satisfies ProgressEvent);
     }
     const n = Math.min(j.log_total - was.logTotal, j.log.length);
     for (const line of n > 0 ? j.log.slice(j.log.length - n) : [])
@@ -470,7 +461,6 @@ function diff(snap: JobsSnapshot): void {
       emit("job://done", { kind: "done", job: j.id, result: j.done.result } satisfies DoneEvent);
   }
   if (fresh.length > 0) emit("jobs://restore", { replace: false, jobs: fresh } satisfies JobsRestore);
-  // Gone from the server's list: forget it, and end it if the page never saw it finish.
   const listed = new Set(snap.jobs.map((j) => j.id));
   for (const [id, was] of [...seen]) {
     if (listed.has(id)) continue;
@@ -493,7 +483,6 @@ function schedule(ms: number) {
   timer = setTimeout(poll, ms);
 }
 
-/** Poll now (or right after the poll in flight). */
 function kick() {
   if (inFlight) again = true;
   else schedule(0);
@@ -527,13 +516,10 @@ async function poll(): Promise<void> {
 
 // ---------- quit ----------
 
-/** How long quit waits for the server to go away (it cancels jobs and cleans up first). */
 export const QUIT_WAIT_MS = 120000;
 export const STILL_ANSWERING: ClientText = "stillAnswering";
 
-/** `POST /api/quit`, then wait until the server is gone. Polling pauses meanwhile: an
- * unreachable server is the expected end, not an offline notice. Rejects with
- * `STILL_ANSWERING` (and polls again) if it is still up at the deadline. */
+/** Polling pauses meanwhile (an unreachable server is the expected end); rejects with `STILL_ANSWERING` if still up at the deadline. */
 async function quit(): Promise<void> {
   const res = await request("POST", "/api/quit", {}).catch(() => null);
   if (!res) throw text("quitUnreachable");

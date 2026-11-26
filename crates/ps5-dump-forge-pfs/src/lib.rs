@@ -1,15 +1,9 @@
-//! PFS images for ShadowMountPlus: the `.ffpfs` writer, the streaming `.ffpfsc` container, and
-//! readers for both.
+//! PFS images for ShadowMountPlus: the `.ffpfs` writer (`plan`, then `write` in offset order), the
+//! streaming `.ffpfsc` container ([`wrap`]), and readers for both.
 //!
-//! Frozen interface (ps5-dump-forge-core depends on it): `plan` validates names and sizes the image
-//! without reading file data; `write` streams the files into `out` in offset order; `wrap` turns
-//! any inner image writer into a `.ffpfsc` as it writes; [`PfsSource`] and [`open_ffpfsc`] read
-//! them back.
-//!
-//! The layout is MkPFS 1.1.0's unsigned PS5 image (PSBrew, GPL-3.0, read for its format and
-//! written here independently): what `mkpfs pack folder --raw --no-compress --version PS5
-//! --inode-bits 32 --block-size 65536` makes, byte for byte for the same tree and time. The one
-//! difference: empty directories are kept (MkPFS drops them). By block:
+//! The layout is MkPFS 1.1.0's unsigned PS5 image (written independently): byte for byte what
+//! `mkpfs pack folder --raw --no-compress --version PS5 --inode-bits 32 --block-size 65536` makes,
+//! except that empty directories are kept. By block:
 //!
 //! | Blocks (64 KiB) | What |
 //! |---|---|
@@ -19,9 +13,7 @@
 //! | then | flat path table; collision resolver, or one reserved empty block |
 //! | then | `uroot`, the other directories, the files: one contiguous run each |
 //!
-//! Files are stored uncompressed: MkPFS's per-file compression passes its own verify, but the
-//! console misreads it. A `.ffpfsc` is the same encoder over a one-file tree whose file is a
-//! zlib PFSC container of the inner image (see [`wrap`]).
+//! Files are stored uncompressed: the console misreads MkPFS's per-file compression.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,46 +27,41 @@ mod read;
 mod wrap;
 
 pub use read::{FfpfscInfo, PfsHeader, PfsSource, open_ffpfsc};
-pub use wrap::{DEFAULT_LEVEL, Stream, WrapOptions, WrapReport, container_size_max, wrap};
+pub use wrap::{
+    DEFAULT_LEVEL, Stream, WrapOptions, WrapReport, block_stored_len, container_size_max, wrap,
+};
 
-/// The PFS block size this crate writes, and the PFSC block size of every container.
+/// The PFS block size, and the PFSC block size of every container.
 pub const BLOCK: u64 = 0x10000;
-/// Read size per `read_range`: bounded memory however large the file.
 const CHUNK: u64 = 8 << 20;
 
-/// Knobs a caller may set. `Default` is the SMP-recommended layout.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// Every inode's timestamp (seconds since 1970); `None` is now. Tests pin it.
+    /// Every inode's timestamp (seconds since 1970); `None` is now.
     pub time: Option<i64>,
 }
 
-/// Everything `write` needs, fixed before the first file byte is read.
 #[derive(Debug, Clone)]
 pub struct Layout {
-    /// Final image size in bytes (a multiple of 64 KiB).
     pub image_size: u64,
     pub files: u64,
     /// Directories below the root, empty ones included.
     pub dirs: u64,
-    /// File-data bytes `write` copies: the `total` its progress reports against.
+    /// File-data bytes `write` copies (its progress total).
     pub data_bytes: u64,
     img: image::Image,
-    /// Hash of the tree's file list and empty dirs as planned; `write` refuses another.
+    /// [`fingerprint`] of the planned tree; `write` refuses another.
     source: u64,
 }
 
-/// What was written.
 #[derive(Debug, Clone)]
 pub struct Report {
     pub image_size: u64,
     pub files: u64,
-    /// Directories below the root.
     pub dirs: u64,
 }
 
-/// Validate names and lay the image out. Fails with every offending path listed.
-/// Checks `cancel` between steps.
+/// Validate names and lay the image out; fails with every offending path listed.
 pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Result<Layout> {
     check_cancel(cancel)?;
     let nodes = image::nodes(tree, cancel)?;
@@ -91,8 +78,7 @@ pub fn plan(tree: &dyn SourceTree, opts: &Options, cancel: &AtomicBool) -> Resul
     })
 }
 
-/// Write the image described by `layout` into `out` (empty, positioned at 0; the caller
-/// fsyncs and renames it). Every byte is written in order, so `out` may be a [`Stream`].
+/// Write `layout` into an empty `out`, every byte in order (so `out` may be a [`Stream`]).
 /// `progress(done, total)` counts file-data bytes.
 pub fn write<W: Write + Seek>(
     tree: &mut dyn SourceTree,
@@ -102,7 +88,6 @@ pub fn write<W: Write + Seek>(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Report> {
     check_cancel(cancel)?;
-    // The plan holds the tree's paths and sizes; a different tree would write wrong data.
     if fingerprint(tree) != layout.source {
         return Err(err(
             "the source changed between planning and writing the PFS image",
@@ -124,7 +109,7 @@ pub fn write<W: Write + Seek>(
             check_cancel(cancel)?;
             let want = (node.size - at).min(CHUNK);
             let buf = tree.read_range(&node.path, at, want as usize)?;
-            // Sources may return short reads; none may return nothing or too much.
+            // Short reads are fine; nothing or too much is not.
             if buf.is_empty() || buf.len() as u64 > want {
                 return Err(err(format!(
                     "{}: read {} bytes at {at} of its planned {} (did it change?)",
@@ -152,8 +137,7 @@ pub fn write<W: Write + Seek>(
     })
 }
 
-/// FNV-1a over every planned path and size, so `write` can tell a renamed, reordered or
-/// resized source from the one `plan` saw.
+/// FNV-1a over every planned path and size and the empty dirs.
 fn fingerprint(tree: &dyn SourceTree) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
@@ -174,7 +158,6 @@ fn fingerprint(tree: &dyn SourceTree) -> u64 {
     h
 }
 
-/// Seconds since 1970, for `Options::time` left unset.
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,7 +175,6 @@ fn err(msg: impl Into<String>) -> Error {
     Error::Format(msg.into())
 }
 
-/// Little-endian fields of fixed-size buffers; every caller's offset is in range.
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }

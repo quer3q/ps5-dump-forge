@@ -1,26 +1,20 @@
-//! Protected container entries (`flags1` bit 31): `nptitle.dat` and the two `npbind.dat` files a
-//! package keeps encrypted in its container. The builder's `crypto::encrypt_entry` is the writer;
-//! this is its inverse.
-//!
-//! key/iv = SHA3-256(row ‖ entry key): the first 16 bytes the IV, the last 16 the AES-128 key,
-//! CBC. `row` is the entry's 32-byte table row as stored, and the entry key is the passcode-derived
-//! key the row's `flags2 >> 12` names.
+//! Protected container entries (`flags1` bit 31: `nptitle.dat`, `npbind.dat`), the inverse of the
+//! builder's `crypto::encrypt_entry`. IV ‖ AES-128 key = SHA3-256(stored 32-byte row ‖ entry key),
+//! CBC; the entry key is the passcode-derived key `flags2 >> 12` names.
 
 use ps5upload_fpkg::cnt::ids;
 use ps5upload_fpkg::crypto::{derive_pfs_key, sha3};
 
 use crate::pfs::{Container, Entry, Pkg};
 
-/// `flags1` bit 31: the entry is stored encrypted.
 pub(crate) const FLAG: u32 = 0x8000_0000;
 
-/// The most a protected entry may be and still be decrypted: they are a few KiB.
+/// Protected entries are a few KiB.
 const MAX_SIZE: u64 = 1 << 20;
 
-/// The entry-keys slot holds keys 0..=6.
 const KEY_COUNT: u32 = 7;
 
-/// AES-128-CBC decryption in place; `data` must be whole 16-byte blocks.
+/// `data` must be whole 16-byte blocks.
 fn aes128_cbc_decrypt(key: &[u8; 16], iv: [u8; 16], data: &mut [u8]) {
     use aes::cipher::{BlockCipherDecrypt, KeyInit as _};
     debug_assert!(data.len().is_multiple_of(16));
@@ -38,7 +32,6 @@ fn aes128_cbc_decrypt(key: &[u8; 16], iv: [u8; 16], data: &mut [u8]) {
     }
 }
 
-/// Decrypt a protected entry in place: the inverse of `crypto::encrypt_entry`.
 pub(crate) fn decrypt_entry(row: &[u8; 32], entry_key: &[u8; 32], data: &mut [u8]) {
     let mut pre = Vec::with_capacity(64);
     pre.extend_from_slice(row);
@@ -51,9 +44,8 @@ pub(crate) fn decrypt_entry(row: &[u8; 32], entry_key: &[u8; 32], data: &mut [u8
     );
 }
 
-/// Whether `key`, the passcode-derived key `k`, passes the container's entry-keys slot (the
-/// 32-byte seed digest, then `SHA3(k) ^ k` for keys 0..=6); `None` when the slot has no digest
-/// for it.
+/// Whether key `k` passes the entry-keys slot (a 32-byte seed digest, then `SHA3(k) ^ k` per key);
+/// `None` when the slot has no digest for it.
 pub(crate) fn key_check(
     pkg: &mut Pkg,
     cnt: &Container,
@@ -76,12 +68,8 @@ pub(crate) fn key_check(
     Ok(Some(stored == want))
 }
 
-/// The plaintext of protected entry `e`, or why it can't be had.
-///
-/// The key comes from the content id and the passcode, so before any byte is decrypted the
-/// passcode is tested against the container's entry-keys slot (`SHA3(k) ^ k` per key, after the
-/// 32-byte seed digest). A wrong passcode would otherwise write garbage into the game's folder
-/// as if it were the file; a plaintext image never tests the passcode itself.
+/// The plaintext of protected entry `e`, or why not. The passcode is key-checked first: a wrong
+/// one would otherwise write garbage as the file (a plaintext image never tests it).
 pub(crate) fn plaintext(
     pkg: &mut Pkg,
     cnt: &Container,
@@ -103,7 +91,6 @@ pub(crate) fn plaintext(
         Some(false) => return Err("the passcode fails the container's key check".into()),
         Some(true) => {}
     }
-    // Stored padded to the cipher's block; `size` is the file's own length.
     let mut data = vec![0u8; e.size.next_multiple_of(16) as usize];
     pkg.read_at(e.at, &mut data).map_err(|e| e.to_string())?;
     decrypt_entry(&e.row, &key, &mut data);
@@ -119,10 +106,7 @@ mod tests {
     const CONTENT_ID: &str = "UP0000-PPSA01234_00-TESTGAME00000000";
     const PLAIN_LEN: usize = 50;
 
-    /// A container of two entries as a third-party builder writes it: the entry-keys slot (the
-    /// seed digest and `SHA3(k) ^ k` for keys 0..=6) and a protected `nptitle.dat` whose key
-    /// is `passcode`'s key 3, encrypted by the builder's own `encrypt_entry`. Returns the
-    /// package and the file's plaintext.
+    /// A container with the entry-keys slot and a protected `nptitle.dat` under `passcode`'s key 3.
     fn container(passcode: &str) -> (Pkg, Container, Vec<u8>) {
         let (keys_at, title_at) = (0x1100usize, 0x1200usize);
         let plain: Vec<u8> = (0..PLAIN_LEN).map(|i| (i * 7 + 1) as u8).collect();
@@ -167,8 +151,6 @@ mod tests {
         (pkg, cnt, plain)
     }
 
-    /// A container-only `nptitle.dat` reads back as the file it was (padded to the cipher's
-    /// block, truncated to its size).
     #[test]
     fn a_protected_entry_reads_back_as_its_file() {
         let (mut pkg, cnt, plain) = container(DEFAULT_PASSCODE);
@@ -179,7 +161,6 @@ mod tests {
         );
     }
 
-    /// Another passcode fails the key check; it never yields garbage as if it were the file.
     #[test]
     fn a_wrong_passcode_yields_nothing() {
         let (mut pkg, cnt, _) = container(DEFAULT_PASSCODE);

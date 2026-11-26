@@ -1,7 +1,5 @@
-//! The AMPRPAK4 manifest reader, which runs every check the runtime makes when it opens a
-//! manifest (so verification of a written pack and any unpack go through the same rules), the
-//! volume, CRC sidecar and runtime profile checks, and [`Unpacked`]: a source tree with the
-//! packed files decoded back and the pack artifacts hidden.
+//! The AMPRPAK4 manifest reader with every runtime open check, the volume/sidecar/profile checks,
+//! and [`Unpacked`], the packs decoded back as a tree.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,7 +26,6 @@ fn bad(msg: impl Into<String>) -> Error {
     Error::Format(msg.into())
 }
 
-/// One manifest file record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRecord {
     /// Relative to the game root (`/app0/` stripped), spelling kept.
@@ -48,7 +45,6 @@ impl FileRecord {
     }
 }
 
-/// One chunk record, decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chunk {
     pub pack_id: u16,
@@ -59,10 +55,8 @@ pub struct Chunk {
     pub flags: u8,
 }
 
-/// One pack (volume) record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pack {
-    /// Relative to the game root.
     pub name: String,
     pub payload_bytes: u64,
     pub file_size: u64,
@@ -76,7 +70,6 @@ impl Pack {
     }
 }
 
-/// A manifest that passed every runtime-contract check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub build_id: [u8; 16],
@@ -85,7 +78,6 @@ pub struct Manifest {
     pub packs: Vec<Pack>,
 }
 
-/// The NUL-terminated string at `off..off+len` of the string table.
 fn string(strings: &[u8], off: u32, len: u32, what: &str) -> Result<String> {
     let (off, end) = (off as usize, off as usize + len as usize);
     if end >= strings.len() || strings[end] != 0 || strings[off..end].contains(&0) {
@@ -363,8 +355,7 @@ fn placement_ok(pack: &Pack, c: &Chunk) -> bool {
     io_begin >= pack.payload_offset() && io_end <= pack.file_size
 }
 
-/// Checks the AMPRDAT3 header of volume `pack_id` (its first 64 bytes) against the manifest and
-/// the volume's actual size.
+/// Checks volume `pack_id`'s AMPRDAT3 header against the manifest and the volume's size.
 pub fn check_volume_header(h: &[u8], pack_id: usize, m: &Manifest, actual_size: u64) -> Result<()> {
     let pack = m
         .packs
@@ -479,9 +470,8 @@ pub fn detect<T: SourceTree + ?Sized>(tree: &mut T) -> Result<bool> {
     Ok(tree.read_range(MANIFEST, 0, 8)? == PAK_MAGIC)
 }
 
-/// A source tree with its packs decoded back: packed records become plain files, and the
-/// manifest, the volumes it names and its two sidecars are hidden by exact name. Everything
-/// else (loose records, an unrelated `foo.pak`, diagnostics) passes through unchanged.
+/// A source tree with its packs decoded back; the manifest, its volumes and sidecars hidden by
+/// exact name.
 pub struct Unpacked<T: SourceTree + ?Sized> {
     inner: Box<T>,
     manifest: Manifest,
@@ -489,18 +479,14 @@ pub struct Unpacked<T: SourceTree + ?Sized> {
     profile: Option<RuntimeProfile>,
     files: Vec<SourceFile>,
     empty_dirs: Vec<String>,
-    /// Packed records by path: index into `manifest.files`.
     packed: HashMap<String, usize>,
-    /// Packed records also on disk with identical bytes (the plain copy kept).
     identical: Vec<String>,
-    /// Packed records also on disk with other contents (the packed copy served).
     differing: Vec<String>,
     hidden: HashSet<String>,
     /// The last decoded chunk: (chunk index, decoded length, bytes).
     cache: Option<(usize, usize, Vec<u8>)>,
 }
 
-/// Reads all of `path`, which the listing says is `size` bytes.
 fn read_exact<T: SourceTree + ?Sized>(tree: &mut T, path: &str, size: u64) -> Result<Vec<u8>> {
     let b = tree.read_range(path, 0, usize::try_from(size).unwrap_or(usize::MAX))?;
     if b.len() as u64 != size {
@@ -509,12 +495,9 @@ fn read_exact<T: SourceTree + ?Sized>(tree: &mut T, path: &str, size: u64) -> Re
     Ok(b)
 }
 
-/// Opens the packs of `tree`: the manifest with every runtime check, every volume header, and
-/// the CRC sidecar and runtime profile when present. A packed path also on disk (ASCII
-/// case-folded) is never refused: identical copies keep the plain file, otherwise the packed
-/// copy wins and the physical file is left out. A loose record's file may be missing or of
-/// another size: the runtime reads loose files from the disk as they are, so an edited packed
-/// game still unpacks.
+/// Opens the packs of `tree` with every runtime check. A packed path also on disk (folded) is kept
+/// if identical, else the packed copy wins; a loose record's file may be missing or resized (the
+/// runtime reads it as it is).
 pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> {
     let sizes: HashMap<String, u64> = inner
         .files()
@@ -591,9 +574,7 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
                 f.path
             )));
         }
-        // A loose record only lists the file: the runtime opens it from the disk as it is
-        // and never checks its size, so an edit (or a conversion's runtime swap) may change
-        // or remove it.
+        // A loose record only lists the file: the runtime never checks its size.
         if !f.packed() {
             continue;
         }
@@ -611,8 +592,7 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // A path cannot be a file and a folder at once; an underlying empty folder that now holds
-    // a packed file is not empty any more.
+    // A path can't be a file and a folder; an empty folder holding a packed file isn't empty.
     let folded: HashSet<String> = files.iter().map(|f| f.path.to_ascii_lowercase()).collect();
     let mut dirs = HashSet::new();
     for f in &folded {
@@ -658,11 +638,9 @@ pub fn unpack<T: SourceTree + ?Sized>(mut inner: Box<T>) -> Result<Unpacked<T>> 
         hidden,
         cache: None,
     };
-    // A packed record also on disk: one identical copy (same name, same size, at most
-    // MAX_DUPLICATE_BYTES, same bytes) keeps the plain file; otherwise (another copy, another
-    // case, or several files folding to the record) the packed copy is served under the
-    // record's name and every physical file folding to it leaves the tree, so the tree keeps
-    // the manifest's spelling.
+    // Packed and on disk: one identical copy (≤ MAX_DUPLICATE_BYTES) keeps the plain file;
+    // otherwise the packed copy is served under the manifest's spelling and every folding file
+    // leaves.
     for (record, physical, size) in duplicates {
         let same = match physical.as_slice() {
             [one] => {
@@ -704,28 +682,23 @@ impl<T: SourceTree + ?Sized> Unpacked<T> {
         &self.manifest
     }
 
-    /// The relative paths the packs held (packed records).
     pub fn packed_paths(&self) -> impl Iterator<Item = &str> {
         self.packed.keys().map(String::as_str)
     }
 
-    /// Packed records also on disk with identical bytes; their plain copies are kept.
     pub fn identical_paths(&self) -> &[String] {
         &self.identical
     }
 
-    /// Packed records also on disk with another size or other bytes (or over 16 MiB); the
-    /// packed copy is served and the physical file is left out.
+    /// Packed records also on disk with other contents (or over 16 MiB): the packed copy served.
     pub fn differing_paths(&self) -> &[String] {
         &self.differing
     }
 
-    /// The validated runtime profile, if the tree has one.
     pub fn profile(&self) -> Option<RuntimeProfile> {
         self.profile
     }
 
-    /// Whether decoded chunks are checked against a CRC sidecar.
     pub fn has_crc(&self) -> bool {
         self.crcs.is_some()
     }
@@ -1035,13 +1008,9 @@ mod tests {
     }
 
     struct Hand {
-        /// Logical path, size, flags, first chunk, chunk count, block shift.
         files: Vec<(&'static str, u64, u32, u32, u32, u8)>,
-        /// Pack id, offset, stored, codec, flags.
         chunks: Vec<(u16, u64, u32, Codec, u8)>,
-        /// Name, file size, payload offset, page; flags are IoPageLayout.
         packs: Vec<(&'static str, u64, u64, u32)>,
-        /// Volume contents: pack id, offset, bytes.
         data: Vec<(usize, u64, Vec<u8>)>,
     }
 

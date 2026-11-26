@@ -1,10 +1,7 @@
-//! FLINK v2 (`VERSION`), Connect's Forge-to-Forge protocol over TCP: the frame layer. A frame is a 16-byte
-//! header (`"FL"`, type, flags, channel u32 LE, body length u32 LE, CRC-32 of bytes 0..12 u32 LE)
-//! and its body. After the handshake every frame is followed by a 16-byte MAC: BLAKE3 keyed with
-//! the direction's key over (u64 LE counter, header, body), the counter counting that direction's
-//! frames from 0. Authentication only, no encryption: frames are plaintext on the LAN.
-//! Any error (bad magic, CRC, length or MAC, a timeout) means the connection is closed: the
-//! stream may be mid-frame, so nothing is read from it again.
+//! FLINK v2, Connect's Forge-to-Forge protocol over TCP. A frame is a 16-byte header (`"FL"`,
+//! type, flags, channel u32 LE, body length u32 LE, CRC-32 of bytes 0..12) and its body; after the
+//! handshake a 16-byte MAC follows: BLAKE3 keyed per direction over (u64 LE counter, header, body).
+//! Authenticated, not encrypted. Any error closes the connection (the stream may be mid-frame).
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -13,9 +10,8 @@ use std::time::{Duration, Instant};
 pub const MAGIC: [u8; 2] = *b"FL";
 pub const HEADER_LEN: usize = 16;
 pub const TAG_LEN: usize = 16;
-/// The largest body on a data lane (an 8 MiB chunk plus its JSON fits).
+/// A data lane's largest body (an 8 MiB chunk plus its JSON).
 pub const MAX_BODY: u32 = 16 << 20;
-/// The largest body on the control connection (JSON only).
 pub const MAX_CONTROL_BODY: u32 = 64 << 10;
 
 fn bad(msg: &str) -> io::Error {
@@ -43,7 +39,6 @@ impl Header {
         b
     }
 
-    /// Checks magic, CRC and `len <= max_body`.
     pub fn decode(b: &[u8; HEADER_LEN], max_body: u32) -> io::Result<Header> {
         if b[0..2] != MAGIC {
             return Err(bad("bad magic"));
@@ -109,7 +104,6 @@ impl Mac {
         self.tag_parts(header, &[body])
     }
 
-    /// The tag of a body given as `parts` in order (the same tag as their concatenation's).
     fn tag_parts(&self, header: &[u8; HEADER_LEN], parts: &[&[u8]]) -> [u8; TAG_LEN] {
         let mut h = blake3::Hasher::new_keyed(&self.key);
         h.update(&self.counter.to_le_bytes());
@@ -130,7 +124,6 @@ impl Mac {
         Ok(())
     }
 
-    /// The tag for the next frame sent; each call uses up one counter value.
     pub fn seal(&mut self, header: &[u8; HEADER_LEN], body: &[u8]) -> io::Result<[u8; TAG_LEN]> {
         self.seal_parts(header, &[body])
     }
@@ -145,8 +138,7 @@ impl Mac {
         Ok(tag)
     }
 
-    /// Checks the next frame received; the counter moves on only when it matches, so a replayed
-    /// or reordered frame never does.
+    /// The counter moves on only on a match, so a replayed or reordered frame never does.
     pub fn open(
         &mut self,
         header: &[u8; HEADER_LEN],
@@ -160,19 +152,16 @@ impl Mac {
     }
 }
 
-/// Constant-time equality of two tags.
 fn ct_eq(a: &[u8; TAG_LEN], b: &[u8; TAG_LEN]) -> bool {
     let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
     std::hint::black_box(diff) == 0
 }
 
-/// Writes one frame (header, body, then the tag when `mac` is set): a small one in one
-/// `write_all`, a large one (a data chunk) as it is, never copied.
+/// A small frame in one `write_all`, a large one (a data chunk) never copied.
 pub fn write_frame<W: Write>(w: &mut W, frame: &Frame, mac: Option<&mut Mac>) -> io::Result<()> {
     write_parts(w, frame.header()?, &[&frame.body], mac)
 }
 
-/// `write_frame` for a body given as `parts` in order (`header.len` their total).
 fn write_parts<W: Write>(
     w: &mut W,
     header: Header,
@@ -203,7 +192,6 @@ fn write_parts<W: Write>(
     w.flush()
 }
 
-/// Reads one frame (and its tag when `mac` is set), checking magic, CRC, `max_body` and the MAC.
 pub fn read_frame<R: Read>(r: &mut R, max_body: u32, mac: Option<&mut Mac>) -> io::Result<Frame> {
     let mut header = [0u8; HEADER_LEN];
     r.read_exact(&mut header)?;
@@ -227,12 +215,10 @@ pub fn read_frame<R: Read>(r: &mut R, max_body: u32, mac: Option<&mut Mac>) -> i
     })
 }
 
-/// On the PS5, the largest send and receive buffers its kernel takes (from 16 MiB down by a
-/// quarter each try, as FreeBSD refuses a size past `kern.ipc.maxsockbuf`), since its defaults
-/// start at 48/80 KiB. Measured: the PS5 accepts any size and silently clamps it to 512 KiB, and
-/// neither that, nor `TCP_CONGESTION` cubic (htcp is refused), nor more connections moves its
-/// Wi-Fi send (~15 MB/s, its uplink's cap). Elsewhere the OS's own autotuning stays (setting a
-/// size turns it off on Linux).
+/// On the PS5, the largest socket buffers its kernel takes (16 MiB down by a quarter each try:
+/// FreeBSD refuses past `kern.ipc.maxsockbuf`); its defaults are 48/80 KiB. Measured: it clamps to
+/// 512 KiB, and neither that, cubic, nor more connections moves its Wi-Fi send (~15 MB/s).
+/// Elsewhere the OS autotunes (a set size turns that off on Linux).
 pub fn tune_buffers(stream: &TcpStream) {
     #[cfg(target_os = "freebsd")]
     {
@@ -271,8 +257,8 @@ pub struct Conn {
     deadline: Option<Instant>,
 }
 
-/// The conn's reads: each bounded by its timeout and, while one is set, by its deadline, so a
-/// peer dripping a byte per timeout can't hold the conn past it.
+/// Reads bounded by the timeout and, while set, the deadline: a peer dripping bytes can't hold
+/// the conn past it.
 struct Bounded<'a> {
     stream: &'a TcpStream,
     timeout: Duration,
@@ -307,7 +293,6 @@ impl Read for Bounded<'_> {
 }
 
 impl Conn {
-    /// `timeout` bounds every read and write (a peer silent that long is gone).
     pub fn new(stream: TcpStream, max_body: u32, timeout: Duration) -> io::Result<Conn> {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -323,7 +308,6 @@ impl Conn {
         })
     }
 
-    /// Bounds every read in total until cleared (`None` puts the plain timeout back).
     pub fn set_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.deadline = deadline;
         if deadline.is_none() {
@@ -332,9 +316,8 @@ impl Conn {
         Ok(())
     }
 
-    /// Bounds every write by `timeout` from now on (reads keep theirs). A send that gets no byte
-    /// out for that long fails; `write_all` sends again after a partial send, so a peer that
-    /// stopped reading ends a write in up to twice it.
+    /// A peer that stopped reading ends a write in up to twice `timeout` (`write_all` retries a
+    /// partial send).
     pub fn set_write_timeout(&mut self, timeout: Duration) -> io::Result<()> {
         self.stream.set_write_timeout(Some(timeout))
     }
@@ -355,19 +338,13 @@ impl Conn {
         )
     }
 
-    /// From here on every frame carries a MAC; both counters start at 0.
     pub fn set_keys(&mut self, send: [u8; 32], recv: [u8; 32]) {
         self.send_mac = Some(Mac::new(send));
         self.recv_mac = Some(Mac::new(recv));
     }
 
-    /// Raised to `MAX_RPC_BODY` once the handshake has authenticated the peer.
     pub fn set_max_body(&mut self, max_body: u32) {
         self.max_body = max_body;
-    }
-
-    pub fn keyed(&self) -> bool {
-        self.send_mac.is_some()
     }
 
     pub fn send_frame(&mut self, frame: &Frame) -> io::Result<()> {
@@ -387,9 +364,8 @@ impl Conn {
         self.stream.peer_addr()
     }
 
-    /// Whether the peer closed its side (a read would end at once, with no bytes or a reset),
-    /// asked without blocking: for a wait in which the peer sends nothing, so its leaving is seen
-    /// at once rather than when a later write fails.
+    /// Whether the peer closed its side, asked without blocking (for a wait in which it sends
+    /// nothing).
     fn peer_left(&self) -> bool {
         if self.stream.set_nonblocking(true).is_err() {
             return false;
@@ -405,21 +381,14 @@ impl Conn {
 
 // ---- Handshake --------------------------------------------------------------------------------
 //
-// C→S `Hello`, S→C `Hello` (plain JSON). Then one plain step from the client: `Pair {commit}`
-// (pairing, which the other device's user approves; `commit` = H(its X25519 public key)) or
-// `Auth {}` (known peers). To a `Pair` the server answers `PairWait {key}` (its X25519 key), the
-// client reveals `PairKey {key}` (checked against its commitment), and both now share a secret and
-// show the same six-digit check number; the server `Ping`s every 2 s while its user decides, then
-// sends `PairOk {}` or `Error {code}` (denied, timed out, busy, already paired, too many). Neither
-// side can pick its key after seeing the other's (the commitment), so a man in the middle gets one
-// 1-in-a-million guess at matching numbers per attempt. To an `Auth`: `AuthOk {}` or `Error {code}`.
-// On success both set the session's direction keys and exchange a MAC'd `Ready {}`, which proves
-// both hold the same pair secret.
-// ponytail: the check number stops a man in the middle only when someone compares both screens;
-// a key id is claimed, not proved (no long-term key pair), so a known one is never paired again
-// (it is forgotten first).
+// Plain `Hello` both ways, then the client's `Pair {commit}` (commit = H(its X25519 key)) or
+// `Auth {}`. To a `Pair`: `PairWait {key}`, the client reveals `PairKey {key}` (checked against the
+// commitment), both show one six-digit check number, the server pings while its user decides, then
+// `PairOk {}` or `Error {code}`. The commitment leaves a man in the middle one 1-in-a-million guess.
+// To an `Auth`: `AuthOk {}` or `Error {code}`. Then a MAC'd `Ready {}` each way proves the secret.
+// ponytail: the check number helps only when someone compares both screens; a key id is claimed,
+// not proved, so a known one is never paired again (forget it first).
 
-/// Frame kinds. Handshake frames are on channel 0.
 pub mod kind {
     pub const HELLO: u8 = 1;
     pub const PAIR: u8 = 2;
@@ -428,43 +397,37 @@ pub mod kind {
     pub const AUTH_OK: u8 = 5;
     pub const READY: u8 = 6;
     pub const ERROR: u8 = 7;
-    /// The server's X25519 key, while its user decides (`kind2`'s are 8..=15).
+    // `kind2`'s are 8..=15.
     pub const PAIR_WAIT: u8 = 16;
-    /// The client's X25519 key, revealed after the server's (it committed to it in `Pair`).
     pub const PAIR_KEY: u8 = 17;
 }
 
 pub const VERSION: u32 = 2;
-/// How long a pairing request waits for the other device's user.
 pub const PAIR_WAIT: Duration = if cfg!(test) {
     Duration::from_secs(3)
 } else {
     Duration::from_secs(60)
 };
-/// The listening side's Hello and Pair/Auth (or a lane's Join) in total, so a peer dripping
-/// bytes can't hold a conn slot; a pairing gets `PAIR_WAIT` more once its `Pair` is in.
+/// The listening side's whole handshake (or a lane's Join), so a dripping peer can't hold a conn
+/// slot; a pairing gets `PAIR_WAIT` more once its `Pair` is in.
 pub const HANDSHAKE_WAIT: Duration = if cfg!(test) {
     Duration::from_millis(1500)
 } else {
     Duration::from_secs(15)
 };
-/// The server pings this often while its user decides (a client's reads time out otherwise).
 const PAIR_PING: Duration = Duration::from_secs(2);
 
-/// `Error {code}` values.
 pub const NOT_PAIRED: &str = "not_paired";
 pub const DENIED: &str = "denied";
 pub const TIMED_OUT: &str = "timed_out";
 pub const TOO_MANY_ATTEMPTS: &str = "too_many_attempts";
 pub const BAD_HELLO: &str = "bad_hello";
 pub const BAD_KEY: &str = "bad_key";
-/// The server's user has as many requests waiting as it takes (not counted against the asker).
+/// Too many requests waiting (not counted against the asker).
 pub const BUSY: &str = "busy";
-/// The asking device is paired here already: forget it here first to pair again.
 pub const ALREADY_PAIRED: &str = "already_paired";
 
-/// This device as it introduces itself; `port` is its FLINK listener (the peer stores
-/// `<tcp peer ip>:<port>` as the address to reach it).
+/// `port`: its FLINK listener (the peer stores `<tcp peer ip>:<port>`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hello {
     pub v: u32,
@@ -475,7 +438,6 @@ pub struct Hello {
     pub nonce: String,
 }
 
-/// What the caller supplies about itself (the nonce is made per handshake).
 #[derive(Clone, Debug)]
 pub struct Me {
     pub key_id: String,
@@ -484,13 +446,12 @@ pub struct Me {
     pub port: u16,
 }
 
-/// `Pair {key}` and `PairWait {key}`: an X25519 public key, hex.
+/// An X25519 public key, hex.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeyBody {
     key: String,
 }
 
-/// `Pair {commit}`: H(the client's X25519 public key), hex.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CommitBody {
     commit: String,
@@ -500,28 +461,24 @@ fn commitment(public: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("forge flink v2 commit", public)
 }
 
-/// A pairing request as the server's user sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairRequest {
-    /// Unique per request, made by the server (random), never the client's.
+    /// Random, made by the server.
     pub id: String,
     pub key_id: String,
     pub name: String,
     pub platform: String,
     pub ip: std::net::IpAddr,
-    /// Six digits both screens show: they match unless someone is in the middle.
     pub check: String,
 }
 
 /// Asks this device's user about pairing requests.
 pub trait Approver {
-    /// Takes `req` to ask about; false when it can't now (too many waiting, one from that address
-    /// already): the client is told `BUSY`, not counted against it.
+    /// False: the client is told `BUSY`, not counted against it.
     fn admit(&self, req: &PairRequest) -> bool;
-    /// Waits up to `wait` for the answer: `Some(true)` allow, `Some(false)` deny, `None` none yet
-    /// (asked again after a ping, until [`PAIR_WAIT`] is over).
+    /// Up to `wait` for the answer; `None`: none yet (asked again after a ping).
     fn decide(&self, req: &PairRequest, wait: Duration) -> Option<bool>;
-    /// The request is over, answered or not (it timed out, or the peer left).
+    /// Answered, timed out, or the peer left.
     fn done(&self, req: &PairRequest);
 }
 
@@ -530,7 +487,7 @@ struct ErrorBody {
     code: String,
 }
 
-/// The handshake's nonces and pair secret, kept for deriving data-lane keys (`dir_keys`).
+/// Kept for deriving data-lane keys (`dir_keys`).
 #[derive(Clone, Debug)]
 pub struct Session {
     pub secret: [u8; 32],
@@ -538,8 +495,7 @@ pub struct Session {
     pub nonce_s: [u8; 16],
 }
 
-/// A finished handshake: the conn is keyed. `new_secret` is set when this handshake paired (the
-/// caller stores it under `peer.key_id`, replacing any older one).
+/// A finished handshake (the conn keyed); `new_secret` set when it paired.
 #[derive(Debug)]
 pub struct Handshake {
     pub peer: Hello,
@@ -548,8 +504,7 @@ pub struct Handshake {
     pub session: Session,
 }
 
-/// The peer's `Error {code}` (or a local refusal such as `NOT_PAIRED`), carried inside an
-/// `io::Error` of kind `PermissionDenied`; `refusal` reads it back.
+/// An `Error {code}` (or a local refusal) inside a `PermissionDenied` `io::Error`; see `refusal`.
 #[derive(Debug)]
 pub struct Refused(pub String);
 
@@ -565,7 +520,6 @@ fn refused(code: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, Refused(code.to_string()))
 }
 
-/// The refusal code of a handshake error, if it was one.
 pub fn refusal(e: &io::Error) -> Option<&str> {
     e.get_ref()?.downcast_ref::<Refused>().map(|r| r.0.as_str())
 }
@@ -585,7 +539,6 @@ pub fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-/// Nonces and key ids in the order every derivation uses: nonce_c ‖ nonce_s ‖ key_c ‖ key_s.
 struct Transcript {
     nonce_c: [u8; 16],
     nonce_s: [u8; 16],
@@ -598,7 +551,6 @@ impl Transcript {
         [self.nonce_c, self.nonce_s, self.key_c, self.key_s].concat()
     }
 
-    /// The X25519 secret with everything both sides saw: nonces, key ids and both public keys.
     fn pair_material(&self, shared: &[u8; 32], pub_c: &[u8; 32], pub_s: &[u8; 32]) -> Vec<u8> {
         [&shared[..], &self.bytes(), pub_c, pub_s].concat()
     }
@@ -610,7 +562,6 @@ impl Transcript {
         )
     }
 
-    /// The six digits both screens show.
     fn check(&self, shared: &[u8; 32], pub_c: &[u8; 32], pub_s: &[u8; 32]) -> String {
         let h = blake3::derive_key(
             "forge flink v2 check",
@@ -621,7 +572,6 @@ impl Transcript {
     }
 }
 
-/// A fresh X25519 key pair (its public half as bytes).
 fn x25519_pair() -> io::Result<(x25519_dalek::StaticSecret, [u8; 32])> {
     let mut k = [0u8; 32];
     getrandom::fill(&mut k).map_err(|e| io::Error::other(format!("no randomness: {e}")))?;
@@ -630,15 +580,13 @@ fn x25519_pair() -> io::Result<(x25519_dalek::StaticSecret, [u8; 32])> {
     Ok((secret, public))
 }
 
-/// The X25519 secret with the peer's public key; `None` for a key that gives no secret (a
-/// low-order point).
+/// `None` for a low-order point.
 fn shared_with(mine: &x25519_dalek::StaticSecret, theirs: [u8; 32]) -> Option<[u8; 32]> {
     let shared = mine.diffie_hellman(&x25519_dalek::PublicKey::from(theirs));
     shared.was_contributory().then(|| shared.to_bytes())
 }
 
-/// Direction keys (c2s, s2c) for a session, or for a data lane when `lane_nonce` is non-empty:
-/// derive_key("forge flink v1 session", secret ‖ nonce_c ‖ nonce_s ‖ lane_nonce ‖ "c2s"|"s2c").
+/// (c2s, s2c) for the session, or a data lane when `lane_nonce` is non-empty.
 pub fn dir_keys(s: &Session, lane_nonce: &[u8]) -> ([u8; 32], [u8; 32]) {
     let key = |dir: &[u8]| {
         let m = [&s.secret[..], &s.nonce_c, &s.nonce_s, lane_nonce, dir].concat();
@@ -647,9 +595,8 @@ pub fn dir_keys(s: &Session, lane_nonce: &[u8]) -> ([u8; 32], [u8; 32]) {
     (key(b"c2s"), key(b"s2c"))
 }
 
-/// Pairing requests denied or left unanswered: 5 per source IP per 10 minutes, then that address's
-/// requests are refused (unasked) until its oldest leaves the window. No cap across addresses:
-/// requests from many could then lock everyone out, and each one needs a person's Allow anyway. The clock is the caller's `now` (tests pass their own).
+/// Denied or unanswered pairing requests: 5 per source IP per 10 minutes, then refused unasked.
+/// No cap across addresses: many could then lock everyone out.
 #[derive(Default)]
 pub struct Budget {
     fails: Vec<(std::time::Instant, std::net::IpAddr)>,
@@ -664,7 +611,6 @@ impl Budget {
             .retain(|(t, _)| now.saturating_duration_since(*t) < Self::WINDOW);
     }
 
-    /// Whether `ip` may ask to pair now.
     pub fn allows(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
         self.prune(now);
         self.fails.iter().filter(|(_, i)| *i == ip).count() < Self::PER_IP
@@ -675,8 +621,8 @@ impl Budget {
         self.fails.push((now, ip));
     }
 
-    /// Failures still in the window (all sources).
-    pub fn failures(&mut self, now: std::time::Instant) -> usize {
+    #[cfg(test)]
+    fn failures(&mut self, now: std::time::Instant) -> usize {
         self.prune(now);
         self.fails.len()
     }
@@ -688,7 +634,6 @@ fn send_json<T: serde::Serialize>(conn: &mut Conn, kind: u8, body: &T) -> io::Re
 }
 
 fn send_error(conn: &mut Conn, code: &str) -> io::Error {
-    // Best effort: the connection closes either way.
     let _ = send_json(
         conn,
         kind::ERROR,
@@ -703,7 +648,6 @@ fn parse<T: serde::de::DeserializeOwned>(f: &Frame) -> io::Result<T> {
     serde_json::from_slice(&f.body).map_err(|e| bad(&format!("json: {e}")))
 }
 
-/// The next frame, which must be `want`; the peer's `Error {code}` becomes `refused(code)`.
 fn expect(conn: &mut Conn, want: u8) -> io::Result<Frame> {
     let f = conn.recv_frame()?;
     if f.kind == kind::ERROR {
@@ -716,7 +660,6 @@ fn expect(conn: &mut Conn, want: u8) -> io::Result<Frame> {
     Ok(f)
 }
 
-/// A peer's Hello with its key id and nonce decoded; `None` when malformed or another version.
 fn check_hello(f: &Frame) -> Option<(Hello, [u8; 16], [u8; 16])> {
     let h: Hello = parse(f).ok()?;
     let key = unhex::<16>(&h.key_id)?;
@@ -745,7 +688,6 @@ fn new_nonce() -> io::Result<[u8; 16]> {
     Ok(n)
 }
 
-/// Both sides key the conn and trade a MAC'd `Ready`: a wrong pair secret fails here.
 fn finish(conn: &mut Conn, session: &Session, client: bool) -> io::Result<()> {
     let (c2s, s2c) = dir_keys(session, &[]);
     if client {
@@ -757,10 +699,8 @@ fn finish(conn: &mut Conn, session: &Session, client: bool) -> io::Result<()> {
     expect(conn, kind::READY).map(|_| ())
 }
 
-/// The connecting side. With `pairing` it asks to pair (or re-pair): `pairing` gets the check
-/// number to show while the other device's user decides, and the call returns once they did
-/// (`DENIED`, `TIMED_OUT` as refusals). Without, it needs a stored pair secret for the peer's key
-/// id (`peers`), else it stops with `NOT_PAIRED` before sending anything secret.
+/// The connecting side. With `pairing` (given the check number to show) it asks to pair; without,
+/// it needs `peers`' secret for the peer, else `NOT_PAIRED` before sending anything secret.
 pub fn client_handshake(
     conn: &mut Conn,
     me: &Me,
@@ -783,7 +723,6 @@ pub fn client_handshake(
     };
     let (secret, new_secret) = match pairing {
         Some(on_check) => {
-            // Committed first, revealed only once the server's key is fixed.
             let (mine, pub_c) = x25519_pair()?;
             let commit = hex(&commitment(&pub_c));
             send_json(conn, kind::PAIR, &CommitBody { commit })?;
@@ -793,7 +732,6 @@ pub fn client_handshake(
                 shared_with(&mine, pub_s).ok_or_else(|| bad("the device sent a bad key"))?;
             send_json(conn, kind::PAIR_KEY, &KeyBody { key: hex(&pub_c) })?;
             on_check(&t.check(&shared, &pub_c, &pub_s));
-            // Its user decides; it pings meanwhile (a silent peer fails the read).
             let deadline = std::time::Instant::now() + PAIR_WAIT + PAIR_PING * 5;
             loop {
                 let f = conn.recv_frame()?;
@@ -829,9 +767,7 @@ pub fn client_handshake(
     })
 }
 
-/// Asks the listener on `conn` who it is (Connect's probe): our Hello, then its Hello, and the
-/// caller drops the conn (the listener's handshake ends at the missing next frame: nothing is
-/// paired, asked or counted). Refuses this device itself.
+/// Connect's probe: Hellos swapped, then the caller drops the conn (nothing paired or counted).
 pub fn introduce(conn: &mut Conn, me: &Me) -> io::Result<Hello> {
     let key_c = my_key(me)?;
     send_json(conn, kind::HELLO, &hello(me, &new_nonce()?))?;
@@ -843,10 +779,8 @@ pub fn introduce(conn: &mut Conn, me: &Me) -> io::Result<Hello> {
     Ok(peer)
 }
 
-/// The listening side. A `Pair` is put to this device's user (`approver`) within `budget` (a
-/// denied or unanswered request is counted; past the budget requests are refused unasked); an
-/// `Auth` needs a stored pair secret for the client (`peers`), else `Error {not_paired}`. Every
-/// refusal is sent to the peer and returned as `refused(code)`; the caller closes the conn.
+/// The listening side: a `Pair` goes to `approver` within `budget`, an `Auth` needs `peers`'
+/// secret. Every refusal is sent and returned as `refused(code)`; the caller closes the conn.
 pub fn server_handshake(
     conn: &mut Conn,
     me: &Me,
@@ -883,7 +817,6 @@ fn server_steps(
     let f = conn.recv_frame()?;
     let (secret, new_secret) = match f.kind {
         kind::PAIR => {
-            // The user's answer may take `PAIR_WAIT`; the rest stays bounded as before.
             conn.set_deadline(Some(Instant::now() + PAIR_WAIT + HANDSHAKE_WAIT))?;
             let ip = conn.peer_addr()?.ip();
             // A key id is claimed, not proved: a known one never replaces its pairing.
@@ -921,8 +854,7 @@ fn server_steps(
             }
             let answer = ask(conn, approver, &req);
             approver.done(&req);
-            // Every asked request that ends unapproved counts, a requester that left too (else
-            // asking and leaving would show the prompt without end).
+            // A requester that left counts too, else asking and leaving would prompt without end.
             if !matches!(answer, Ok(true)) {
                 lock().fail(ip, std::time::Instant::now());
             }
@@ -932,7 +864,6 @@ fn server_steps(
                 Err(e) if refusal(&e) == Some(TIMED_OUT) => {
                     return Err(send_error(conn, TIMED_OUT));
                 }
-                // The peer left (its pings failed): nothing to answer.
                 Err(e) => return Err(e),
             }
             send_json(conn, kind::PAIR_OK, &serde_json::json!({}))?;
@@ -962,10 +893,8 @@ fn server_steps(
     })
 }
 
-/// The server's user's answer to `req`, asked in `PAIR_PING` slices with a ping to the client
-/// between them; `refused(TIMED_OUT)` after `PAIR_WAIT`. The client sends nothing meanwhile, so
-/// one that closed its side (a cancelled request) is seen before the next ping: a ping alone is
-/// seen to fail only once the client's reset is back, slices later on a slow machine.
+/// The user's answer, asked in `PAIR_PING` slices with a ping between; `refused(TIMED_OUT)` after
+/// `PAIR_WAIT`. A client that closed is seen by `peer_left` (a ping fails only slices later).
 fn ask(conn: &mut Conn, approver: &dyn Approver, req: &PairRequest) -> io::Result<bool> {
     let start = std::time::Instant::now();
     loop {
@@ -988,13 +917,10 @@ fn ask(conn: &mut Conn, approver: &dyn Approver, req: &PairRequest) -> io::Resul
 
 // ---- Control: RPC and liveness ----------------------------------------------------------------
 //
-// After the handshake the control conn carries `Request {id, method, body}` and `Response {id,
-// ok|err}` (JSON, channel 0) plus empty `Ping`/`Pong`. Split it (`Conn::split`) into one reader
-// thread (`Receiver::recv_control`, which answers pings) and a shared `Sender` (callers and
-// `keepalive`). Make the control conn with `timeout = DEAD_AFTER`: a peer silent that long fails
-// the reader's next read, which is the dead signal.
+// `Request {id, method, body}` / `Response {id, ok|err}` (JSON) plus empty `Ping`/`Pong`, split
+// into one reader (`recv_control`, which answers pings) and a shared `Sender`. With `timeout =
+// DEAD_AFTER`, a peer silent that long fails the reader's next read: the dead signal.
 
-/// Frame kinds after the handshake (the handshake's are 1..=7).
 pub mod kind2 {
     pub const PING: u8 = 8;
     pub const PONG: u8 = 9;
@@ -1002,15 +928,12 @@ pub mod kind2 {
     pub const RESPONSE: u8 = 11;
     pub const JOIN: u8 = 12;
     pub const JOIN_OK: u8 = 13;
-    /// `Data {job, file, offset, hash}` + bytes on a lane (`data_frame`).
     pub const DATA: u8 = 14;
-    /// The receiver's answer to each `Data` (`DataOk`).
     pub const DATA_OK: u8 = 15;
 }
 
 pub const PING_EVERY: Duration = Duration::from_secs(2);
 pub const DEAD_AFTER: Duration = Duration::from_secs(12);
-/// `Error {code}` on a data lane whose Join didn't check out (unknown session or bad MAC).
 pub const BAD_JOIN: &str = "bad_join";
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1067,14 +990,12 @@ impl Response {
     }
 }
 
-/// What the control reader hands up; pings are answered and pongs swallowed on the way.
 #[derive(Debug, PartialEq)]
 pub enum Control {
     Request(Request),
     Response(Response),
 }
 
-/// The writing half of a split conn (share it behind a `Mutex`).
 pub struct Sender {
     stream: TcpStream,
     mac: Option<Mac>,
@@ -1085,13 +1006,11 @@ impl Sender {
         write_frame(&mut self.stream, frame, self.mac.as_mut())
     }
 
-    /// Closes both halves (the reader's next read fails).
     pub fn shutdown(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
-/// The reading half of a split conn (one reader thread).
 pub struct Receiver {
     stream: TcpStream,
     max_body: u32,
@@ -1103,8 +1022,7 @@ impl Receiver {
         read_frame(&mut self.stream, self.max_body, self.mac.as_mut())
     }
 
-    /// The next request or response. A `Ping` is answered with a `Pong` through `tx`; a peer's
-    /// `Error {code}` is `refused(code)`; a read timeout means the peer is dead.
+    /// A `Ping` is answered through `tx`; a read timeout means the peer is dead.
     pub fn recv_control(&mut self, tx: &std::sync::Mutex<Sender>) -> io::Result<Control> {
         loop {
             let f = self.recv_frame().map_err(|e| match e.kind() {
@@ -1130,7 +1048,6 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Conn {
-    /// Two halves over one socket, keeping the MAC counters (the timeouts stay as set).
     pub fn split(self) -> io::Result<(Sender, Receiver)> {
         let tx = Sender {
             stream: self.stream.try_clone()?,
@@ -1145,34 +1062,11 @@ impl Conn {
     }
 }
 
-/// Sends a `Ping` every `PING_EVERY` until `stop` fires or is dropped; a failed send shuts the
-/// conn down, so the reader fails too.
-pub fn keepalive(
-    tx: std::sync::Arc<std::sync::Mutex<Sender>>,
-    stop: std::sync::mpsc::Receiver<()>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(PING_EVERY) {
-            let mut tx = lock(&tx);
-            if tx
-                .send_frame(&Frame::new(kind2::PING, 0, Vec::new()))
-                .is_err()
-            {
-                tx.shutdown();
-                return;
-            }
-        }
-    })
-}
-
 // ---- Data lanes -------------------------------------------------------------------------------
 //
-// A lane is another TCP conn to the same FLINK port. It opens with a plain `Join {session, lane,
-// nonce}` frame followed by a 16-byte MAC under the control session's c2s key (a fresh `Mac`,
-// counter 0). The server looks the session up by id, checks the MAC, keys the lane with
-// `dir_keys(session, lane nonce)` and answers a MAC'd `JoinOk {}`; a bad Join gets `Error
-// {bad_join}`. A recorded Join replayed onto a new conn would get the same lane keys, so the
-// service takes each lane nonce once (`server_join` returns it).
+// Another TCP conn to the FLINK port: `Join {session, lane, nonce}` MAC'd under the session's c2s
+// key at counter 0, answered by a `JoinOk {}` under `dir_keys(session, nonce)` or `Error
+// {bad_join}`. A replayed Join would get the same lane keys, so the caller takes each nonce once.
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Join {
@@ -1182,15 +1076,13 @@ pub struct Join {
 }
 
 impl Session {
-    /// A public id for the control session (no secret in it), named by `Join`.
+    /// The public id `Join` names.
     pub fn id(&self) -> String {
         let m = [self.nonce_c, self.nonce_s].concat();
         hex(&blake3::derive_key("forge flink v1 session id", &m)[..16])
     }
 }
 
-/// The connecting side of a lane: Join, then wait for the MAC'd `JoinOk`. The conn is keyed with
-/// the lane's keys on return.
 pub fn client_join(conn: &mut Conn, session: &Session, lane: u32) -> io::Result<()> {
     let nonce = new_nonce()?;
     let join = json_frame(
@@ -1203,7 +1095,7 @@ pub fn client_join(conn: &mut Conn, session: &Session, lane: u32) -> io::Result<
     )?;
     let (c2s, _) = dir_keys(session, &[]);
     write_frame(&mut conn.stream, &join, Some(&mut Mac::new(c2s)))?;
-    // The answer's header and body first: a refusal comes plain, a `JoinOk` with a lane MAC.
+    // A refusal comes plain, a `JoinOk` with a lane MAC.
     let (header, h, body) = read_head(&mut conn.stream)?;
     if h.kind == kind::ERROR {
         let e: ErrorBody = serde_json::from_slice(&body).map_err(|e| bad(&format!("json: {e}")))?;
@@ -1221,7 +1113,7 @@ pub fn client_join(conn: &mut Conn, session: &Session, lane: u32) -> io::Result<
         .map_or(Ok(()), |m| m.open(&header, &body, &tag))
 }
 
-/// One frame's raw header, decoded header and body (no tag), bounded by `MAX_CONTROL_BODY`.
+/// A frame without its tag, bounded by `MAX_CONTROL_BODY`.
 fn read_head(r: &mut impl Read) -> io::Result<([u8; HEADER_LEN], Header, Vec<u8>)> {
     let mut header = [0u8; HEADER_LEN];
     r.read_exact(&mut header)?;
@@ -1231,10 +1123,8 @@ fn read_head(r: &mut impl Read) -> io::Result<([u8; HEADER_LEN], Header, Vec<u8>
     Ok((header, h, body))
 }
 
-/// The listening side of a lane: the Join's session (`sessions` looks it up by id), lane number
-/// and nonce (the caller refuses one it has taken before: a replay), the conn keyed with the
-/// lane's keys. A malformed Join, an unknown session or a bad MAC
-/// is answered `Error {bad_join}` and returned as `refused(BAD_JOIN)`; the caller closes.
+/// The Join's session, lane and nonce (the caller refuses a nonce taken before: a replay), the
+/// conn keyed; anything wrong is `refused(BAD_JOIN)`.
 pub fn server_join(
     conn: &mut Conn,
     sessions: &dyn Fn(&str) -> Option<Session>,
@@ -1265,14 +1155,10 @@ pub fn server_join(
 
 // ---- Data -------------------------------------------------------------------------------------
 //
-// A `Data` body is `u32 LE head length ‖ DataHead JSON ‖ bytes`: chunk `offset` of manifest file
-// `file` (an index), `CHUNK` bytes (the file's last chunk: what is left; an empty file: one empty
-// chunk at 0), `hash` the bytes' BLAKE3 in hex. The receiver answers each with `DataOk`, or
-// `Error {"transfer_failed: <why>"}` and closes the lane (the job has failed).
+// `u32 LE head length ‖ DataHead JSON ‖ bytes` (`hash` their BLAKE3), answered by `DataOk` or
+// `Error {"transfer_failed: <why>"}` and the lane closed.
 
-/// A data chunk: 8 MiB.
 pub const CHUNK: u64 = 8 << 20;
-/// The prefix of the `Error` code a receiver sends when a job fails on a lane.
 pub const TRANSFER_FAILED: &str = "transfer_failed";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1281,13 +1167,12 @@ pub struct DataHead {
     pub file: u32,
     pub offset: u64,
     pub hash: String,
-    /// A read by path: the file's stat taken after the read, so one round trip both reads a
-    /// small file and checks it is unchanged.
+    /// A read by path: the stat after the read, so one round trip checks it is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stat: Option<serde_json::Value>,
 }
 
-/// `complete`: this chunk ended the job (every file finalized, empty folders made).
+/// `complete`: this chunk ended the job.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DataOk {
     pub job: u64,
@@ -1306,7 +1191,6 @@ pub fn chunk_hash(bytes: &[u8]) -> String {
     hex(blake3::hash(bytes).as_bytes())
 }
 
-/// A `Data` body's start: the head's length, then the head.
 fn data_prefix(head: &DataHead, extra: usize) -> io::Result<Vec<u8>> {
     let json = serde_json::to_vec(head).map_err(|e| bad(&format!("json: {e}")))?;
     let mut body = Vec::with_capacity(4 + json.len() + extra);
@@ -1322,7 +1206,7 @@ pub fn data_frame(head: &DataHead, bytes: &[u8]) -> io::Result<Frame> {
 }
 
 impl Conn {
-    /// Sends `data_frame(head, bytes)` without copying `bytes` into a frame body first.
+    /// `data_frame` without copying `bytes`.
     pub fn send_data(&mut self, head: &DataHead, bytes: &[u8]) -> io::Result<()> {
         let prefix = data_prefix(head, 0)?;
         let len =
@@ -1349,23 +1233,16 @@ pub fn parse_data(f: &Frame) -> io::Result<(DataHead, &[u8])> {
     Ok((head, &f.body[4 + n..]))
 }
 
-/// Sends `Error {code}` (best effort) and returns it as a refusal; the caller closes.
 pub fn send_refusal(conn: &mut Conn, code: &str) -> io::Error {
     send_error(conn, code)
 }
 
-// ---- Manifest ---------------------------------------------------------------------------------
-//
-// What a transfer carries: relative `/`-separated paths (the selection's own name first), file
-// sizes and empty folders. The receiver checks every path before anything is written.
-
-/// A control conn's frames after the handshake (an RPC may carry a manifest).
+/// A control conn's frames after the handshake.
 pub const MAX_RPC_BODY: u32 = MAX_BODY;
 pub const MAX_PATH: usize = 1024;
-pub const MAX_ENTRIES: usize = 200_000;
 
-/// A manifest path: not empty, at most `MAX_PATH` bytes, relative, no `\` or NUL, and no empty,
-/// `.` or `..` part.
+/// A relative `/`-separated path: at most `MAX_PATH` bytes, no `\` or NUL, no empty, `.` or `..`
+/// part.
 pub fn check_path(p: &str) -> Result<(), String> {
     let bad = |why: &str| Err(format!("bad path {p:?}: {why}"));
     if p.is_empty() {
@@ -1384,60 +1261,6 @@ pub fn check_path(p: &str) -> Result<(), String> {
         return bad("an empty, . or .. part");
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ManifestFile {
-    pub path: String,
-    pub size: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Manifest {
-    pub files: Vec<ManifestFile>,
-    #[serde(default)]
-    pub empty_dirs: Vec<String>,
-}
-
-impl Manifest {
-    /// Every path checked, at most `MAX_ENTRIES`, no path twice, and nothing below a file or
-    /// below an empty folder.
-    pub fn check(&self) -> Result<(), String> {
-        if self.files.len() + self.empty_dirs.len() > MAX_ENTRIES {
-            return Err(format!("more than {MAX_ENTRIES} entries"));
-        }
-        let mut seen = std::collections::HashSet::new();
-        let paths = self.files.iter().map(|f| f.path.as_str());
-        for p in paths.chain(self.empty_dirs.iter().map(String::as_str)) {
-            check_path(p)?;
-            if !seen.insert(p) {
-                return Err(format!("{p:?} is listed twice"));
-            }
-        }
-        for p in &seen {
-            let mut parent = *p;
-            while let Some((up, _)) = parent.rsplit_once('/') {
-                if seen.contains(up) {
-                    return Err(format!("{p:?} is inside the file or empty folder {up:?}"));
-                }
-                parent = up;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn total(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
-    }
-
-    /// The first part of every path (what lands in the target folder).
-    pub fn tops(&self) -> std::collections::BTreeSet<&str> {
-        let paths = self.files.iter().map(|f| f.path.as_str());
-        paths
-            .chain(self.empty_dirs.iter().map(String::as_str))
-            .map(|p| p.split('/').next().unwrap_or(p))
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -1866,37 +1689,6 @@ mod tests {
             &long,
         ] {
             assert!(check_path(bad).is_err(), "{bad:?}");
-        }
-        let file = |path: &str| ManifestFile {
-            path: path.into(),
-            size: 3,
-        };
-        let m = Manifest {
-            files: vec![file("g/a"), file("g/d/b")],
-            empty_dirs: vec!["g/e".into()],
-        };
-        assert_eq!(m.check(), Ok(()));
-        assert_eq!(m.total(), 6);
-        assert_eq!(m.tops().into_iter().collect::<Vec<_>>(), ["g"]);
-        for bad in [
-            Manifest {
-                files: vec![file("g/a"), file("g/a")],
-                ..Default::default()
-            },
-            Manifest {
-                files: vec![file("g/a"), file("g/a/b")],
-                ..Default::default()
-            },
-            Manifest {
-                files: vec![file("g/e/x")],
-                empty_dirs: vec!["g/e".into()],
-            },
-            Manifest {
-                files: vec![file("../x")],
-                ..Default::default()
-            },
-        ] {
-            assert!(bad.check().is_err(), "{bad:?}");
         }
     }
 }

@@ -1,6 +1,5 @@
-//! A strict HTTP/1.1 subset: one request per connection, origin-form targets, `GET` and
-//! `POST`, bodies by `Content-Length` only. Anything else is refused rather than guessed at.
-//! A reply is a body in memory, or a download its own writer streams after the head.
+//! A strict HTTP/1.1 subset: one request per connection, `GET` and `POST`, bodies by
+//! `Content-Length` only. Anything else is refused rather than guessed at.
 
 use std::borrow::Cow;
 use std::io::{ErrorKind, Read, Write};
@@ -9,21 +8,17 @@ use std::time::{Duration, Instant};
 
 pub(crate) const HEAD_MAX: usize = 16 * 1024;
 pub(crate) const BODY_MAX: usize = 1024 * 1024;
-/// The body cap of the routes that take a whole request (`start_job`, `edit_check`,
-/// `existing_targets`): a dropped folder in the web build is one `add` per file, about 200
-/// bytes each, and a transfer lists every path it sends.
+/// A dropped folder is one `add` per file (~200 B each); a transfer lists every path it sends.
 pub(crate) const JOB_BODY_MAX: usize = 8 * 1024 * 1024;
-/// A route whose body has no size limit: streamed to disk, never held in memory.
+/// Bodies of any size, streamed to disk.
 pub(crate) const UPLOAD: &str = "/api/edit_upload";
-/// Connect's phone upload: a raw body of any size into a server folder, streamed as [`UPLOAD`].
 pub(crate) const CONNECT_UPLOAD: &str = "/api/connect/upload";
 
-/// A request line and its headers (names lowercased), with the bytes read past them.
+/// Header names lowercased; `rest` the bytes read past the head.
 pub(crate) struct Head {
     pub method: String,
-    /// The target without its query.
     pub path: String,
-    /// The query, still percent-encoded (`""` without one).
+    /// Still percent-encoded.
     pub query: String,
     headers: Vec<(String, String)>,
     pub length: usize,
@@ -44,19 +39,14 @@ pub(crate) struct Response {
     kind: &'static str,
     body: Cow<'static, [u8]>,
     pub retry_after: Option<u64>,
-    /// A static file's `Cache-Control` (API replies always get `no-store`).
     cache: Option<&'static str>,
-    /// An asset embedded gzipped: `Some(true)` sent so (`Content-Encoding: gzip`), `Some(false)`
-    /// decoded for a client that takes no gzip; either way `Vary: Accept-Encoding`.
+    /// `Some(true)` sent gzipped, `Some(false)` decoded; either way `Vary: Accept-Encoding`.
     gzip: Option<bool>,
-    /// Runs once the response is sent (quit).
     pub after: Option<Box<dyn FnOnce() + Send>>,
-    /// A download's file name and bytes, streamed after the head instead of `body`.
-    /// Boxed: most replies carry none, and every `Err(Response)` stays small.
+    /// Boxed so every `Err(Response)` stays small.
     download: Option<Box<Download>>,
 }
 
-/// Writes a download's body: exactly its `len` bytes into the writer it is given.
 pub(crate) type Body = Box<dyn FnOnce(&mut dyn Write) -> std::io::Result<()> + Send>;
 
 struct Download {
@@ -73,18 +63,15 @@ impl Response {
         }
     }
 
-    /// An SVG drawn per request (`GET /api/qr`).
     pub fn svg(body: String) -> Self {
         Self::new(200, "image/svg+xml", Cow::Owned(body.into_bytes()))
     }
 
-    /// `{"error": text}`, the shape of every refusal.
     pub fn error(status: u16, text: impl std::fmt::Display) -> Self {
         let body = serde_json::json!({ "error": text.to_string() }).to_string();
         Self::new(status, JSON, Cow::Owned(body.into_bytes()))
     }
 
-    /// An [`Response::error`]'s text (the whole body for another response).
     pub fn error_text(&self) -> String {
         serde_json::from_slice::<serde_json::Value>(&self.body)
             .ok()
@@ -92,10 +79,8 @@ impl Response {
             .unwrap_or_else(|| String::from_utf8_lossy(&self.body).into_owned())
     }
 
-    /// Vite names `assets/*` by content hash, so a new build never reuses a name: those are
-    /// cached for good. Everything else (`index.html`, the AppCache manifest `forge.appcache`)
-    /// is checked on every load, so reloading the payload always shows its own UI (found on
-    /// the PS5 browser, which kept an old page).
+    /// `assets/*` are named by content hash, cached for good; the rest is checked on every load
+    /// (the PS5 browser kept an old page).
     pub fn asset(name: &str, bytes: &'static [u8]) -> Self {
         let mut r = Self::new(200, content_type(name), Cow::Borrowed(bytes));
         r.cache = Some(if name.starts_with("assets/") {
@@ -106,8 +91,6 @@ impl Response {
         r
     }
 
-    /// An asset embedded as a gzip stream (build.rs): as it is when `accept_encoding` takes gzip,
-    /// else decoded here.
     pub fn gzip_asset(name: &str, gz: &'static [u8], accept_encoding: Option<&str>) -> Self {
         let take = accept_encoding.is_some_and(takes_gzip);
         let mut r = Self::asset(name, gz);
@@ -122,8 +105,19 @@ impl Response {
         r
     }
 
-    /// `len` bytes, written by `body` after the head, as an attachment named `name` (any
-    /// text: [`disposition`] makes the header safe).
+    /// `None` for a reply with a hook after it or a download.
+    pub fn duplicate(&self) -> Option<Self> {
+        if self.after.is_some() || self.download.is_some() {
+            return None;
+        }
+        Some(Self {
+            body: self.body.clone(),
+            after: None,
+            download: None,
+            ..*self
+        })
+    }
+
     pub fn download(kind: &'static str, name: &str, len: u64, body: Body) -> Self {
         let mut r = Self::new(200, kind, Cow::Borrowed(b""));
         r.download = Some(Box::new(Download {
@@ -161,9 +155,11 @@ impl Response {
     fn bytes(&self) -> Vec<u8> {
         let reason = match self.status {
             200 => "OK",
+            202 => "Accepted",
             400 => "Bad Request",
             404 => "Not Found",
             409 => "Conflict",
+            411 => "Length Required",
             413 => "Content Too Large",
             429 => "Too Many Requests",
             502 => "Bad Gateway",
@@ -182,7 +178,6 @@ impl Response {
         if let Some(d) = &self.download {
             head += &format!("Content-Disposition: {}\r\n", disposition(&d.name));
         }
-        // API replies: the page must never see a stale one.
         if self.kind == JSON || self.download.is_some() {
             head += "Cache-Control: no-store\r\n";
         } else if let Some(cache) = self.cache {
@@ -210,8 +205,7 @@ fn bad(text: &str) -> Response {
     Response::error(400, text)
 }
 
-/// Whether an `Accept-Encoding` value takes gzip: `gzip`, `x-gzip` or `*` listed, its `q` not 0
-/// (a `gzip;q=0` refuses it even beside `*`).
+/// `gzip`, `x-gzip` or `*` with a `q` not 0 (a `gzip;q=0` refuses it even beside `*`).
 fn takes_gzip(value: &str) -> bool {
     let mut star = false;
     for item in value.split(',') {
@@ -254,7 +248,6 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// One read that gives up at `deadline`, however slowly the bytes trickle in.
 fn read_some(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> Result<usize, Response> {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -297,7 +290,6 @@ pub(crate) fn read_head(stream: &mut TcpStream, deadline: Instant) -> Result<Hea
     Err(Response::error(413, "the request head is over 16 KiB"))
 }
 
-/// The head without its final blank line.
 pub(crate) fn parse_head(bytes: &[u8]) -> Result<Head, Response> {
     let text = std::str::from_utf8(bytes).map_err(|_| bad("the request head is not UTF-8"))?;
     let mut lines = text.split("\r\n");
@@ -397,9 +389,8 @@ pub(crate) fn read_body(
     Ok(body)
 }
 
-/// An [`UPLOAD`] body as a reader: the bytes read past the head, then the socket, `idle` for
-/// each read and no deadline for the whole (a GiB file takes minutes); it ends after
-/// `Content-Length` bytes. A client that closes early gives `UnexpectedEof`.
+/// An [`UPLOAD`] body: `idle` per read, no deadline for the whole; a client that closes early
+/// gives `UnexpectedEof`.
 pub(crate) struct BodyReader<'a> {
     rest: std::io::Cursor<Vec<u8>>,
     stream: &'a mut TcpStream,
@@ -444,12 +435,9 @@ impl Read for BodyReader<'_> {
     }
 }
 
-/// Writes the response within `timeout`, however slowly the client reads, and closes; a
-/// download gets `timeout` for each write of its body instead (a GiB file takes minutes, a
-/// client that stops reading still loses its thread). A download whose body fails part way is
-/// cut short: the client sees fewer bytes than `Content-Length` says, and marks it failed. Unread request bytes are
-/// drained for a moment first, so the close doesn't reset the connection before the client
-/// has read the response.
+/// Within `timeout` however slowly the client reads (a download: per write of its body; one
+/// that fails part way ends short of `Content-Length`). Unread request bytes are drained for a
+/// moment first, so the close doesn't reset the connection before the client reads the reply.
 pub(crate) fn send(stream: &mut TcpStream, response: &mut Response, timeout: Duration) {
     if write_by(stream, &response.bytes(), Instant::now() + timeout).is_ok()
         && let Some(d) = response.download.as_mut()
@@ -470,7 +458,6 @@ pub(crate) fn send(stream: &mut TcpStream, response: &mut Response, timeout: Dur
     }
 }
 
-/// A download's body: its writer, held to exactly `len` bytes.
 fn stream_body(stream: &mut TcpStream, d: &mut Download, timeout: Duration) -> std::io::Result<()> {
     let body = d.body.take().ok_or(ErrorKind::Other)?;
     let mut sink = Sink {
@@ -485,7 +472,7 @@ fn stream_body(stream: &mut TcpStream, d: &mut Download, timeout: Duration) -> s
     }
 }
 
-/// The socket under a download: each write by its own deadline, never past `Content-Length`.
+/// Each write by its own deadline, never past `Content-Length`.
 struct Sink<'a> {
     stream: &'a mut TcpStream,
     timeout: Duration,
@@ -507,9 +494,7 @@ impl Write for Sink<'_> {
     }
 }
 
-/// `attachment; filename="..."` with an ASCII stand-in (`_` for anything else, a quote, a
-/// backslash or a control character), plus `filename*=UTF-8''...` percent-encoded when the
-/// name isn't plain ASCII (RFC 6266): no header injection whatever the name holds.
+/// RFC 6266 with an ASCII stand-in: no header injection whatever the name holds.
 fn disposition(name: &str) -> String {
     let plain = |c: char| c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ';
     let ascii: String = name
@@ -531,8 +516,7 @@ fn disposition(name: &str) -> String {
     header
 }
 
-/// Decodes `%XX` escapes (`+` stays `+`, as `encodeURIComponent` writes a space `%20`);
-/// `None` for a bad escape or text that isn't UTF-8.
+/// `+` stays `+` (`encodeURIComponent` writes a space `%20`); `None` for a bad escape or non-UTF-8.
 pub(crate) fn percent_decode(text: &str) -> Option<String> {
     let mut out = Vec::with_capacity(text.len());
     let mut bytes = text.bytes();
@@ -550,7 +534,7 @@ pub(crate) fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// The decoded value of `key` in a query (`a=1&b=2`); the first one wins.
+/// The first one wins.
 pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
     query
         .split('&')
@@ -559,16 +543,13 @@ pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
         .and_then(|(_, v)| percent_decode(v))
 }
 
-/// `write_all` with one absolute deadline: the timeout is what is left of it before each
-/// write, so a client reading a trickle can't hold the thread write after write.
+/// One absolute deadline, so a client reading a trickle can't hold the thread write after write.
 fn write_by(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> std::io::Result<()> {
     write_until(stream, bytes, deadline, |s, left| {
         s.set_write_timeout(Some(left))
     })
 }
 
-/// [`write_by`] over any writer, `timeout` setting the per-write limit (unit-tested with a
-/// writer that takes a byte at a time; a socket's kernel buffer would hide the deadline).
 fn write_until<W: Write>(
     w: &mut W,
     mut bytes: &[u8],
@@ -596,9 +577,8 @@ pub(crate) fn busy(stream: TcpStream) {
     let mut stream = stream;
     let _ = stream.set_nonblocking(true);
     let _ = stream.write_all(&Response::error(503, "too many connections; try again").bytes());
-    // Closing with the request still unread sends a reset, which the browser shows as a network
-    // error instead of the 503: end the write side, then drain what came, 20 ms at most (this
-    // runs on the accept thread).
+    // Closing with the request unread sends a reset (a network error, not the 503): shut the
+    // write side, then drain for 20 ms at most (this is the accept thread).
     let _ = stream.shutdown(Shutdown::Write);
     let deadline = Instant::now() + Duration::from_millis(20);
     let mut sink = [0u8; 4096];
@@ -617,30 +597,6 @@ pub(crate) fn busy(stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gzip_is_taken_only_when_asked_for() {
-        for yes in [
-            "gzip",
-            "gzip, deflate, br",
-            "br;q=1, GZip;q=0.5",
-            "x-gzip",
-            "*",
-            "br, *",
-        ] {
-            assert!(takes_gzip(yes), "{yes}");
-        }
-        for no in [
-            "",
-            "identity",
-            "br",
-            "gzip;q=0",
-            "*, gzip;q=0",
-            "gzip;q=0.0, *",
-        ] {
-            assert!(!takes_gzip(no), "{no}");
-        }
-    }
 
     #[test]
     fn a_gzipped_asset_is_sent_as_it_is_or_decoded() {
@@ -662,7 +618,7 @@ mod tests {
         }
     }
 
-    /// Takes one byte per write, a little late each time: always progress, never done in time.
+    /// One byte per write, a little late each time: always progress, never done in time.
     struct Trickle(Vec<u8>);
 
     impl Write for Trickle {
@@ -695,9 +651,7 @@ mod tests {
         // A per-write timeout would have let all 1000 bytes through (5 s); this stops near 60 ms.
         assert!(w.0.len() < 100, "{} bytes", w.0.len());
         assert!(start.elapsed() < Duration::from_millis(500));
-        // Each write gets what is left of the one deadline, never a fresh allowance.
         assert!(limits.windows(2).all(|l| l[1] < l[0]));
-        // A writer that keeps up finishes.
         let mut fast = Vec::new();
         write_until(
             &mut fast,

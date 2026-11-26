@@ -1,17 +1,14 @@
-// The Storage tab's Package installer view (the PS5 only): every `.pkg` under the server's roots,
-// scanned on the first visit and on Refresh (core's `scan_packages`; nothing kept), each row with
-// Install, which asks (InstallDialog.tsx) and starts an install job listed under Storage.
+// Storage's Package installer (the PS5 only): every `.pkg` under the roots, scanned on visit and Refresh.
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { api, errorText, prettyBytes, type PackageContent, type PackageEntry, type PackageScan } from "./api";
-import { basename, Dots, notifyDeleted, PathLine } from "./common";
+import { basename, Dots, FreeSpace, notifyDeleted, PathLine } from "./common";
 import { confirmDelete } from "./delete";
 import { gameTitle, useMessages } from "./i18n";
 import { Icon } from "./icons";
 import { installHere } from "./InstallDialog";
 import type { Action } from "./jobs";
-import { FreeSpace } from "./Library";
 
 const name = (e: PackageEntry) => gameTitle(e.title_names, e.title_name) || e.title_id || basename(e.path);
 
@@ -221,7 +218,7 @@ function Row(props: {
       <button
         type="button"
         className="small icon-only danger"
-        // The row being deleted keeps focus (aria-disabled), as the Library's does.
+        // The row being deleted keeps focus (aria-disabled), as the File explorer's does.
         disabled={props.locked && !props.deleting}
         aria-disabled={props.deleting || undefined}
         aria-label={props.deleting ? lib.deleting(n) : lib.remove(n)}

@@ -2,10 +2,8 @@
 # Run FreeBSD's own `fsck_ufs -n` and `dumpfs` on raw UFS2 images (the
 # independent check, because a writer and its own reader can share bugs).
 #
-# macOS and current Debian/Ubuntu ship no UFS tooling, so this boots an official FreeBSD
-# arm64 VM image under qemu (TCG) inside a Docker container, attaches every image as an
-# extra read-only virtio disk (vtbd1, vtbd2, ...) and drives the serial console with expect.
-# The VM boots from a throwaway overlay, so the cached base image is never modified.
+# Boots an official FreeBSD arm64 VM under qemu (TCG) in Docker from a throwaway overlay, each
+# image a read-only virtio disk, driven over the serial console with expect.
 #
 #   scripts/fsck-ufs.sh a.ffpkg b.ffpkg
 #
@@ -14,9 +12,8 @@
 #   FSCK_UFS_EXTRA='truncate -s 136511488 /tmp/r; md=$(mdconfig -f /tmp/r);
 #     newfs -O 2 -b 65536 -f 65536 -m 0 -S 4096 -i 65536 /dev/$md >/dev/null; dumpfs /dev/$md | head -45'
 #
-# Cache: $PS5_FORGE_CACHE (default ~/.cache/ps5-dump-forge), the ~2 GB qcow2. A run takes
-# about a minute on Apple silicon. Exit status 0 only when every image is explicitly clean
-# (see chk below): fsck_ufs -n exits 0 even when it reports and declines a repair.
+# Cache: $PS5_FORGE_CACHE (default ~/.cache/ps5-dump-forge). Exit 0 only when every image is
+# explicitly clean (chk below): fsck_ufs -n exits 0 even when it declines a repair.
 set -euo pipefail
 
 [ $# -ge 1 ] || { echo "usage: $0 <image>..." >&2; exit 2; }

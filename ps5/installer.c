@@ -1,10 +1,6 @@
-/* Hands a package to the PS5's installer: sceAppInstUtilInstallByPackage with an http:// URL that
- * Forge serves on 127.0.0.1 (crates/ps5-dump-forge-core/src/install.rs). Sony accepts or refuses at
- * once, then fetches the package over HTTP Range requests on its own threads. Behaviour after
- * ps5upload's installer (payload/installer/sony.c, include/sceAppInstUtil.h, authid.h); our own code.
- * Returns 0 when Sony accepts the package; else -1 with its error in *code. Invalid URLs are
- * rejected locally with SCE kernel EINVAL. Logs to stdout (the serve log).
- */
+/* sceAppInstUtilInstallByPackage with an http:// URL install.rs serves on 127.0.0.1; Sony accepts
+ * or refuses at once, then fetches it with Range requests. Behaviour after ps5upload's installer;
+ * our own code. Returns 0 when accepted, else -1 with Sony's error in *code. */
 #include <ps5/kernel.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -19,7 +15,7 @@
 #define SHELLCORE_AUTHID 0x3800000000000010ULL
 #define REFUSED_PREFLIGHT 0x80B22404u
 #define MAX_INSTALL_URL 127
-/* SCE kernel EINVAL, used only if the caller violates the URL limit. */
+/* SCE kernel EINVAL. */
 #define BAD_INSTALL_URL 0x80020016u
 
 /* The published layout is six pointers, but Sony reads the 8 bytes after icon_url: nonzero there
@@ -71,7 +67,6 @@ static meta_info meta;
 static pkg_info pkg;
 static playgo_info playgo;
 
-/* This process's credentials as the installer needs them, and what they were before. */
 typedef struct {
     uint64_t authid;
     uint8_t caps[16];

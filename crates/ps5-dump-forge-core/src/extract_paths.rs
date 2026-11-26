@@ -1,17 +1,10 @@
-//! Extract (a request with [`ConvertRequest::extract`]): files and folders of any source
-//! copied into an existing folder on this computer or a paired one (`flink://`), each under
-//! its own last component. Every
-//! check runs before the first byte is written; nothing there is replaced unless the request
-//! says [`ConvertRequest::replace`] (a file onto a file, a folder merged into a folder, each
-//! replaced file refused as Delete refuses it; on another device the device judges what it
-//! may replace, [`crate::remote::Remote::rename_replace`]). Each file goes through an
-//! exclusive temporary name beside its target, synced, then renamed without replacing (over
-//! the file it replaces); a selected folder is created exclusively first (one merged into is
-//! kept). BLAKE3 while writing; verify checks each file's size, and with full verification
-//! re-reads and re-hashes it.
-// ponytail: no rollback: a failure part way leaves the files already extracted (the error
-// says how many); each file itself is atomic. No U5 sync cadence on the PS5: each file is
-// synced once, whole.
+//! Extract ([`ConvertRequest::extract`]): files and folders of any source copied into an
+//! existing folder here, on a peer or on a NAS, each under its last component. Every check
+//! runs first; nothing is replaced unless [`ConvertRequest::replace`]. Each file goes through
+//! an exclusive temporary name, synced, renamed without replacing (or over the file it
+//! replaces). BLAKE3 while writing; verify checks sizes, or re-reads and re-hashes (full).
+// ponytail: no rollback: a failure part way leaves the files already extracted (each file is
+// atomic). No U5 sync cadence on the PS5: each file is synced once, whole.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
@@ -30,30 +23,25 @@ use crate::remote::RemoteDir;
 use crate::temp_file::{write_temp, write_temp_new};
 use crate::{ConvertRequest, Format, JobReport, VerifyMode, VerifySummary};
 
-/// The stages an extract reports, in order.
 pub(crate) const STAGES: [&str; 4] = ["scan", "preflight", "write", "verify"];
-/// One read of a copy or of the check.
 pub(crate) const CHUNK: u64 = 8 << 20;
 /// Room beyond the copied bytes the destination must have.
 const MARGIN: u64 = 1 << 20;
 
-/// One selected path, resolved against the source's listing.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Selection {
-    /// The game path as selected.
     pub(crate) path: String,
-    /// Its last component: the name it gets in the destination.
+    /// Its last component: its name in the destination.
     pub(crate) name: String,
     /// A folder (else one file, `files[0]`).
     pub(crate) dir: bool,
-    /// The files to copy, by game path.
     pub(crate) files: Vec<SourceFile>,
     /// Folders inside a selected folder, relative to it, parents first.
     pub(crate) dirs: Vec<String>,
 }
 
 impl Selection {
-    /// `game` (a game path inside this selection) as a destination-relative path.
+    /// `game` (a path inside this selection) as a destination-relative path.
     fn target(&self, game: &str) -> String {
         match game.strip_prefix(&self.path) {
             Some(rest) if self.dir => format!("{}{rest}", self.name),
@@ -62,8 +50,7 @@ impl Selection {
     }
 }
 
-/// Why `path` is not a plain game path (`/`-separated, relative, no empty, `.` or `..`
-/// component, no `\`).
+/// Why `path` is not a plain game path (`/`-separated, relative, no empty/`.`/`..` part, no `\`).
 fn bad_path(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         return Some("an empty path");
@@ -77,8 +64,8 @@ fn bad_path(path: &str) -> Option<&'static str> {
         .then_some("an empty, '.' or '..' component")
 }
 
-/// Resolves `paths` against the source's `files` and `empty_dirs`: every unknown or malformed
-/// path, two selections with one name, and a selection inside another are findings.
+/// Resolves `paths` against the listing; unknown or malformed paths, two selections with one
+/// name and one selection inside another are findings.
 pub(crate) fn select(
     files: &[SourceFile],
     empty_dirs: &[String],
@@ -114,8 +101,7 @@ pub(crate) fn select(
             findings.push(format!("extract: {path} is not in the game"));
             continue;
         }
-        // Every folder below the selected one: each file's parents and each empty folder with
-        // its parents. Sorted, a parent comes before its children (it is their prefix).
+        // Every folder below the selected one, sorted so a parent precedes its children.
         let mut dirs = BTreeSet::new();
         for rel in (inside.iter().map(|f| &f.path[prefix.len()..]))
             .map(|p| p.rsplit_once('/').map_or("", |(d, _)| d))
@@ -163,7 +149,6 @@ pub(crate) fn select(
     }
 }
 
-/// What the request itself can't be, before anything is read.
 fn request_findings(req: &ConvertRequest) -> Vec<String> {
     let mut findings = Vec::new();
     if req.format != Format::Folder {
@@ -199,8 +184,8 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     findings
 }
 
-/// Every check on the destination folder `root` (canonical): not inside a folder source,
-/// nothing at any selection's name, the names it can hold, free space.
+/// Every check on the destination `root` (canonical): not inside a folder source, the
+/// selections' names, what the folder can hold, free space.
 fn destination_findings(
     req: &ConvertRequest,
     kind: Kind,
@@ -209,8 +194,7 @@ fn destination_findings(
     ctx: &Ctx,
 ) -> (Vec<String>, Replacing) {
     let mut findings = Vec::new();
-    // A device's paths compare as spelled (normalized, an SMB share's case folded: the device
-    // resolves them), local ones canonical.
+    // A device's paths compare as spelled (it resolves them), local ones canonical.
     let inside = if crate::remote::is_remote(root) || crate::remote::is_remote(&req.source) {
         use crate::remote::FlinkPath;
         match (FlinkPath::parse(root), FlinkPath::parse(&req.source)) {
@@ -231,19 +215,16 @@ fn destination_findings(
     (findings, replacing)
 }
 
-/// What a request with [`ConvertRequest::replace`] replaces, as its preflight found it: the
-/// paths [`write`] builds.
+/// What a request with [`ConvertRequest::replace`] replaces, as preflight found it.
 #[derive(Debug, Default)]
 pub(crate) struct Replacing {
-    /// Files renamed over.
     files: HashSet<PathBuf>,
     /// Folders merged into (kept, not made).
     dirs: HashSet<PathBuf>,
 }
 
-/// The destination folder `root`'s checks (`what` leads each finding): nothing at any
-/// selection's name (with `replace`, only what [`replace_findings`] passes),
-/// the names it can hold, free space.
+/// `root`'s checks (`what` leads each finding): nothing at a selection's name (with `replace`,
+/// only what [`replace_findings`] passes), the names it can hold, free space.
 pub(crate) fn target_findings(
     what: &str,
     root: &Path,
@@ -303,7 +284,7 @@ pub(crate) fn target_findings(
     findings.extend(crate::extract::extraction_findings(
         &files,
         &dirs,
-        // Another device's folding is unknown: as if it folds (an SMB share does).
+        // Another device's folding is unknown: as if it folds (SMB does).
         crate::extract::CASE_INSENSITIVE || peer,
     ));
     // U2: names as the folder's filesystem folds them; with no probe, as if it folds.
@@ -316,7 +297,6 @@ pub(crate) fn target_findings(
     (findings, replacing)
 }
 
-/// What is at a target path, as [`replace_findings`] judges it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Found {
     File,
@@ -326,17 +306,16 @@ enum Found {
     Other,
 }
 
-/// What is at paths here or on another device ([`Kinds::at`]); each remote folder is listed
-/// once, not stat'ed per entry (a merged folder of 10,000 files is 10,000 round trips else).
+/// What is at paths here or on another device; a remote folder is listed once, not stat'ed per
+/// entry (a merged folder of 10,000 files would be 10,000 round trips).
 #[derive(Default)]
 struct Kinds {
     listed: HashMap<PathBuf, Result<Vec<crate::remote::RemoteEntry>, String>>,
 }
 
 impl Kinds {
-    /// What is at `path` (`None`: nothing), or why that can't be said. On another device an
-    /// entry whose name differs only in case is a refusal: the device may take the two names
-    /// for one (an SMB share does) or not, so neither a merge nor a new name is safe.
+    /// What is at `path` (`None`: nothing). On another device a case-only different name is a
+    /// refusal: the device may fold the two into one, so neither a merge nor a new name is safe.
     fn at(&mut self, path: &Path) -> Result<Option<Found>, String> {
         use crate::remote::FlinkPath;
         if !crate::remote::is_remote(path) {
@@ -389,11 +368,9 @@ impl Kinds {
     }
 }
 
-/// What selection `s` would replace in `root` (here or on another device), its target
-/// existing: a file onto a file, a folder onto a folder (merged: every folder and file inside
-/// checked too). A kind mismatch at any level is a finding, and so is a replaced file Delete
-/// would refuse ([`Ctx::replace_refusal`]; on another device only what this device's jobs use:
-/// a peer refuses the rest itself, at the rename); what passes goes into `replacing`.
+/// What selection `s` would replace in `root`: a file onto a file, a folder merged into a
+/// folder (everything inside checked). A kind mismatch at any level, or a file Delete would
+/// refuse ([`Ctx::replace_refusal`]; a peer judges the rest itself), is a finding.
 fn replace_findings(
     what: &str,
     root: &Path,
@@ -404,8 +381,7 @@ fn replace_findings(
 ) -> Vec<String> {
     let mut findings = Vec::new();
     let top = root.join(&s.name);
-    // The selection's folders (destination-relative) that are missing or not a folder there:
-    // nothing below them exists to replace. Parents come first.
+    // The selection's folders missing (or not folders) there: nothing below them to replace.
     let mut absent: HashSet<String> = HashSet::new();
     let parent_absent = |rel: &str, absent: &HashSet<String>| {
         rel.rsplit_once('/')
@@ -458,8 +434,7 @@ fn replace_findings(
             }
             continue;
         }
-        // Every folder merged into is checked too: the top one's job check covers those inside
-        // it, but not ShadowMount+'s mount folder found further down (PS5).
+        // Each merged folder checked too: ShadowMount+'s mount folder may be further down (PS5).
         if let Err(e) = ctx.replace_refusal(&path, dir) {
             findings.push(format!("{what}: {e}"));
             continue;
@@ -473,7 +448,6 @@ fn replace_findings(
     findings
 }
 
-/// One log line naming what was replaced (the first ten and a count of the rest).
 pub(crate) fn log_replaced(replaced: &[PathBuf], ctx: &Ctx) {
     if replaced.is_empty() {
         return;
@@ -507,7 +481,7 @@ pub(crate) fn existing_targets(req: &ConvertRequest) -> anyhow::Result<Vec<PathB
     } else {
         bail!("only an extract or a transfer has targets to check");
     };
-    // The folder itself first: a device that doesn't answer is an error, not "nothing there".
+    // The folder first: a device that doesn't answer is an error, not "nothing there".
     let root = if crate::remote::is_remote(&req.output) {
         RemoteDir::open(&req.output)?.path().to_path_buf()
     } else {
@@ -530,7 +504,6 @@ pub(crate) fn preflight_failed(findings: Vec<String>) -> anyhow::Error {
     anyhow::anyhow!("preflight failed:\n  {}", findings.join("\n  "))
 }
 
-/// The extract job: scan, preflight, write, verify.
 pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> {
     ctx.stages(&STAGES);
     ctx.progress("scan", 0, 1);
@@ -552,7 +525,6 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
     ctx.progress("preflight", 0, 1);
     let selections =
         select(tree.files(), tree.empty_dirs(), &req.extract).map_err(preflight_failed)?;
-    // On a peer: the folder there, its path spelled as `FlinkPath` normalizes it.
     let mut peer = if crate::remote::is_remote(&req.output) {
         Some(RemoteDir::open(&req.output)?)
     } else {
@@ -614,8 +586,7 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
         }
         verify(&written, req.full_verify, ctx)
     });
-    // A failure (or cancel) after some files were finished: they stay, and the log says so
-    // too, since a cancelled job's error may be only "cancelled".
+    // Files finished before a failure stay; logged too, as a cancel's error is only "cancelled".
     let checked = match (outcome, written.len()) {
         (Ok(checked), _) => checked,
         (Err(e), 0) => return Err(made_note(e, &made, "extract", ctx)),
@@ -648,13 +619,14 @@ pub(crate) fn run(req: &ConvertRequest, ctx: &Ctx) -> anyhow::Result<JobReport> 
             samples: 0,
             seed: 0,
         },
+        source_bytes: total,
+        started_at_ms: 0,
+        ended_at_ms: 0,
     })
 }
 
-/// `tree` read one range ahead on its own thread, so the next read overlaps writing and
-/// hashing the last one (as convert's writers do). When each selected file is the next
-/// non-empty one of `files()` after the one before it, the next file is read ahead too; else
-/// a guess past a file's end could send an archive's decoder past what is asked next.
+/// `tree` read one range ahead on its own thread; the next file too only when the selection
+/// follows `files()` order (a guess past a file's end could send an archive's decoder astray).
 pub(crate) fn read_ahead(
     tree: Box<dyn SourceTree>,
     selections: &[Selection],
@@ -682,24 +654,19 @@ pub(crate) fn read_ahead(
     .context("starting the read-ahead thread")
 }
 
-/// A new folder at `path`, exclusively (an existing one fails), 0777 on the PS5.
+/// A new folder at `path`, exclusively, 0777 on the PS5.
 fn make_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir(path).with_context(|| format!("creating {}", path.display()))?;
     make_dir_open(path).with_context(|| format!("opening up {}", path.display()))
 }
 
-/// What [`write`] has done so far.
 pub(crate) struct Written<'a> {
-    /// Each finished file: its path, size and BLAKE3.
     pub(crate) files: &'a mut Vec<(PathBuf, u64, blake3::Hash)>,
-    /// Each selection folder made.
     pub(crate) made: &'a mut Vec<PathBuf>,
-    /// Each file renamed over one that was there ([`Replacing`]).
     pub(crate) replaced: &'a mut Vec<PathBuf>,
 }
 
-/// Copies every selection into `root` (through `peer` when it is on one), replacing only what
-/// `replacing` names; `out` records what was done, `done` the bytes copied.
+/// Copies every selection into `root` (or `peer`), replacing only what `replacing` names.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write(
     tree: &mut dyn SourceTree,
@@ -729,8 +696,7 @@ pub(crate) fn write(
             bytes
         ));
         if let Some(dir) = peer.as_deref_mut() {
-            // Each folder made exclusively (one merged into kept, parents first); the peer
-            // syncs each folder a file is renamed into.
+            // Each folder made exclusively unless merged into; the peer syncs renamed-into folders.
             if s.dir {
                 if replacing.dirs.contains(&target) {
                     dir.keep(&s.name);
@@ -765,7 +731,6 @@ pub(crate) fn write(
         }
         let mut synced = vec![root.to_path_buf()];
         if s.dir {
-            // A folder merged into is kept; every other one is made exclusively.
             if !replacing.dirs.contains(&target) {
                 make_dir(&target)?;
                 made.push(target.clone());
@@ -797,7 +762,7 @@ pub(crate) fn write(
             Ok(())
         });
         if files.is_err() {
-            // The barrier for the files finished before the failure (they stay).
+            // The barrier for the files finished before the failure.
             let _ = fsync_dir(root);
         }
         files?;
@@ -814,8 +779,7 @@ pub(crate) fn write(
     Ok(())
 }
 
-/// A folder synced; on macOS a plain fsync, made durable by the F_FULLFSYNC of the
-/// [`fsync_dir`] that follows it ([`crate::extract::sync_file`]).
+/// A folder synced; on macOS a plain fsync, made durable by the root's F_FULLFSYNC after it.
 fn sync_folder(dir: &Path) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     return crate::extract::sync_file(&File::open(dir)?);
@@ -823,8 +787,7 @@ fn sync_folder(dir: &Path) -> io::Result<()> {
     fsync_dir(dir)
 }
 
-/// A failure before any file was finished: the folders `write` made stay (a retry finds them
-/// taken), so the error (and the log) names them.
+/// A failure before any file was finished: the folders made stay, so the error names them.
 pub(crate) fn made_note(e: anyhow::Error, made: &[PathBuf], job: &str, ctx: &Ctx) -> anyhow::Error {
     let note = match made {
         [] => return e,
@@ -838,7 +801,6 @@ pub(crate) fn made_note(e: anyhow::Error, made: &[PathBuf], job: &str, ctx: &Ctx
     anyhow::anyhow!("{e:#}; {note}")
 }
 
-/// Streams `file` of `tree` into `out` in chunks, hashing it, checking cancel between chunks.
 fn copy(
     tree: &mut dyn SourceTree,
     file: &SourceFile,
@@ -873,8 +835,7 @@ fn copy(
     Ok(())
 }
 
-/// Each written file's size; with `full`, its bytes re-read and re-hashed too. Returns the
-/// bytes read back.
+/// Each written file's size; with `full`, re-read and re-hashed. Returns the bytes read back.
 pub(crate) fn verify(
     written: &[(PathBuf, u64, blake3::Hash)],
     full: bool,
@@ -894,8 +855,7 @@ pub(crate) fn verify(
         ctx.check()?;
         let shown = || path.display().to_string();
         let peer = crate::remote::is_remote(path);
-        // On another device: fast mode takes the size from its folder's one listing; the full
-        // check reads back through the reader whose open gave the size.
+        // Remote: fast mode takes the size from the folder's one listing.
         let mut reader = None;
         let len = match peer {
             true if !full && let Some(len) = listed.size(path) => len,
@@ -935,14 +895,12 @@ pub(crate) fn verify(
     Ok(done)
 }
 
-/// Written files' folders on another device, each listed once by [`verify`]: one request per
-/// folder, not one per file.
+/// Written files' folders on another device, each listed once by [`verify`].
 #[derive(Default)]
 struct Listed(HashMap<PathBuf, HashMap<String, u64>>);
 
 impl Listed {
-    /// The size of the regular file at `path` by its folder's listing; `None` when the listing
-    /// fails or doesn't show it as one (then a stat, as before, says why).
+    /// The size of the regular file at `path` by its folder's listing; `None` then a stat says why.
     fn size(&mut self, path: &Path) -> Option<u64> {
         let (dir, name) = (path.parent()?, path.file_name()?.to_str()?);
         let sizes = self.0.entry(dir.to_path_buf()).or_insert_with(|| {

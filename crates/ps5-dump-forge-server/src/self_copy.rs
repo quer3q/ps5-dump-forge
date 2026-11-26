@@ -1,8 +1,5 @@
-//! The PS5 payload saves a copy of its own ELF as `/data/dumpforge/ps5-dump-forge.elf`,
-//! so the home-screen tile's page can ask elfldr to start it after a console restart. A running
-//! payload can't read its own file, so `ps5/build.sh` builds twice: stage 1 (no copy inside),
-//! then stage 2 with stage 1 embedded by `build.rs` as a blob:
-//!
+//! The payload's copy of its own ELF, so the tile's page can ask elfldr to start it after a
+//! restart. A payload can't read its own file, so stage 2 embeds stage 1 as a blob:
 //! `PDFGSELF`, u64 LE raw length, u64 LE compressed length, SHA-256 of the raw ELF (32 bytes),
 //! then one zstd frame. `scripts/release-ps5.sh` reads the same layout.
 
@@ -17,17 +14,15 @@ use sha2::{Digest, Sha256};
 use crate::compare_versions as compare;
 
 const MAGIC: &[u8; 8] = b"PDFGSELF";
-/// Where the payload keeps its copy, and `ensure`'s lock beside it (`.<name>.lock`).
 #[cfg(target_env = "ps5")]
 pub(crate) const TARGET: &str = "/data/dumpforge/ps5-dump-forge.elf";
 #[cfg(target_env = "ps5")]
 pub(crate) const TARGET_LOCK: &str = "/data/dumpforge/.ps5-dump-forge.elf.lock";
 const HEADER: usize = 8 + 8 + 8 + 32;
-/// More than any payload this will ever be; a bad descriptor can't ask for more memory.
+/// A bad descriptor can't ask for more memory.
 const MAX_ELF: u64 = 256 << 20;
 
-/// The ELF a blob carries: decompressed to exactly its declared length, its SHA-256 checked,
-/// and an ELF of this `version` (its `ps5-dump-forge-version:` marker).
+/// Exactly its declared length, its SHA-256 checked, an ELF of this `version`.
 pub(crate) fn unpack(blob: &[u8], version: &str) -> Result<Vec<u8>, String> {
     if blob.len() < HEADER || &blob[..8] != MAGIC {
         return Err("no PDFGSELF descriptor".into());
@@ -68,10 +63,8 @@ pub(crate) fn unpack(blob: &[u8], version: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// The version in the first `ps5-dump-forge-version:<v>\0` marker.
 pub(crate) fn version_of(elf: &[u8]) -> Option<&str> {
-    // Sliced from the one marker literal, so no second copy of its prefix sits in the ELF
-    // (scripts/release-ps5.sh wants exactly one).
+    // Sliced from the one marker literal: release-ps5.sh wants exactly one copy in the ELF.
     let marker = crate::VERSION_MARKER;
     let prefix = &marker[..marker.len() - 1 - env!("CARGO_PKG_VERSION").len()];
     let at = elf.windows(prefix.len()).position(|w| w == prefix)? + prefix.len();
@@ -83,23 +76,17 @@ pub(crate) fn version_of(elf: &[u8]) -> Option<&str> {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Outcome {
     Saved,
-    /// The file is already these bytes.
     UpToDate,
-    /// The file is a strictly newer version (this one), left as it is.
     KeptNewer(String),
 }
 
-/// Makes `target` hold `elf` (of `version`) unless it already does or holds a strictly newer
-/// version. Anything else (missing, older, the same version built differently, no marker) is
-/// replaced: a unique temporary file next to it, synced, renamed over it, the folder synced.
+/// Unless `target` is these bytes or a strictly newer version: temp, sync, rename, folder sync.
 // ponytail: reads whatever file is at `target` (up to MAX_ELF) to find its version; another
 // program swapping files there in between is out of scope (no protections, by decision).
 pub(crate) fn ensure(target: &Path, elf: &[u8], version: &str) -> io::Result<Outcome> {
     let dir = target.parent().unwrap_or(Path::new("."));
     let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("elf");
-    // One save at a time across processes (flock, released on drop): two copies starting
-    // together (a takeover can be by an older version) would each read, compare and rename,
-    // and the older one's could land last.
+    // flock: two copies starting together (one older) could otherwise land the older last.
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -130,7 +117,6 @@ pub(crate) fn ensure(target: &Path, elf: &[u8], version: &str) -> io::Result<Out
         }
     }
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    // Only a dead process with our pid can have left this one.
     let _ = fs::remove_file(&tmp);
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -149,8 +135,6 @@ pub(crate) fn ensure(target: &Path, elf: &[u8], version: &str) -> io::Result<Out
     result.map(|()| Outcome::Saved)
 }
 
-/// On `serve` start: the copy, in a background thread, logged to stdout (the serve log) and
-/// shown as `self_copy` in `GET /api/session`.
 #[cfg(target_env = "ps5")]
 mod payload {
     use std::path::Path;
@@ -201,7 +185,6 @@ mod payload {
         }
     }
 
-    /// Before the process exits (another copy already serves, or quit): the copy finishes.
     pub(crate) fn wait() {
         let handle = SAVING.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(handle) = handle {
@@ -224,7 +207,6 @@ mod tests {
         [b"\x7fELF", filler, prefix, version.as_bytes(), b"\0"].concat()
     }
 
-    /// build.rs's layout, with the lengths given.
     fn blob(raw: &[u8], raw_len: u64, hash: &[u8]) -> Vec<u8> {
         let packed = zstd::bulk::compress(raw, 19).unwrap();
         let len = (packed.len() as u64).to_le_bytes();
@@ -247,8 +229,7 @@ mod tests {
         let b = good(&a);
         assert!(err(&b[..b.len() - 1]).contains("compressed bytes"));
         assert!(err(&[&b[..], b"x"].concat()).contains("compressed bytes"));
-        // Lengths are checked before memory is set aside, and the stream is read only one
-        // byte past what is declared.
+        // Lengths checked before memory is set aside; read only one byte past the declared.
         let hash = Sha256::digest(&a);
         assert!(err(&blob(&a, MAX_ELF + 1, &hash)).contains("over"));
         assert!(err(&blob(&a, 100, &hash)).contains("decompressed to 101+ bytes"));
@@ -264,7 +245,6 @@ mod tests {
         assert!(err(&good(&elf("9.9.9", b""))).contains("\"9.9.9\""));
     }
 
-    /// Saves racing each other (an older copy starting beside a newer one) end with the newer.
     #[test]
     fn concurrent_saves_keep_the_newest() {
         let dir = std::env::temp_dir().join(format!("forge-self-race-{}", std::process::id()));

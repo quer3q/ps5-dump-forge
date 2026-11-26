@@ -1,0 +1,72 @@
+/* The Transfer screen's device panes (TransferPane.tsx): the File explorer's list (`.xgrid`,
+   `.xrow`, `.crumbs`, `.explorer-well` in styles.css) with a checkbox column for the batch. */
+.transfer-pane { min-width: 0; }
+/* The pane's head: a small label (the device's icon and name), not a heading. */
+.transfer-head { align-items: center; gap: 8px; margin-bottom: 10px; min-height: 30px; }
+.transfer-head > button { flex: none; }
+.transfer-head > .icon { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.transfer-device {
+  min-width: 0; font-size: 13px; font-weight: 600; color: var(--fg-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* "N items selected" with Clear: state, so the accent's soft tint, not a warning. */
+.transfer-selected {
+  align-items: center; gap: 8px; margin: 0 0 10px; padding: 4px 6px; padding-inline-start: 12px;
+  border-radius: var(--radius); background: var(--accent-soft); color: var(--fg); font-size: 12.5px;
+}
+.transfer-selected .icon { flex: none; width: 15px; height: 15px; color: var(--accent); }
+.transfer-selected > button { flex: none; }
+/* Checkbox, name, size. */
+.transfer-grid .xrow { grid-template-columns: 22px minmax(0, 1fr) auto; padding-inline-start: 8px; }
+.xcheck { display: flex; align-items: center; justify-content: center; }
+.xcheck input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.xcheck input:disabled { cursor: not-allowed; opacity: 0.42; }
+/* A folder's name opens it. */
+.transfer-grid .xlabel.opens { cursor: pointer; }
+.transfer-grid .xlabel.opens:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+/* A selected row: the accent's soft fill and a bold name. */
+.transfer-grid .xrow.picked { background: var(--accent-soft); }
+.transfer-grid .xrow.picked .xlabel { color: var(--fg); font-weight: 600; }
+/* Names and sizes are LTR inside an RTL page. */
+[dir="rtl"] .transfer-grid .xlabel { unicode-bidi: isolate; text-align: start; }
+@media (pointer: coarse) {
+  .transfer-grid .xrow { grid-template-columns: 32px minmax(0, 1fr) auto; }
+  .xcheck input { width: 20px; height: 20px; }
+}
+
+/* The Transfer screen (Transfer.tsx): the device tabs over one card (`.dev-window`, devices.css)
+   holding the two panes and their bars. */
+.transfer-tabs { min-width: 0; }
+.transfer-window { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.transfer-panes, .transfer-bars { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (min-width: 880px) {
+  .transfer-panes, .transfer-bars { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  /* A 1px --line in the gap between the panes, inside the card's padding (no edge touched). */
+  .transfer-panes { position: relative; }
+  .transfer-panes::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: var(--line); }
+}
+.transfer-bars:not(:has(.transfer-bar)) { display: none; }
+.transfer-bar { gap: 8px; align-items: center; }
+.transfer-bar > button { max-width: 100%; min-width: 0; }
+/* The device's name in "Copy N items to <device>" / "Install on <PS5>": cut, the full name in its title. */
+.t-dev { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-offline > .note-line { margin: 0; }
+/* This browser's pane: a drop zone for the browser's files, then Download. */
+.transfer-browser-pane { display: flex; flex-direction: column; gap: 10px; }
+.transfer-browser-pane > p { margin: 0; }
+.transfer-dropzone {
+  display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 24px 16px;
+  border-radius: var(--radius); background: var(--inset); text-align: center;
+}
+.transfer-dropzone > .icon { width: 22px; height: 22px; color: var(--muted); }
+.transfer-dropzone > p { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.transfer-drop-title { font-weight: 600; }
+.transfer-dropzone .upload-line { align-self: stretch; margin-top: 0; text-align: start; }
+.transfer-browser-pane.drop .transfer-dropzone { background: var(--accent-soft); }
+.transfer-download { gap: 8px; align-items: center; }
+.transfer-download .note { font-size: 12.5px; }
+/* Inside the one card the panes don't stick: the tabs sit above them. */
+@media (min-width: 880px) {
+  .transfer-panes { gap: 24px; }
+  .transfer-pane.explorer { position: static; height: calc(100 * var(--vh) - 150px); }
+}

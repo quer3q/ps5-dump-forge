@@ -1,15 +1,11 @@
-// src/rar.rs declares UnRAR's C API itself (dll.hpp). This compiles the two structs it passes,
-// copied verbatim from unrar_sys 0.5.8's vendor/unrar/dll.hpp under its `#pragma pack(push, 1)`,
-// with the C++ compiler unrar_sys builds UnRAR with, and asserts their sizes and the offsets of
-// every field Rust touches: the same numbers rar.rs asserts against its `repr(C, packed)` copies.
-// wchar_t is 2 bytes on Windows and the PS5 (UTF-16), 4 elsewhere; LPARAM is pointer-sized. A
-// mismatch fails the build here instead of misreading RARHeaderDataEx at run time. Nothing is linked.
+// Compiles rar.rs's two UnRAR structs (verbatim from unrar_sys 0.5.8's dll.hpp, `pack(1)`) with
+// UnRAR's C++ compiler and asserts the sizes and offsets rar.rs asserts, so a wchar_t mismatch
+// fails the build. Nothing is linked.
 // ponytail: the copy is checked by hand: an unrar_sys bump must diff its dll.hpp against it.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let var = |k: &str| std::env::var(k).unwrap_or_default();
-    // UnRAR's Windows code (registry, process tokens, CryptGenRandom, file ACLs) needs advapi32,
-    // which unrar_sys links only powrprof and shell32 beside; the MSVC link fails without it.
+    // UnRAR's Windows code needs advapi32, which unrar_sys doesn't link; MSVC fails without it.
     if var("CARGO_CFG_TARGET_OS") == "windows" {
         println!("cargo:rustc-link-lib=advapi32");
     }

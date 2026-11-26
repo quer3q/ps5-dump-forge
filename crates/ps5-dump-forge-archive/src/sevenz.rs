@@ -52,21 +52,15 @@ fn entry(e: &ArchiveEntry) -> Result<Entry, ArchiveError> {
         encrypted: false,
     })
 }
-// ponytail: 64 MiB caps the next header, an encoded header's declared sizes and its LZMA/LZMA2/PPMd
-// memory; past it a 7z is refused, though no real archive of a game comes near it.
+// ponytail: 64 MiB caps the next header, its sizes and coder memory.
 const HEADER_LIMIT: u64 = 64 << 20;
-// ponytail: 1 GiB of LZMA/LZMA2/PPMd memory per block (summed over its coders, all alive at once while
-// it decodes); 7-Zip's -mx9 uses 64 MiB and larger is rare. Raise it if a real game archive needs it.
+// ponytail: 1 GiB of coder memory per block (7-Zip -mx9 uses 64 MiB).
 const DATA_DICT_LIMIT: u64 = 1 << 30;
-// ponytail: coders per block; 7-Zip writes at most ~7 (AES on each BCJ2 stream). sevenz-rust2 nests one
-// reader per coder and rescans the bind pairs for each, so a crafted million-coder chain would spin and
-// then overflow the stack.
+// ponytail: coders per block (7-Zip writes ~7); a crafted chain would overflow the stack.
 const MAX_CODERS: u64 = 16;
 
-/// Checks the start header and an encoded header before sevenz-rust2 reads the archive: it decodes an
-/// encoded header to its declared size with no memory limit, so a small crafted `.7z` could otherwise
-/// expand to gigabytes before any check. Only what is clearly over is refused; anything odd is left to
-/// sevenz-rust2. Also tells a byte-split set that lacks its last part.
+/// Checks the start header and an encoded header before sevenz-rust2 decodes it unbounded (a small
+/// crafted `.7z` could expand to gigabytes). Also tells a byte-split set missing its last part.
 fn check_header(source: &mut Parts, paths: &[PathBuf]) -> Result<(), ArchiveError> {
     let mut h = [0u8; 32];
     if source.len < 32 {
@@ -133,8 +127,7 @@ fn number(b: &mut &[u8]) -> Option<u64> {
     }
     Some(value)
 }
-/// The encoded header's StreamsInfo (after its 0x17): `Some(true)` when an unpack size or a coder's
-/// dictionary is over the limit, `None` for a structure sevenz-rust2 should judge.
+/// StreamsInfo: `Some(true)` when a size or dictionary is over the limit, `None` for sevenz-rust2.
 fn encoded_over(mut b: &[u8]) -> Option<bool> {
     let b = &mut b;
     let mut nid = byte(b)?;
@@ -243,20 +236,12 @@ fn dictionary(id: &[u8], props: &[u8]) -> Option<u64> {
 }
 /// What one block's LZMA2 decode workers may hold together, so a job stays inside 512 MiB.
 const DECODE_BUDGET: u64 = 256 << 20;
-/// Larger packed blocks are not walked for [`largest_run`]: they decode on one thread.
-// ponytail: the walk reads the block once before it decodes, so past this a solid block decodes
-// on one thread (on a slow drive the extra read costs what the threads save). Upgrade: walk
-// while decoding, from the reader's own chunk headers, if large solid blocks matter.
+// ponytail: past this a solid block decodes on one thread (the walk is an extra read).
 const WALK_MAX: u64 = 1 << 30;
 
-/// Decode threads for block `b`. sevenz-rust2 decodes LZMA2 on several threads, one run of
-/// chunks between dictionary resets per worker; with patch 0021 at most two runs per worker
-/// are out, each decoded into a buffer that may have doubled past it, plus the input and the
-/// run being served: a dictionary and six runs per worker. So the count follows the block's largest
-/// run, found by walking its chunk headers just before it decodes (the pages stay cached for
-/// the decoder). One thread unless the block is a lone LZMA2 coder, whose pack stream is then
-/// the LZMA2 stream, starting at `start` (a filter's place in a chain isn't public, and every
-/// LZMA2 coder of a chain would get the threads).
+/// Decode threads for block `b`: a dictionary + six runs per worker within the budget (patch 0021),
+/// from the largest run between dictionary resets. Only a lone LZMA2 coder, its stream at `start`,
+/// gets threads.
 fn decode_threads(
     archive: &Archive,
     b: usize,
@@ -284,8 +269,7 @@ fn decode_threads(
     (DECODE_BUDGET / per_worker).clamp(1, cores) as u32
 }
 
-/// The most bytes an LZMA2 stream of `len` bytes at `at` unpacks between dictionary resets
-/// (where sevenz-rust2's decoder splits work); `None` if it doesn't parse, or on cancel.
+/// The most bytes an LZMA2 stream unpacks between dictionary resets; `None` unparsed or cancelled.
 fn largest_run(
     source: &mut (impl Read + Seek),
     at: u64,
@@ -340,8 +324,7 @@ fn open(
     let pw = SecretPassword(Password::from(password.unwrap_or("")));
     let archive = Archive::read(&mut source, &pw.0).map_err(|e| map(e, password.is_some()))?;
     let mut encrypted = false;
-    // Every block is checked before anything decodes: sevenz-rust2 gives file data no memory limit.
-    // A multi-input coder other than BCJ2 is refused by sevenz-rust2 itself before it allocates.
+    // Every block is checked before decoding: sevenz-rust2 gives file data no memory limit.
     for block in &archive.blocks {
         if block.coders.len() as u64 > MAX_CODERS {
             return Err(ArchiveError::Unsupported(format!(
@@ -457,9 +440,7 @@ pub(super) fn walk(
             return Ok(());
         }
         let decoder = BlockDecoder::new(1, i, &archive, &pw.0, &mut source);
-        // sevenz-rust2 walks a block's first `num_unpack_sub_streams` entries, so an empty file
-        // listed between two of its streams pushes the last stream out of the walk (and out of
-        // `entries`): refuse that rather than leave a file out.
+        // sevenz-rust2 walks only `num_unpack_sub_streams` entries: an empty file there drops one.
         if decoder.entries().iter().filter(|e| e.has_stream).count() != expected {
             return Err(ArchiveError::Unsupported(
                 "This 7z lists an empty file between packed ones, which can't be unpacked; \

@@ -1,12 +1,9 @@
-// Path helpers for what the UI shows and joins. No imports, so a plain `node` can check them
-// (TypeScript type stripping).
+// Path helpers. No imports, so a plain `node` can check them (TypeScript type stripping).
 
 // `\` is a legal name character on macOS and Linux; only Windows uses it as a separator.
 let WINDOWS = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
-/** The http build: paths are the server's, split and joined by its separator (`GET
- * /api/session`'s `separator`), never by the viewer's OS. `"/"`: slash only (the PS5, a
- * macOS/Linux host); `"\\"`: the Windows rules. */
+/** The http build: paths are the server's, split by its separator (`/api/session`), never the viewer's OS. */
 export function setServerSeparator(separator: string): void {
   WINDOWS = separator === "\\";
   SEPARATORS = WINDOWS ? /[\\/]/ : /\//;
@@ -16,12 +13,10 @@ function lastSep(p: string): number {
   return WINDOWS ? Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")) : p.lastIndexOf("/");
 }
 
-/** `path` without trailing separators. */
 export function trimSep(path: string): string {
   return path.replace(WINDOWS ? /[\\/]+$/ : /\/+$/, "");
 }
 
-/** The folder holding `path`. */
 export function dirname(path: string): string {
   const p = trimSep(path);
   const i = lastSep(p);
@@ -34,8 +29,7 @@ export function basename(path: string): string {
   return p.slice(lastSep(p) + 1);
 }
 
-/** `name` inside `dir`, with the platform's separator. A trailing `\` on macOS or Linux is
- * part of the folder's name, not a separator. */
+/** `name` inside `dir`; a trailing `\` on macOS or Linux is part of the folder's name. */
 export function joinPath(dir: string, name: string): string {
   if (!dir) return name;
   const ends = WINDOWS ? /[\\/]$/ : /\/$/;

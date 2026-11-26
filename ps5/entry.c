@@ -1,13 +1,7 @@
-/* Payload entry, linked in front of Rust's main with -Wl,--wrap=main. elfldr starts a payload
- * with no arguments and no terminal, so with none it runs "serve" (the web UI), its stdout and
- * stderr in /data/dumpforge/serve-<pid>.txt (earlier versions' /data/ps5-dump-forge is renamed
- * to it first). The web launcher starts the saved copy with
- * elfldr's args=serve: "serve" as the first argument is that same launch (never the args file).
- * A developer hook: an args file there (one argument per line, the command first: "convert",
- * "/mnt/usb0/GAME", "--to", "ffpkg") runs once instead of a no-argument serve, renamed to
- * args.done before it runs, its output in log-<pid>.txt. Each launch that logs first deletes
- * the logs of earlier runs, keeping the newest one. Run with other arguments, it is the plain CLI.
- */
+/* Payload entry (-Wl,--wrap=main). No arguments, or "serve" (elfldr's args=serve): serve, logged
+ * to FORGE_DIR/serve-<pid>.txt. A developer args file (one argument per line) runs once instead of
+ * a no-argument serve, renamed to args.done first, logged to log-<pid>.txt. Other arguments: the
+ * plain CLI. */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -38,8 +32,7 @@ struct notification {
 _Static_assert(sizeof(struct notification) == 3120, "SDK notification ABI");
 int sceKernelSendNotificationRequest(int, struct notification *, size_t, int);
 
-// Exported for the Rust side (the server's URL). Copies at most 3,074 bytes,
-// never reading past them, and always NUL-terminates.
+// Copies at most 3,074 bytes and always NUL-terminates.
 int ps5_notify(const char *message) {
     struct notification request = {0};
     memcpy(request.message, message, strnlen(message, sizeof(request.message) - 1));
@@ -142,7 +135,6 @@ int __wrap_main(int argc, char **argv) {
             ps5_notify("Dump Forge: cannot rename " FORGE_DIR "/args to args.done");
             return 1;
         }
-        // No args file: the normal launch.
         static char *serve_args[] = {"ps5-dump-forge", "serve", NULL};
         return serve(2, serve_args);
     }

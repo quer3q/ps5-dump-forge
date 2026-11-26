@@ -138,6 +138,7 @@ fn run(out: &Path, mini: &Path, work: &Path) -> Res<()> {
             Half::Raw(_) => 0u8,
             Half::Lz(_) => 1,
             Half::LzDelta(_) => 2,
+            Half::Entropy(_) => 3,
         };
         let mut input = vec![kind(&halves[0]) | halves.get(1).map_or(0, |h| kind(h) << 2)];
         input.extend_from_slice(&((data.len() - 1) as u32).to_le_bytes());

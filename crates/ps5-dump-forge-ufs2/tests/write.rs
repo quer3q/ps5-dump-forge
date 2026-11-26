@@ -1,6 +1,5 @@
-//! Round trips through the writer, checked by the vendored reader and by the mini fsck in
-//! `common`. Images land in `$CARGO_TARGET_TMPDIR/ufs2/` so `scripts/fsck-ufs.sh` can be
-//! pointed at them afterwards.
+//! Writer round trips, checked by the vendored reader and `common`'s mini fsck; images land in
+//! `$CARGO_TARGET_TMPDIR/ufs2/` for `scripts/fsck-ufs.sh`.
 
 mod common;
 
@@ -19,8 +18,7 @@ fn assert_clean(image: &std::path::Path) -> common::Fsck {
     r
 }
 
-/// A game-shaped folder through `FolderSource`: nested dirs, an empty dir, a zero-length
-/// file, files at the direct -> single-indirect edge, non-ASCII (NFC) names.
+/// A game-shaped folder: nested and empty dirs, an empty file, the indirect edge, NFC names.
 #[test]
 fn game_folder_round_trip() {
     let root = scratch("game-src");

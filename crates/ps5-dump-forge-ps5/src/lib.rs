@@ -1,11 +1,6 @@
-//! The PS5 payload's global allocator: the CLI installs [`Pool`] when built for the PS5
-//! (`ps5/build.sh`) or for musl (the static Linux CLI); nothing here is used on other targets.
-//!
-//! [`Pool`] keeps freed blocks of 64 B to 4 MiB in power-of-two classes and hands them out again
-//! instead of returning them to the libc (smaller ones stay with it). The PS5 libc serializes
-//! every malloc, realloc and free across threads: 4 Kraken compression threads ran at 12.7 MB/s
-//! on a game image (one ran at 11.7), with 25,000 libc calls per 32 MiB; through `Pool`,
-//! 49.3 MB/s (one: 17.6).
+//! The CLI's global allocator on the PS5 and musl: freed blocks of 64 B to 4 MiB kept in
+//! power-of-two classes. The PS5 libc serializes every malloc across threads: 4 Kraken threads ran
+//! at 12.7 MB/s (25,000 libc calls per 32 MiB); through `Pool`, 49.3 MB/s.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ptr::null_mut;
@@ -16,7 +11,6 @@ const MAX_SHIFT: u32 = 22;
 const CLASSES: usize = (MAX_SHIFT - MIN_SHIFT + 1) as usize;
 const SLOTS: usize = 16;
 
-/// Free blocks per class, lock-free: a slot holds one or is null.
 static FREE: [[AtomicPtr<u8>; SLOTS]; CLASSES] =
     [const { [const { AtomicPtr::new(null_mut()) }; SLOTS] }; CLASSES];
 
@@ -27,8 +21,7 @@ fn slots(c: usize) -> usize {
     if c as u32 + MIN_SHIFT <= 20 { SLOTS } else { 4 }
 }
 
-/// The class of `l`, for the sizes and alignments kept here. Blocks under 64 B stay with the
-/// libc, as in the build that was measured.
+/// Blocks under 64 B stay with the libc, as in the build that was measured.
 fn class(l: &Layout) -> Option<usize> {
     let size = l.size();
     if !(1 << MIN_SHIFT..=1 << MAX_SHIFT).contains(&size) || l.align() > 16 {
@@ -42,7 +35,6 @@ fn class_layout(c: usize) -> Layout {
     unsafe { Layout::from_size_align_unchecked(1 << (c as u32 + MIN_SHIFT), 16) }
 }
 
-/// The payload's allocator (see the crate docs).
 pub struct Pool;
 
 // SAFETY: every block of a class is allocated from `System` at its class layout and returned

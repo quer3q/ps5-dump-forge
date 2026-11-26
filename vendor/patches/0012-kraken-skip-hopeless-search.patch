@@ -1,0 +1,147 @@
+diff --git a/ps5upload-fpkg/src/kraken.rs b/ps5upload-fpkg/src/kraken.rs
+index 04b8aeab14669717204bbe9c153a6502f93139f4..cd6fff9dbdefa1b79cc44bc235e133a96d551926 100644
+--- a/ps5upload-fpkg/src/kraken.rs
++++ b/ps5upload-fpkg/src/kraken.rs
+@@ -1071,25 +1071,82 @@ pub fn encode_block(block: &[u8]) -> Vec<Half> {
+     encode_block_at(block, Level::default())
+ }
+ 
++/// Whether the half `buf[start..end]` is not worth the encoder's search, which keeps a half only
++/// when it saves 2%: its bytes are spread almost evenly (over 7.9 bits each, so coding them as
++/// literals saves under 1.3%), and so are its delta literals (each byte less the one
++/// [`MIN_DISTANCE`] back, the recent distance a half starts with, which literal mode 0 codes),
++/// and with what the matches a one-probe hash scan finds would save (priced by [`gain`]) the
++/// estimate stays under 1%. Measured on the 74,725 halves of a 9.2 GB game (compressed audio and
++/// textures): it skipped 31,188 of its 34,071 raw halves, a third of the fast level's CPU time,
++/// and stored 4 that the search kept (each saving 2.0–2.6%) raw, 12 KB; at the balanced level 1
++/// of a sampled 9,339 halves. Deltas at a distance some match would set first are not
++/// estimated. A half it misjudges is only stored raw, still valid.
++// ponytail: thresholds from that one game; widen the corpus if a game ever compresses worse
++fn not_worth_searching(buf: &[u8], start: usize, end: usize) -> bool {
++    let (mut counts, mut deltas) = ([0u32; 256], [0u32; 256]);
++    for (i, &b) in buf.iter().enumerate().take(end).skip(start) {
++        counts[usize::from(b)] += 1;
++        // The even half's first bytes have nothing 8 back: the encoder stores them as its seed.
++        if i >= MIN_DISTANCE {
++            deltas[usize::from(b.wrapping_sub(buf[i - MIN_DISTANCE]))] += 1;
++        }
++    }
++    let entropy = |counts: &[u32; 256]| -> f64 {
++        let n: u32 = counts.iter().sum();
++        counts
++            .iter()
++            .filter(|&&c| c > 0)
++            .map(|&c| {
++                let p = f64::from(c) / f64::from(n);
++                -p * p.log2()
++            })
++            .sum()
++    };
++    let bits = entropy(&counts).min(entropy(&deltas));
++    if bits <= 7.9 {
++        return false;
++    }
++    let n = (end - start) as f64;
++    // Earlier bytes of the block (the even half, for the odd one) are where its matches reach.
++    let mut head = vec![u32::MAX; 1 << HASH_BITS];
++    let mut saved = n * (8.0 - bits);
++    let mut i = 0;
++    while i + 4 <= end {
++        let h = Matcher::hash(buf, i);
++        let c = head[h];
++        head[h] = i as u32;
++        if i >= start && c != u32::MAX && i - c as usize >= MIN_DISTANCE {
++            let len = match_len(buf, c as usize, i, end);
++            if len >= MIN_MATCH {
++                saved += gain(len, i - c as usize, false).max(0) as f64;
++                i += len;
++                continue;
++            }
++        }
++        i += 1;
++    }
++    saved < n * 8.0 / 100.0
++}
++
+ /// Encode one block (up to 256 KiB) into its halves. A half that does not shrink is raw.
+ pub fn encode_block_at(block: &[u8], level: Level) -> Vec<Half> {
+     assert!(!block.is_empty() && block.len() <= BLOCK);
+-    let mut m = Matcher::new(block.len(), level);
+     let even_end = block.len().min(HALF);
+-    let mut halves = vec![Half::from_encoded(
+-        encode_half(block, 0, even_end, true, &mut m, level),
+-        &block[..even_end],
+-    )];
++    let even = (!not_worth_searching(block, 0, even_end)).then(|| {
++        let mut m = Matcher::new(block.len(), level);
++        encode_half(block, 0, even_end, true, &mut m, level)
++    });
++    let mut halves = vec![Half::from_encoded(even.flatten(), &block[..even_end])];
+     if block.len() > HALF {
+-        // The odd half may reach back into the even half, so its matcher starts out knowing it.
+-        m = Matcher::new(block.len(), level);
+-        for i in 0..even_end {
+-            m.insert(block, i);
+-        }
+-        halves.push(Half::from_encoded(
+-            encode_half(block, HALF, block.len(), false, &mut m, level),
+-            &block[HALF..],
+-        ));
++        let odd = (!not_worth_searching(block, HALF, block.len())).then(|| {
++            // The odd half may reach back into the even half, so its matcher starts out knowing it.
++            let mut m = Matcher::new(block.len(), level);
++            for i in 0..even_end {
++                m.insert(block, i);
++            }
++            encode_half(block, HALF, block.len(), false, &mut m, level)
++        });
++        halves.push(Half::from_encoded(odd.flatten(), &block[HALF..]));
+     }
+     halves
+ }
+@@ -1474,6 +1531,45 @@ mod tests {
+         assert_eq!(decode_block(&halves, BLOCK).unwrap(), data);
+     }
+ 
++    /// The search is skipped for noise, but not for noise that repeats, within a half or from
++    /// the even half into the odd one, and never for compressible data.
++    #[test]
++    fn only_halves_the_search_cannot_win_skip_it() {
++        let n = noise(HALF, 3);
++        assert!(not_worth_searching(&n, 0, HALF));
++        let quarter = noise(HALF / 2, 5);
++        let repeated = [quarter.clone(), quarter].concat();
++        assert!(!not_worth_searching(&repeated, 0, HALF));
++        let twice = [n.clone(), n].concat();
++        assert!(!not_worth_searching(&twice, HALF, BLOCK));
++        let halves = encode_block_at(&twice, Level::Fast);
++        assert!(matches!(halves[0], Half::Raw(_)) && halves[1].is_lz());
++        assert_eq!(decode_block(&halves, BLOCK).unwrap(), twice);
++        let text = b"the quick brown fox jumps over the lazy dog ".repeat(HALF / 44);
++        assert!(!not_worth_searching(&text, 0, text.len()));
++    }
++
++    /// Bytes spread evenly with no repeats can still halve as delta literals (each byte 1..16
++    /// more than the one 8 back): the search is not skipped, and every level compresses it.
++    #[test]
++    fn delta_coded_noise_is_still_searched() {
++        let mut data = vec![17u8, 48, 91, 144, 207, 8, 101, 250];
++        let mut x = 2u32;
++        while data.len() < HALF {
++            x ^= x << 13;
++            x ^= x >> 17;
++            x ^= x << 5;
++            data.push(data[data.len() - 8].wrapping_add(1 + (x & 15) as u8));
++        }
++        assert!(!not_worth_searching(&data, 0, HALF));
++        for level in [Level::Fast, Level::Balanced, Level::Smallest] {
++            let halves = encode_block_at(&data, level);
++            assert!(halves[0].is_delta(), "{level:?}");
++            assert!(halves[0].bytes().len() < HALF * 3 / 5, "{level:?}");
++            assert_eq!(decode_block(&halves, HALF).unwrap(), data);
++        }
++    }
++
+     #[test]
+     fn short_blocks_long_runs_and_mixed_content_round_trip() {
+         for len in [

@@ -39,22 +39,26 @@ const MINUTES: Noun = { one: "دقيقة", two: "دقيقتين", few: "دقائ
 const HOURS: Noun = { one: "ساعة", two: "ساعتين", few: "ساعات", many: "ساعةً", other: "ساعة" };
 const DAYS: Noun = { one: "يوم", two: "يومين", few: "أيام", many: "يومًا", other: "يوم" };
 const RESULTS: Noun = { one: "نتيجة واحدة", two: "نتيجتان", few: "نتائج", many: "نتيجةً", other: "نتيجة" };
+const LINES: Noun = { one: "سطر واحد", two: "سطران", few: "أسطر", many: "سطرًا", other: "سطر" };
+const BACKPORT_LIBS: Noun = {
+  one: "مكتبة باكبورت واحدة",
+  two: "مكتبتَي باكبورت",
+  few: "مكتبات باكبورت",
+  many: "مكتبة باكبورت",
+  other: "مكتبة باكبورت",
+};
 
 const ar: Messages = {
   // App.tsx
   app: {
     screens: "الأقسام",
-    convert: "تحويل",
     active: (n) => `، النشطة: ${num(n)}`,
     edit: "تحرير",
-    pack: "الحزم",
     storage: "التخزين",
     connect: "الاتصال",
     disconnected: "غير متصل",
-    connected: (n: number) => `متصل (${count(n, DEVICES)})`,
+    connected: (n: number) => count(n, DEVICES),
     about: "حول",
-    prevTab: "التبويب السابق (⁦L2⁩)",
-    nextTab: "التبويب التالي (⁦R2⁩)",
     offline: "غير متصل، جارٍ إعادة المحاولة…",
     stop: "إيقاف",
     stillRunning: (n) =>
@@ -93,37 +97,17 @@ const ar: Messages = {
     queued: "في الانتظار",
     progress: (percent, left) => `اكتمل ${percent}%${left ? `، المتبقي ${left}` : ""}`,
   },
-  // Convert.tsx
+  // build/ (Build's convert settings and checks)
   convert: {
-    target: "الهدف",
-    targetFormat: "الصيغة الهدف",
+    targetFormat: "الصيغة",
     alreadyFolder: "المصدر مجلد بالفعل",
-    lz4Backport:
-      "أصول هذه اللعبة محزومة بـ LZ4، وبيان LZ4 الخاص بها يتضمن الباكبورت: فُكّ حزمها أولًا في تبويب «الحزم»، ثم أزل الباكبورت هنا.",
-    zstdBackport:
-      "أصول هذه اللعبة محزومة بـ zstd، وفهرس zstd الخاص بها يتضمن الباكبورت: فُكّ حزمها أولًا في تبويب «الحزم»، ثم أزل الباكبورت هنا.",
-    unreadable: "لا يمكن البناء: تعذّرت قراءة هذا المصدر (راجع «المصدر»).",
     patchBlocked: "لا يمكن البناء: هذه حزمة تصحيح لا تحتوي إلا على ما غيّره التحديث. افتحها في «تحرير» لاستخراج ملفاتها.",
     openInEdit: "فتح في «تحرير»",
-    noContentId: "لا يمكن البناء بصيغة fpkg: لا يحتوي ⁦param.json⁩ لهذه اللعبة على Content ID، وهو ما تحتاجه الحزمة.",
+    noContentId: "لا يمكن البناء بصيغة FPKG: لا يحتوي ⁦param.json⁩ لهذه اللعبة على Content ID، وهو ما تحتاجه الحزمة.",
     blocked: (first, more) =>
       `لا يمكن البناء: ${iso(first)}${more > 0 ? ` (بالإضافة إلى ${count(more, { one: "ملاحظة أخرى", two: "ملاحظتين أخريين", few: "ملاحظات أخرى", many: "ملاحظةً أخرى", other: "ملاحظة أخرى" })}، راجع «المصدر»)` : ""}.`,
-    amprZstdRuntime: "يثبّت هذا التحويل ⁦ampr-emu-ng⁩ في ⁦fakelib/libSceAmpr.sprx⁩، وهذه الحزم تحتاج إليه.",
-    amprNgReplaced: (version) => `يستبدل ⁦ampr-emu-ng⁩ الخاص بهذه اللعبة بنسخة ⁦ampr_emu⁩ ${iso(version)}.`,
-    amprRuntime: (a, own, version) => {
-      if (a === "install") return `تستخدم هذه اللعبة AMPR لكن لا يوجد فيها ⁦ampr_emu⁩: سيثبّت التحويل نسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}.`;
-      if (a === "trace") return `سيستبدل التحويل ⁦ampr_emu⁩ الخاص بهذه اللعبة بنسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}.`;
-      if (a === "replace")
-        return own
-          ? `سيستبدل التحويل ⁦ampr_emu⁩ ${iso(own)} الخاص بهذه اللعبة بنسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}.`
-          : `سيستبدل التحويل ⁦ampr_emu⁩ الخاص بهذه اللعبة، الذي لا يذكر رقم إصداره، بنسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}.`;
-      return own
-        ? `إصدار ⁦ampr_emu⁩ في هذه اللعبة ${iso(own)} مماثل للنسخة المضمّنة ${iso(version)} أو أحدث منها: سيُبقي عليه التحويل.`
-        : `تحتوي هذه اللعبة بالفعل على نسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}: سيُبقي عليها التحويل.`;
-    },
     amprIndex: (state: "stale" | "damaged" | "missing") =>
       `${state === "stale" ? "لا يطابق ⁦ampr_emu.index⁩ ملفات هذه اللعبة" : state === "damaged" ? "تتعذّر قراءة ⁦ampr_emu.index⁩" : "لا يوجد ⁦ampr_emu.index⁩ في هذه اللعبة"}: سيكتب التحويل فهرسًا جديدًا.`,
-    amprPkgIndex: "ستحصل الحزمة على ⁦ampr_emu.index⁩ جديد مبني من ملفاتها.",
     removeBackport: "إزالة الباكبورت",
     removeHint: (libs, emulators, other) =>
       `يستبعد من ⁦fakelib/⁩ ${count(libs, { one: "مكتبة باكبورت واحدة", two: "مكتبتَي باكبورت", few: "مكتبات باكبورت", many: "مكتبة باكبورت", other: "مكتبة باكبورت" })}` +
@@ -156,9 +140,9 @@ const ar: Messages = {
         tagline: "الأفضل، إن سمح البرنامج الثابت",
         cells: ["أصلية، بالسرعة الكاملة", "أصغر بنسبة 30–60%، حسب اللعبة"],
       },
-      zstd: { tagline: "مع ampr-emu-ng", cells: ["تحميل أسرع بنسبة تصل إلى 80%", "حتى نصف حجم اللعبة"] },
+      zstd: { tagline: "مع ampr-emu-ng", cells: ["تحميل أسرع", "حتى نصف حجم اللعبة"] },
       lz4: {
-        tagline: "مع ampr-emu-ng أو ampr_emu",
+        tagline: "مع ampr-emu-ng",
         cells: [
           "تحميل أسرع بنسبة 30–40%، حسب أرقام المطوّرين الأصليين",
           "نحو نصف حجم اللعبة، حسب أرقام المطوّرين الأصليين",
@@ -173,34 +157,22 @@ const ar: Messages = {
       },
       folder: { tagline: "ملفات اللعبة كما هي", cells: ["السرعة الكاملة لوحدة التخزين", FLAT] },
     },
-    features: [
-      ["تحويل", "بين المجلد و ffpkg و exfat و ffpfs و ffpfsc و fpkg، في الاتجاهين."],
-      ["نقل", "إرسال الملفات وتحويل الألعاب بين PS5 وأجهزة الكمبيوتر و NAS عبر SMB أو FTP أو NFS."],
-      ["تحرير", "ملفات اللعبة كأنها مجلد، واطّلع على غلافها والبرنامج الثابت والباكبورت والمحتوى الإضافي ومشكلات أسماء الملفات قبل البناء."],
-      ["بالتدفّق", "من أي مصدر إلى أي وجهة: بلا نسخة مؤقتة، حتى للصورة داخل ffpfsc أو اللعبة داخل أرشيف."],
-      ["الأرشيفات", "ملف ⁦.zip⁩ أو ⁦.7z⁩ أو ⁦.rar⁩ يضم لعبة يُتصفَّح ويُحوَّل ويُحزَم كأنه مجلد."],
-      ["USB وبطاقات SD", "يُكتب على الذاكرات والبطاقات المهيأة بنظام exFAT أو FAT32."],
-      ["الحزم", "حزم أصول zstd أو LZ4 مع إصلاح ذكي."],
-      ["التخزين", "مكتبة لألعابك ومستكشف الملفات لإعادة التسمية والنقل والحذف."],
-      ["آمن", "لا تتغير لعبتك أبدًا ما لم تطلب ذلك؛ تُتجاوز الملفات غير المفيدة وتُبلَّغ أسماء الملفات السيئة مسبقًا."],
-    ],
-    about: "حول",
     compare: "مقارنة الصيغ",
     compareLabel: "مقارنة الصيغ",
     format: "الصيغة",
     credits: "شكر وتقدير",
-    upstream: (app) =>
-      `أرقام المطوّرين الأصليين: ما يذكره مؤلفو ampr_emu و Lazy_AMPR، ولم يقِسها ${app}؛ وهي تختلف من لعبة إلى أخرى. ampr_emu 0.4.2.1 إصدار تجريبي من المطوّرين الأصليين؛ مشكلة معروفة: تتعطّل بعض الألعاب عند الحفظ.`,
-    bundled: "تعمل المجلدات المحزومة بـ LZ4 على ampr_emu 0.4.2.1 من تطوير drakmor (⁦GPL-3.0⁩)، مضمّنًا دون تعديل. الشيفرة المصدرية:",
+    upstream: (app: string) =>
+      `أرقام المطوّرين الأصليين: ما يذكره مؤلفو ampr_emu و Lazy_AMPR، ولم يقِسها ${app}؛ وهي تختلف من لعبة إلى أخرى.`,
+    bundled: "⁦ampr_emu⁩ من تطوير drakmor (⁦GPL-3.0⁩)، وقد تفرّع عنه ⁦ampr-emu-ng⁩. لم يعد Forge يضمّنه: بل يستبدل ⁦ampr_emu⁩ الخاص باللعبة بـ ⁦ampr-emu-ng⁩ ما لم تُبقِ عليه «الإعدادات». الشيفرة المصدرية:",
     lazy: "تعتمد استراتيجية الحزم على Lazy_AMPR من تطوير Nazky:",
-    ng: "تعمل حزم zstd و LZ4 على ampr-emu-ng. المصدر:",
+    ng: "تعمل حزم ZSTD و LZ4 على ⁦ampr-emu-ng⁩ (⁦GPL-3.0-or-later⁩)، بيئة تشغيل AMPR الوحيدة المضمّنة، دون تعديل. المصدر:",
     logo: "الشعار من تصميم Xxcco:",
     unrar:
       "تُقرأ أرشيفات ⁦.rar⁩ بمكتبة UnRAR المضمّنة من تطوير Alexander Roshal (للاستخراج فقط، بموجب ترخيص UnRAR).",
     language: "اللغة",
     system: "لغة النظام",
     notifications: "الإشعار عند اكتمال المهمة",
-    notificationsHint: "يظهر على الجهاز لمهام التحويل والحزم ونقل الملفات.",
+    notificationsHint: "يظهر على الجهاز عند انتهاء مهمة بناء أو حزم أو نقل ملفات.",
     notificationsFailed: "تعذّر تغيير الإشعارات.",
   },
   // Edit.tsx
@@ -230,11 +202,9 @@ const ar: Messages = {
     leftoversNote: (app) =>
       `نواتج غير مكتملة، عادةً من مهام توقفت قبل انتهائها. لا تحذف إلا ما تعرفه منها، وفقط حين لا تعمل أي مهمة؛ لا يحذفها ${app} من تلقاء نفسه أبدًا.`,
     checked: (n) => `المجلدات التي فُحصت (${num(n)})`,
-    /** Edit's folds under the game card. */
     facts: "معلومات اللعبة",
     explorer: "ملفات اللعبة",
     howTitle: "كيف يعمل هذا",
-    /** The empty state's paragraphs. */
     how: (app) => [
       "افتح **مجلد لعبة** أو **صورتها**، ثم عدّلها كما تعدّل مجلدًا على ذاكرة USB: **أضف الملفات واستبدلها** (اسحبها إلى هنا أو استخدم «إضافة»)، **وأعد التسمية واحذف**.",
       `لا يتغير شيء **حتى تضغط «تطبيق»**: تتراكم تغييراتك هنا، ثم يكتبها ${app} مباشرةً في الصورة أو المجلد دفعة واحدة ويتحقق من النتيجة. **هذا ليس قرصًا مُركّبًا**: ${app} يسجّل تغييراتك ويطبّقها بنفسه.`,
@@ -253,11 +223,14 @@ const ar: Messages = {
     matches: (n) => count(n, RESULTS),
     emptyFolder: "هذا المجلد فارغ.",
     open: (name) => `فتح ${iso(name)}`,
-    archiveNote: "يمكن تصفّح الأرشيفات لكن لا يمكن تحريرها. حوّله أولًا إلى مجلد أو صورة لتعديله.",
-    nasNote: "يمكن تصفح الألعاب الموجودة على NAS واستخراجها، لكن لا يمكن تعديلها. لتغييرها، حوّلها أو استخرجها إلى هذا الجهاز أولًا.",
+    archiveNote: "يمكن تصفّح الأرشيفات لكن لا يمكن تحريرها. ابنِ منه مجلدًا أو صورة أولًا لتعديله.",
+    rebuildTimePkg: (t) => `تعيد إعادة البناء ضغط اللعبة كلها: نحو ${t} بسرعة ~26 MB/s على PS5 (أسرع على الكمبيوتر). عدّل نسخة غير محزومة بدلًا من ذلك لتتجنّب ذلك.`,
+    rebuildTimePs5: (t) => `تعيد إعادة البناء كتابة الصورة كلها (نحو ${t} على جهاز PS5 هذا).`,
+    rebuildTimeHost: (t) => `تعيد إعادة البناء كتابة الصورة كلها (نحو ${t} على هذا الكمبيوتر).`,
+    rebuildTimeAny: (t) => `تعيد إعادة البناء كتابة الصورة كلها (نحو ${t} على PS5).`,
+    nasNote: "يمكن تصفح الألعاب الموجودة على NAS واستخراجها، لكن لا يمكن تعديلها. لتغييرها، ابنِها أو استخرجها إلى هذا الجهاز أولًا.",
     patchNote: "هذه حزمة تصحيح: لا تحتوي إلا على ما غيّره التحديث. تظهر الملفات التي تحتويها كاملة؛ يمكن تصفحها واستخراجها، لكن لا يمكن تعديلها.",
-    peerNote: "يمكن تصفح الألعاب الموجودة على Forge آخر واستخراجها، لكن لا يمكن تعديلها. لتغييرها، حوّلها أو استخرجها إلى هذا الجهاز أولًا.",
-    /** The explorer's changes: none is made until Apply. */
+    peerNote: "يمكن تصفح الألعاب الموجودة على Forge آخر واستخراجها، لكن لا يمكن تعديلها. لتغييرها، ابنِها أو استخرجها إلى هذا الجهاز أولًا.",
     addFiles: "إضافة ملفات",
     addFolder: "إضافة مجلد",
     pickAddFiles: "اختر ملفات لإضافتها",
@@ -268,7 +241,6 @@ const ar: Messages = {
     renameTip: "إعادة التسمية (F2)",
     removeTip: "حذف (مفتاح Delete)",
     removeTipMac: "حذف (fn+Delete)",
-    /** Extract: copy files or folders out of the source into a folder chosen on this machine. */
     extractItem: (name: string) => `استخراج ${iso(name)}`,
     extractTip: "نسخه إلى مجلد تختاره",
     extractFolder: "استخراج المجلد",
@@ -341,7 +313,6 @@ const ar: Messages = {
     replace: "استبدال",
     skip: "تخطي",
     cancel: "إلغاء",
-    /** How the changes go in (the pending bar), from core's check before Apply. */
     modeLabel: "طريقة التطبيق",
     checking: "جارٍ التحقق من طريقة تطبيق التغييرات",
     nothingToChange: "لا شيء لتغييره: تبقى اللعبة كما هي.",
@@ -356,7 +327,7 @@ const ar: Messages = {
     inPlaceText: "تُكتب في الصورة.",
     inPlaceNeeds: (need, free) => `تُكتب في الصورة؛ تحتاج إلى ${iso(need)} من ${iso(free)} متاحة فيها.`,
     noRoom: (need, free) => `تحتاج التغييرات إلى ${iso(need)}، والمساحة المتاحة في الصورة ${iso(free)}.`,
-    alwaysRebuilt: "يُعاد بناء صور ffpfsc و fpkg دائمًا.",
+    alwaysRebuilt: "يُعاد بناء صور ffpfsc و FPKG دائمًا.",
     rebuildText: "تُكتب صورة جديدة بجانبها وتحل محلها بعد التحقق منها.",
     rebuildNeeds: (need, free) =>
       `تُكتب صورة جديدة بجانبها (تلزم مساحة متاحة نحو ${iso(need)}، والمتاح ${iso(free)}) وتحل محلها بعد التحقق منها.`,
@@ -393,11 +364,9 @@ const ar: Messages = {
       `جارٍ رفع الملف ${num(i)} من ${num(n)}: ${iso(sent)} من ${iso(total)}`,
     uploadLabel: "الرفع",
     uploadCancelled: "أُلغي الرفع. لم يتغير شيء في اللعبة.",
-    applyRunning: "جارٍ تطبيق التغييرات. ينتظر التحرير حتى تنتهي المهمة أدناه.",
+    applyRunning: "جارٍ تطبيق التغييرات. ينتظر التحرير حتى تنتهي المهمة (انظر «قائمة الانتظار»).",
     applyFailed: "لم تُطبَّق التغييرات:",
     applyRefused: "لا يمكن تطبيق التغييرات بهذه الطريقة:",
-    applyCancelled: "أُلغيت المهمة. لا تزال تغييراتك مدرجة هنا.",
-    folderPartly: "قد يكون بعضها في المجلد بالفعل: الملفات المعروضة هي ما يحتويه الآن.",
     interrupted: "انقطع تحرير سابق لهذه الصورة. تُعاد الصورة إلى ما كانت عليه قبل فحص تغييراتك التالية أو تطبيقها.",
   },
   // JobList.tsx
@@ -441,6 +410,7 @@ const ar: Messages = {
     },
     stepsLabel: "الخطوات",
     stepDone: (s) => `${s}: مكتملة`,
+    stepFailed: (s) => `${s}: فشلت`,
     stepLater: (s) => `${s}: لم تبدأ بعد`,
     packingWriting: "الحزم والكتابة",
     rate: { read: "قراءة", compress: "ضغط", pack: "حزم", write: "كتابة" },
@@ -451,12 +421,11 @@ const ar: Messages = {
     packTag: {
       lz4Pack: (level: string) => `LZ4: حزم · ${level}`,
       lz4Unpack: "LZ4: فك الحزم",
-      zstdPack: (level: string) => `zstd: حزم · ${level}`,
+      zstdPack: (level: string) => `ZSTD: حزم · ${level}`,
       level: (n: number) => `المستوى ${num(n)}`,
-      zstdUnpack: "zstd: فك الحزم",
+      zstdUnpack: "ZSTD: فك الحزم",
       withRules: (tag) => `${tag} · قواعد مخصّصة`,
     },
-    /** An Edit tab job's tag: changes written into the source, or a rebuilt image swapped in. */
     edit: "تحرير",
     editRebuild: "تحرير · إعادة بناء",
     transfer: "نقل",
@@ -478,7 +447,6 @@ const ar: Messages = {
     from: "من ",
     left: (d) => `المتبقي ${d}`,
     inStep: (time) => `${time} في هذه الخطوة`,
-    result: (bytes, n) => `${iso(bytes)}، ${count(n, FILES)} ←`,
     outputPath: "مسار الناتج",
     sourceDeleted: (v) => `حُذف المصدر: ${iso(v)}`,
     sourceKept: (v) => `أُبقي المصدر: ${iso(v)}`,
@@ -509,60 +477,27 @@ const ar: Messages = {
     log: (n) => `السجل (${num(n)})`,
     logLabel: "السجل",
   },
-  // Library.tsx
+  // Storage text shared by Files.tsx, Packages.tsx, Edit.tsx and common.tsx (FreeSpace)
   library: {
-    pickTitle: "اختر مجلدًا لـ «المكتبة»",
-    scanningIn: (name) => `جارٍ مسح ${iso(name)}`,
-    scanning: "جارٍ المسح",
-    cantScanFolder: "تعذّر مسح هذا المجلد",
-    chooseAnother: "اختيار مجلد آخر",
-    pickPrompt: "اختر مجلدًا يحتوي على مكتبتك لمسحه",
-    choose: "اختيار مجلد",
-    cantScan: "تعذّر مسح «المكتبة»:",
     cantDelete: "تعذّر الحذف:",
     deleted: (path) => `تم حذف ${iso(path)}`,
-    truncated: "بلغ المسح حدّه. قد تكون هذه القائمة غير مكتملة.",
-    limits: "يتوقف البحث عند ستة مستويات من المجلدات وبعد نحو 15 ثانية من المسح.",
-    noRoots: "لا توجد مجلدات متاحة للمسح.",
-    none: "لم يُعثر على ألعاب. يبحث الفحص حتى ستة مستويات من العمق ويتخطى مجلدات النظام. لا يزال بإمكانك اختيار مصادر أخرى في «تحرير» أو «تحويل».",
-    skipped: "المواقع والملفات التي تم تخطيها",
-    library: "المكتبة",
     storageTip: "المساحة الحرة في التخزين الداخلي لجهاز PS5 (⁦/data⁩)",
     free: (free, total) => (
       <>
         متاح <b>{iso(free)}</b> من {iso(total)}
       </>
     ),
-    refresh: "تحديث",
     cards: "عرض البطاقات",
     list: "عرض القائمة",
-    games: "الألعاب",
-    edit: (n) => `تحرير ${iso(n)}`,
-    convert: (n) => `تحويل ${iso(n)}`,
     remove: (n) => `حذف ${iso(n)}`,
     deleting: (n) => `جارٍ حذف ${iso(n)}`,
-    lz4Tip: "حزم أصول LZ4",
-    zstdTip: "حزم أصول zstd",
     showAs: "طريقة العرض",
-    kinds: "عرض النوع",
-    all: "الكل",
-    lz4Chip: "LZ4",
-    zstdChip: "zstd",
-    countIn: (n, path) => (
-      <>
-        {n === 1 ? <b>لعبة واحدة</b> : n === 2 ? <b>لعبتان</b> : <><b>{num(n)}</b> {plural(n, { zero: "ألعاب", few: "ألعاب", many: "لعبةً", other: "لعبة" })}</>} في {path}
-      </>
-    ),
   },
-  // Storage.tsx, Files.tsx: the Storage tab (Library | File explorer)
+  // Storage.tsx, Files.tsx: the Storage tab (File explorer | Package installer)
   storage: {
     views: "طريقة عرض التخزين",
-    library: "المكتبة",
     files: "مستكشف الملفات",
     title: "مستكشف الملفات",
-    pickTitle: "اختر مجلدًا لتصفّحه",
-    pickPrompt: "اختر مجلدًا لتصفّح ملفاته",
-    choose: "اختيار مجلد",
     roots: "محركات الأقراص",
     location: "الموقع",
     folders: "المجلدات",
@@ -605,47 +540,29 @@ const ar: Messages = {
     moved: (path) => `تم النقل إلى ${iso(path)}`,
     devices: "الأجهزة",
     thisDevice: "هذا الجهاز",
-    otherDevice: "«النقل» يبقى على جهاز واحد: اسحبه إلى علامة تبويب جهاز آخر لنسخه إليه.",
-    dropCopy: (folder) => `أفلِت للنسخ إلى ${iso(folder)}`,
+    otherDevice: "النقل إلى مجلد آخر يبقى على جهاز واحد: للنسخ بين الأجهزة استخدم شاشة «النقل».",
+    loadingDevices: "جارٍ تحميل الأجهزة",
+    noDevice: "لا يوجد جهاز متصل",
+    noDeviceHint: "اقرن جهاز PS5 أو كمبيوتر، أو أضف NAS، لإدارة ملفاته هنا.",
+    openConnect: "فتح «الاتصال»",
     dropMove: (folder) => `أفلِت للنقل إلى ${iso(folder)}`,
     cantCopy: "تعذّر النسخ:",
     copyNoFolder: "افتح مجلدًا على ذلك الجهاز أولًا.",
-    copyOne: (name, to) => `جارٍ نسخ ${iso(name)} إلى ${iso(to)}. يظهر النقل في «الاتصال».`,
-    copyMany: (n, to) => `جارٍ نسخ ${count(n, { ...ITEMS, two: "عنصرين" })} إلى ${iso(to)}. يظهر النقل في «الاتصال».`,
-    openConnect: "فتح «الاتصال»",
+    copyOne: (name: string, to: string) => `جارٍ نسخ ${iso(name)} إلى ${iso(to)}. يظهر النقل في «قائمة الانتظار».`,
+    copyMany: (n: number, to: string) =>
+      `جارٍ نسخ ${count(n, { ...ITEMS, two: "عنصرين" })} إلى ${iso(to)}. يظهر النقل في «قائمة الانتظار».`,
   },
-  // Pack.tsx
+  // build/ (Build's pack settings and checks), JobList.tsx's pack tags
   pack: {
-    title: "الحزم",
     help: "كيف يعمل الحزم",
-    engine: "نوع الحزم",
-    engines: { zstd: "zstd", lz4: "LZ4" },
-    actions: { pack: "حزم", unpack: "فك الحزم" },
-    info: (e, packed) =>
-      e === "zstd"
-        ? packed
-          ? "يعيد كتابة حزم zstd كملفات عادية."
-          : "يحزم أصول اللعبة في أجزاء zstd."
-        : packed
-          ? "يعيد كتابة حزم LZ4 كملفات عادية."
-          : "قد لا تعمل بعض الألعاب. يحزم أصول اللعبة في أجزاء LZ4.",
-    noAmprRuntime: "لا تحتوي هذه اللعبة على بيئة تشغيل AMPR: يحقن Pack أداة ampr-emu-ng.",
-    strategy: (s) => `استراتيجية الحزم: ${s === "everything" ? "حزم كل شيء ما عدا ملفات النظام" : "استراتيجية ⁦LZ4⁩ للتوافق"}.`,
     patch: "لا يمكن حزم حزمة تصحيح.",
     additionalContent: "لا يمكن حزم المحتوى الإضافي (بلا ⁦eboot.bin⁩).",
-    unreadable: "لا يمكن البدء: تعذّرت قراءة المصدر (راجع «المصدر»).",
-    blocked: (a, first, more) => {
-      const rest = more > 0 ? ` (بالإضافة إلى ${count(more, { one: "ملاحظة أخرى", two: "ملاحظتين أخريين", few: "ملاحظات أخرى", many: "ملاحظةً أخرى", other: "ملاحظة أخرى" })}، راجع «المصدر»)` : "";
-      return a === "pack" ? `لا يمكن الحزم: ${iso(first)}${rest}.` : `لا يمكن فك الحزم: ${iso(first)}${rest}.`;
-    },
-    target: "الهدف",
-    packFolder: (e) => `مستحسن. الأسرع وبأقل تأخير: مجلد لعبة جديد، أصوله في حزم ${e === "zstd" ? "zstd" : "LZ4"}.`,
     levels: { fast: "سريع", medium: "متوسط", max: "أقصى" },
     levelNotes: {
       zstd: {
-        fast: { tone: "good", text: "مستحسن. zstd 5: سريع، وحجم جيد." },
-        medium: { text: "zstd 9: أصغر، وأبطأ." },
-        max: { text: "zstd 19: الأصغر؛ أبطأ بكثير، وذاكرة أكثر." },
+        fast: { tone: "good", text: "مستحسن. ZSTD 5: سريع، وحجم جيد." },
+        medium: { text: "ZSTD 9: أصغر، وأبطأ." },
+        max: { text: "ZSTD 19: الأصغر؛ أبطأ بكثير، وذاكرة أكثر." },
       },
       lz4: {
         fast: { tone: "good", text: "مستحسن. LZ4 الافتراضي: الأسرع." },
@@ -653,36 +570,8 @@ const ar: Messages = {
         max: { text: "LZ4 HC 12: الأصغر، والأبطأ." },
       },
     },
-    runtime: "بيئة التشغيل",
-    runtimeNotes: {
-      ng: { tone: "good", text: "مستحسن. يقرأ حزم zstd و LZ4." },
-      ampr_emu: { text: "⁦ampr_emu⁩ الأصلي." },
-    },
-    ngNote: `يحتاج إلى ⁦ampr-emu-ng⁩: يثبّته «حزم» في ⁦fakelib/⁩. أوقف تحديث fakelib في ${iso("ShadowMount+")}، وإلا فسيستبدل بيئة التشغيل.`,
-    installsRuntime: (version) => `لا يوجد ⁦ampr_emu⁩ هنا: سيثبّت «حزم» ${iso(`ampr_emu ${version}`)}.`,
-    freshIndex: (state) =>
-      `${state === "stale" ? "⁦ampr_emu.index⁩ قديم" : state === "damaged" ? "⁦ampr_emu.index⁩ تالف" : "لا يوجد ⁦ampr_emu.index⁩"}: سيكتب «حزم» فهرسًا جديدًا.`,
-    direct: "يحزم مباشرة إلى الصورة؛ تُقرأ اللعبة مرتين.",
-    unpackFolder: "مجلد لعبة جديد بملفات عادية.",
-    unpackHint: (n) =>
-      n === null
-        ? "يعيد كتابة الملفات المحزومة كملفات عادية."
-        : `يعيد كتابة ${count(n, { one: "الملف المحزوم الوحيد كملف عادي", two: "الملفين المحزومين كملفين عاديين", few: "ملفات محزومة كملفات عادية", many: "ملفًا محزومًا كملفات عادية", other: "ملف محزوم كملفات عادية" })}.`,
-    likelyFail: (fmt) => <>
-      من المرجّح أن يفشل البناء بصيغة <b>{fmt}</b>: فهي ترفض أسماء ملفات مدرجة في «المصدر».
-    </>,
-    collides: (a, folder) =>
-      a === "pack"
-        ? folder
-          ? "هناك مهمة تكتب هذا المجلد بالفعل: يحتاج «حزم» إلى اسم آخر."
-          : "هناك مهمة تكتب هذا الملف بالفعل: يحتاج «حزم» إلى اسم آخر."
-        : folder
-          ? "هناك مهمة تكتب هذا المجلد بالفعل: يحتاج «فك الحزم» إلى اسم آخر."
-          : "هناك مهمة تكتب هذا الملف بالفعل: يحتاج «فك الحزم» إلى اسم آخر.",
-    already: (a, fmt) => a === "pack"
-      ? <>تُكتب هذه اللعبة بالفعل بصيغة <b>{fmt}</b>؛ إعادة «حزم» تُنشئ نسخة ثانية.</>
-      : <>تُكتب هذه اللعبة بالفعل بصيغة <b>{fmt}</b>؛ إعادة «فك الحزم» تُنشئ نسخة ثانية.</>,
-    source: "المصدر",
+    freshIndex: (state: "stale" | "damaged" | "missing") =>
+      `${state === "stale" ? "⁦ampr_emu.index⁩ قديم" : state === "damaged" ? "⁦ampr_emu.index⁩ تالف" : "لا يوجد ⁦ampr_emu.index⁩"}: سيكتب الحزم فهرسًا جديدًا.`,
     rules: {
       title: "قواعد مخصّصة (TOML)",
       titleWith: (name) => `قواعد مخصّصة (TOML): ${iso(name)}`,
@@ -698,32 +587,32 @@ const ar: Messages = {
     close: "إغلاق",
     body: () => (
       <>
-        <h3>zstd</h3>
+        <h3>ZSTD</h3>
         <ol>
-          <li>يحزم أصول اللعبة في أجزاء zstd، في مجلد أو صورة.</li>
-          <li><b>سريع</b> (zstd 5) سريع؛ أما <b>متوسط</b> (9) و<b>أقصى</b> (19) فأصغر وأبطأ.</li>
-          <li>تعرض اللعبة المحزومة <b>فك الحزم</b>: فتعود الملفات العادية.</li>
+          <li>يحزم أصول اللعبة في أجزاء ZSTD، في مجلد أو صورة.</li>
+          <li><b>سريع</b> (ZSTD 5) سريع؛ أما <b>متوسط</b> (9) و<b>أقصى</b> (19) فأصغر وأبطأ.</li>
+          <li>في لعبة محزومة بـ ZSTD، يؤدي اختيار <b>بلا</b> إلى فك حزمها: فتعود الملفات العادية.</li>
         </ol>
 
         <h3>LZ4</h3>
         <ol>
           <li><b>قد لا تعمل بعض الألعاب.</b> احتفظ بنسخة.</li>
           <li>يحزم في أجزاء LZ4، في مجلد أو صورة: <b>سريع</b> (LZ4)، <b>متوسط</b> (HC 9)، <b>أقصى</b> (HC 12).</li>
-          <li>بيئة التشغيل: <b>⁦ampr-emu-ng⁩</b> (الافتراضية) أو <b>⁦ampr_emu⁩</b> الأصلي.</li>
-          <li>تعرض اللعبة المحزومة <b>فك الحزم</b>.</li>
+          <li>يعمل على ⁦ampr-emu-ng⁩، كما تعمل حزم ZSTD.</li>
+          <li>في لعبة محزومة بـ LZ4، يؤدي اختيار <b>بلا</b> إلى فك حزمها.</li>
         </ol>
 
         <h3>⁦ampr-emu-ng⁩</h3>
         <ol>
-          <li>يقرأ حزم zstd و LZ4؛ ويثبّته «حزم» في ⁦fakelib/⁩.</li>
+          <li>بيئة تشغيل AMPR الوحيدة التي يضمّنها Forge. يقرأ حزم ZSTD و LZ4؛ ويثبّته الحزم في ⁦fakelib/⁩.</li>
+          <li>يستبدل البناء به ⁦ampr_emu⁩ الخاص باللعبة، ما لم تُبقِ «الإعدادات» على ⁦ampr_emu⁩. لا يحمل FPKG بيئة تشغيل: يوفّرها مُحمِّل الجهاز.</li>
           <li>أوقف تحديث fakelib في {iso("ShadowMount+")}، وإلا فسيستبدل بيئة التشغيل ولن تتمكن اللعبة من قراءة حزمها.</li>
         </ol>
 
         <h3>استراتيجية الحزم</h3>
         <ol>
-          <li><b>حزم كل شيء ما عدا ملفات النظام</b> (⁦zstd⁩، و⁦LZ4⁩ مع ⁦ampr-emu-ng⁩): كل الملفات ما عدا ⁦eboot.bin⁩ والملفات التنفيذية والوحدات و⁦sce_sys⁩ و⁦sce_module⁩ و⁦fakelib⁩ وملفات ⁦.ini⁩ (يبقى ⁦dlc_emu.ini⁩ قابلًا للتعديل)؛ ويقدّم ⁦ampr-emu-ng⁩ الباقي، بما فيه الصوت والفيديو.</li>
-          <li><b>استراتيجية ⁦LZ4⁩ للتوافق</b> (⁦LZ4⁩ مع ⁦ampr_emu⁩): تبقى الإعدادات والوسائط والملفات الأخرى التي تقرؤها اللعبة مباشرةً منفصلة.</li>
-          <li>عند «حزم» فقط: من <b>قواعد مخصّصة (TOML)</b> اختر ملف تعريف بصيغة ⁦ampr_pack.py⁩ و⁦Lazy_AMPR⁩، على هذا الجهاز أو على جهاز آخر.</li>
+          <li><b>حزم كل شيء ما عدا ملفات النظام</b> (⁦ZSTD⁩ و⁦LZ4⁩): كل الملفات ما عدا ⁦eboot.bin⁩ والملفات التنفيذية والوحدات و⁦sce_sys⁩ و⁦sce_module⁩ و⁦fakelib⁩ وملفات ⁦.ini⁩ (يبقى ⁦dlc_emu.ini⁩ قابلًا للتعديل)؛ ويقدّم ⁦ampr-emu-ng⁩ الباقي، بما فيه الصوت والفيديو.</li>
+          <li>عند الحزم: من <b>قواعد مخصّصة (TOML)</b> اختر ملف تعريف بصيغة ⁦ampr_pack.py⁩ و⁦Lazy_AMPR⁩، على هذا الجهاز أو على جهاز آخر.</li>
           <li>تُطبَّق آخر قاعدة مطابقة؛ وتبقى ملفات النظام منفصلة دائمًا. قد تؤدي القواعد الخاطئة إلى لعبة لا تعمل.</li>
         </ol>
       </>
@@ -756,12 +645,21 @@ const ar: Messages = {
     cantList: "تعذّر فتح هذا المجلد:",
     cancel: "إلغاء",
     chooseFolder: "اختيار هذا المجلد",
-    netOnlyHere: "الأرشيفات و⁦fpkg⁩ تُفتح من هذا الجهاز فقط.",
-    shortcuts: "الاختصارات",
-    addShortcut: "إضافة اختصار",
-    removeShortcut: "إزالة الاختصار",
-    shortcutsFull: "9 اختصارات كحد أقصى: أزل واحدًا أولًا.",
-    removeShortcutNamed: (name: string) => `إزالة الاختصار ${iso(name)}`,
+    netOnlyHere: "الأرشيفات و⁦FPKG⁩ تُفتح من هذا الجهاز فقط.",
+  },
+  // bookmarks.tsx: the bookmarked folders (Transfer and the File explorer)
+  bookmarks: {
+    label: "الإشارات المرجعية",
+    add: "إضافة هذا المجلد إلى الإشارات المرجعية",
+    remove: "إزالة الإشارة المرجعية",
+    removeNamed: (name: string) => `إزالة الإشارة المرجعية ${iso(name)}`,
+    full: "9 إشارات مرجعية كحد أقصى",
+  },
+  // DeviceTabs.tsx
+  deviceTabs: {
+    add: "إضافة جهاز",
+    offline: "غير متصل",
+    offlineNamed: (name: string) => `${iso(name)} · غير متصل`,
   },
   // common.tsx
   common: {
@@ -805,7 +703,7 @@ const ar: Messages = {
     traceRuntime: "بيئة تتبّع LZ4 القديمة",
     noRuntime: "لا توجد بيئة تشغيل",
     packed: (kind) => `محزومة (⁦${kind}⁩)`,
-    zstdKept: "حزم أصول zstd: يُبقي عليها التحويل",
+    zstdKept: "حزم أصول ZSTD: يُبقي عليها التحويل",
     damaged: "حزم تالفة",
     unpacked: "غير محزومة",
     packedDetail: (files, volumes, percent) =>
@@ -816,12 +714,14 @@ const ar: Messages = {
       damaged: "⁦ampr_emu.index⁩ تالف: يعيد أي تحويل كتابته",
       missing: "لا يوجد ⁦ampr_emu.index⁩: يكتبه أي تحويل",
     },
-    runtimeAction: (a, version) =>
+    runtimeAction: (a: "install" | "replace" | "keep" | "keepIfPacks") =>
       a === "install"
-        ? `سيثبّت أي تحويل نسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}`
+        ? "سيثبّت أي تحويل ⁦ampr-emu-ng⁩ المضمّن"
         : a === "replace"
-          ? `سيستبدل أي تحويل بيئة التشغيل بنسخة ⁦ampr_emu⁩ المضمّنة ${iso(version)}`
-          : `يُبقي عليه أي تحويل`,
+          ? "سيستبدل أي تحويل بيئة التشغيل بـ ⁦ampr-emu-ng⁩ المضمّن"
+          : a === "keep"
+            ? "يُبقي عليه أي تحويل (الإعدادات)"
+            : "يُبقي عليه أي تحويل إن كان يقرأ حزم LZ4، وإلا فيستبدله بـ ⁦ampr-emu-ng⁩",
     backportLibs: (exclusive, n) =>
       `${exclusive ? "fakelib2/، يُركّب وحده" : "fakelib/"}، ${count(n, { one: "مكتبة باكبورت واحدة", two: "مكتبتا باكبورت", few: "مكتبات باكبورت", many: "مكتبة باكبورت", other: "مكتبة باكبورت" })}`,
     findings: "ملاحظات التحقق المسبق",
@@ -882,11 +782,11 @@ const ar: Messages = {
   password: {
     title: "يحتاج هذا الأرشيف إلى كلمة مرور",
     text: "أدخل كلمة المرور لفتحه.",
-    wrong: "كلمة المرور غير صحيحة.",
+    wrong: "كلمة المرور غير صحيحة. تحقّق منها وحاول مرة أخرى.",
     label: "كلمة المرور",
     cancel: "إلغاء",
     unlock: "فتح القفل",
-    checking: "جارٍ التحقق…",
+    checking: "جارٍ التحقق",
   },
   // main-http.tsx
   launch: {
@@ -916,38 +816,6 @@ const ar: Messages = {
   },
   // target.tsx
   target: {
-    format: {
-      folder: { text: "فك صورة أو حزمة وإعادتها إلى مجلد لعبة عادي." },
-      exfat: {
-        text: "للألعاب التي لا تعمل جيدًا بصيغة ffpkg ولا تعمل إلا كمحتوى قرص خارجي. تُفتح أيضًا على Mac أو PC.",
-      },
-      ffpkg: {
-        text: "نظام الملفات الخاص بـ ⁦PS5 (UFS2)⁩. يمكن تركيبها قابلة للكتابة.",
-      },
-      ffpfs: {
-        text: "نظام الملفات PFS الخاص بـ PS5، دون ضغط. يجب أن تكون أسماء الملفات بأحرف ASCII فقط.",
-      },
-      ffpfsc: {
-        text: "الأصغر: حاوية مضغوطة حول صورة واحدة، تُركّب دائمًا للقراءة فقط.",
-      },
-      pkg: { tone: "good", text: "مستحسن. تعمل مثل لعبة أصلية، ولكن فقط إن سمح بذلك إصدار البرنامج الثابت لديك." },
-      lz4: {
-        text: "مجلد لعبة حُزمت أصوله في أجزاء LZ4، يفك محاكي AMPR المضمّن (ampr_emu) حزمها أثناء تشغيل اللعبة.",
-      },
-    },
-    innerFfpkg: { text: "نظام الملفات الخاص بـ ⁦PS5 (UFS2)⁩." },
-    innerExfat: { tone: "good", text: "مستحسن. الصورة الأكثر استقرارًا داخل حاوية مضغوطة." },
-    level0: { text: "دون ضغط: تُخزَّن كل كتلة كما هي. يكون الملف بحجم الصورة." },
-    levelDefault: {
-      tone: "good",
-      text: "مستحسن. هذا هو المستوى الافتراضي في zlib. المستوى 1 يبني أسرع بنحو 3 أضعاف وملفه أكبر بنحو 3%؛ والمستوى 9 أصغر بالكاد.",
-    },
-    levelLow: {
-      text: "يبني أسرع من المستوى 6 (المستوى 1 بنحو 3 أضعاف)؛ لكن الملف يكون أكبر (المستوى 1 بنحو 3%).",
-    },
-    levelHigh: {
-      text: "أصغر بالكاد من المستوى 6 (المستوى 9 بنسبة 0.04%)، لكن الضغط يستغرق وقتًا أطول (المستوى 9 بنحو 25%)، مع انشغال كل الأنوية طوال الوقت.",
-    },
     kraken: {
       fast: { label: "سريع", note: { tone: "good", text: "مستحسن. أسرع بناء." } },
       balanced: {
@@ -984,7 +852,7 @@ const ar: Messages = {
       folder
         ? `طويل جدًا: ${count(bytes, { one: "بايت واحد", two: "بايتان", few: "بايتات", many: "بايتًا", other: "بايت" })}، والحد الأقصى ${max} (UTF-8).`
         : `طويل جدًا: ${count(bytes, { one: "بايت واحد", two: "بايتان", few: "بايتات", many: "بايتًا", other: "بايت" })} قبل الامتداد، والحد الأقصى ${max} (UTF-8).`,
-    pkgExt: (ext) => `ينتهي بـ ${iso(`.${ext}`)}، لكن fpkg يُحفظ بامتداد ${iso(".pkg")}: الامتداد هو ما يحدد برنامج التشغيل.`,
+    pkgExt: (ext) => `ينتهي بـ ${iso(`.${ext}`)}، لكن FPKG يُحفظ بامتداد ${iso(".pkg")}: الامتداد هو ما يحدد برنامج التشغيل.`,
     otherExt: (ext, target) =>
       `ينتهي بـ ${iso(`.${ext}`)}، لكن الهدف ${target}: الامتداد هو ما يحدد برنامج التشغيل.`,
     extractInto: "الاستخراج إلى هذا المجلد",
@@ -1014,7 +882,6 @@ const ar: Messages = {
     versionOut: "يُحذف الإصدار لإفساح المجال.",
     cut: "يُقص الاسم عند 63 بايت.",
     idOnly: "نص القالب يملأ 63 بايت، لذا يُسمّى الإخراج بمعرّف اللعبة.",
-    limit: `لا يستطيع ${iso("ShadowMount+")} تركيب صورة يزيد اسمها على 63 بايت (58 لـ ffpfsc)، لذا يُقصَّر العنوان أولًا في الاسم الأطول.`,
     errors: {
       long: (max: number) => `لا يتجاوز القالب ${max} بايت.`,
       open: `توجد ${iso("{")} بلا ${iso("}")} تغلقها.`,
@@ -1035,7 +902,8 @@ const ar: Messages = {
     later: "لاحقًا",
     updating: "جارٍ التحديث…",
     updatingNote: "يجري تنزيل الإصدار الجديد. سيُعاد تحميل هذه الصفحة بالإصدار الجديد تلقائيًا.",
-    downloading: "يجري التنزيل في متصفحك: فُكّ ضغط الأرشيف واستبدل به هذه النسخة.",
+    downloading: "يُفتح التنزيل في متصفحك: ضع الملف الذي نزّلته مكان هذه النسخة (على Mac، اسحب التطبيق من صورة القرص إلى مجلد التطبيقات).",
+    downloadingCli: "يُفتح التنزيل في المتصفح: استبدل أداة سطر الأوامر ⁦ps5-dump-forge⁩ بالملف الذي نزّلته، أو شغّل ⁦ps5-dump-forge update --install⁩ على الحاسوب الذي يعمل عليه.",
     failed: (v) => `تعذّر التحديث إلى ${iso(`v${v}`)}`,
     timeout: (v) => `لم يبدأ الإصدار ${iso(`v${v}`)} خلال دقيقة. إذا اكتمل تنزيله، فأوقف Dump Forge وافتحه من جديد لإكمال التحديث.`,
     retry: "إعادة المحاولة",
@@ -1065,7 +933,6 @@ const ar: Messages = {
     all: "الكل",
     onlineOf: (n, total) => `${num(n)} من ${num(total)} متصل`,
     sendFilesTo: (name) => `إرسال ملفات إلى ${iso(name)}`,
-    details: (name) => `تفاصيل ${iso(name)}`,
     userIs: (user) => `المستخدم ${iso(user)}`,
     nearby: "بالقرب منك",
     nearbyNone: "لم يُعثر على أجهزة جديدة",
@@ -1130,40 +997,22 @@ const ar: Messages = {
     passwordNone: "لا توجد",
     edit: "تعديل",
     nasForgetNote: "يزيل «نسيان» هذا الـ NAS وكلمة مروره المحفوظة من هذا الجهاز.",
-    pickSendFiles: "الملفات المراد إرسالها",
-    pickSendFolder: "المجلد المراد إرساله",
-    pickSaveTo: "مكان الحفظ",
     thisBrowser: "هذا المتصفح",
-    browserHint: "تذهب الملفات من هذا الهاتف أو الكمبيوتر إلى مجلد على هذا الجهاز، ويحفظ هذا المتصفح ملفًا من هذا الجهاز.",
-    uploadTo: "المجلد المراد الرفع إليه",
     uploadPick: "اختيار ملفات للرفع",
     uploading: (name, i, n) => `جارٍ رفع ${iso(name)} (${num(i)} من ${num(n)})`,
     uploaded: "اكتمل الرفع",
     uploadSkipped: (names) => `لم يُرفع، إذ يوجد هناك مجلد أو رابط بالاسم نفسه: ${iso(names)}.`,
     uploadedBefore: (done, n) => `الملفات المرفوعة: ${num(done)} من ${num(n)}. تبقى على هذا الجهاز.`,
-    cantStart: "تعذّر بدء النقل:",
     cantUpload: "تعذّر الرفع:",
-    pickDownload: "الملف المراد تنزيله",
-    transferIntro: "أرسل ملفات أو مجلدًا من أي جهاز إلى مجلد هنا أو على جهاز مقترن أو على NAS. يُنفَّذ النقل كمهمة في قائمة المهام.",
     send: "إرسال",
-    sendWhat: "ما المراد إرساله",
-    sendTo: "الإرسال إلى",
-    sendNeedsDevice: "اتصل بجهاز آخر أولًا: أقرِن Forge أو أضِف NAS.",
-    nothingChosen: "لم يُختر شيء بعد",
-    chooseFiles: "اختيار ملفات",
-    chooseFolder: "اختيار مجلد",
-    startTransfer: "بدء",
-    uploadHere: "الرفع إلى هذا الجهاز",
     downloadHere: "التنزيل من هذا الجهاز",
-    consoleNoFiles: "لا يستطيع متصفح PS5 اختيار الملفات: افتح هذه الصفحة على هاتف أو كمبيوتر.",
     wholeRoot: "لا يمكن إرسال جهاز أو مشاركة أو محرك أقراص بالكامل: اختر مجلدًا داخله.",
-    helpPhone: "امسح رمز QR لفتح هذه الصفحة على هاتف. هناك، ينقل «الرفع إلى هذا الجهاز» و«التنزيل من هذا الجهاز» في «نقل الملفات» ملفات الهاتف.",
-    /** How to connect: short paragraphs, in order (no headings). */
+    helpPhone: "امسح رمز QR لفتح هذه الصفحة على هاتف. هناك، يرفع «النقل» ملفات الهاتف إلى هذا الجهاز وينزّل ملفات هذا الجهاز إلى الهاتف.",
     help: [
       "يربط «الاتصال» نسخ Dump Forge على جهاز PS5 وأجهزة الكمبيوتر لديك في الشبكة نفسها.",
       "للإقران، شغّل «الاكتشاف التلقائي» واختر «إقران» في «بالقرب منك»، أو اكتب عنوانًا في «إضافة جهاز»، ثم اسمح بذلك على الجهاز الآخر. لا تسمح إلا إذا عرضت الشاشتان رقم التحقق نفسه.",
       "يُضاف NAS (SMB وFTP وNFS) بالطريقة نفسها. الأجهزة المقترنة وأجهزة NAS مصادر للألعاب ووجهات للإخراج معًا، ولا تُعدَّل ألعابها هناك.",
-      "ينسخ «نقل الملفات» الملفات والمجلدات بين أي منها. ولا يُستبدل أي اسم موجود بالفعل في الوجهة إلا بعد تأكيدك.",
+      "ينسخ «النقل»، في القائمة الجانبية، الملفات والمجلدات بين أي منها. ولا يُستبدل أي اسم موجود بالفعل في الوجهة إلا بعد تأكيدك.",
     ],
     helpSecurity: "لا شيء مما يُرسَل بين الأجهزة مشفّر: يمكن لأي شخص على شبكتك قراءته. وتُحفَظ كلمة مرور NAS على هذا الجهاز دون تشفير. استخدم «الاتصال» على شبكتك المنزلية فقط.",
     helpSpeed: "يرسل «اختبار السرعة»، في صف جهاز مقترن أو في تفاصيله، ⁦128 MiB⁩ إليه ويستلم ⁦128 MiB⁩ منه، دون كتابة شيء على القرص، ويعرض سرعة الشبكة في كل اتجاه.",
@@ -1204,7 +1053,7 @@ const ar: Messages = {
     content: { game: "لعبة", patch: "تصحيح", additional_content: "محتوى إضافي", unknown: "غير معروف" },
     install: "تثبيت",
     installName: (name) => `تثبيت ${iso(name)}`,
-    started: (name) => `جارٍ تثبيت ${iso(name)}. تظهر المهمة أدناه.`,
+    started: (name: string) => `جارٍ تثبيت ${iso(name)}. تظهر المهمة في «قائمة الانتظار».`,
     tag: "تثبيت",
     title: "تثبيت هذه الحزمة؟",
     titleOn: (device) => `تثبيت هذه الحزمة على ${iso(device)}؟`,
@@ -1220,7 +1069,255 @@ const ar: Messages = {
     installPkg: "تثبيت pkg",
     installPkgOn: (device) => `تثبيت حزمة على ${iso(device)}`,
     pickTitle: "اختر حزمة لتثبيتها",
-    sent: (device) => `يثبّت ${iso(device)} الحزمة. تظهر المهمة أدناه.`,
+    sent: (device: string) => `يثبّت ${iso(device)} الحزمة. تظهر المهمة في «قائمة الانتظار».`,
+  },
+  // Build's and Edit's Restore metadata online switch (build/options.tsx, Edit.tsx)
+  metadata: {
+    tag: "البيانات الوصفية",
+    cant: "تعذّرت استعادة البيانات الوصفية:",
+    label: "استعادة البيانات الوصفية عبر الإنترنت",
+    buildHint: `قبل البناء، يُنزّل ${iso("param.json")} والصور والصوت وجداول ${iso("PlayGo")} لهذا الإصدار من خادم تحديثات ${iso("Sony")} ويضعها في الناتج حيث تختلف. لا تتغيّر اللعبة نفسها. يحتاج إلى الإنترنت؛ ومن دونه يستمر البناء كما هو.`,
+    buildSummary: `يضع البيانات الوصفية من ${iso("Sony")} في الناتج (لا تتغيّر اللعبة)`,
+    editHint: `يطبّق على هذه اللعبة، مع تغييراتك، ${iso("param.json")} والصور والصوت وجداول ${iso("PlayGo")} لهذا الإصدار من خادم تحديثات ${iso("Sony")} حيث تختلف: يتغيّر المجلد مباشرة، و${iso("exfat")} أو ${iso("ffpkg")} في مكانه، ويُعاد بناء ${iso("ffpfs")} أو ${iso("ffpfsc")} أو ${iso("FPKG")}. يحتاج إلى الإنترنت؛ إذا فشل التنزيل فلا يتغيّر شيء.`,
+    editOnly: `البيانات الوصفية من ${iso("Sony")} لهذا الإصدار، مطبّقة على هذه اللعبة`,
+    editAlso: `تُطبَّق أيضًا البيانات الوصفية من ${iso("Sony")} لهذا الإصدار، بعد تنزيلها أولًا.`,
+    editConfirm: `تطبيق البيانات الوصفية من ${iso("Sony")}؟`,
+    editConfirmText: "تُنزَّل البيانات الوصفية أولًا؛ وإذا فشل ذلك فلا يتغيّر شيء.",
+  },
+  // App.tsx: the side rail
+  rail: {
+    build: "البناء",
+    settings: "الإعدادات",
+    queue: "قائمة الانتظار",
+    transfer: "النقل",
+    collapse: "طيّ القائمة",
+    expand: "توسيع القائمة",
+  },
+  // Queue.tsx
+  queue: {
+    empty: "لا توجد مهام بعد. تظهر هنا مهام البناء والتحرير والنقل والتثبيت.",
+    counts: (running: number, queued: number, failed: number, done: number): string =>
+      [
+        running && `قيد التشغيل: ${num(running)}`,
+        queued && `في الانتظار: ${num(queued)}`,
+        failed && `فشلت: ${num(failed)}`,
+        done && `اكتملت: ${num(done)}`,
+      ]
+        .filter(Boolean)
+        .join("، ") || "لا شيء لعرضه",
+    retryFailed: (n: number): string => (n > 0 ? `إعادة محاولة الفاشلة (${num(n)})` : "إعادة محاولة الفاشلة"),
+    retrying: (i: number, n: number) => `تجري إعادة المحاولة: ${num(i)} من ${num(n)}`,
+    clearFinished: "مسح المنتهية",
+    filters: { all: "الكل", running: "قيد التشغيل", failed: "فشلت", done: "اكتملت" },
+    filterLabel: "عرض",
+    noneShown: "لا توجد مهام تطابق هذا المرشّح.",
+  },
+  // Settings.tsx
+  settings: {
+    appearance: "المظهر",
+    theme: "السمة",
+    themeHint: "الداكنة تناسب التلفاز، والفاتحة تناسب غرفة مضيئة.",
+    dark: "داكنة",
+    light: "فاتحة",
+    scheme: "نظام الألوان",
+    schemeHint: "لون التمييز في التطبيق كله.",
+    schemes: { abyss: "الهاوية", ember: "الجمر", moss: "الطحلب", cobalt: "الكوبالت", dusk: "الغسق", rose: "الورد", sand: "الرمل", volt: "فولت", mono: "أحادي اللون" },
+    advanced: "خيارات متقدمة",
+    advancedOpen: "إظهار الخيارات المتقدمة دائمًا",
+    advancedHint:
+      "يعرض كل الحزم والصيغ دون «المزيد»، ويُبقي كل الأقسام المطوية مفتوحة. أوقفه ليبقى «البناء» قصيرًا.",
+    bundled: (version: string) => `${version} (مضمّنة)`,
+    replaceAmprEmu: "استبدال ampr_emu بـ ampr-emu-ng",
+    languageHint: "لغات النظام إلى أن تختار لغة.",
+    notificationsGroup: "PS5",
+  },
+  // JobList.tsx: a finished job's result
+  result: {
+    file: "الناتج",
+    type: "النوع",
+    size: "الحجم",
+    files: "الملفات",
+    time: "الوقت",
+    verified: "تم التحقق",
+    verifiedFast: "تم التحقق (سريع)",
+    verifiedFull: "تم التحقق (كامل)",
+    notVerified: "لم يُبلَّغ عن أي فحص",
+    checks: "الفحوص:",
+    copy: "نسخ التفاصيل",
+    copied: "تم النسخ",
+    copyFailed: "لا يمكن النسخ هنا",
+    ofSource: (pct: number) => `${num(pct, 1)}% من ملفات اللعبة`,
+    filesN: (n: number) => count(n, FILES),
+    to: "كُتب في",
+    took: (d: string) => `استغرق ${d}`,
+    kinds: {
+      pkg: "FPKG: قابلة للتثبيت على PS5 يدعم FPKG",
+      exfat: "صورة exfat: يركّبها ShadowMount+، قابلة للكتابة",
+      ffpkg: "صورة ffpkg ‏(UFS2): يركّبها ShadowMount+، قابلة للكتابة",
+      ffpfs: "صورة ffpfs ‏(PFS): يركّبها ShadowMount+",
+      ffpfsc: "صورة ffpfsc ‏(PFS مضغوط): يركّبها ShadowMount+ للقراءة فقط",
+      folder: "مجلد اللعبة",
+    } as Record<string, string | undefined>,
+    zstdFolder: "مجلد بحزم ZSTD",
+    lz4Folder: "مجلد بحزم LZ4",
+    withPacks: (image: string, kind: string) => `${image}، والملفات في حزم ${kind}`,
+    edited: (what: string) => `${what}، عُدّل في مكانه`,
+    rebuilt: (what: string) => `${what}، أُعيد بناؤه`,
+    extracted: "الملفات المستخرجة",
+    transferred: "الملفات المنسوخة",
+    installed: "سُلّمت الحزمة إلى مثبّت PS5",
+  },
+  // JobList.tsx: the log panel
+  log: {
+    lines: (n: number, of?: number): string =>
+      of === undefined ? count(n, LINES) : `${num(n)} من ${count(of, LINES)}`,
+    filter: "تصفية",
+    follow: "تمرير تلقائي",
+    copy: "نسخ",
+    copied: "تم النسخ",
+    copyFailed: "فشل النسخ",
+    save: "حفظ",
+    clear: "مسح",
+    cleared: "تم المسح",
+  },
+  // common.tsx: the source card's fact chips
+  sourceChips: {
+    sdk: (v: string) => `SDK ${v}`,
+    firmware: (v: string) => `FW ${v}+`,
+  },
+  // prefs.tsx: Advanced's badge
+  advanced: {
+    changed: "مُعدّلة",
+    defaults: "الافتراضية",
+  },
+  // build/*: the Build screen
+  build: {
+    summary: "الملخص",
+    addToQueue: "إضافة إلى قائمة الانتظار",
+    queued: "أُضيف إلى قائمة الانتظار",
+    openQueue: "فتح قائمة الانتظار",
+    space: (free: string, dir: string, needed: string) => (
+      <>
+        المساحة الحرة في <span className="path">{iso(dir)}</span>: {free}، والمطلوب نحو {needed}
+      </>
+    ),
+    needed: (needed: string) => `المطلوب نحو ${needed}`,
+    spaceRaw: "تُفحص المساحة كأن لا شيء مضغوط.",
+    estimate: "تقدير",
+    advanced: "خيارات متقدمة",
+    options: "الخيارات",
+    fastVerify: "تحقق سريع: تُفحص كل البُنى، وتُعاد قراءة عيّنة من البيانات.",
+    fullVerify: "تحقق كامل: تُعاد قراءة كل بايت.",
+    deleted: "يُحذف المصدر بعد نجاح البناء. لا يمكن التراجع.",
+    zstdBackport:
+      "أصول هذه اللعبة محزومة بـ ZSTD وفهرس ZSTD يتضمّن الباكبورت: ابنِها مرة واحدة بخيار «الحزم: بلا»، ثم أزل الباكبورت.",
+    lz4Backport:
+      "أصول هذه اللعبة محزومة بـ LZ4 وبيان LZ4 يتضمّن الباكبورت: ابنِها مرة واحدة بخيار «الحزم: بلا»، ثم أزل الباكبورت.",
+    backportLeftOut: (n: number) => `يُستبعد من ⁦fakelib/⁩ ${count(n, BACKPORT_LIBS)}.`,
+    packsTitle: "الهدف",
+    packs: "الحزم",
+    more: "المزيد",
+    moreTip: "صيغ أخرى",
+    cards: {
+      folder: "ملفات عادية، تُنسخ إلى أي مكان، ويشغّلها ShadowMount+",
+      pkg: "تُثبَّت على PS5 مثل حزمة لعبة",
+      exfat: "يركّبها ShadowMount+ وتُفتح على الحاسوب",
+      ffpkg: "صورة UFS2 لـ ShadowMount+، ويمكن تركيبها للكتابة",
+      ffpfs: "صورة PFS بلا ضغط، بأسماء ملفات ASCII فقط",
+      ffpfsc: "أصغر صورة: مضغوطة، وتُركَّب دائمًا للقراءة فقط",
+      lz4: "أصول محزومة بـ LZ4، في مجلد عادي",
+    },
+    zstdFolderCard: "أصول محزومة بـ ZSTD، في مجلد عادي",
+    packCards: {
+      nonePlain: "ملفات اللعبة كما هي",
+      unpack: "يعيد كتابة الحزم ملفاتٍ عادية",
+      keepZstd: "تُبقى حزم ZSTD بايتًا ببايت",
+      keepLz4: "تُبقى حزم LZ4 بايتًا ببايت",
+      zstd: "لعبة أصغر وتحميل أسرع، مع ampr-emu-ng",
+      repackZstd: "يفك حزم LZ4 ويحزمها من جديد بـ ZSTD",
+      lz4: "يحزم الأصول بـ LZ4، مع ampr-emu-ng",
+      repackLz4: "يفك حزم ZSTD ويحزمها من جديد بـ LZ4",
+    },
+    naming: "الناتج: يجري إنشاء الاسم",
+    output: (name: string, dir: string) => (
+      <>
+        الناتج: <b className="path">{iso(name)}</b> في <span className="path">{iso(dir)}</span>
+      </>
+    ),
+    choices: { none: "بلا", zstd: "ZSTD", lz4: "LZ4" },
+    levelLabel: (level: string, engine: string, n: number) => `${level}، ${engine} ${n}`,
+    levelTip: (engine: string, n: number, note: string) => `${engine} ${n}. ${note}`,
+    sumKeepZstd: "تُبقى حزم ZSTD بايتًا ببايت.",
+    sumKeepLz4: "تُبقى حزم LZ4 بايتًا ببايت.",
+    sumKeepPlain: "لا تُنشأ حزم: تُحوَّل ملفات اللعبة كما هي.",
+    sumUnpack: (engine: string) => `تُعاد كتابة حزم ${engine} ملفاتٍ عادية.`,
+    sumPack: (engine: string, level: string) => `تُحزم ملفات اللعبة في أجزاء ${engine} (${level}).`,
+    sumRepack: (from: string, to: string, level: string) => `تُفك حزم ${from} وتُحزم من جديد بـ ${to} (${level}).`,
+    sumRules: (name: string) => `تختار القواعد المخصصة ${iso(name)} الملفات التي تُحزم.`,
+    sumInside: (format: string, level: number) => `في الداخل: ${format}، مستوى zlib ${level}.`,
+    ngInstalled: "يُثبَّت ampr-emu-ng في ⁦fakelib/libSceAmpr.sprx⁩.",
+    ngReplaced: (old: string) => `يُستبدل ${iso(old)} الخاص باللعبة بـ ampr-emu-ng.`,
+    ngReplacedTrace: "تُستبدل بيئة تشغيل التتبّع القديمة الخاصة باللعبة بـ ampr-emu-ng.",
+    ngKept: (old: string) => `يُبقى ${iso(old)} الخاص باللعبة.`,
+    ngUpdated: (v: string) => `يُستبدل ${iso(`ampr-emu-ng${v}`)} الخاص باللعبة بالنسخة المضمّنة.`,
+    ngSame: (v: string) => `يُبقى ${iso(`ampr-emu-ng${v}`)} الخاص باللعبة.`,
+    pkgNoRuntime: "تُستبعد بيئة تشغيل AMPR من FPKG: يوفّرها مُحمِّل الجهاز.",
+    recommended: "موصى به",
+    resultTitle: "تقريبًا، بعد البناء",
+    resultNow: "اللعبة الآن",
+    resultCustomRules: "قواعد مخصصة: بلا تقدير",
+    backportTitle: "الباكبورت",
+    backportNone: "لا يوجد باكبورت في هذه اللعبة.",
+    backportPlain: "للتحويل العادي فقط: دون إنشاء حزم أو فكّها.",
+  },
+  // TransferPane.tsx: one device's pane of the Transfer screen
+  transfer: {
+    pane: (device) => `الملفات على ${iso(device)}`,
+    roots: "محركات الأقراص",
+    location: "الموقع",
+    up: "أعلى",
+    upTip: "الصعود مجلدًا واحدًا",
+    refresh: "تحديث",
+    filter: "تصفية حسب الاسم",
+    filterLabel: "تصفية هذا المجلد حسب الاسم",
+    inFolder: (dirs, files) => `${count(dirs, FOLDERS)}، ${count(files, FILES)}`,
+    matches: (n) => count(n, RESULTS),
+    firstOf: (max, n) => `أول ${num(max)} من ${num(n)}`,
+    truncated: "يحتوي هذا المجلد على أكثر من 10,000 عنصر: لا يُعرض منها إلا أول 10,000.",
+    name: "الاسم",
+    size: "الحجم",
+    select: (name) => `تحديد ${iso(name)}`,
+    open: (name) => `فتح ${iso(name)}`,
+    selected: (n) => `المحدد: ${count(n, ITEMS)}`,
+    clear: "مسح",
+    clearTip: "مسح التحديد",
+    dragItems: (n) => count(n, ITEMS),
+    dropHere: (path) => `أفلِت للإرسال إلى ${iso(path)}`,
+    notHere: "افتح مجلدًا لإرسال الملفات إليه.",
+    emptyFolder: "هذا المجلد فارغ.",
+    noMatch: (f) => `لا شيء هنا يطابق «${iso(f)}».`,
+    noRoots: "لا توجد محركات أقراص متاحة للتصفّح.",
+    cantList: "تعذّر فتح هذا المجلد:",
+    loading: "جارٍ التحميل",
+    link: "رابط",
+    linkTip: "رابط: يمكن فتحه، لكن لا يمكن تحديده",
+    mounted: "مُركَّب",
+    mountedTip: `مُركَّب بواسطة ${iso("ShadowMount+")}: أوقف اللعبة وأوقف تشغيل ${iso("ShadowMount+")} لتحديده`,
+    withTitle: "النقل مع",
+    loadingDevices: "جارٍ تحميل الأجهزة",
+    noneTitle: "لا يوجد جهاز للنقل معه",
+    noneHint: "أقرِن Dump Forge آخر أو أضف NAS من «الاتصال»، أو شغّل جهازًا محفوظًا.",
+    openConnect: "فتح «الاتصال»",
+    deviceOffline: (device) => `${iso(device)} غير متصل. ستظهر ملفاته مجددًا عند عودته.`,
+    copyTo: (n, device) => `نسخ ${count(n, ITEMS)} إلى ${iso(device)}`,
+    copyNoFolder: (device) => `افتح على ${iso(device)} المجلد الذي تريد النسخ إليه.`,
+    installOn: (device) => `التثبيت على ${iso(device)}`,
+    dropFiles: "أفلِت الملفات هنا لرفعها",
+    uploadInto: (folder) => `تذهب إلى ${iso(folder)}، المجلد المعروض على هذا الجهاز.`,
+    uploadNoFolder: "افتح مجلدًا على هذا الجهاز للرفع إليه.",
+    foldersLeftOut: (names) => `لا تُرفع المجلدات، بل الملفات فقط: ${iso(names)}.`,
+    downloadFiles: (n) => `تنزيل ${count(n, FILES)}`,
+    downloadNone: "حدّد ملفات على هذا الجهاز لتنزيلها (لا تُنزَّل المجلدات).",
   },
   duration: { s: (s) => `${s} ث`, ms: (m, s) => `${m} د ${s} ث`, hm: (h, m) => `${h} س ${m} د` },
 };

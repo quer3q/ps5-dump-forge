@@ -1,9 +1,5 @@
-//! A paired Forge's files: paths `flink://<key_id>/<path>` (`path` relative to the peer's share
-//! root: the PS5's `/`, a computer's home). Core never talks FLINK itself: the Connect service
-//! registers a [`Remote`] once ([`set`]) and everything here goes through it ([`get`]). A folder
-//! is served as a [`RemoteTree`]; an image is read through [`RemoteReader`]. A server's files
-//! (`ftp://`, `smb://`, `nfs://`) go through the same calls, answered by [`crate::ftp`],
-//! [`crate::smb`] and [`crate::nfs`].
+//! Files on another device (`flink://<key_id>/<path>`, `ftp://`, `smb://`, `nfs://`), all
+//! through the [`Remote`] trait: Connect registers the peers' ([`set`]), servers have adapters.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -17,30 +13,28 @@ use ps5upload_fpkg::source::{SourceFile, SourceTree};
 
 use crate::scan::is_junk;
 
-/// What [`Remote::stat`] says of a path. `mtime` is the same value [`Remote::list`] gives, so
-/// a listing's entry and a later stat compare equal while the file is unchanged.
+/// What [`Remote::stat`] says; `mtime` equals [`Remote::list`]'s, so an unchanged file compares equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteStat {
     pub dir: bool,
-    /// A file's length; 0 for a folder.
     pub size: u64,
     pub mtime: Option<SystemTime>,
     /// A symbolic link (not followed: `dir` false, `size` 0); never read.
     pub link: bool,
 }
 
-/// One entry of a folder on a peer (links are not followed: the peer lists what they are).
+/// One entry of a folder on a peer (links not followed).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoteEntry {
     pub name: String,
     pub dir: bool,
     pub size: u64,
     pub mtime: Option<SystemTime>,
-    /// A symbolic link (`dir`/`size` may describe its target); never walked or read.
+    /// A link (`dir`/`size` may describe its target); never walked or read.
     pub link: bool,
     /// A FIFO, socket or device: refused wherever a local scan refuses one.
     pub special: bool,
-    /// A name that isn't UTF-8 on the peer (`name` is its lossy spelling): refused likewise.
+    /// A name that isn't UTF-8 on the peer (`name` lossy): refused likewise.
     pub bad_name: bool,
 }
 
@@ -49,18 +43,13 @@ pub(crate) fn addressable(name: &str) -> bool {
     !matches!(name, "" | "." | "..") && !name.contains(['/', '\\'])
 }
 
-/// A paired peer's files, as the Connect service reaches them. Every path is confined to the
-/// peer's share root by the peer; every call is one request and may block on the network.
+/// Another device's files; every call is one request and may block on the network.
 pub trait Remote: Send + Sync {
-    /// The file or folder at `path` (`NotFound` when there is none).
     fn stat(&self, path: &FlinkPath) -> io::Result<RemoteStat>;
-    /// A folder's entries, in any order; special files and names that aren't UTF-8 are marked
-    /// (`RemoteEntry::special`, `bad_name`), and `read_at` refuses anything but a regular file.
+    /// A folder's entries, in any order, special files and non-UTF-8 names marked.
     fn list(&self, path: &FlinkPath) -> io::Result<Vec<RemoteEntry>>;
-    /// `len` bytes of the file at `path` from `offset`; fewer only where the file ends.
     fn read_at(&self, path: &FlinkPath, offset: u64, len: usize) -> io::Result<Vec<u8>>;
-    /// [`Remote::read_at`], then the file's stat taken after the read (a peer may answer both
-    /// in one round trip, which is what makes many small files quick).
+    /// [`Remote::read_at`], then the stat taken after it (one round trip on a peer).
     fn read_checked(
         &self,
         path: &FlinkPath,
@@ -70,50 +59,41 @@ pub trait Remote: Send + Sync {
         let bytes = self.read_at(path, offset, len)?;
         Ok((bytes, self.stat(path)?))
     }
-    /// The whole new file `to` (at most [`PUT_MAX`] bytes) as `tmp`, created (never over
-    /// anything), written, synced and closed, then renamed to `to` without replacing; `tmp`
-    /// removed on any failure. A peer may do it all in one round trip, which is what makes many
-    /// small files quick.
+    /// `to` (at most [`PUT_MAX`] bytes) written as `tmp`, synced, closed and renamed without
+    /// replacing; `tmp` removed on any failure. One round trip on a peer.
     fn put_new(&self, tmp: &FlinkPath, to: &FlinkPath, bytes: &[u8]) -> io::Result<()> {
         put(self, tmp, to, bytes, false)
     }
-    /// Makes the folder `path` (its parent must exist; `AlreadyExists` when it does).
     fn mkdir(&self, path: &FlinkPath) -> io::Result<()>;
-    /// Creates the file `path` for writing, never replacing one (`AlreadyExists`); the handle
-    /// names it in the calls below until [`Remote::close`].
+    /// Creates `path` for writing, never replacing one (`AlreadyExists`).
     fn create(&self, path: &FlinkPath) -> io::Result<u64>;
-    /// Writes `bytes` at `offset` of a created file.
     fn write_at(&self, handle: u64, offset: u64, bytes: &[u8]) -> io::Result<()>;
-    /// Makes what was written durable on the peer.
     fn sync(&self, handle: u64) -> io::Result<()>;
-    /// Closes a created file; the handle is gone after this, whatever it returns, unless
-    /// [`Remote::reopen`] gives the file back.
+    /// The handle is gone after this, whatever it returns, unless [`Remote::reopen`] gives it back.
     fn close(&self, handle: u64) -> io::Result<()>;
-    /// Opens a created file again for writing after its [`Remote::close`], while it is not
-    /// renamed; it stays as it is when it is open. `Unsupported` where the device can't (a
-    /// device from before this call, a NAS): the caller then keeps the file open.
+    /// A closed, unrenamed created file open again; `Unsupported` on an older peer or a NAS.
     fn reopen(&self, _handle: u64) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
-    /// Renames on the same peer, never replacing `to` (`AlreadyExists`).
+    /// Never replaces `to` (`AlreadyExists`).
     fn rename_no_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()>;
-    /// Renames the file `from` on the same device over the file `to` (or to a free name),
-    /// never over a folder or a link: what an extract or transfer the user confirmed
-    /// replacing ([`crate::ConvertRequest::replace`]) puts in place.
+    /// A file over the file `to` (or to a free name), never over a folder or a link (Replace).
     fn rename_replace(&self, from: &FlinkPath, to: &FlinkPath) -> io::Result<()>;
-    /// Removes the file `path` (the peer allows only files a job of this device created).
     fn remove(&self, path: &FlinkPath) -> io::Result<()>;
-    /// Bytes free on the volume holding the folder `dir`.
+    /// An empty folder (`DirectoryNotEmpty` otherwise); `Unsupported` on a peer.
+    fn rmdir(&self, _path: &FlinkPath) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// The filesystem `path` is on (an NFS `fsid`), so a NAS Delete never crosses into another; `None`: not told.
+    fn fs_id(&self, _path: &FlinkPath) -> io::Result<Option<u128>> {
+        Ok(None)
+    }
     fn free_space(&self, dir: &FlinkPath) -> io::Result<u64>;
-    /// Deletes the file or folder `path` for good, as the device's own Delete would (a paired
-    /// Forge: its `Jobs::delete_path` and its protected paths). Refused unless the device
-    /// does it: a NAS share is read only here.
+    /// Deletes `path` as the device's own Delete would; refused unless the device does it.
     fn delete_path(&self, path: &FlinkPath) -> Result<(), crate::DeleteError> {
         Err(crate::delete::not_here(path))
     }
-    /// Moves or renames `from` to `to` on the same device, as its own Move to would
-    /// (`replace`: the user confirmed taking over a `to` there). Refused unless the device
-    /// does it, as [`Remote::delete_path`].
+    /// Moves `from` to `to` on the same device as its own Move to would; refused unless it does.
     fn move_path(
         &self,
         from: &FlinkPath,
@@ -124,8 +104,7 @@ pub trait Remote: Send + Sync {
     }
 }
 
-/// [`Remote::put_new`] in calls: `tmp` created, written, synced and closed, then renamed to
-/// `to` (over a file there when `replace`); `tmp` removed on any failure.
+/// [`Remote::put_new`] in separate calls (over a file there when `replace`).
 fn put<R: Remote + ?Sized>(
     remote: &R,
     tmp: &FlinkPath,
@@ -158,12 +137,10 @@ fn registry() -> &'static RwLock<Option<Arc<dyn Remote>>> {
     &R
 }
 
-/// Registers the Connect service's peers (a later call replaces the earlier one).
 pub fn set(remote: Arc<dyn Remote>) {
     *registry().write().unwrap_or_else(|e| e.into_inner()) = Some(remote);
 }
 
-/// The registered [`Remote`]; an error before [`set`] (no Connect service runs).
 pub fn get() -> io::Result<Arc<dyn Remote>> {
     registry()
         .read()
@@ -172,7 +149,6 @@ pub fn get() -> io::Result<Arc<dyn Remote>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no paired device service"))
 }
 
-/// The [`Remote`] that serves `at`: Connect's for a paired Forge, a client for a server.
 pub fn get_for(at: &FlinkPath) -> io::Result<Arc<dyn Remote>> {
     match at.scheme {
         Scheme::Flink => get(),
@@ -182,19 +158,15 @@ pub fn get_for(at: &FlinkPath) -> io::Result<Arc<dyn Remote>> {
     }
 }
 
-/// Whether `path` is an `ftp://` path (a saved FTP server's).
 pub fn is_ftp(path: &Path) -> bool {
     has_scheme(path, Scheme::Ftp.prefix())
 }
 
-/// Whether `path` is on a device this one reads and writes through a [`Remote`]: a paired
-/// Forge (`flink://`) or a server (`ftp://`, `smb://`, `nfs://`).
 pub fn is_remote(path: &Path) -> bool {
     Scheme::of(path).is_some()
 }
 
-/// Whether `path` is on a NAS share (`smb://`, `nfs://`): a game source and an output, but
-/// nothing on it is edited, deleted or moved, and no file is added to an edit from it.
+/// Whether `path` is on a NAS share (`smb://`, `nfs://`): never edited, never an edit's Add.
 pub fn is_nas(path: &Path) -> bool {
     matches!(Scheme::of(path), Some(Scheme::Smb | Scheme::Nfs))
 }
@@ -207,13 +179,10 @@ fn has_scheme(path: &Path, scheme: &str) -> bool {
     })
 }
 
-/// Which kind of device a [`FlinkPath`] is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Scheme {
-    /// A paired Forge, by key id.
     #[default]
     Flink,
-    /// An FTP server, by `host[:port]`.
     Ftp,
     /// An SMB server, by `host[:port]`; a path's first part is the share.
     Smb,
@@ -233,7 +202,6 @@ impl Scheme {
         }
     }
 
-    /// A server's port when its address names none.
     fn default_port(self) -> u16 {
         match self {
             Scheme::Flink => 0,
@@ -243,7 +211,6 @@ impl Scheme {
         }
     }
 
-    /// The scheme `path` is spelled with, when it is a [`Remote`] one.
     pub fn of(path: &Path) -> Option<Scheme> {
         Scheme::ALL
             .into_iter()
@@ -251,14 +218,12 @@ impl Scheme {
     }
 }
 
-/// Whether `path` is a `flink://` path.
 pub fn is_flink(path: &Path) -> bool {
     has_scheme(path, Scheme::Flink.prefix())
 }
 
-/// A server's `host[:port]` as its paths spell it: lower case, IPv6 in brackets, the port only
-/// when it isn't `default`; `None` for anything else (a user name, a path, an empty host, a bad
-/// port).
+/// A server's `host[:port]` as its paths spell it (lower case, IPv6 bracketed, port only when
+/// not `default`); `None` for a user name, a path, an empty host or a bad port.
 pub fn authority(s: &str, default: u16) -> Option<String> {
     let (host, port) = if let Some(rest) = s.strip_prefix('[') {
         let (host, rest) = rest.split_once(']')?;
@@ -296,7 +261,6 @@ pub fn authority(s: &str, default: u16) -> Option<String> {
     })
 }
 
-/// An [`authority`] as host (IPv6 without brackets) and port.
 pub fn host_port(authority: &str, default: u16) -> (&str, u16) {
     let (host, rest) = match authority.strip_prefix('[') {
         Some(v6) => v6.split_once(']').unwrap_or((v6, "")),
@@ -309,10 +273,8 @@ pub fn host_port(authority: &str, default: u16) -> (&str, u16) {
     (host, port.unwrap_or(default))
 }
 
-/// A parsed `flink://` path: `key_id` the peer's (32 hex digits, lower case), `path`
-/// `/`-separated and empty at its share root. On a server (`ftp://`, `smb://`, `nfs://`
-/// `host[:port]/path`) `key_id` is the server's [`authority`] and `path` is from the server's
-/// root (for SMB its first part is the share).
+/// A parsed remote path: `key_id` a peer's 32 lower hex digits or a server's [`authority`];
+/// `path` `/`-separated, empty at the root (on SMB its first part is the share).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FlinkPath {
     pub key_id: String,
@@ -321,9 +283,7 @@ pub struct FlinkPath {
 }
 
 impl FlinkPath {
-    /// Whether this path is `other` or inside it, on the same device: compared as spelled (the
-    /// device resolves its paths), ASCII case-insensitively on an SMB share (an NFS server's
-    /// paths, as a POSIX filesystem's, case-sensitively).
+    /// Whether this is `other` or inside it on the same device, as spelled (ASCII case-folded on SMB).
     // ponytail: a FLINK peer or FTP server that folds case is compared case-sensitively.
     pub(crate) fn within(&self, other: &FlinkPath) -> bool {
         let fold = |p: &str| match self.scheme {
@@ -367,7 +327,6 @@ impl FlinkPath {
         })
     }
 
-    /// The `flink://` (or server) spelling.
     pub fn url(&self) -> PathBuf {
         let mut s = format!("{}{}", self.scheme.prefix(), self.key_id);
         if !self.path.is_empty() {
@@ -377,12 +336,10 @@ impl FlinkPath {
         PathBuf::from(s)
     }
 
-    /// This server's host and port (a server path's only).
     pub(crate) fn host_port(&self) -> (&str, u16) {
         host_port(&self.key_id, self.scheme.default_port())
     }
 
-    /// The folder above; `None` at the share root.
     pub fn parent(&self) -> Option<Self> {
         if self.path.is_empty() {
             return None;
@@ -395,7 +352,6 @@ impl FlinkPath {
         Some(up)
     }
 
-    /// `name` (one plain name) inside this folder.
     pub fn join(&self, name: &str) -> Self {
         let mut down = self.clone();
         down.path = if self.path.is_empty() {
@@ -411,7 +367,7 @@ impl FlinkPath {
     }
 }
 
-/// (length, modification time) of a file on a peer, for [`crate::convert::SourceStamp`].
+/// (length, mtime) of a remote file, for [`crate::convert::SourceStamp`].
 pub fn seen(path: &Path) -> anyhow::Result<(u64, Option<SystemTime>)> {
     let at = FlinkPath::parse(path)?;
     let s = get_for(&at)?.stat(&at).with_context(|| at.shown())?;
@@ -422,7 +378,6 @@ pub fn seen(path: &Path) -> anyhow::Result<(u64, Option<SystemTime>)> {
     Ok((s.size, s.mtime))
 }
 
-/// One folder of a peer, as [`crate::list_dir`] lists a local one.
 pub fn list_dir(path: &Path) -> anyhow::Result<crate::Listing> {
     let at = FlinkPath::parse(path)?;
     listing(&*get_for(&at)?, &at)
@@ -434,8 +389,7 @@ fn listing(remote: &dyn Remote, at: &FlinkPath) -> anyhow::Result<crate::Listing
         .list(at)
         .with_context(|| at.shown())?
         .into_iter()
-        // A name `parse` can't give back (a `\` on a Unix peer) would open another path; one
-        // that isn't UTF-8 is left out, as a local listing leaves it out.
+        // A name `parse` can't give back would open another path; non-UTF-8 is left out as locally.
         .filter(|e| addressable(&e.name) && !e.bad_name)
         .map(|e| ListEntry {
             path: at.join(&e.name).url(),
@@ -457,7 +411,7 @@ fn listing(remote: &dyn Remote, at: &FlinkPath) -> anyhow::Result<crate::Listing
     })
 }
 
-/// `at` as the folder above lists it (so a link shows as one); the share root, by a stat.
+/// `at` as its parent lists it (so a link shows as one); the root by a stat.
 pub(crate) fn entry(remote: &dyn Remote, at: &FlinkPath) -> io::Result<RemoteEntry> {
     let Some(up) = at.parent() else {
         let s = remote.stat(at)?;
@@ -475,8 +429,7 @@ pub(crate) fn entry(remote: &dyn Remote, at: &FlinkPath) -> io::Result<RemoteEnt
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
 }
 
-/// `len` bytes of `path` from `offset` (cut at `stamp`'s length), then a stat: fails unless
-/// every byte came and the file still has `stamp`'s length and mtime.
+/// `len` bytes from `offset` (cut at `stamp`'s length); fails unless all came and the stamp still holds.
 fn fetch(
     remote: &dyn Remote,
     path: &FlinkPath,
@@ -508,26 +461,22 @@ fn fetch(
     Ok(buf)
 }
 
-/// At most this many entries and this deep, as a folder scan would go.
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_DEPTH: usize = 64;
 
-/// A game folder on a peer. Sizes and mtimes are listed up front and every read fails when its
-/// file's size or mtime moved since. Junk ([`is_junk`]) is skipped, as the folder scanner skips it;
-/// a link or a name a `flink://` path can't spell refuses the folder, as a local scan refuses links.
-/// A read that continues the last one doubles its window up to 64 MiB (checked when fetched, as
-/// [`RemoteReader`]'s window is).
+/// A game folder on a peer, listed up front; a read fails once its file's size or mtime moved.
+/// Junk is skipped; a link or an unspellable name refuses the folder. Sequential reads double
+/// their window up to 64 MiB.
 pub struct RemoteTree {
     remote: Arc<dyn Remote>,
     root: FlinkPath,
     files: Vec<SourceFile>,
     seen: HashMap<String, RemoteStat>,
     empty_dirs: Vec<String>,
-    /// Where the last read ended (path, offset): a read starting there is sequential.
+    /// Where the last read ended (path, offset).
     next: Option<(String, u64)>,
-    /// The last fetch's window length.
     want: usize,
-    /// Bytes read ahead of a sequential read (path, offset, bytes).
+    /// Read ahead of a sequential read (path, offset, bytes).
     ahead: Option<(String, u64, Vec<u8>)>,
 }
 
@@ -559,8 +508,7 @@ impl RemoteTree {
             let at = tree.at(&rel);
             let entries = tree.remote.list(&at).with_context(|| at.shown())?;
             count += entries.len();
-            // Junk is skipped unread, as the folder scanner skips it: a link in `.Trashes`
-            // refuses nothing, and a folder holding only junk is empty.
+            // Junk skipped unread: a link in `.Trashes` refuses nothing.
             let entries: Vec<RemoteEntry> =
                 entries.into_iter().filter(|e| !is_junk(&e.name)).collect();
             if entries.is_empty() && !rel.is_empty() {
@@ -610,12 +558,10 @@ impl RemoteTree {
         Ok(tree)
     }
 
-    /// The size and mtime `path` was listed with.
     pub(crate) fn stamp(&self, path: &str) -> Option<RemoteStat> {
         self.seen.get(path).copied()
     }
 
-    /// A listed file's modification time as listed.
     pub(crate) fn mtime(&self, path: &str) -> Option<SystemTime> {
         self.seen.get(path).and_then(|s| s.mtime)
     }
@@ -652,7 +598,6 @@ impl SourceTree for RemoteTree {
                 format!("{path}: not in the folder"),
             )
         })?;
-        // Served from what was read ahead when it holds the whole range.
         if let Some((p, at, bytes)) = &self.ahead
             && p == path
             && offset >= *at
@@ -664,14 +609,12 @@ impl SourceTree for RemoteTree {
             return Ok(out);
         }
         self.ahead = None;
-        // A growing sequential window lets the peer serve it on several lanes.
         let sequential = self
             .next
             .as_ref()
             .is_some_and(|(p, o)| p == path && *o == offset);
         let want = if sequential {
-            // From at least 1 MiB, so small sequential reads (LZ4's 64 KiB chunks) reach a
-            // full window in a few fetches.
+            // At least 1 MiB, so LZ4's 64 KiB chunks reach a full window in a few fetches.
             len.max(self.want.saturating_mul(2).clamp(WINDOW_MIN, WINDOW_MAX))
         } else {
             len
@@ -696,12 +639,9 @@ impl SourceTree for RemoteTree {
     }
 }
 
-/// An image file on a peer as `Read + Seek`, read ahead in a window that starts at 1 MiB (the
-/// image readers ask for headers a few hundred bytes at a time) and doubles up to 64 MiB while
-/// the reads stay sequential. Its length and mtime are taken at open; every read fails once
-/// either moved.
-// ponytail: one request at a time; the Connect side deals a request's 8 MiB pieces over its
-// data lanes, so a full window keeps 8 in flight, but none while the window is being used.
+/// An image file on a peer as `Read + Seek`: a window from 1 MiB doubling up to 64 MiB while
+/// reads stay sequential; every read fails once the length or mtime taken at open moved.
+// ponytail: one request at a time, so nothing is in flight while the window is being used.
 pub struct RemoteReader {
     remote: Arc<dyn Remote>,
     path: FlinkPath,
@@ -709,15 +649,13 @@ pub struct RemoteReader {
     pos: u64,
     window: Vec<u8>,
     window_at: u64,
-    /// The last window's length, and where a read that continues the last one starts.
     want: usize,
     next: u64,
-    /// The largest window read ahead (`WINDOW_MAX` unless [`Self::window_max`] lowers it).
     max: usize,
 }
 
 const WINDOW_MIN: usize = 1 << 20;
-/// 8 pieces of the Connect side's 8 MiB, one per data lane.
+/// 8 of the Connect side's 8 MiB pieces, one per data lane.
 const WINDOW_MAX: usize = 64 << 20;
 
 impl RemoteReader {
@@ -726,7 +664,7 @@ impl RemoteReader {
         if stamp.dir {
             bail!("{}: a folder, not a file", path.shown());
         }
-        // A link's stat is the link's own (size 0): read, it would pass for an empty file.
+        // A link's own stat (size 0) would pass for an empty file.
         if stamp.link {
             bail!("{}: a link (not followed)", path.shown());
         }
@@ -757,7 +695,7 @@ impl RemoteReader {
         self.len() == 0
     }
 
-    /// The file's stat now, when it still has the length and mtime it was opened with.
+    /// The stat now, when it still matches the one taken at open.
     pub fn stamp_now(&self) -> io::Result<Option<RemoteStat>> {
         let now = self.remote.stat(&self.path)?;
         Ok((now == self.stamp).then_some(now))
@@ -782,7 +720,6 @@ impl Read for RemoteReader {
             } else {
                 WINDOW_MIN
             };
-            // A read at least a window long skips the window.
             if buf.len() >= self.want {
                 let data = self.fetch(buf.len().min(self.max))?;
                 buf[..data.len()].copy_from_slice(&data);
@@ -814,15 +751,12 @@ impl Seek for RemoteReader {
 }
 
 impl RemoteReader {
-    /// A fresh reader of the same file, stamped now.
     pub(crate) fn reopen(&self) -> anyhow::Result<Self> {
         Self::open(self.remote.clone(), &self.path)
     }
 }
 
-/// The output `path` on a peer: its folder must be there. Every format can go there: an image
-/// through a [`RemoteFile`], a `.pkg` through a [`RemotePkgOut`], a folder (LZ4 packs included)
-/// through a [`RemoteDir`].
+/// The output `path` on a peer, its folder checked to be there.
 pub(crate) fn output_path(path: &Path) -> anyhow::Result<PathBuf> {
     let at = FlinkPath::parse(path)?;
     let Some(dir) = at.parent() else {
@@ -837,8 +771,7 @@ pub(crate) fn output_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(at.url())
 }
 
-/// Whether something is at `path` on a peer: anything but "not found" counts, so a name is
-/// never taken for free while the device can't say.
+/// Whether something is at `path` on a peer: anything but "not found" counts as taken.
 pub(crate) fn exists(path: &Path) -> bool {
     let Ok(at) = FlinkPath::parse(path) else {
         return false;
@@ -848,8 +781,7 @@ pub(crate) fn exists(path: &Path) -> bool {
         .map_or_else(|e| e.kind() != io::ErrorKind::NotFound, |_| true)
 }
 
-/// Free space in the folder `dir` on a peer against `need`, as [`crate::preflight::destination`]
-/// checks a local one.
+/// Free space in `dir` on a peer against `need`, as [`crate::preflight::destination`] checks.
 // ponytail: the peer's file system (FAT32's 4 GiB limit) is not asked; its write fails then.
 pub(crate) fn destination(dir: &Path, need: u64) -> crate::preflight::Destination {
     const MIB: u64 = 1 << 20;
@@ -878,24 +810,18 @@ pub(crate) fn destination(dir: &Path, need: u64) -> crate::preflight::Destinatio
     }
 }
 
-/// Files up to this size go to a peer whole, in one [`Remote::put_new`] (one Connect lane
-/// chunk).
-pub const PUT_MAX: usize = 8 << 20;
+/// Files up to this size go in one [`Remote::put_new`] (one Connect lane chunk).
+const PUT_MAX: usize = 8 << 20;
 
-/// Largest piece a [`RemoteFile`] sends at once: 8 of the Connect side's 8 MiB pieces, one per
-/// data lane.
+/// Largest piece a [`RemoteFile`] sends at once.
 const WRITE_CHUNK: usize = 64 << 20;
 
-/// A file created on a peer, written as `Write + Seek`: sequential writes are kept until 64 MiB
-/// are buffered (or a write lands elsewhere), then sent with their offset. [`finish`] sends
-/// the rest, syncs and closes it; dropped unfinished, what is buffered is lost.
-///
-/// [`finish`]: RemoteFile::finish
+/// A file created on a peer as `Write + Seek`: sequential writes buffered up to 64 MiB, then
+/// sent at their offset. Dropped before `finish`, what is buffered is lost.
 pub struct RemoteFile {
     remote: Arc<dyn Remote>,
     handle: u64,
     pos: u64,
-    /// The file's length as written so far, the buffer included.
     len: u64,
     buf: Vec<u8>,
     buf_at: u64,
@@ -916,19 +842,17 @@ impl RemoteFile {
     fn send(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
             self.remote.write_at(self.handle, self.buf_at, &self.buf)?;
-            // Freed, not kept: an LZ4 pack keeps every volume's file open until it ends.
+            // Freed, not kept: a pack keeps many volumes' files at once.
             self.buf = Vec::new();
         }
         Ok(())
     }
 
-    /// Sends what is buffered, then syncs and closes the file.
     pub fn finish(mut self) -> io::Result<()> {
         self.sync_open()?;
         self.remote.close(self.handle)
     }
 
-    /// Sends what is buffered and syncs, leaving the file open.
     fn sync_open(&mut self) -> io::Result<()> {
         self.send()?;
         self.remote.sync(self.handle)
@@ -971,8 +895,7 @@ impl Seek for RemoteFile {
     }
 }
 
-/// A `.part` this job created on a peer, as [`crate::finalize::Part`] is a local one: dropped
-/// without [`publish`](RemotePart::publish), it is removed (failure, cancel or panic alike).
+/// A `.part` this job created on a peer; dropped without `publish`, it is removed.
 // ponytail: no identity check; the peer only renames or removes a file this session created.
 pub(crate) struct RemotePart {
     remote: Arc<dyn Remote>,
@@ -980,13 +903,11 @@ pub(crate) struct RemotePart {
     at: FlinkPath,
     url: PathBuf,
     published: bool,
-    /// Whether the file is open on the peer (a pack's volume is closed once written, then opened
-    /// again for its header).
+    /// Open on the peer (a pack's volume is closed once written, reopened for its header).
     open: bool,
 }
 
 impl RemotePart {
-    /// Creates `path` (exclusively) on its peer.
     pub(crate) fn create_file(path: &Path) -> anyhow::Result<(Self, RemoteFile)> {
         let at = FlinkPath::parse(path)?;
         Self::create(get_for(&at)?, at)
@@ -1008,8 +929,7 @@ impl RemotePart {
         Ok((part, file))
     }
 
-    /// The part, opened again if it was closed, written again from its start (a pack volume's
-    /// header); its length is not known to the writer, so it is never sought from the end.
+    /// The part (reopened if closed) written again from its start: a pack volume's header.
     fn rewrite(&mut self) -> io::Result<RemoteFile> {
         if !self.open {
             self.remote.reopen(self.handle)?;
@@ -1018,8 +938,7 @@ impl RemotePart {
         Ok(RemoteFile::new(self.remote.clone(), self.handle))
     }
 
-    /// Closes the part once written and synced, when the peer can open it again; otherwise it
-    /// stays open. A peer takes only so many files open at once, and a pack has dozens of volumes.
+    /// Closes the written part when the peer can reopen it (peers cap open files; packs have many volumes).
     fn close_if_reopenable(&mut self) -> io::Result<()> {
         if !self.open {
             return Ok(());
@@ -1038,18 +957,15 @@ impl RemotePart {
         &self.url
     }
 
-    /// The part as written, read back from the peer.
     pub(crate) fn reader(&self) -> anyhow::Result<RemoteReader> {
         RemoteReader::open(self.remote.clone(), &self.at)
     }
 
-    /// Renames the (verified, synced and closed) part to `output` on the peer, never over
-    /// anything there.
+    /// Renames the verified part to `output`, never over anything there.
     pub(crate) fn publish(self, output: &Path) -> anyhow::Result<()> {
         self.publish_as(output, false)
     }
 
-    /// [`RemotePart::publish`], over a file at `output` when `replace`.
     fn publish_as(mut self, output: &Path, replace: bool) -> anyhow::Result<()> {
         let to = FlinkPath::parse(output)?;
         let renamed = if replace {
@@ -1066,28 +982,19 @@ impl RemotePart {
 impl Drop for RemotePart {
     fn drop(&mut self) {
         if !self.published {
-            // Closed first (a second close of a finished part only errs): an open upload would
-            // stay in the client's table and could keep the file from being removed.
+            // Closed first: an open upload stays in the client's table and may block the remove.
             let _ = self.remote.close(self.handle);
             let _ = self.remote.remove(&self.at);
         }
     }
 }
 
-/// A `.pkg` part on a peer as the package builder writes it ([`ps5upload_fpkg::PkgOut`]): the
-/// clones (the in-place Kraken spool, the self-check's reader, the job's verify) share one write
-/// buffer, sequential writes held up to 64 MiB and sent at their offset, each clone at a position
-/// of its own (the builder seeks before every read and write). A read sends what is held, then
-/// reads the part back by path; `sync_out` sends it and syncs on the peer. Nothing is kept on
-/// this device: a production build spools in place (no `PS5UPLOAD_FPKG_SPOOL_DIR`) and digests
-/// each compressed block as it writes it (vendor patch 0026), so the package crosses the network
-/// once written and once read by the builder's self-check, then the job's verify reads it.
-// Each clone reads ahead and serves the verifier's small reads from up to `PKG_WINDOWS` windows
-// (its reads interleave a few streams: metadata entries and the blocks they name) until anything
-// is written: over FTP every read is a data connection of its own (a 10k-file package's verify
-// took ~500 s with one per read). A window starts at 256 KiB and the one a read continues is
-// replaced by one twice its size, up to 4 MiB; the least recently used goes first; a read
-// larger than that is served and not kept.
+/// A `.pkg` part on a peer for the builder ([`ps5upload_fpkg::PkgOut`]): clones (Kraken spool,
+/// self-check, verify) share one 64 MiB write buffer, each at its own position. Nothing is
+/// kept on this device (in-place spool, blocks digested as written: vendor patch 0022).
+// Each clone serves small reads from up to `PKG_WINDOWS` windows (256 KiB doubling to 4 MiB,
+// LRU) until anything is written: over FTP each read is a data connection (a 10k-file
+// package's verify took ~500 s without them).
 // ponytail: windows per clone, not shared; one lane at a time.
 pub(crate) struct RemotePkgOut {
     shared: Arc<Mutex<PkgShared>>,
@@ -1095,12 +1002,11 @@ pub(crate) struct RemotePkgOut {
     windows: Vec<Window>,
 }
 
-/// Bytes read at `at`, valid while the shared `written` count is still this one.
+/// Bytes read at `at`, valid while `written` is unchanged.
 struct Window {
     at: u64,
     bytes: Vec<u8>,
     written: u64,
-    /// The size of the window that replaces this one when a read continues it.
     next: usize,
 }
 
@@ -1114,9 +1020,8 @@ struct PkgShared {
     handle: u64,
     buf: Vec<u8>,
     buf_at: u64,
-    /// The part's length as written so far, what is held included.
     len: u64,
-    /// Writes so far (every clone's read-ahead window is stale once it moves).
+    /// Writes so far (a window is stale once it moves).
     written: u64,
 }
 
@@ -1131,7 +1036,6 @@ impl PkgShared {
 }
 
 impl RemotePkgOut {
-    /// The `.part` `path`, created (exclusively) on its peer.
     pub(crate) fn create(path: &Path) -> anyhow::Result<(RemotePart, Self)> {
         let (part, _file) = RemotePart::create_file(path)?;
         let shared = PkgShared {
@@ -1159,7 +1063,7 @@ impl RemotePkgOut {
         self.shared.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Sends what is held, syncs and closes the part (every clone is done with it).
+    /// Sends what is held, syncs and closes the part.
     pub(crate) fn finish(self) -> io::Result<()> {
         let mut s = self.lock();
         s.send()?;
@@ -1219,8 +1123,7 @@ impl Read for RemotePkgOut {
                     return Ok(0);
                 }
                 if bytes.len() > PKG_AHEAD_MAX {
-                    // A large read (the sweep's 8 MiB batches) is served, not kept: windows stay
-                    // within `PKG_WINDOWS` x 4 MiB per clone.
+                    // Served, not kept: windows stay within `PKG_WINDOWS` x 4 MiB.
                     let n = buf.len().min(bytes.len());
                     buf[..n].copy_from_slice(&bytes[..n]);
                     self.pos += n as u64;
@@ -1239,7 +1142,6 @@ impl Read for RemotePkgOut {
             }
         };
         drop(s);
-        // Most recently used last.
         let w = self.windows.remove(i);
         let from = (pos - w.at) as usize;
         let n = buf.len().min(w.bytes.len() - from);
@@ -1280,12 +1182,9 @@ impl ps5upload_fpkg::PkgOut for RemotePkgOut {
     }
 }
 
-/// `dir/name` on its peer as [`crate::temp_file::write_temp_new`] writes a local file: an
-/// exclusive temporary name beside it that `fill` writes, sent, synced and closed, then renamed
-/// without replacing (over a file there when `replace`; the peer syncs the folder). On any
-/// failure the temporary file is removed. What `fill` writes is held up to [`PUT_MAX`] bytes:
-/// a new file that small goes in one [`Remote::put_new`] (a replacing one in [`put`]'s calls);
-/// a larger one is created at that point and streamed.
+/// `dir/name` on its peer as [`crate::temp_file::write_temp_new`] writes a local one: a
+/// temporary name filled by `fill`, synced, renamed (over a file when `replace`), removed on
+/// failure. Up to [`PUT_MAX`] it goes in one [`Remote::put_new`], larger is streamed.
 fn write_temp_new(
     remote: &Arc<dyn Remote>,
     dir: &FlinkPath,
@@ -1316,8 +1215,7 @@ fn write_temp_new(
     }
 }
 
-/// [`write_temp_new`]'s writer: bytes held until they pass [`PUT_MAX`], then the temporary file
-/// created on the peer and everything streamed into it.
+/// [`write_temp_new`]'s writer: held up to [`PUT_MAX`], then created and streamed.
 struct Spill<'a> {
     remote: &'a Arc<dyn Remote>,
     tmp: &'a FlinkPath,
@@ -1345,14 +1243,10 @@ impl Write for Spill<'_> {
     }
 }
 
-/// A folder a job writes on a peer, as [`crate::extract::Dest`] writes a local `.part`:
-/// folders are made as needed (one already there that this job didn't make or [`keep`] is an
-/// error: two names folded together, or something planted), each file through a temporary
-/// name.
-///
-/// [`keep`]: RemoteDir::keep
-// ponytail: no rollback: a failure leaves the folders and the files finished before it (the
-// peer removes only this session's unrenamed files).
+/// A folder a job writes on a peer, as [`crate::extract::Dest`] a local `.part`: folders made as
+/// needed (one already there that this job didn't make or `keep` is an error), each file
+/// through a temporary name.
+// ponytail: no rollback: a failure leaves what was finished before it.
 pub(crate) struct RemoteDir {
     remote: Arc<dyn Remote>,
     root: FlinkPath,
@@ -1361,7 +1255,6 @@ pub(crate) struct RemoteDir {
 }
 
 impl RemoteDir {
-    /// The existing folder `path` on its peer.
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
         let root = FlinkPath::parse(path)?;
         let remote = get_for(&root)?;
@@ -1371,7 +1264,7 @@ impl RemoteDir {
         Ok(Self::at(remote, root))
     }
 
-    /// A new folder at `path` on its peer, made exclusively (anything there fails).
+    /// A new folder at `path`, made exclusively.
     pub(crate) fn create(path: &Path) -> anyhow::Result<Self> {
         let root = FlinkPath::parse(path)?;
         let remote = get_for(&root)?;
@@ -1394,7 +1287,6 @@ impl RemoteDir {
         &self.url
     }
 
-    /// The folder `rel` (`""` is the root), made with its parents as needed.
     pub(crate) fn dir(&mut self, rel: &str) -> anyhow::Result<FlinkPath> {
         let mut cur = self.root.clone();
         let mut prefix = String::new();
@@ -1420,13 +1312,11 @@ impl RemoteDir {
         Ok(cur)
     }
 
-    /// The folder `rel`, already there, taken as one [`RemoteDir::dir`] made: a folder a job
-    /// merges into ([`crate::ConvertRequest::replace`]).
+    /// The existing folder `rel`, taken as made: one a job merges into (Replace).
     pub(crate) fn keep(&mut self, rel: &str) {
         self.created.insert(rel.trim_matches('/').to_string());
     }
 
-    /// The new file `rel`, its folders made as needed, written by `fill`.
     pub(crate) fn write_new(
         &mut self,
         rel: &str,
@@ -1435,7 +1325,6 @@ impl RemoteDir {
         self.write(rel, false, fill)
     }
 
-    /// [`RemoteDir::write_new`], over the file at `rel` when `replace`.
     pub(crate) fn write(
         &mut self,
         rel: &str,
@@ -1447,12 +1336,10 @@ impl RemoteDir {
         write_temp_new(&self.remote, &dir, name, replace, fill)
     }
 
-    /// The folder as written, read back from the peer.
     pub(crate) fn tree(&self, cancel: &AtomicBool) -> anyhow::Result<RemoteTree> {
         RemoteTree::open(self.remote.clone(), &self.root, cancel)
     }
 
-    /// Where the LZ4 packer puts its files: this folder's root.
     pub(crate) fn packs(&self) -> RemotePacks<'_> {
         RemotePacks {
             dir: self,
@@ -1461,12 +1348,10 @@ impl RemoteDir {
     }
 }
 
-/// Pack files (LZ4 or zstd) written into a [`RemoteDir`]'s root, each under a temporary name until
-/// [`RemotePacks::publish`] renames it without replacing. A file is closed as soon as it is
-/// written and opened again for its header (the packer rewrites every volume's header last), so
-/// only the files being written count against the peer's open files. Dropped, they are removed.
-// ponytail: a peer from before `reopen` keeps every file open until `publish`, and takes 32 open
-// files per session: a pack of more than about 30 volumes (~120 GiB of packs) fails there.
+/// Pack files (LZ4 or zstd) in a [`RemoteDir`]'s root under temporary names until `publish`.
+/// Each is closed once written and reopened for its header, so only those being written count
+/// against the peer's open files. Dropped, they are removed.
+// ponytail: an older peer without `reopen` keeps all open (32 per session): ~30 volumes at most.
 pub(crate) struct RemotePacks<'a> {
     dir: &'a RemoteDir,
     parts: Vec<(String, RemotePart)>,
@@ -1513,7 +1398,6 @@ impl ps5_dump_forge_lz4::writer::PackOutput for RemotePacks<'_> {
     }
 }
 
-/// The zstd packer writes through the same files as the LZ4 one.
 impl ps5_dump_forge_zstd::writer::PackOutput for RemotePacks<'_> {
     type W = RemoteFile;
 
@@ -1530,14 +1414,12 @@ impl ps5_dump_forge_zstd::writer::PackOutput for RemotePacks<'_> {
     }
 }
 
-/// A file on a peer, to read back what a job wrote there.
 pub(crate) fn reader(path: &Path) -> anyhow::Result<RemoteReader> {
     let at = FlinkPath::parse(path)?;
     RemoteReader::open(get_for(&at)?, &at)
 }
 
-/// The source at a `flink://` path: a folder, or an `.exfat`/`.ffpkg`/`.ffpfs`/`.ffpfsc` image
-/// (junk filtering is the caller's); a server's (`ftp://`, `smb://`, `nfs://`) alike.
+/// The source at a remote path: a folder or an image (junk filtering is the caller's).
 pub(crate) fn open(
     path: &Path,
     kind: crate::convert::Kind,
@@ -1575,8 +1457,7 @@ pub(crate) fn open(
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .0
         }
-        // ponytail: as on a NAS, a `.pkg` or an archive isn't read (their readers take a local
-        // path); copy it over first.
+        // ponytail: a `.pkg` or an archive isn't read (their readers take a local path).
         Kind::Pkg | Kind::Archive(_) => bail!(
             "{shown}: a .pkg or archive on another device can't be read yet: copy it to this \
              device first"
@@ -1584,15 +1465,14 @@ pub(crate) fn open(
     })
 }
 
-/// What [`crate::convert::Kind::of`] needs: whether the path is a folder (a share root is).
+/// Whether the path is a folder (a share root is), for [`crate::convert::Kind::of`].
 pub(crate) fn is_dir(path: &Path) -> anyhow::Result<bool> {
     let at = FlinkPath::parse(path)?;
     Ok(at.path.is_empty() || get_for(&at)?.stat(&at).with_context(|| at.shown())?.dir)
 }
 
-/// The file `rel` under the folder `path` on a peer when it is a file of at most `max` bytes,
-/// else `None` (missing, a folder, a link (never followed: an FTP `RETR` would read its
-/// target), or bigger).
+/// The file `rel` under `path` when it is a file of at most `max` bytes, else `None` (a link
+/// is never followed: an FTP `RETR` would read its target).
 pub(crate) fn read_small(path: &Path, rel: &str, max: u64) -> anyhow::Result<Option<Vec<u8>>> {
     let at = rel
         .split('/')
@@ -1621,7 +1501,6 @@ pub(crate) mod tests {
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
-    /// A file's bytes and mtime (seconds); `None` is a folder.
     type Node = Option<(Vec<u8>, u64)>;
 
     /// A peer in memory: files and folders by path (`""` is the root), reads counted.
@@ -1629,19 +1508,18 @@ pub(crate) mod tests {
     pub(crate) struct Fake {
         nodes: Mutex<HashMap<String, Node>>,
         reads: AtomicUsize,
-        /// Bytes `read_at` has served.
         pub(crate) read_bytes: std::sync::atomic::AtomicU64,
-        /// Paths listed as links.
         pub(crate) links: Mutex<Vec<String>>,
-        /// Paths listed as special files, and as names that aren't UTF-8.
+        /// Listed as special files, and as names that aren't UTF-8.
         pub(crate) specials: Mutex<Vec<String>>,
         pub(crate) bad_names: Mutex<Vec<String>>,
-        /// Files created here, by handle.
         handles: Mutex<HashMap<u64, String>>,
-        /// What `free_space` says (unset: 1 TiB).
+        /// Unset: 1 TiB.
         pub(crate) free: Mutex<Option<u64>>,
-        /// Every path ever created here.
         pub(crate) created: Mutex<Vec<String>>,
+        pub(crate) fs_ids: Mutex<HashMap<String, u128>>,
+        /// `stat` follows a link (as SMB and FTP do): only a listing marks it.
+        pub(crate) stat_follows: std::sync::atomic::AtomicBool,
     }
 
     /// Handles unique across every fake, so [`Peers`] finds a handle's peer.
@@ -1662,7 +1540,6 @@ pub(crate) mod tests {
             Arc::new(fake)
         }
 
-        /// A file's bytes, `None` when there is none.
         pub(crate) fn file(&self, path: &str) -> Option<Vec<u8>> {
             self.nodes
                 .lock()
@@ -1673,7 +1550,6 @@ pub(crate) mod tests {
                 .map(|f| f.0)
         }
 
-        /// Every path held, sorted.
         pub(crate) fn paths(&self) -> Vec<String> {
             let mut paths: Vec<String> = self.nodes.lock().unwrap().keys().cloned().collect();
             paths.sort();
@@ -1715,7 +1591,9 @@ pub(crate) mod tests {
                 .map(Self::stat_of)
                 .ok_or_else(missing)?;
             // As the peer's lstat: a link is itself, never its target.
-            if self.links.lock().unwrap().contains(&path.path) {
+            if !self.stat_follows.load(Ordering::Relaxed)
+                && self.links.lock().unwrap().contains(&path.path)
+            {
                 return Ok(RemoteStat {
                     dir: false,
                     size: 0,
@@ -1853,6 +1731,69 @@ pub(crate) mod tests {
         fn free_space(&self, _: &FlinkPath) -> io::Result<u64> {
             Ok(self.free.lock().unwrap().unwrap_or(1 << 40))
         }
+
+        /// A link is removed itself (as SMB's reparse-point open does).
+        fn rmdir(&self, path: &FlinkPath) -> io::Result<()> {
+            let mut nodes = self.nodes.lock().unwrap();
+            let link = self.links.lock().unwrap().contains(&path.path);
+            let inside = format!("{}/", path.path);
+            if !link && nodes.keys().any(|k| k.starts_with(&inside)) {
+                return Err(io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            match nodes.get(&path.path) {
+                Some(None) => nodes.remove(&path.path).map(drop).ok_or_else(missing),
+                Some(Some(_)) => Err(io::ErrorKind::NotADirectory.into()),
+                None => Err(missing()),
+            }
+        }
+
+        fn fs_id(&self, path: &FlinkPath) -> io::Result<Option<u128>> {
+            Ok(self.fs_ids.lock().unwrap().get(&path.path).copied())
+        }
+    }
+
+    /// A NAS Delete never enters a link (even one a stat follows) nor another filesystem.
+    #[test]
+    fn a_nas_delete_keeps_out_of_links_and_other_filesystems() {
+        use crate::DeleteError;
+        let fake = Fake::with(
+            &[
+                ("s/games/a.bin", bytes(3)),
+                ("s/games/link/kept.bin", bytes(3)),
+            ],
+            &["s", "s/games", "s/games/link"],
+        );
+        fake.links.lock().unwrap().push("s/games/link".into());
+        fake.stat_follows.store(true, Ordering::Relaxed);
+        crate::delete::nas_delete(&*fake, &at("s/games/link")).unwrap();
+        assert!(
+            fake.file("s/games/link/kept.bin").is_some(),
+            "the link was entered"
+        );
+        // A link inside a folder goes as an entry, with the folder.
+        let fake = Fake::with(&[("s/g/a.bin", bytes(3))], &["s", "s/g", "s/g/l"]);
+        fake.links.lock().unwrap().push("s/g/l".into());
+        fake.stat_follows.store(true, Ordering::Relaxed);
+        crate::delete::nas_delete(&*fake, &at("s/g")).unwrap();
+        assert_eq!(fake.paths(), ["", "s"]);
+
+        let fake = Fake::with(
+            &[("e/x.bin", bytes(3)), ("d/m/y.bin", bytes(3))],
+            &["e", "d", "d/m"],
+        );
+        fake.fs_ids.lock().unwrap().extend([
+            ("".into(), 1),
+            ("e".into(), 2),
+            ("d".into(), 1),
+            ("d/m".into(), 3),
+        ]);
+        for root in ["e", "d"] {
+            let r = crate::delete::nas_delete(&*fake, &at(root));
+            assert!(matches!(r, Err(DeleteError::Refused(_))), "{root}: {r:?}");
+        }
+        let r = crate::delete::nas_move(&*fake, &at("e"), &at("d/e"), false);
+        assert!(matches!(r, Err(DeleteError::Refused(_))), "{r:?}");
+        assert!(fake.file("e/x.bin").is_some() && fake.file("d/m/y.bin").is_some());
     }
 
     fn at(path: &str) -> FlinkPath {
@@ -1867,8 +1808,7 @@ pub(crate) mod tests {
         (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
     }
 
-    /// A peer that takes `cap` open files at most (as a Connect peer's session does), refuses a
-    /// write or close on a closed one and, with `reopens`, opens a closed one again.
+    /// A peer capping open files at `cap`, refusing writes to closed ones; `reopens` reopens them.
     struct Capped {
         inner: Arc<Fake>,
         open: Mutex<HashSet<u64>>,
@@ -1948,8 +1888,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A pack's volumes go out one open file at a time and get their headers when reopened (issue
-    /// #42: a pack of more than 32 volumes); a peer that can't reopen keeps them open to the end.
+    /// Issue #42: pack volumes are closed once written and reopened for their headers.
     #[test]
     fn pack_volumes_are_closed_once_written_and_opened_again_for_their_headers() {
         use ps5_dump_forge_lz4::writer::PackOutput;
@@ -2004,8 +1943,7 @@ pub(crate) mod tests {
         assert!(!p("nfs://nas:12049/srv/g").within(&p("nfs://nas/srv/g")));
     }
 
-    /// `within` and `in_use` compare as spelled, so a path with an empty, `.` or `..` part
-    /// is refused on every scheme.
+    /// Empty, `.` and `..` parts are refused on every scheme (`within` compares as spelled).
     #[test]
     fn parse_refuses_dot_and_empty_parts() {
         let parse = |s: &str| FlinkPath::parse(Path::new(s));
@@ -2044,8 +1982,7 @@ pub(crate) mod tests {
         assert!(parse(&format!("flink://{}g/x", &KEY[1..])).is_err());
     }
 
-    /// Every test that goes through the registry ([`get`]) shares one `Peers`, each with a
-    /// peer (key) of its own, so tests running at once never replace each other's.
+    /// One `Peers` for every registry test, a key each, so concurrent tests never clash.
     #[derive(Default)]
     struct Peers(Mutex<HashMap<String, Arc<Fake>>>);
 
@@ -2156,7 +2093,6 @@ pub(crate) mod tests {
         let mut buf = [0u8; 512];
         r.read_exact(&mut buf).unwrap();
         fake.touch("img.exfat");
-        // Still inside the window: no request, no error.
         r.read_exact(&mut buf).unwrap();
         r.seek(SeekFrom::Start(2 << 20)).unwrap();
         let e = r.read_exact(&mut buf).unwrap_err();
@@ -2213,14 +2149,12 @@ pub(crate) mod tests {
         let e = tree.read("empty.bin").unwrap_err().to_string();
         assert!(e.contains("changed while it was being read"), "{e}");
         assert!(RemoteTree::open(fake.clone(), &at("other.bin"), &cancel).is_err());
-        // Links and names a path can't spell refuse the folder.
         fake.links.lock().unwrap().push("g/sce_sys".into());
         let e = RemoteTree::open(fake.clone(), &at("g"), &cancel)
             .err()
             .unwrap();
         assert!(e.to_string().contains("symlink (not followed)"), "{e}");
         fake.links.lock().unwrap().clear();
-        // So do special files and names that aren't UTF-8 (a listing leaves the latter out).
         fake.specials.lock().unwrap().push("g/sce_sys".into());
         let e = RemoteTree::open(fake.clone(), &at("g"), &cancel).err();
         assert!(e.unwrap().to_string().contains("special file"));
@@ -2231,7 +2165,6 @@ pub(crate) mod tests {
         let l = listing(&*fake, &at("g")).unwrap();
         assert!(!l.entries.is_empty() && l.entries.iter().all(|e| e.name != "sce_sys"));
         fake.bad_names.lock().unwrap().clear();
-        // Junk is skipped unread: a link inside it refuses nothing, a folder of junk is empty.
         for d in ["g/.Trashes", "g/.Trashes/x", "g/data/j"] {
             fake.nodes.lock().unwrap().insert(d.into(), None);
         }
@@ -2248,7 +2181,6 @@ pub(crate) mod tests {
         assert!(RemoteTree::open(fake, &at("g"), &cancel).is_err());
     }
 
-    /// Every file under `dir`, with its length and mtime.
     fn local_files(dir: &Path) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
         let mut found = Vec::new();
         let mut todo = vec![dir.to_path_buf()];
@@ -2301,7 +2233,6 @@ pub(crate) mod tests {
         .unwrap();
         // Full, so the self-check's reads don't depend on a seed.
         req.full_verify = true;
-        // The bytes read from the peer when the builder starts its self-check and when it ends.
         let marks = Arc::new(Mutex::new(Vec::new()));
         let (seen, counted) = (marks.clone(), fake.clone());
         let emit: Box<dyn Fn(Event) + Send + Sync> = Box::new(move |e| {
@@ -2317,8 +2248,7 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(report.output, out);
 
-        // Nothing written here: no spool, part or scratch file beside the source or anywhere
-        // in the test's folders.
+        // Nothing written here: no spool, part or scratch file anywhere.
         assert_eq!(local_files(&dir), before);
         let size = fake.file("game.pkg").unwrap().len() as u64;
         assert!(size > noise.len() as u64, "{size}");
@@ -2328,19 +2258,15 @@ pub(crate) mod tests {
             panic!("{marks:?}")
         };
         assert_eq!((v.as_str(), d.as_str()), ("fpkg: verifying", "fpkg: done"));
-        // Compressed blocks are digested as written (vendor patch 0026): nothing is read back
-        // before the self-check (it was the whole image, about the package, before).
+        // Blocks are digested as written (vendor patch 0022): nothing read before the self-check.
         assert_eq!(*verifying, 0, "read back before the self-check");
-        // The full self-check reads the package twice, its block sweep and its
-        // playgo-chunk.crc pass (vendor `verify_file_sampled`; fast mode samples both), plus
-        // a few metadata blocks.
+        // The full self-check reads it twice (block sweep, playgo-chunk.crc) plus metadata.
         let build = done - verifying;
         assert!(
             build >= size && build <= 2 * size + (1 << 20),
             "the build read {build} bytes of a {size}-byte package"
         );
-        // The job's own verify reads it at most once more, plus what its read-ahead windows
-        // fetch past a jump (256 KiB each).
+        // Verify reads it at most once more, plus read-ahead windows past a jump (256 KiB each).
         let total = fake.read_bytes.load(Ordering::Relaxed);
         assert!(
             total <= done + size + (4 << 20),
