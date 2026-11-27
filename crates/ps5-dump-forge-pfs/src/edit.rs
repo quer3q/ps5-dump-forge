@@ -144,7 +144,8 @@ fn parse_inode(ino: u32, d: &[u8], fill: i32, ndblock: u64) -> Result<Option<Ino
     let blocks = u64::from(field(0x60)?);
     let db0 = field(0x64)? as i32;
     let fills = (1..12).all(|k| le32(d, 0x64 + k * 4) == Some(fill as u32));
-    let ib_clear = (0..5).all(|k| le32(d, 0x94 + k * 4) == Some(0));
+    // MkPFS fills the unused indirect slots with -1, this crate leaves them 0: either is none.
+    let ib_clear = (0..5).all(|k| matches!(le32(d, 0x94 + k * 4), Some(0) | Some(0xFFFF_FFFF)));
     if !fills || !ib_clear || db0 <= 0 || blocks != size.div_ceil(BLOCK).max(1) {
         return Err(bad());
     }

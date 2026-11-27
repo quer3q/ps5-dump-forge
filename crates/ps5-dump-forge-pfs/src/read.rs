@@ -4,7 +4,8 @@
 //! names decoded strictly; damage is an error, never a panic or a skip. The flat path table and
 //! resolver must be exactly what the walked tree encodes to (the console looks files up there).
 //! ponytail: contiguous nodes only (`db[0]` plus a run, no indirect blocks): what MkPFS and this
-//! crate write; anything else is refused as an unsupported layout.
+//! crate write (the unused indirect slots stay 0, or -1 where MkPFS fills them); anything else is
+//! refused as an unsupported layout.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
@@ -56,7 +57,8 @@ struct Inode {
     size_compressed: u64,
     blocks: u64,
     db0: i64,
-    /// `db[1..12]`'s one value when they agree and every `ib` is 0 (-1 a run, 0 the super-root).
+    /// `db[1..12]`'s one value when they agree and every `ib` is unused (0 or -1; -1 a run, 0 the
+    /// super-root).
     fill: Option<i32>,
 }
 
@@ -249,7 +251,9 @@ fn read_inodes(r: &mut dyn ReadSeek, h: &PfsHeader) -> Result<Vec<Inode>> {
         for i in 0..per_block.min(h.inodes - b * per_block) as usize {
             let d = &block[i * INODE_LEN..(i + 1) * INODE_LEN];
             let rest: Vec<i32> = (1..12).map(|k| le32(d, 0x64 + k * 4) as i32).collect();
-            let ib_clear = (0..5).all(|k| le32(d, 0x94 + k * 4) == 0);
+            // A used indirect slot would be a layout `extent` cannot serve; MkPFS fills the
+            // unused ones with -1, this crate leaves them 0.
+            let ib_clear = (0..5).all(|k| matches!(le32(d, 0x94 + k * 4), 0 | 0xFFFF_FFFF));
             let fill = rest.iter().all(|&p| p == rest[0]) && ib_clear;
             inodes.push(Inode {
                 mode: le16(d, 0),

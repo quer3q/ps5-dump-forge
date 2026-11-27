@@ -620,6 +620,41 @@ fn damaged_images_are_refused() {
     }
 }
 
+/// MkPFS (and Game Compressor after it) fills the unused indirect slots with -1 where this crate
+/// writes 0: an image like that reads whole, and a real indirect block still does not.
+#[test]
+fn mkpfs_minus_one_indirect_slots_open() {
+    let mut tree = MemTree::new(&[
+        ("eboot.bin", 2 * BLOCK + 5),
+        ("sce_sys/param.json", 30),
+        ("a/b/c.bin", 40),
+    ]);
+    let (_, img) = build(&mut tree);
+    let mut minus_one = img.clone();
+    for n in 1..u64_at(&img, 0x30) as usize {
+        let at = B + n * 0xA8 + 0x94;
+        for k in 0..5 {
+            minus_one[at + k * 4..at + k * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        }
+    }
+    let mut back = PfsSource::from_reader(Box::new(Cursor::new(minus_one)), "x".into()).unwrap();
+    assert_same(&mut tree, &mut back);
+
+    // Any other value in an indirect slot is a layout the reader cannot serve: eboot.bin is
+    // inode 7, and its indirect block would hold pointers this reader never follows.
+    let mut used = img.clone();
+    let at = B + 7 * 0xA8 + 0x94;
+    used[at..at + 4].copy_from_slice(&40u32.to_le_bytes());
+    let e = PfsSource::from_reader(Box::new(Cursor::new(used)), "x".into())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        e.contains("eboot.bin") && e.contains("pointer layout"),
+        "{e}"
+    );
+}
+
 #[test]
 fn damaged_containers_are_refused() {
     let data: Vec<u8> = (0..3 * B as u32).map(|i| (i % 251) as u8).collect();
