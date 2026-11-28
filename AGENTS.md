@@ -1554,7 +1554,9 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   --version PS5 --inode-bits 32 --block-size 65536` except that empty directories are kept. Inodes: super-root,
   flat path table, collision resolver (only if two paths' FPT hashes collide), uroot, dirs, files; every node's
   data is contiguous. Files are stored uncompressed (per-file PFSC passes verify but the console misreads it).
-  Names: ASCII only, no case collisions, every offender listed.
+  Names: ASCII only, no case collisions, every offender listed. The writer leaves the inodes' unused
+  indirect slots 0; the reader and editor also take -1 there (GameCompressor's `.ffpfsc`, PR #79), any other
+  value is refused as a layout they can't serve.
 - `.ffpfsc`: a single-file PFS (MkPFS `pack file` layout) whose one file is a zlib PFSC container of 64 KiB
   blocks around a nested `.exfat`/`.ffpkg`/`.ffpfs` named `<TITLE_ID>.<ext>` (default `.ffpkg`, by user decision; the UI defaults to exfat;
   exFAT is MkPFS's most stable). Always PFSC, zlib level 0–9 as zlib numbers them (the slider, `--level`, `ffpfsc_level`;
