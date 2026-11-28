@@ -975,6 +975,9 @@ const zh: Messages = {
       "显示所有打包方式和格式（不收进“更多”），并让所有折叠区域保持展开。关闭后“构建”页面更简短。",
     bundled: (version: string) => `${version}（内置）`,
     replaceAmprEmu: "用 ampr-emu-ng 替换 ampr_emu",
+    installedGames: "显示已安装的游戏",
+    installedGamesHint:
+      "在选择器和文件浏览器中，于 /data 旁列出已安装的游戏（/user/app），以便将已安装 FPKG 的 app.pkg 选作构建或编辑的来源。只读：不会更改或删除其中任何内容。零售版游戏无法读取。",
     languageHint: "在你选择语言之前，使用系统语言。",
     notificationsGroup: "PS5",
   },

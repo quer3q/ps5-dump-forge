@@ -2,7 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import { api, jobNotifications } from "./api";
+import { api, jobNotifications, runtimePlatform } from "./api";
 import { CardHead } from "./common";
 import { getChoice, type Lang, LANGS, setLang, useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
@@ -31,6 +31,10 @@ export function Settings(props: { shown: boolean }) {
   const f = useMessages().formats;
   const S = useMessages().settings;
   const [ng, setNg] = useState<string | null>(null);
+  const [ps5, setPs5] = useState(false);
+  useEffect(() => {
+    runtimePlatform().then((p) => setPs5(p === "ps5"), () => {});
+  }, []);
   useEffect(() => {
     let gone = false;
     api
@@ -140,6 +144,23 @@ export function Settings(props: { shown: boolean }) {
             <span className="switch-track" aria-hidden="true" />
           </span>
         </label>
+        {ps5 && (
+          <label className="settings-row">
+            <span className="settings-text">
+              <span className="settings-label">{S.installedGames}</span>
+              <span className="muted hint">{S.installedGamesHint}</span>
+            </span>
+            <span className="switch">
+              <input
+                type="checkbox"
+                className="visually-hidden"
+                checked={prefs.installedGames}
+                onChange={(e) => setPrefs({ installedGames: e.target.checked })}
+              />
+              <span className="switch-track" aria-hidden="true" />
+            </span>
+          </label>
+        )}
       </section>
     </div>
   );

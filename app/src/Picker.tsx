@@ -3,14 +3,15 @@
 
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 
-import { errorText, prettyBytes } from "./api";
+import { errorText, prettyBytes, runtimePlatform } from "./api";
 import { NAS_PORT, type NasProtocol } from "./peers";
 import { Dots, FOCUSABLE, openOverlay, pairPromptUp, panelId, tabId, TabList } from "./common";
 import { useMessages } from "./i18n";
 import type { Messages } from "./locales/en";
 import { Icon, type IconName } from "./icons";
-import { Bookmarks } from "./bookmarks";
+import { Bookmarks, BookmarkToggle } from "./bookmarks";
 import { joinPath, SEPARATORS } from "./paths";
+import { shownRoots } from "./prefs";
 import type { PickOptions } from "./transport";
 
 interface Entry {
@@ -160,7 +161,7 @@ function crumbs(drives: string, path: string | null, roots: string[]): { label: 
 /** The backend's roots, then each saved NAS offered (not with tabs); a NAS list that fails adds none. */
 async function roots(o: PickOptions, b: PickerBackend, tabbed: boolean): Promise<Listing> {
   const [base, nas] = await Promise.all([
-    b.list(null),
+    b.list(null).then(async (l) => shownRoots(l, await runtimePlatform().catch(() => "ps5"))),
     offered(o) && !tabbed ? b.saved().then((s) => s.nas, () => []) : Promise.resolve([]),
   ]);
   const shares = nas.map((n) => ({ name: n.name, path: nasRoot(n.host, n.port, n.protocol), dir: true, size: null, nas: true }));
@@ -362,27 +363,31 @@ function Picker({
             "aria-labelledby": tabId("pick", String(tab)),
           })}
         >
-          <nav className="crumbs" aria-label={t.location}>
-            {trail.map((c, i) => (
-              <Fragment key={i}>
-                {i > 0 && (
-                  <span className="muted" aria-hidden="true">
-                    /
-                  </span>
-                )}
-                {/* After a failed listing the last crumb stays a button: it tries again. */}
-                {i === trail.length - 1 && !error ? (
-                  <span className="here" aria-current="location">
-                    {c.label}
-                  </span>
-                ) : (
-                  <button type="button" className="link" onClick={() => go(c.path)}>
-                    {c.label}
-                  </button>
-                )}
-              </Fragment>
-            ))}
-          </nav>
+          <div className="row nowrap">
+            <nav className="crumbs grow" aria-label={t.location}>
+              {trail.map((c, i) => (
+                <Fragment key={i}>
+                  {i > 0 && (
+                    <span className="muted" aria-hidden="true">
+                      /
+                    </span>
+                  )}
+                  {/* After a failed listing the last crumb stays a button: it tries again. */}
+                  {i === trail.length - 1 && !error ? (
+                    <span className="here" aria-current="location">
+                      {c.label}
+                    </span>
+                  ) : (
+                    <button type="button" className="link" onClick={() => go(c.path)}>
+                      {c.label}
+                    </button>
+                  )}
+                </Fragment>
+              ))}
+            </nav>
+            {/* Pinned here too: with no other device the panes that also pin aren't shown (#76). */}
+            {dev.root === null && !(here !== null && isNet(here)) && <BookmarkToggle path={here} root={null} />}
+          </div>
           {/* This device's bookmarks (the Transfer screen's and File explorer's), to jump to a folder. */}
           {dev.root === null && <Bookmarks root={null} here={here} onOpen={(path) => path !== here && void go(path)} />}
           {anyOff && (

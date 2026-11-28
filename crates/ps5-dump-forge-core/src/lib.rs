@@ -673,7 +673,7 @@ pub mod out {
     use std::path::Path;
 
     /// Why a peer may not write, rename or remove at `path`: on the PS5 ShadowMount+'s mount
-    /// folder. ponytail: no destination probe (U1) per peer write.
+    /// folder or an installed game. ponytail: no destination probe (U1) per peer write.
     pub fn refusal(path: &Path) -> Option<String> {
         #[cfg(target_os = "freebsd")]
         return ps5_refusal(path);
@@ -686,7 +686,7 @@ pub mod out {
 
     /// The PS5 rule on any OS (a server selected by `Platform::Ps5`).
     pub fn ps5_refusal(path: &Path) -> Option<String> {
-        crate::edit_job::smp_inside(path)
+        crate::edit_job::smp_inside(path).or_else(|| crate::edit_job::installed_inside(path))
     }
 
     /// A file that must not exist yet (a link at `path` not followed).

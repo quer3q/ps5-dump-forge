@@ -1025,6 +1025,9 @@ const fr: Messages = {
       "Affiche tous les paquets et formats, sans « Plus », et garde toutes les sections ouvertes. Désactivez-le pour que Créer reste court.",
     bundled: (version: string) => `${version} (fourni)`,
     replaceAmprEmu: "Remplacer ampr_emu par ampr-emu-ng",
+    installedGames: "Afficher les jeux installés",
+    installedGamesHint:
+      "Affiche les jeux installés (/user/app) à côté de /data dans les sélecteurs et l'explorateur de fichiers, pour qu'un app.pkg de FPKG installé serve de source à Créer ou Modifier. Lecture seule : rien n'y est modifié ni supprimé. Un jeu du commerce ne peut pas être lu.",
     languageHint: "Les langues du système, jusqu’à ce que vous en choisissiez une.",
     notificationsGroup: "PS5",
   },

@@ -166,6 +166,8 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     // Into a mounted game, written through the mount while the game may run.
     #[cfg(target_os = "freebsd")]
     findings.extend(crate::edit_job::smp_inside(&req.output).map(|why| format!("extract: {why}")));
+    findings
+        .extend(crate::edit_job::installed_here(&req.output).map(|why| format!("extract: {why}")));
     if crate::remote::is_remote(&req.output) {
         if let Err(e) = RemoteDir::open(&req.output) {
             findings.push(format!("extract: {e:#}"));

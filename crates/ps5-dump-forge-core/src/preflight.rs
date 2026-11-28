@@ -182,6 +182,7 @@ pub(crate) fn output(source: &Path, output: &Path, format: Format) -> Vec<String
         }
     }
     findings.extend(stem_finding(output, format));
+    findings.extend(crate::edit_job::installed_here(output));
     if let (Ok(source), Ok(out)) = (
         crate::remote::FlinkPath::parse(source),
         crate::remote::FlinkPath::parse(output),

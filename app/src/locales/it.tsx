@@ -1025,6 +1025,9 @@ const it: Messages = {
       "Mostra tutti i pacchetti e i formati, senza “Altro”, e tiene aperte tutte le sezioni. Disattivalo per mantenere breve Crea.",
     bundled: (version: string) => `${version} (incluso)`,
     replaceAmprEmu: "Sostituisci ampr_emu con ampr-emu-ng",
+    installedGames: "Mostra i giochi installati",
+    installedGamesHint:
+      "Mostra i giochi installati (/user/app) accanto a /data nei selettori e in Esplora file, così l'app.pkg di un FPKG installato può essere la sorgente di Crea o Modifica. Solo lettura: lì non si cambia né si elimina nulla. Un gioco retail non si può leggere.",
     languageHint: "Le lingue del sistema, finché non ne scegli una.",
     notificationsGroup: "PS5",
   },

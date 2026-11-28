@@ -71,6 +71,12 @@ fn check<'a>(
     }
     let failed = |e: io::Error| DeleteError::Failed(format!("resolving {shown}: {e}"));
     let real = path.canonicalize().map_err(failed)?;
+    installed(&path)?;
+    if crate::edit_job::installed_holder(&path) || crate::edit_job::installed_holder(&real) {
+        return Err(DeleteError::Refused(format!(
+            "{shown} holds installed games (user/app), which Dump Forge only reads; nothing changed"
+        )));
+    }
     // Gone or elsewhere, the journal could never restore its image; Edit's open settles it.
     if let Some(image) =
         journal_image(&real).filter(|i| kind.is_file() && i.symlink_metadata().is_ok())
@@ -763,6 +769,9 @@ pub(crate) fn replace_refusal<'a>(
     guarded: impl IntoIterator<Item = &'a PathBuf>,
 ) -> Result<(), DeleteError> {
     if dir || crate::remote::is_remote(path) {
+        if dir && !crate::remote::is_remote(path) {
+            installed(path)?;
+        }
         // A folder merged into takes new files: never ShadowMount+'s mount folder.
         #[cfg(any(target_os = "freebsd", test))]
         if dir && !crate::remote::is_remote(path) {
@@ -829,6 +838,7 @@ pub(crate) fn move_<'a>(
         }
     }
     let to = to.components().collect::<PathBuf>();
+    installed(&to)?;
     let shown_to = to.display();
     let refused = |m: String| Err(DeleteError::Refused(m));
     let Some(Component::Normal(name)) = to.components().next_back() else {
@@ -1215,6 +1225,14 @@ fn run_merge(
     Ok(())
 }
 
+/// Refuses a path at or inside an installed game: read only (#78).
+fn installed(path: &Path) -> Result<(), DeleteError> {
+    match crate::edit_job::installed_here(path) {
+        Some(why) => Err(DeleteError::Refused(format!("{why}; nothing changed"))),
+        None => Ok(()),
+    }
+}
+
 /// (PS5) Refuses a path at or inside ShadowMount+'s mount folder: a mounted game, not files.
 #[cfg(any(target_os = "freebsd", test))]
 fn smp_folder(path: &Path, real: &Path) -> Option<DeleteError> {
@@ -1579,6 +1597,11 @@ mod tests {
         std::fs::write(dir.join("x.bin"), b"x").unwrap();
         std::fs::write(dir.join("y.bin"), b"y").unwrap();
         let x = dir.join("x.bin");
+        // An installed game is read only (#78).
+        assert_eq!(
+            moved(&x, Path::new("/user/app/PPSA01234/x.bin"), &[], &[]),
+            "refused"
+        );
         // Never replaced, never into itself.
         assert_eq!(moved(&x, &dir.join("y.bin"), &[], &[]), "refused");
         assert_eq!(std::fs::read(dir.join("y.bin")).unwrap(), b"y");

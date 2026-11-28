@@ -115,6 +115,8 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
                 .to_string(),
         );
     }
+    let pkg = req.install.as_deref().unwrap_or(Path::new(""));
+    findings.extend(crate::edit_job::installed_here(pkg).map(|why| format!("install: {why}")));
     findings
 }
 

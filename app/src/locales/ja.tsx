@@ -996,6 +996,9 @@ const ja: Messages = {
       "すべてのパックと形式を「その他」なしで表示し、折りたたみをすべて開いたままにします。オフにすると「ビルド」が短く保たれます。",
     bundled: (version: string) => `${version}（同梱）`,
     replaceAmprEmu: "ampr_emu を ampr-emu-ng に置き換える",
+    installedGames: "インストール済みのゲームを表示",
+    installedGamesHint:
+      "インストール済みのゲーム (/user/app) を選択画面とファイルエクスプローラーで /data の横に表示し、インストール済み FPKG の app.pkg をビルドや編集のソースにできるようにします。読み取り専用で、そこでは何も変更・削除されません。製品版のゲームは読み取れません。",
     languageHint: "言語を選ぶまではシステムの言語を使います。",
     notificationsGroup: "PS5",
   },

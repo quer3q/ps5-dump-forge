@@ -990,6 +990,9 @@ const ko: Messages = {
       "모든 팩과 형식을 ‘더 보기’ 없이 표시하고 접힌 항목을 모두 열어 둡니다. 끄면 빌드 화면이 짧게 유지됩니다.",
     bundled: (version: string) => `${version}(번들)`,
     replaceAmprEmu: "ampr_emu를 ampr-emu-ng로 교체",
+    installedGames: "설치된 게임 표시",
+    installedGamesHint:
+      "설치된 게임(/user/app)을 선택 창과 파일 탐색기에서 /data 옆에 표시해, 설치된 FPKG의 app.pkg를 빌드나 편집의 소스로 고를 수 있게 합니다. 읽기 전용: 그곳의 어떤 것도 바뀌거나 삭제되지 않습니다. 정품 게임은 읽을 수 없습니다.",
     languageHint: "직접 선택하기 전까지는 시스템 언어를 따릅니다.",
     notificationsGroup: "PS5",
   },

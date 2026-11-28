@@ -17,10 +17,12 @@ export type Prefs = {
   /** Replace a game's ampr_emu with the bundled ampr-emu-ng: sent with every Build request as
    * `replace_ampr_emu` (PLAN.md D1). */
   replaceAmprEmu: boolean;
+  /** PS5: list `/user/app` (installed games, read only) among the roots (issue #78). */
+  installedGames: boolean;
 };
 
 const KEY = "forge.ui";
-const DEFAULTS: Prefs = { theme: "dark", scheme: "cobalt", railCollapsed: false, advancedOpen: false, replaceAmprEmu: true };
+const DEFAULTS: Prefs = { theme: "dark", scheme: "cobalt", railCollapsed: false, advancedOpen: false, replaceAmprEmu: true, installedGames: false };
 
 function load(): Prefs {
   try {
@@ -31,6 +33,7 @@ function load(): Prefs {
       railCollapsed: v.railCollapsed === true,
       advancedOpen: v.advancedOpen === true,
       replaceAmprEmu: v.replaceAmprEmu !== false,
+      installedGames: v.installedGames === true,
     };
   } catch {
     return DEFAULTS;
@@ -58,6 +61,10 @@ export function setPrefs(patch: Partial<Prefs>) {
   }
   subs.forEach((f) => f());
 }
+
+/** A PS5 root listing without `/user/app` while Settings' installed games switch is off (a computer's root stays). */
+export const shownRoots = <L extends { entries: { path: string }[] }>(l: L, platform: string): L =>
+  platform !== "ps5" || current.installedGames ? l : { ...l, entries: l.entries.filter((e) => e.path !== "/user/app") };
 
 /** The preferences now, for code outside React (a step's request). */
 export const getPrefs = (): Prefs => current;

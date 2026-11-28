@@ -879,7 +879,17 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   first, at most 4 waiting, 429 when it stays full for 30 s, 409 once stopping.
   - **Roots** (the Package installer, the PS5's explorer): the server's `Roots::current()`: `/data` and each
     drive while mounted (the browse roots; no `/mnt/shadowmnt`), classified by FreeBSD `statfs`
-    (`MNT_LOCAL` and ufs, msdosfs, exfat, exfatfs, bfs, nullfs, cd9660, udf, zfs).
+    (`MNT_LOCAL` and ufs, msdosfs, exfat, exfatfs, bfs, nullfs, cd9660, udf, zfs). Then `/user/app`, the installed
+    games (issue #78, by user decision): listed and read (an installed FPKG's `app.pkg` a Build or Edit source; a retail
+    one refused by the reader), served only while it resolves to itself, never reached by a paired device
+    (`reach`/`above`) nor scanned by the Package installer (`Roots::writable`); the UI lists it only while Settings'
+    "Show installed games" is on (`prefs.tsx` `shownRoots`, PS5 listings only); Build's output for such a source
+    defaults to `/data` (`target.tsx`). Read only (core `edit_job::installed_inside`: at or inside
+    `/user/app` or `/mnt/<drive>/user/app`, as typed or resolved; `installed_here` only where jobs run on the PS5):
+    delete, move and replace (`delete.rs`; also a folder holding an existing one, `installed_holder`), edits and metadata recovery,
+    every job output (`preflight::output`, extract, transfer), install and `out::ps5_refusal` (peer writes, phone and
+    Edit uploads) refuse it; Delete the source keeps it. ponytail: a missing `/mnt/<drive>/user/app` can be created by
+    a folder named `app` (nothing installed there to lose).
   - **Refused folders** (core `folder_refusal`, the desktop app's listings, deletes and moves; one list,
     `library_roots::refusal`, checked on the canonical path, ASCII case-insensitive on macOS and Windows):
     the filesystem root (Windows: the system drive root), `~/Library` / `~/AppData` and everything inside,
@@ -1120,8 +1130,8 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   `folderToo` mode: a file click picks an image or archive, "Choose this folder" a game folder, told apart
   by extension. Rows: at most 2,000 shown, one Tab stop, arrows move; multi-select's button reads
   "Choose N files"; a picker starts where the last browse ended (kept until the page closes).
-  Pickers show this device's bookmark chips on its tab, no toggle (by user request). **Bookmarks** (issue #18; the
-  pickers' old shortcuts, renamed by user decision; `bookmarks.tsx`, `devices.css`): toggled on the Transfer screen's panes and the File explorer. A
+  Pickers show this device's bookmark chips and toggle on its tab (issue #76: with no device paired no other place pins one). **Bookmarks** (issue #18; the
+  pickers' old shortcuts, renamed by user decision; `bookmarks.tsx`, `devices.css`): toggled on the Transfer screen's panes, the File explorer and this device's picker tab. A
   bookmark toggle (`BookmarkToggle`, `aria-pressed`, "Bookmark this folder" / "Remove bookmark") at the end of
   the crumbs bar pins the folder shown (any device's, a root too; at 9 a new one takes the place of the oldest
   that pane can't reach, an offline or other device's; off, `aria-disabled`, when all 9 reach it, "9 bookmarks
@@ -1412,7 +1422,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   light, colour scheme (nine swatches, cobalt first), the UI language select: System + each language), **Advanced**
   ("Always show advanced options": every Build fold open; the bundled ampr-emu-ng's version, from the session's
   `bundled_ng_version`, Tauri `bundled_ng_version`; "Replace ampr_emu with ampr-emu-ng", on by default, sent as
-  `replace_ampr_emu`), **Output names** (issue #33; the naming template, below) and, on the PS5 web build, the
+  `replace_ampr_emu`; on the PS5 "Show installed games", off by default: Roots above), **Output names** (issue #33; the naming template, below) and, on the PS5 web build, the
   saved job-end notification switch.
 - UI languages: English (the fallback), Russian, Simplified Chinese (`zh`), German, Spanish, French,
   Japanese, Brazilian Portuguese (`pt`), Italian, Korean and Arabic; UI text only (`app/src/i18n.ts`). Backend text
@@ -1450,7 +1460,7 @@ write safety); `docs/LZ4.md` the Pack user guide (zstd and LZ4 packs); `docs/zst
   storage falls back to the system languages), the bookmarks (`forge.shortcuts` in
   `localStorage`, the old shortcuts' key, issue #18; unreadable storage is none), the output naming (`forge.naming`, issue #33; unreadable or invalid is the default), the UI
   preferences (`forge.ui`, `prefs.tsx`, by user decision, D1: theme, scheme, collapsed rail, "Always show advanced
-  options" and "Replace ampr_emu with ampr-emu-ng", sent per request as `replace_ampr_emu`; unreadable storage is the
+  options", "Replace ampr_emu with ampr-emu-ng", sent per request as `replace_ampr_emu`, and "Show installed games"; unreadable storage is the
   defaults) and the PS5 Settings notification switch (kept by the server on the console as `notifications.off`; by
   user decision). Defaults: Build's None + fpkg (`.pkg`) for every source (D8: a packed game is decoded unless its
   own kind is picked; picker order Folder, fpkg, then under More exfat, ffpkg, ffpfsc, ffpfs), exfat inside a `.ffpfsc` in the UI (by user decision; core and CLI keep ffpkg; Build's Advanced fold), at zlib

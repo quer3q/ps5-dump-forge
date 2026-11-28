@@ -181,7 +181,8 @@ export function useOutput(
       password.current = null;
       lastNamed.current = null;
       // A source on another device: the user picks the output folder (core says so until then).
-      outDir.current = isNetwork(src) ? "" : dirname(src);
+      // An installed game (PS5 /user/app) is read only: its output goes to /data (#78).
+      outDir.current = isNetwork(src) ? "" : /^\/(mnt\/[^/]+\/)?user\/app(\/|$)/.test(src) ? "/data" : dirname(src);
       setOutput("");
       setFailed(false);
       if (fmt) void refresh(src, fmt);

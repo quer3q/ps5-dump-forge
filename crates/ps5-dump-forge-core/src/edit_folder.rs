@@ -68,6 +68,7 @@ pub(crate) fn plan(
     // A mounted game's folder: written through the mount while the game may run.
     #[cfg(target_os = "freebsd")]
     findings.extend(crate::edit_job::smp_inside(&req.source));
+    findings.extend(crate::edit_job::installed_here(&req.source));
     if !findings.is_empty() {
         return Ok(Err(findings));
     }

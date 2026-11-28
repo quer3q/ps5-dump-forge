@@ -712,7 +712,7 @@ impl Server {
         if self.opts.platform != Platform::Ps5 {
             return Err(Response::error(400, "packages install only on a PS5"));
         }
-        let found = self.capped(|| ps5_dump_forge_core::scan_packages(&self.roots.current()))?;
+        let found = self.capped(|| ps5_dump_forge_core::scan_packages(&self.roots.writable()))?;
         Ok(Response::json(&found))
     }
 
@@ -961,6 +961,12 @@ impl Server {
             let text = format!("{}: no such file or folder", source.display());
             return Err(Response::error(404, text));
         };
+        // Staged beside the source: never beside an installed game.
+        if self.opts.platform == Platform::Ps5
+            && let Some(why) = ps5_dump_forge_core::out::ps5_refusal(&source)
+        {
+            return Err(Response::error(400, why));
+        }
         let mut dir = staging_dir(&source)?;
         self.refuse_if_stopping()?;
         let (name, parents) = parts.split_last().unwrap_or((&"", &[]));

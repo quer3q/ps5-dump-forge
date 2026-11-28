@@ -1021,6 +1021,9 @@ const de: Messages = {
       "Zeigt alle Pakete und Formate ohne „Mehr“ und hält alle eingeklappten Bereiche offen. Schalten Sie es aus, damit Erstellen kurz bleibt.",
     bundled: (version: string) => `${version} (mitgeliefert)`,
     replaceAmprEmu: "ampr_emu durch ampr-emu-ng ersetzen",
+    installedGames: "Installierte Spiele anzeigen",
+    installedGamesHint:
+      "Zeigt installierte Spiele (/user/app) neben /data in den Auswahlfenstern und im Datei-Explorer, damit die app.pkg eines installierten FPKG als Quelle zum Erstellen oder Bearbeiten dienen kann. Nur lesend: dort wird nichts geändert oder gelöscht. Ein Retail-Spiel lässt sich nicht lesen.",
     languageHint: "Die Sprachen des Systems, bis Sie eine wählen.",
     notificationsGroup: "PS5",
   },

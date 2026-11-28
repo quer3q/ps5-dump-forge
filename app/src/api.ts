@@ -3,6 +3,7 @@
 import { transport } from "forge-transport";
 import { msg, num } from "./i18n";
 import { readable, type NasProtocol } from "./peers";
+import { shownRoots } from "./prefs";
 import type { DropEvent, DropItem, PickOptions, Unlisten } from "./transport";
 
 export type { DropEvent, DropItem, HostTree } from "./transport";
@@ -551,7 +552,8 @@ export const api = {
   movePath: (from: string, to: string, replace = false) =>
     invoke<null>("move_path", { from, to, replace }).then(() => undefined),
   /** Null (http build only): the server's browse roots. */
-  listDir: (path: string | null) => invoke<DirListing>("list_dir", { path, explorer: true }),
+  listDir: (path: string | null) =>
+    invoke<DirListing>("list_dir", { path, explorer: true }).then(async (l) => (path === null ? shownRoots(l, await runtimePlatform().catch(() => "ps5")) : l)),
   /** http build on the PS5: `/data` in bytes; null when unknown. */
   storage: () => invoke<{ free: number; total: number } | null>("storage", {}),
   freeSpace: (path: string) => invoke<number | null>("free_space", { path }),

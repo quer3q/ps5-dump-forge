@@ -107,6 +107,7 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
         Err(e) => findings.push(format!("{}: {e:#}", source.display())),
     }
     findings.extend(crate::edit_job::smp_inside(source));
+    findings.extend(crate::edit_job::installed_here(source));
     findings
 }
 

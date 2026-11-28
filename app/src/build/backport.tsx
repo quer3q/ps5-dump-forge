@@ -18,7 +18,9 @@ function BackportSwitch({ ctx, on, set }: { ctx: DeriveCtx; on: boolean; set: (o
   const bm = useMessages().build;
   const ins = ctx.ins!;
   const ok = removable(ctx);
-  const emus = emulatorNames(ins);
+  // An FPKG leaves the AMPR runtime out (core `lz4::leave_out_for_pkg`), so it doesn't stay.
+  const kept = ctx.format === "pkg" ? ins.emulators.filter((e) => e.path !== "fakelib/libSceAmpr.sprx") : ins.emulators;
+  const emus = emulatorNames({ ...ins, emulators: kept });
   const why = ins.backport.length === 0 ? bm.backportNone : backportApplies(ctx) ? null : bm.backportPlain;
   const tip =
     why ??

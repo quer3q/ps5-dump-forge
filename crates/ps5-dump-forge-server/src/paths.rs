@@ -1,5 +1,6 @@
 //! The roots: where the file browser starts. On a computer they confine nothing; on the PS5
-//! listings and paired devices reach only `/data` and each drive while it is mounted.
+//! listings and paired devices reach only `/data` and each drive while it is mounted; listings
+//! (not paired devices) also `/user/app`, the installed games, read only.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -9,12 +10,16 @@ use std::time::{Duration, Instant};
 use crate::Platform;
 
 const DATA: &str = "/data";
+/// Installed games (issue #78): browsed and read as a source, never written (core refuses that).
+const APP: &str = "/user/app";
 
 /// Each root with the path it was named by (`/data` may resolve elsewhere).
 type Named = Vec<(PathBuf, PathBuf)>;
 
 pub(crate) struct Roots {
     list: Vec<Candidate>,
+    /// PS5: [`APP`], in [`Self::current`] and [`Self::confine`] only.
+    app: Option<Candidate>,
     ps5: bool,
     statfs: fn(&Path) -> Option<Mount>,
     /// [`Self::now`] cached for a paired device's calls: a transfer asks for every file.
@@ -69,9 +74,15 @@ impl Roots {
                 Err(why) => notes.push(format!("not serving {}: {why}", path.display())),
             }
         }
+        let app = ps5.then(|| Candidate {
+            path: APP.into(),
+            pinned: pin(Path::new(APP)).ok(),
+            drive: false,
+        });
         (
             Self {
                 list,
+                app,
                 ps5,
                 statfs,
                 ttl: Duration::from_secs(1),
@@ -81,8 +92,17 @@ impl Roots {
         )
     }
 
-    /// Canonical, each once; drives only while mounted.
+    /// Canonical, each once; drives only while mounted; then the read-only `/user/app`.
     pub fn current(&self) -> Vec<PathBuf> {
+        let mut roots = self.writable();
+        // Core's read-only rule matches `/user/app` by name: one resolving elsewhere isn't served.
+        let app = (self.app.as_ref()).and_then(|c| self.live(c).filter(|r| *r == c.path));
+        roots.extend(app.filter(|a| !roots.contains(a)));
+        roots
+    }
+
+    /// [`Self::current`] without `/user/app`.
+    pub fn writable(&self) -> Vec<PathBuf> {
         self.now().into_iter().map(|(_, root)| root).collect()
     }
 
@@ -110,18 +130,21 @@ impl Roots {
     fn now(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut roots: Vec<(PathBuf, PathBuf)> = Vec::new();
         for c in &self.list {
-            let root = match &c.pinned {
-                Some(root) => root.is_dir().then(|| root.clone()),
-                None if self.ps5 => pin(&c.path)
-                    .ok()
-                    .filter(|r| !c.drive || mounted(r, (self.statfs)(r))),
-                None => None,
-            };
-            if let Some(root) = root.filter(|r| roots.iter().all(|(_, x)| x != r)) {
+            if let Some(root) = self.live(c).filter(|r| roots.iter().all(|(_, x)| x != r)) {
                 roots.push((c.path.clone(), root));
             }
         }
         roots
+    }
+
+    fn live(&self, c: &Candidate) -> Option<PathBuf> {
+        match &c.pinned {
+            Some(root) => root.is_dir().then(|| root.clone()),
+            None if self.ps5 => pin(&c.path)
+                .ok()
+                .filter(|r| !c.drive || mounted(r, (self.statfs)(r))),
+            None => None,
+        }
     }
 
     /// PS5: at or inside a root, resolved as far as it exists (the rest never `..`). A computer
@@ -130,9 +153,9 @@ impl Roots {
         if !self.ps5 || ps5_dump_forge_core::net::is_network(path) {
             return Ok(());
         }
-        let now = self.now();
+        let now = self.current();
         match resolve(path) {
-            Some(real) if now.iter().any(|(_, root)| real.starts_with(root)) => Ok(()),
+            Some(real) if now.iter().any(|root| real.starts_with(root)) => Ok(()),
             _ => Err(outside(path)),
         }
     }
@@ -200,6 +223,7 @@ impl Roots {
             .collect();
         Roots {
             list,
+            app: None,
             ps5: true,
             statfs,
             ttl: Duration::ZERO,
@@ -364,7 +388,8 @@ mod tests {
     }
 
     /// The PS5's reach: `/data` (a link here) and a drive while mounted; nothing else, also not
-    /// through a link inside a root. A computer reaches everything.
+    /// through a link inside a root; `/user/app` listed and read, never a paired device's. A
+    /// computer reaches everything.
     #[test]
     fn ps5_reaches_only_data_and_mounted_drives() {
         let tmp = std::env::temp_dir().join(format!("forge-reach-{}", std::process::id()));
@@ -373,15 +398,28 @@ mod tests {
         std::fs::create_dir_all(tmp.join("mnt/usb0")).unwrap();
         std::fs::create_dir_all(tmp.join("mnt/usb1")).unwrap();
         std::fs::create_dir_all(tmp.join("system")).unwrap();
+        std::fs::create_dir_all(tmp.join("user/app/PPSA00001")).unwrap();
         let tmp = tmp.canonicalize().unwrap();
         let (data, real) = (tmp.join("data"), tmp.join("user/data"));
         std::os::unix::fs::symlink(&real, &data).unwrap();
         std::os::unix::fs::symlink(tmp.join("system"), real.join("out")).unwrap();
         let (usb0, usb1) = (tmp.join("mnt/usb0"), tmp.join("mnt/usb1"));
-        let roots = Roots::fake(
+        let mut roots = Roots::fake(
             &[(data.clone(), false), (usb0.clone(), true), (usb1, true)],
             fake_statfs,
         );
+        let app = tmp.join("user/app");
+        roots.app = Some(Candidate {
+            path: app.clone(),
+            pinned: None,
+            drive: false,
+        });
+        assert_eq!(roots.current(), [real.clone(), app.clone()]);
+        assert_eq!(roots.writable(), std::slice::from_ref(&real));
+        let pkg = app.join("PPSA00001/app.pkg");
+        assert!(roots.confine(&app).is_ok() && roots.confine(&pkg).is_ok());
+        assert!(roots.reach(&app, true).is_err() && roots.reach(&app, false).is_err());
+        assert!(roots.reach(&pkg, true).is_err() && roots.reach(&pkg, false).is_err());
         let ok = |p: &Path| roots.confine(p).is_ok();
         assert!(ok(&data) && ok(&real.join("game")) && ok(&data.join("game/new/file")));
         assert!(!ok(&tmp) && !ok(&tmp.join("system")) && !ok(&tmp.join("mnt")));

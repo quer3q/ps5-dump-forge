@@ -149,10 +149,12 @@ pub(crate) fn inner_format(image: &Path) -> anyhow::Result<Format> {
     }
 }
 
-/// Why ShadowMount+ having the image mounted refuses it (PS5 only).
+/// Why the image can't be edited: an installed game, or (PS5) one ShadowMount+ has mounted.
 #[cfg(target_os = "freebsd")]
 pub(crate) fn smp_finding(image: &Path) -> Option<String> {
-    smp_inside(image).or_else(|| smp_mount(image, &mut smp_list, &mut smp_is_mount))
+    smp_inside(image)
+        .or_else(|| installed_inside(image))
+        .or_else(|| smp_mount(image, &mut smp_list, &mut smp_is_mount))
 }
 
 /// Why `path` is refused: at or inside ShadowMount+'s mount folder, as typed or resolved (PS5 only).
@@ -166,9 +168,58 @@ pub(crate) fn smp_inside(path: &Path) -> Option<String> {
     })
 }
 
+/// Why `path` is refused: at or inside the PS5's installed games (`/user/app`, or
+/// `/mnt/<drive>/user/app` on extended storage), as typed or resolved (a new path through its
+/// nearest existing folder); read only (#78).
+pub(crate) fn installed_inside(path: &Path) -> Option<String> {
+    let real = || {
+        path.ancestors()
+            .find_map(|a| Some(a.canonicalize().ok()?.join(path.strip_prefix(a).ok()?)))
+    };
+    (installed_at(path) || real().is_some_and(|r| installed_at(&r))).then(|| {
+        format!(
+            "{} is an installed game (/user/app): Dump Forge only reads it",
+            path.display()
+        )
+    })
+}
+
+/// [`installed_inside`] where jobs run on the PS5 (a computer's `/mnt/x/user/app` is the user's).
+pub(crate) fn installed_here(path: &Path) -> Option<String> {
+    if cfg!(any(target_os = "freebsd", test)) {
+        installed_inside(path)
+    } else {
+        None
+    }
+}
+
+/// A folder holding installed games (`/user`, `/mnt/ext0/user`, ...): deleted or moved, they go too.
+pub(crate) fn installed_holder(path: &Path) -> bool {
+    cfg!(any(target_os = "freebsd", test))
+        && held(path).iter().any(|p| p.symlink_metadata().is_ok())
+}
+
+/// The installed-games folders `path` would hold by name.
+fn held(path: &Path) -> Vec<PathBuf> {
+    let mut v = vec![path.join("app"), path.join("user/app")];
+    v.retain(|p| installed_at(p));
+    v
+}
+
+fn installed_at(path: &Path) -> bool {
+    use std::path::Component::{Normal, RootDir};
+    let parts: Vec<_> = path.components().collect();
+    let app = |rest: &[std::path::Component]| matches!(rest, [Normal(u), Normal(a), ..] if *u == "user" && *a == "app");
+    match parts.as_slice() {
+        [RootDir, Normal(m), Normal(_), rest @ ..] if *m == "mnt" => app(rest),
+        [RootDir, rest @ ..] => app(rest),
+        _ => false,
+    }
+}
+
 #[cfg(not(target_os = "freebsd"))]
-pub(crate) fn smp_finding(_: &Path) -> Option<String> {
-    None
+pub(crate) fn smp_finding(image: &Path) -> Option<String> {
+    installed_here(image)
 }
 
 /// A non-UTF-8 name is an error (fails closed): changed to fit, it would be another path.
@@ -1513,6 +1564,36 @@ mod tests {
         }
         for path in ["/mnt", "/mnt/shadowmnt2/x", "/data/games/My Game"] {
             assert_eq!(smp_inside(Path::new(path)), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn installed_games_are_read_only() {
+        for path in [
+            "/user/app",
+            "/user/app/PPSA01234/eboot.bin",
+            "/user/./app/PPSA01234",
+            "/mnt/ext0/user/app/PPSA01234",
+        ] {
+            assert!(installed_inside(Path::new(path)).is_some(), "{path}");
+        }
+        for path in [
+            "/user/app2",
+            "/user/apps/x",
+            "/user",
+            "/data/user/app",
+            "/mnt/user/app",
+        ] {
+            assert_eq!(installed_inside(Path::new(path)), None, "{path}");
+        }
+        // Deleting or moving a folder above them takes them along.
+        for (path, holds) in [
+            ("/user", true),
+            ("/mnt/ext0/user", true),
+            ("/mnt/ext0", true),
+            ("/data", false),
+        ] {
+            assert_eq!(!held(Path::new(path)).is_empty(), holds, "{path}");
         }
     }
 

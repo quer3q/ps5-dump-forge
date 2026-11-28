@@ -1029,6 +1029,9 @@ const en = {
       "Shows every pack and format, with no More, and keeps every fold open. Turn it off to keep Build short.",
     bundled: (version: string) => `${version} (bundled)`,
     replaceAmprEmu: "Replace ampr_emu with ampr-emu-ng",
+    installedGames: "Show installed games",
+    installedGamesHint:
+      "Lists installed games (/user/app) beside /data in the pickers and the File explorer, so an installed FPKG's app.pkg can be a Build or Edit source. Read only: nothing there is changed or deleted. A retail game can't be read.",
     languageHint: "The system's languages until you choose one.",
     notificationsGroup: "PS5",
   },

@@ -52,6 +52,8 @@ fn request_findings(req: &ConvertRequest) -> Vec<String> {
     }
     #[cfg(target_os = "freebsd")]
     findings.extend(crate::edit_job::smp_inside(&req.output).map(|why| format!("transfer: {why}")));
+    findings
+        .extend(crate::edit_job::installed_here(&req.output).map(|why| format!("transfer: {why}")));
     if is_remote(&req.output) {
         if let Err(e) = RemoteDir::open(&req.output) {
             findings.push(format!("transfer: {e:#}"));
